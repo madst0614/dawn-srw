@@ -73,6 +73,8 @@ CLI Arguments:
         --n_runs          Runs for factual analysis (default: 10)
         --batch_size      Dataloader batch size (default: 16)
         --max_samples     Max samples for dataloader (default: 5000)
+        --n_clusters      Clusters for embedding analysis (default: 5)
+        --pool_type       Neuron pool type: fv, fqk, rv, rqk (default: fv)
 """
 
 import os
@@ -121,6 +123,8 @@ class ModelAnalyzer:
         n_runs: int = 10,
         batch_size: int = 16,
         max_samples: int = 5000,
+        n_clusters: int = 5,
+        pool_type: str = 'fv',
     ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
@@ -134,6 +138,8 @@ class ModelAnalyzer:
         self.n_runs = n_runs
         self.batch_size = batch_size
         self.max_samples = max_samples
+        self.n_clusters = n_clusters
+        self.pool_type = pool_type
 
         self.model = None
         self.tokenizer = None
@@ -455,7 +461,7 @@ class ModelAnalyzer:
         self.results['routing'] = results
         return results
 
-    def analyze_embedding(self) -> Dict:
+    def analyze_embedding(self, n_clusters: int = 5) -> Dict:
         """Analyze embeddings (DAWN only)."""
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
@@ -466,9 +472,9 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'embedding'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Analyzing neuron embeddings...")
+        print(f"  Analyzing neuron embeddings ({n_clusters} clusters)...")
         analyzer = EmbeddingAnalyzer(self.model, device=self.device)
-        results = analyzer.run_all(str(output_dir))
+        results = analyzer.run_all(str(output_dir), n_clusters=n_clusters)
 
         # Print summary
         sim = results.get('similarity', {})
@@ -502,7 +508,7 @@ class ModelAnalyzer:
         self.results['semantic'] = results
         return results
 
-    def analyze_pos(self, max_sentences: int = 2000) -> Dict:
+    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv') -> Dict:
         """Analyze POS neuron specialization (DAWN only)."""
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
@@ -513,11 +519,11 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'pos'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences)...")
+        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type})...")
         analyzer = POSNeuronAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
-        results = analyzer.run_all(str(output_dir), max_sentences=max_sentences)
+        results = analyzer.run_all(str(output_dir), pool_type=pool_type, max_sentences=max_sentences)
 
         # Print summary
         specificity = results.get('neuron_specificity', {})
@@ -531,7 +537,7 @@ class ModelAnalyzer:
         self.results['pos'] = results
         return results
 
-    def analyze_factual(self, n_runs: int = 10) -> Dict:
+    def analyze_factual(self, n_runs: int = 10, pool_type: str = 'fv') -> Dict:
         """Analyze factual knowledge neurons (DAWN only)."""
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
@@ -542,7 +548,7 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'factual'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"  Analyzing factual neurons ({n_runs} runs per prompt)...")
+        print(f"  Analyzing factual neurons ({n_runs} runs per prompt, pool={pool_type})...")
         analyzer = BehavioralAnalyzer(
             self.model, tokenizer=self.tokenizer, device=self.device
         )
@@ -555,7 +561,7 @@ class ModelAnalyzer:
         ]
         targets = ["Paris", "Berlin", "Tokyo", "blue"]
 
-        results = analyzer.analyze_factual_neurons(prompts, targets, n_runs=n_runs)
+        results = analyzer.analyze_factual_neurons(prompts, targets, n_runs=n_runs, pool_type=pool_type)
 
         # Print summary
         per_target = results.get('per_target', {})
@@ -892,10 +898,10 @@ class ModelAnalyzer:
             ('performance', self.analyze_performance, {'n_batches': self.val_batches}),
             ('health', self.analyze_health, {}),
             ('routing', self.analyze_routing, {'n_batches': self.n_batches}),
-            ('embedding', self.analyze_embedding, {}),
+            ('embedding', self.analyze_embedding, {'n_clusters': self.n_clusters}),
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
-            ('pos', self.analyze_pos, {'max_sentences': self.max_sentences}),
-            ('factual', self.analyze_factual, {'n_runs': self.n_runs}),
+            ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type}),
+            ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
             ('weight', self.analyze_weight, {}),
@@ -908,7 +914,7 @@ class ModelAnalyzer:
                 ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
                 ('health', self.analyze_health, {}),
                 ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'n_runs': max(5, self.n_runs // 2)}),
+                ('factual', self.analyze_factual, {'n_runs': max(5, self.n_runs // 2), 'pool_type': self.pool_type}),
             ]
 
         if only:
@@ -994,6 +1000,8 @@ class MultiModelAnalyzer:
         n_runs: int = 10,
         batch_size: int = 16,
         max_samples: int = 5000,
+        n_clusters: int = 5,
+        pool_type: str = 'fv',
     ):
         self.checkpoint_paths = checkpoint_paths
         self.val_data_path = val_data_path
@@ -1007,6 +1015,8 @@ class MultiModelAnalyzer:
         self.n_runs = n_runs
         self.batch_size = batch_size
         self.max_samples = max_samples
+        self.n_clusters = n_clusters
+        self.pool_type = pool_type
 
         self.analyzers = []
         self.results = {}
@@ -1038,6 +1048,8 @@ class MultiModelAnalyzer:
                 n_runs=self.n_runs,
                 batch_size=self.batch_size,
                 max_samples=self.max_samples,
+                n_clusters=self.n_clusters,
+                pool_type=self.pool_type,
             )
             analyzer.run_all(paper_only=paper_only, only=only)
 
@@ -1339,6 +1351,8 @@ Examples:
     parser.add_argument('--n_runs', type=int, default=10, help='Number of runs for factual analysis (default: 10)')
     parser.add_argument('--batch_size', type=int, default=16, help='Dataloader batch size (default: 16)')
     parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
+    parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
+    parser.add_argument('--pool_type', type=str, default='fv', help='Neuron pool type: fv, fqk, rv, rqk (default: fv)')
 
     args = parser.parse_args()
 
@@ -1353,6 +1367,8 @@ Examples:
     print(f"max_sentences: {args.max_sentences}")
     print(f"n_runs: {args.n_runs}")
     print(f"max_samples: {args.max_samples}")
+    print(f"n_clusters: {args.n_clusters}")
+    print(f"pool_type: {args.pool_type}")
     print("=" * 60 + "\n")
 
     # Device check
@@ -1381,6 +1397,8 @@ Examples:
             n_runs=args.n_runs,
             batch_size=args.batch_size,
             max_samples=args.max_samples,
+            n_clusters=args.n_clusters,
+            pool_type=args.pool_type,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
     else:
@@ -1393,6 +1411,8 @@ Examples:
             n_runs=args.n_runs,
             batch_size=args.batch_size,
             max_samples=args.max_samples,
+            n_clusters=args.n_clusters,
+            pool_type=args.pool_type,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
 
