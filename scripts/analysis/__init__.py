@@ -95,6 +95,9 @@ from .standalone.routing_analysis import (
 # POS Neuron Analyzer (refactored)
 from .pos_neuron import POSNeuronAnalyzer
 
+# V18.x Specific Analyzer
+from .v18 import V18Analyzer
+
 # Complete analysis tool
 from .analyze_all import ModelAnalyzer, MultiModelAnalyzer
 
@@ -164,6 +167,9 @@ __all__ = [
     'plot_pos_clustering',
     'plot_top_neurons_by_pos',
     'plot_specificity',
+
+    # V18.x analysis
+    'V18Analyzer',
 
     # Complete analysis
     'ModelAnalyzer',

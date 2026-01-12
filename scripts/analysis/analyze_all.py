@@ -64,7 +64,7 @@ CLI Arguments:
         --paper-only      Generate paper outputs only (faster)
         --only            Run only specific analyses (comma-separated)
                           Options: health,routing,embedding,semantic,pos,
-                                   factual,behavioral,coselection,weight
+                                   factual,behavioral,coselection,weight,v18
 
     Analysis Parameters:
         --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
@@ -916,6 +916,103 @@ class ModelAnalyzer:
         self.results['weight'] = results
         return results
 
+    def analyze_v18(self, n_batches: int = 50) -> Dict:
+        """Analyze v18.x specific features (DAWN v18.x only)."""
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.v18 import V18Analyzer
+
+        # Check if model is v18.x
+        analyzer = V18Analyzer(self.model, device=self.device)
+        if not analyzer.is_v18:
+            print("  Skipping (not v18.x model)")
+            return {}
+
+        output_dir = self.output_dir / 'v18'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"  Analyzing v18.x specific features ({n_batches} batches)...")
+        dataloader = self._get_dataloader()
+        results = analyzer.run_all(dataloader, str(output_dir), n_batches)
+
+        # Print detailed summary
+        tau_params = results.get('tau_parameters', {})
+        per_layer = results.get('per_layer', {})
+
+        if tau_params:
+            print(f"\n  ┌─ Tau Parameters ({tau_params.get('structure', 'v18')}) ─────────────────────────────────────")
+
+            # Bias values
+            tau_bias = tau_params.get('tau_bias', {})
+            print(f"  │ {'Pool':<16} {'Bias':>10} {'Weight Norm':>14} {'Weight Std':>12}")
+            print(f"  │ {'─'*16} {'─'*10} {'─'*14} {'─'*12}")
+
+            for pool in tau_bias.keys():
+                bias = tau_bias.get(pool, 0)
+                norm = tau_params.get('tau_weight_norm', {}).get(pool, 0)
+                std = tau_params.get('tau_weight_std', {}).get(pool, 0)
+                print(f"  │ {pool:<16} {bias:>10.4f} {norm:>14.4f} {std:>12.4f}")
+
+            # Q/K differentiation
+            qk_diff = tau_params.get('qk_differentiation', {})
+            if qk_diff:
+                print(f"  │")
+                print(f"  │ Q/K Differentiation:")
+                for key, val in qk_diff.items():
+                    print(f"  │   {key}: {val:.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Per-layer gate summary
+        if per_layer:
+            gate_data = per_layer.get('gate', {})
+            if gate_data:
+                print(f"\n  ┌─ Per-Layer Gate Strength ─────────────────────────────────────────────")
+                print(f"  │ {'Layer':<8} {'FQ':>8} {'FK':>8} {'FV':>8} {'RQ':>8} {'RK':>8} {'RV':>8}")
+                print(f"  │ {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+
+                for layer, pools in sorted(gate_data.items(), key=lambda x: int(x[0][1:])):
+                    row = f"  │ {layer:<8}"
+                    for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
+                        val = pools.get(pool, 0)
+                        row += f" {val:>8.3f}" if val else " {:>8}".format('-')
+                    print(row)
+                print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+            # Q/K overlap
+            qk_data = per_layer.get('qk_overlap', {})
+            if qk_data:
+                print(f"\n  ┌─ Per-Layer Q/K Overlap ───────────────────────────────────────────────")
+                print(f"  │ {'Layer':<8} {'FQK':>10} {'RQK':>10}")
+                print(f"  │ {'─'*8} {'─'*10} {'─'*10}")
+
+                for layer, data in sorted(qk_data.items(), key=lambda x: int(x[0][1:])):
+                    fqk = data.get('fqk', 0)
+                    rqk = data.get('rqk', 0)
+                    print(f"  │ {layer:<8} {fqk:>10.4f} {rqk:>10.4f}")
+                print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+            # Confidence (v18.3+)
+            conf_data = per_layer.get('confidence', {})
+            has_conf = any(pools for pools in conf_data.values())
+            if has_conf:
+                print(f"\n  ┌─ Per-Layer Confidence (v18.3+) ───────────────────────────────────────")
+                print(f"  │ {'Layer':<8} {'FQ':>8} {'FK':>8} {'FV':>8} {'RQ':>8} {'RK':>8} {'RV':>8}")
+                print(f"  │ {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+
+                for layer, pools in sorted(conf_data.items(), key=lambda x: int(x[0][1:])):
+                    if pools:
+                        row = f"  │ {layer:<8}"
+                        for pool in ['fq', 'fk', 'fv', 'rq', 'rk', 'rv']:
+                            val = pools.get(pool, 0)
+                            row += f" {val:>8.3f}" if val else " {:>8}".format('-')
+                        print(row)
+                print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        self.results['v18'] = results
+        return results
+
     def generate_paper_outputs(self):
         """Generate paper-ready figures and tables."""
         paper_dir = self.output_dir / 'paper'
@@ -1142,6 +1239,7 @@ class ModelAnalyzer:
                 "├── behavioral/",
                 "├── coselection/",
                 "├── weight/",
+                "├── v18/",
             ])
 
         lines.extend([
@@ -1172,6 +1270,7 @@ class ModelAnalyzer:
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
             ('weight', self.analyze_weight, {}),
+            ('v18', self.analyze_v18, {'n_batches': self.n_batches // 2}),
         ]
 
         if paper_only:
@@ -1609,7 +1708,7 @@ Examples:
 
     # Analysis mode
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
-    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: health,routing,embedding,semantic,pos,factual,behavioral,coselection,weight)')
+    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: health,routing,embedding,semantic,pos,factual,behavioral,coselection,weight,v18)')
 
     # Analysis parameters
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
