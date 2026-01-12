@@ -194,78 +194,77 @@ class SemanticAnalyzer(BaseAnalyzer):
 
         # Single forward pass
         self.model.eval()
-        self.enable_pref_tensors()
 
-        try:
-            with torch.no_grad():
-                outputs = self.model(input_ids, return_routing_info=True)
+        with torch.no_grad():
+            outputs = self.model(input_ids, return_routing_info=True)
 
-            routing_infos = get_routing_from_outputs(outputs)
-            if routing_infos is None or len(routing_infos) == 0:
-                return [{} for _ in texts]
+        # Get routing_infos directly from outputs tuple
+        if not isinstance(outputs, tuple) or len(outputs) < 2:
+            return [{} for _ in texts]
+        routing_infos = outputs[1]
+        if routing_infos is None or len(routing_infos) == 0:
+            return [{} for _ in texts]
 
-            batch_size = input_ids.shape[0]
-            results = []
+        batch_size = input_ids.shape[0]
+        results = []
 
-            # Process each sample in batch
-            for b in range(batch_size):
-                result = {}
-                seq_len = attention_mask[b].sum().item()
+        # Process each sample in batch
+        for b in range(batch_size):
+            result = {}
+            seq_len = attention_mask[b].sum().item()
 
-                for layer_idx, layer_info in enumerate(routing_infos):
-                    layer_key = f'layer_{layer_idx}'
-                    result[layer_key] = {}
+            for layer_idx, layer_info in enumerate(routing_infos):
+                layer_key = f'layer_{layer_idx}'
+                result[layer_key] = {}
 
-                    # Attention routing
-                    attn = layer_info.get('attention', {})
-                    for key, (display, pref_key, weight_key, pool) in ROUTING_KEYS.items():
-                        weights = attn.get(weight_key)
-                        if weights is not None:
-                            if weights.dim() == 3:
-                                w = weights[b, :seq_len]  # [B,S,N] → [S, N]
-                            elif weights.dim() == 2:
-                                # Batch-level routing: expand to token-level [N] → [S, N]
-                                w = weights[b].unsqueeze(0).expand(seq_len, -1)
-                            else:
-                                continue
-                            result[layer_key][key] = w if keep_on_gpu else w.cpu()
+                # Attention routing
+                attn = layer_info.get('attention', layer_info)
+                for key, (display, pref_key, weight_key, pool) in ROUTING_KEYS.items():
+                    weights = attn.get(weight_key)
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            w = weights[b, :seq_len]  # [B,S,N] → [S, N]
+                        elif weights.dim() == 2:
+                            # Batch-level routing: expand to token-level [N] → [S, N]
+                            w = weights[b].unsqueeze(0).expand(seq_len, -1)
+                        else:
+                            continue
+                        result[layer_key][key] = w if keep_on_gpu else w.cpu()
 
-                    # Knowledge routing
-                    knowledge = layer_info.get('knowledge', {})
-                    for key, (display, weight_key, pool) in KNOWLEDGE_ROUTING_KEYS.items():
-                        weights = knowledge.get(weight_key)
-                        if weights is not None:
-                            if weights.dim() == 3:
-                                w = weights[b, :seq_len]  # [B,S,N] → [S, N]
-                            elif weights.dim() == 2:
-                                # Batch-level routing: expand to token-level [N] → [S, N]
-                                w = weights[b].unsqueeze(0).expand(seq_len, -1)
-                            else:
-                                continue
-                            result[layer_key][key] = w if keep_on_gpu else w.cpu()
+                # Knowledge routing
+                knowledge = layer_info.get('knowledge', {})
+                for key, (display, weight_key, pool) in KNOWLEDGE_ROUTING_KEYS.items():
+                    weights = knowledge.get(weight_key)
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            w = weights[b, :seq_len]  # [B,S,N] → [S, N]
+                        elif weights.dim() == 2:
+                            # Batch-level routing: expand to token-level [N] → [S, N]
+                            w = weights[b].unsqueeze(0).expand(seq_len, -1)
+                        else:
+                            continue
+                        result[layer_key][key] = w if keep_on_gpu else w.cpu()
 
-                # Aggregated representation (GPU)
-                result['aggregated'] = self._aggregate_routing_path_gpu(result)
-                result['entropy'] = self._compute_path_entropy(result)
+            # Aggregated representation (GPU)
+            result['aggregated'] = self._aggregate_routing_path_gpu(result)
+            result['entropy'] = self._compute_path_entropy(result)
 
-                results.append(result)
+            results.append(result)
 
-                # Cache
-                if self._cache_enabled and b < len(uncached_texts):
-                    self._path_cache[uncached_texts[b]] = result
+            # Cache
+            if self._cache_enabled and b < len(uncached_texts):
+                self._path_cache[uncached_texts[b]] = result
 
-            # Merge cached and new results
-            if cached_results:
-                final_results = [None] * len(texts)
-                for orig_idx, cached_result in cached_results:
-                    final_results[orig_idx] = cached_result
-                for i, result in enumerate(results):
-                    final_results[uncached_indices[i]] = result
-                return final_results
+        # Merge cached and new results
+        if cached_results:
+            final_results = [None] * len(texts)
+            for orig_idx, cached_result in cached_results:
+                final_results[orig_idx] = cached_result
+            for i, result in enumerate(results):
+                final_results[uncached_indices[i]] = result
+            return final_results
 
-            return results
-        finally:
-            self.disable_pref_tensors()
+        return results
 
     def get_routing_path(self, text: str) -> Dict[str, Dict[str, torch.Tensor]]:
         """
@@ -682,58 +681,57 @@ class SemanticAnalyzer(BaseAnalyzer):
         target_layers_set = set(target_layers)
 
         self.model.eval()
-        self.enable_pref_tensors()
 
-        try:
-            with torch.no_grad():
-                for sent_data in tqdm(ud_data, desc='POS Analysis (UD)'):
-                    pos_tags, token_ids = self._align_tokens_to_pos(
-                        sent_data['tokens'], sent_data['upos']
-                    )
-                    if not token_ids:
+        with torch.no_grad():
+            for sent_data in tqdm(ud_data, desc='POS Analysis (UD)'):
+                pos_tags, token_ids = self._align_tokens_to_pos(
+                    sent_data['tokens'], sent_data['upos']
+                )
+                if not token_ids:
+                    continue
+
+                input_ids = torch.tensor([token_ids], device=self.device)
+                outputs = self.model(input_ids, return_routing_info=True)
+
+                # Get routing_infos directly from outputs tuple
+                if not isinstance(outputs, tuple) or len(outputs) < 2:
+                    continue
+                routing_infos = outputs[1]
+                if routing_infos is None:
+                    continue
+
+                # Process selected layers
+                for layer_idx, layer_info in enumerate(routing_infos):
+                    if layer_idx not in target_layers_set:
                         continue
 
-                    input_ids = torch.tensor([token_ids], device=self.device)
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    routing_infos = get_routing_from_outputs(outputs)
+                    attn = layer_info.get('attention', layer_info)
+                    knowledge = layer_info.get('knowledge', {})
 
-                    if routing_infos is None:
-                        continue
+                    # Collect weights
+                    all_routing = {}
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        w = attn.get(weight_key)
+                        if w is not None:
+                            all_routing[f'L{layer_idx}/{key}'] = w
 
-                    # Process selected layers
-                    for layer_idx, layer_info in enumerate(routing_infos):
-                        if layer_idx not in target_layers_set:
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        w = knowledge.get(weight_key)
+                        if w is not None:
+                            all_routing[f'L{layer_idx}/{key}'] = w
+
+                    # Map tokens to POS
+                    for s, upos in enumerate(pos_tags):
+                        if upos == 'X':
                             continue
+                        pos_counts[upos] += 1
 
-                        attn = layer_info.get('attention', {})
-                        knowledge = layer_info.get('knowledge', {})
-
-                        # Collect weights
-                        all_routing = {}
-                        for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                            w = attn.get(weight_key)
-                            if w is not None:
-                                all_routing[f'L{layer_idx}/{key}'] = w
-
-                        for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
-                            w = knowledge.get(weight_key)
-                            if w is not None:
-                                all_routing[f'L{layer_idx}/{key}'] = w
-
-                        # Map tokens to POS
-                        for s, upos in enumerate(pos_tags):
-                            if upos == 'X':
-                                continue
-                            pos_counts[upos] += 1
-
-                            for routing_key, w in all_routing.items():
-                                if w is not None and w.dim() >= 2:
-                                    if w.dim() == 3 and s < w.shape[1]:
-                                        pos_weights[f"{routing_key}/{upos}"].append(w[0, s].cpu())
-                                    elif w.dim() == 2:
-                                        pos_weights[f"{routing_key}/{upos}"].append(w[0].cpu())
-        finally:
-            self.disable_pref_tensors()
+                        for routing_key, w in all_routing.items():
+                            if w is not None and w.dim() >= 2:
+                                if w.dim() == 3 and s < w.shape[1]:
+                                    pos_weights[f"{routing_key}/{upos}"].append(w[0, s].cpu())
+                                elif w.dim() == 2:
+                                    pos_weights[f"{routing_key}/{upos}"].append(w[0].cpu())
 
         # Analyze results
         results = {
@@ -958,77 +956,76 @@ class SemanticAnalyzer(BaseAnalyzer):
         neuron_sizes = {}  # Track N for each routing_key
 
         self.model.eval()
-        self.enable_pref_tensors()
 
-        try:
-            with torch.no_grad():
-                for i, batch in enumerate(tqdm(dataloader, desc='Neuron-Token Heatmap', total=max_batches)):
-                    if i >= max_batches:
-                        break
+        with torch.no_grad():
+            for i, batch in enumerate(tqdm(dataloader, desc='Neuron-Token Heatmap', total=max_batches)):
+                if i >= max_batches:
+                    break
 
-                    input_ids = get_batch_input_ids(batch, self.device)
-                    B, S = input_ids.shape
+                input_ids = get_batch_input_ids(batch, self.device)
+                B, S = input_ids.shape
 
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    routing_infos = get_routing_from_outputs(outputs)
+                outputs = self.model(input_ids, return_routing_info=True)
 
-                    if routing_infos is None:
-                        continue
+                # Get routing_infos directly from outputs tuple
+                if not isinstance(outputs, tuple) or len(outputs) < 2:
+                    continue
+                routing_infos = outputs[1]
+                if routing_infos is None:
+                    continue
 
-                    for layer_idx, layer_info in enumerate(routing_infos):
-                        attn = layer_info.get('attention', {})
-                        knowledge = layer_info.get('knowledge', {})
+                for layer_idx, layer_info in enumerate(routing_infos):
+                    attn = layer_info.get('attention', layer_info)
+                    knowledge = layer_info.get('knowledge', {})
 
-                        routing_weights = {}
+                    routing_weights = {}
 
-                        for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                            w = attn.get(weight_key)
-                            if w is not None:
-                                if w.dim() == 3:
-                                    routing_weights[f'L{layer_idx}/{key}'] = w
-                                elif w.dim() == 2:
-                                    routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
+                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                        w = attn.get(weight_key)
+                        if w is not None:
+                            if w.dim() == 3:
+                                routing_weights[f'L{layer_idx}/{key}'] = w
+                            elif w.dim() == 2:
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
 
-                        for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
-                            w = knowledge.get(weight_key)
-                            if w is not None:
-                                if w.dim() == 3:
-                                    routing_weights[f'L{layer_idx}/{key}'] = w
-                                elif w.dim() == 2:
-                                    routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
+                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                        w = knowledge.get(weight_key)
+                        if w is not None:
+                            if w.dim() == 3:
+                                routing_weights[f'L{layer_idx}/{key}'] = w
+                            elif w.dim() == 2:
+                                routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
 
-                        # Vectorized aggregation using scatter_add
-                        for routing_key, weights in routing_weights.items():
-                            B, S, N = weights.shape
+                    # Vectorized aggregation using scatter_add
+                    for routing_key, weights in routing_weights.items():
+                        B, S, N = weights.shape
 
-                            # Initialize accumulator if needed
-                            if routing_key not in token_neuron_sums:
-                                token_neuron_sums[routing_key] = torch.zeros(
-                                    vocab_size, N, device=self.device, dtype=torch.float32
-                                )
-                                neuron_sizes[routing_key] = N
+                        # Initialize accumulator if needed
+                        if routing_key not in token_neuron_sums:
+                            token_neuron_sums[routing_key] = torch.zeros(
+                                vocab_size, N, device=self.device, dtype=torch.float32
+                            )
+                            neuron_sizes[routing_key] = N
 
-                            # Flatten: [B, S] -> [B*S] (use reshape for non-contiguous tensors)
-                            flat_token_ids = input_ids.reshape(-1)  # [B*S]
-                            flat_weights = weights.reshape(-1, N)    # [B*S, N]
+                        # Flatten: [B, S] -> [B*S] (use reshape for non-contiguous tensors)
+                        flat_token_ids = input_ids.reshape(-1)  # [B*S]
+                        flat_weights = weights.reshape(-1, N)    # [B*S, N]
 
-                            # Mask special tokens ([CLS], [SEP], [PAD], etc.)
-                            # Token IDs 100-103 are typically special in BERT
-                            valid_mask = (flat_token_ids >= 104)  # Skip [UNK], [CLS], [SEP], [MASK], [PAD]
+                        # Mask special tokens ([CLS], [SEP], [PAD], etc.)
+                        # Token IDs 100-103 are typically special in BERT
+                        valid_mask = (flat_token_ids >= 104)  # Skip [UNK], [CLS], [SEP], [MASK], [PAD]
 
-                            if valid_mask.any():
-                                valid_ids = flat_token_ids[valid_mask]      # [valid_count]
-                                valid_weights = flat_weights[valid_mask]    # [valid_count, N]
+                        if valid_mask.any():
+                            valid_ids = flat_token_ids[valid_mask]      # [valid_count]
+                            valid_weights = flat_weights[valid_mask]    # [valid_count, N]
 
-                                # scatter_add: accumulate weights by token_id
-                                # token_neuron_sums[routing_key][token_id, :] += valid_weights
-                                token_neuron_sums[routing_key].scatter_add_(
-                                    0,
-                                    valid_ids.unsqueeze(1).expand(-1, N),
-                                    valid_weights
-                                )
-        finally:
-            self.disable_pref_tensors()
+                            # scatter_add: accumulate weights by token_id
+                            # token_neuron_sums[routing_key][token_id, :] += valid_weights
+                            token_neuron_sums[routing_key].scatter_add_(
+                                0,
+                                valid_ids.unsqueeze(1).expand(-1, N),
+                                valid_weights
+                            )
 
         # Convert to results format
         results = {}
