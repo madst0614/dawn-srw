@@ -256,6 +256,14 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             routing_infos = get_routing_from_outputs(outputs)
             if routing_infos is None:
                 return {}
+
+            # Debug: print available keys on first call
+            if not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                if routing_infos and len(routing_infos) > 0:
+                    layer_info = routing_infos[0]
+                    attn = layer_info.get('attention', layer_info)
+                    print(f"  [DEBUG] Routing info keys: {list(attn.keys())[:10]}")
         finally:
             self.disable_pref_tensors()
 
