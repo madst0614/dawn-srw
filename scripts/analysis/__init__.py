@@ -85,7 +85,7 @@ from .paper_figures import PaperFigureGenerator
 
 # Visualizers
 from . import visualizers
-from .routing_analysis import (
+from .standalone.routing_analysis import (
     GenerationRoutingAnalyzer,
     analyze_common_neurons,
     analyze_token_neurons,

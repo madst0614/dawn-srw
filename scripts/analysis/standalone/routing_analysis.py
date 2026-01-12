@@ -34,7 +34,7 @@ from collections import Counter, defaultdict
 
 # Handle both module import and standalone execution
 try:
-    from .utils import (
+    from ..utils import (
         load_model, get_router,
         ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
         HAS_MATPLOTLIB, plt
