@@ -243,11 +243,15 @@ def plot_top_neurons_by_pos(
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
-    top_neurons = results['top_neurons_per_pos']
+    top_neurons = results.get('top_neurons_per_pos', {})
     pos_list = [p for p in UPOS_TAGS if p in top_neurons]
 
+    if not pos_list:
+        print("  Warning: No POS data to plot")
+        return None
+
     n_cols = 4
-    n_rows = (len(pos_list) + n_cols - 1) // n_cols
+    n_rows = max(1, (len(pos_list) + n_cols - 1) // n_cols)
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
     axes = axes.flatten()
