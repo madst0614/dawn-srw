@@ -304,12 +304,25 @@ class BehavioralAnalyzer(BaseAnalyzer):
         # Train and evaluate classifiers per layer/routing key
         results = {'per_layer': {}}
 
-        for layer_key in X_data.keys():
+        # Count total classifiers to train
+        total_classifiers = sum(len(routing_data) for routing_data in X_data.values())
+        classifier_idx = 0
+        print(f"  Training {total_classifiers} classifiers...", flush=True)
+
+        for layer_key in sorted(X_data.keys()):
             results['per_layer'][layer_key] = {}
 
             for routing_key in X_data[layer_key].keys():
+                classifier_idx += 1
                 X = np.array(X_data[layer_key][routing_key])
                 y = np.array(y_labels[layer_key][:len(X)])
+
+                # Limit samples for faster training (max 50k samples)
+                max_samples = 50000
+                if len(X) > max_samples:
+                    indices = np.random.choice(len(X), max_samples, replace=False)
+                    X = X[indices]
+                    y = y[indices]
 
                 if len(X) < 100 or len(np.unique(y)) < 2:
                     results['per_layer'][layer_key][routing_key] = {'error': 'Not enough data'}
@@ -320,7 +333,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         X, y, test_size=0.2, random_state=42
                     )
 
-                    clf = LogisticRegression(max_iter=1000, random_state=42)
+                    # Use faster solver for large datasets
+                    solver = 'saga' if len(X_train) > 10000 else 'lbfgs'
+                    clf = LogisticRegression(max_iter=500, random_state=42, solver=solver, n_jobs=-1)
                     clf.fit(X_train, y_train)
                     y_pred = clf.predict(X_test)
 
