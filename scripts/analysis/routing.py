@@ -21,6 +21,7 @@ from collections import Counter, defaultdict
 from .base import BaseAnalyzer
 from .utils import (
     NEURON_TYPES, NEURON_TYPES_V18, ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS, QK_POOLS,
+    POOL_N_ATTR,  # Direct pool_type to n_attr mapping
     calc_entropy_ratio, gini_coefficient,
     get_batch_input_ids,
     RoutingDataExtractor,  # New extraction layer
@@ -144,9 +145,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             top10 = counts.most_common(10)
             unique = len(counts)
 
-            neuron_types = self.get_neuron_types()
-            pool_info = neuron_types.get(pool, {})
-            n_attr = pool_info[2] if pool_info else None
+            # Use direct POOL_N_ATTR mapping for consistent n_total lookup
+            n_attr = POOL_N_ATTR.get(pool)
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
 
             results[key] = {
@@ -250,9 +250,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             else:
                 continue
 
-            neuron_types = self.get_neuron_types()
-            pool_info = neuron_types.get(pool, {})
-            n_attr = pool_info[2] if pool_info else None
+            # Use direct POOL_N_ATTR mapping for consistent n_total lookup
+            n_attr = POOL_N_ATTR.get(pool)
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
 
             union_count = len(union_selected[layer_key])

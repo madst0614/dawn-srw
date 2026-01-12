@@ -145,6 +145,16 @@ NEURON_ATTRS = {
     'restore_know': 'restore_know',
 }
 
+# Direct pool_type to n_attr mapping (consistent across all model versions)
+POOL_N_ATTR = {
+    'feature_qk': 'n_feature_qk',
+    'feature_v': 'n_feature_v',
+    'restore_qk': 'n_restore_qk',
+    'restore_v': 'n_restore_v',
+    'feature_know': 'n_feature_know',
+    'restore_know': 'n_restore_know',
+}
+
 # Co-selection pairs for v17.1 analysis
 COSELECTION_PAIRS = {
     'fqk_rqk': {
