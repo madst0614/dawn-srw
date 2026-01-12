@@ -75,6 +75,7 @@ CLI Arguments:
         --max_samples     Max samples for dataloader (default: 5000)
         --n_clusters      Clusters for embedding analysis (default: 5)
         --pool_type       Neuron pool type: fv, fqk, rv, rqk (default: fv)
+        --target_layer    Target layer for POS analysis (default: all layers)
         --gen_tokens      Max tokens to generate per sample (default: 50)
 """
 
@@ -127,6 +128,7 @@ class ModelAnalyzer:
         n_clusters: int = 5,
         pool_type: str = 'fv',
         gen_tokens: int = 50,
+        target_layer: int = None,
     ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
@@ -143,6 +145,7 @@ class ModelAnalyzer:
         self.n_clusters = n_clusters
         self.pool_type = pool_type
         self.gen_tokens = gen_tokens
+        self.target_layer = target_layer
 
         self.model = None
         self.tokenizer = None
@@ -743,7 +746,7 @@ class ModelAnalyzer:
         self.results['semantic'] = results
         return results
 
-    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv') -> Dict:
+    def analyze_pos(self, max_sentences: int = 2000, pool_type: str = 'fv', target_layer: int = None) -> Dict:
         """Analyze POS neuron specialization (DAWN only)."""
         if self.model_type != 'dawn':
             print("  Skipping (not DAWN model)")
@@ -754,9 +757,11 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'pos'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type})...")
+        layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
+        print(f"  Analyzing POS neuron specialization ({max_sentences} sentences, pool={pool_type}, {layer_str})...")
         analyzer = POSNeuronAnalyzer(
-            self.model, tokenizer=self.tokenizer, device=self.device
+            self.model, tokenizer=self.tokenizer, device=self.device,
+            target_layer=target_layer
         )
         results = analyzer.run_all(str(output_dir), pool_type=pool_type, max_sentences=max_sentences)
 
@@ -1310,7 +1315,7 @@ class ModelAnalyzer:
             ('routing', self.analyze_routing, {'n_batches': self.n_batches}),
             ('embedding', self.analyze_embedding, {'n_clusters': self.n_clusters}),
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
-            ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type}),
+            ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type, 'target_layer': self.target_layer}),
             ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
@@ -1414,6 +1419,7 @@ class MultiModelAnalyzer:
         n_clusters: int = 5,
         pool_type: str = 'fv',
         gen_tokens: int = 50,
+        target_layer: int = None,
     ):
         self.checkpoint_paths = checkpoint_paths
         self.val_data_path = val_data_path
@@ -1430,6 +1436,7 @@ class MultiModelAnalyzer:
         self.n_clusters = n_clusters
         self.pool_type = pool_type
         self.gen_tokens = gen_tokens
+        self.target_layer = target_layer
 
         self.analyzers = []
         self.results = {}
@@ -1464,6 +1471,7 @@ class MultiModelAnalyzer:
                 n_clusters=self.n_clusters,
                 pool_type=self.pool_type,
                 gen_tokens=self.gen_tokens,
+                target_layer=self.target_layer,
             )
             analyzer.run_all(paper_only=paper_only, only=only)
 
@@ -1767,6 +1775,7 @@ Examples:
     parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
     parser.add_argument('--pool_type', type=str, default='fv', help='Neuron pool type: fv, fqk, rv, rqk (default: fv)')
+    parser.add_argument('--target_layer', type=int, default=None, help='Target layer for POS/routing analysis (default: all layers)')
     parser.add_argument('--gen_tokens', type=int, default=50, help='Max tokens to generate per sample (default: 50)')
 
     args = parser.parse_args()
@@ -1815,6 +1824,7 @@ Examples:
             n_clusters=args.n_clusters,
             pool_type=args.pool_type,
             gen_tokens=args.gen_tokens,
+            target_layer=args.target_layer,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
     else:
@@ -1830,6 +1840,7 @@ Examples:
             n_clusters=args.n_clusters,
             pool_type=args.pool_type,
             gen_tokens=args.gen_tokens,
+            target_layer=args.target_layer,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
 
