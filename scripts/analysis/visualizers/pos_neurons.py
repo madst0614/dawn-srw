@@ -176,7 +176,22 @@ def plot_pos_clustering(
     if len(pos_list) < 2:
         return None
 
+    # Filter out zero vectors (would cause NaN in cosine distance)
+    nonzero_mask = np.any(vectors != 0, axis=1)
+    if nonzero_mask.sum() < 2:
+        print("  Warning: Not enough non-zero POS vectors for clustering")
+        return None
+
+    vectors = vectors[nonzero_mask]
+    pos_list = [p for p, m in zip(pos_list, nonzero_mask) if m]
+
     distances = pdist(vectors, metric='cosine')
+
+    # Replace NaN/Inf with max distance (1.0 for cosine)
+    if not np.all(np.isfinite(distances)):
+        print("  Warning: Replacing NaN/Inf in distance matrix")
+        distances = np.nan_to_num(distances, nan=1.0, posinf=1.0, neginf=0.0)
+
     linkage = hierarchy.linkage(distances, method='ward')
 
     # Plot

@@ -1081,10 +1081,9 @@ class ModelAnalyzer:
         try:
             from scripts.analysis.paper_figures import PaperFigureGenerator
 
-            dataloader = self._get_dataloader()
             gen = PaperFigureGenerator(
                 self.checkpoint_path,
-                dataloader,
+                self.val_data_path,  # Pass path, not dataloader
                 device=self.device
             )
             gen.generate('3,4,6,7', str(figures_dir), n_batches=50)
