@@ -610,7 +610,13 @@ class ModelAnalyzer:
             print(f"\n  ┌─ Q/K Entropy Comparison ───────────────────────────────────────────────")
             for pool, data in qk_entropy.items():
                 if isinstance(data, dict) and 'q_entropy_mean' in data:
-                    print(f"  │ {pool}: Q={data['q_entropy_mean']:.1f}%, K={data['k_entropy_mean']:.1f}%, diff={data.get('entropy_diff', 0):.1f}%")
+                    q_ent = data['q_entropy_mean']
+                    k_ent = data['k_entropy_mean']
+                    # Skip pools with no data (both 0)
+                    if q_ent == 0 and k_ent == 0:
+                        print(f"  │ {pool}: N/A (v18.5 context-based routing)")
+                    else:
+                        print(f"  │ {pool}: Q={q_ent:.1f}%, K={k_ent:.1f}%, diff={data.get('entropy_diff', 0):.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['routing'] = results
