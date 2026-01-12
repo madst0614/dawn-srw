@@ -14,7 +14,10 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
 from .base import BaseAnalyzer
-from .utils import HAS_TQDM, tqdm
+from .utils import (
+    HAS_TQDM, tqdm,
+    RoutingDataExtractor,  # Schema layer for model-agnostic access
+)
 
 
 # Universal POS tags (UPOS)
@@ -41,6 +44,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         tokenizer=None,
         device: str = 'cuda',
         target_layer: int = None,
+        extractor=None,
     ):
         """
         Initialize analyzer.
@@ -51,8 +55,10 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             tokenizer: Tokenizer instance
             device: Device for computation
             target_layer: Specific layer to analyze (None = all)
+            extractor: RoutingDataExtractor instance (created if None)
         """
         super().__init__(model, router=router, tokenizer=tokenizer, device=device)
+        self.extractor = extractor or RoutingDataExtractor(model, device=device)
         self.target_layer = target_layer
         self.model.eval()
 
@@ -238,53 +244,45 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
         Args:
             token_ids: List of token IDs
-            pool_type: Pool to analyze ('fv', 'rv', 'fqk_q', etc.)
+            pool_type: Pool to analyze ('fv', 'rv', 'fqk_q', etc.) - uses standardized keys
 
         Returns:
             {position: [neuron_indices]}
         """
         input_ids = torch.tensor([token_ids], device=self.device)
 
-        with torch.no_grad():
-            outputs = self.model(input_ids, return_routing_info=True)
+        with self.extractor.analysis_context():
+            with torch.no_grad():
+                outputs = self.model(input_ids, return_routing_info=True)
 
-        # Get routing_infos directly from outputs tuple
-        if isinstance(outputs, tuple) and len(outputs) >= 2:
-            routing_infos = outputs[1]
-        else:
-            return {}
-
-        if not routing_infos:
-            return {}
-
-        # Map pool_type to weight key
-        weight_key_map = {
-            'fv': 'fv_weights', 'rv': 'rv_weights',
-            'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
-            'rqk_q': 'rqk_weights_Q', 'rqk_k': 'rqk_weights_K',
-            'fknow': 'feature_know_w', 'rknow': 'restore_know_w',
-        }
-        weight_key = weight_key_map.get(pool_type, 'fv_weights')
+            routing = self.extractor.extract(outputs)
+            if not routing:
+                return {}
 
         position_neurons = defaultdict(set)
         seq_len = input_ids.shape[1]
 
-        for layer_idx, layer_info in enumerate(routing_infos):
-            if self.target_layer is not None and layer_idx != self.target_layer:
+        # pool_type is already a standardized key, extractor handles mapping
+        for layer in routing:
+            if self.target_layer is not None and layer.layer_idx != self.target_layer:
                 continue
 
-            # Get weights from attention or knowledge
-            attn = layer_info.get('attention', layer_info)
-            know = layer_info.get('knowledge', {})
-
-            weights = attn.get(weight_key) or know.get(weight_key)
+            # Get weights using standardized key
+            weights = layer.get_weight(pool_type)
 
             if weights is not None:
-                # weights: [B, T, N]
-                for pos in range(seq_len):
-                    w = weights[0, pos]  # [N]
+                # weights: [B, T, N] or [B, N]
+                if weights.dim() == 3:
+                    for pos in range(min(seq_len, weights.shape[1])):
+                        w = weights[0, pos]  # [N]
+                        active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
+                        position_neurons[pos].update(active_neurons)
+                elif weights.dim() == 2:
+                    # Batch-level routing - same for all positions
+                    w = weights[0]  # [N]
                     active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                    position_neurons[pos].update(active_neurons)
+                    for pos in range(seq_len):
+                        position_neurons[pos].update(active_neurons)
 
         return {pos: list(neurons) for pos, neurons in position_neurons.items()}
 

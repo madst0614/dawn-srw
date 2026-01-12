@@ -180,7 +180,7 @@ class RoutingAnalyzer(BaseAnalyzer):
         per_batch_counts = defaultdict(list)
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, desc='Selection Diversity', total=n_batches)):
                 if i >= n_batches:
                     break
@@ -188,26 +188,23 @@ class RoutingAnalyzer(BaseAnalyzer):
                 input_ids = get_batch_input_ids(batch, self.device)
 
                 try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    # Get routing_infos directly from outputs tuple
-                    if not isinstance(outputs, tuple) or len(outputs) < 2:
-                        continue
-                    routing_infos = outputs[1]
-                    if not routing_infos:
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True)
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
                         continue
                 except Exception:
                     continue
 
-                # Process ALL layers
-                for layer_idx, layer_info in enumerate(routing_infos):
-                    attn = layer_info.get('attention', layer_info)
-                    knowledge = layer_info.get('knowledge', {})
+                # Process ALL layers using extractor
+                for layer in routing:
+                    layer_idx = layer.layer_idx
 
-                    # Attention routing
-                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
+                    # Attention routing - use standardized keys
+                    for key in ROUTING_KEYS.keys():
                         layer_key = f'L{layer_idx}/{key}'
-                        if weight_key in attn:
-                            weights = attn[weight_key]
+                        weights = layer.get_weight(key)
+                        if weights is not None:
                             if weights.dim() == 3:
                                 selected = (weights > 0).any(dim=0).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
@@ -217,11 +214,11 @@ class RoutingAnalyzer(BaseAnalyzer):
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
                                 per_batch_counts[layer_key].append(selected.sum().item())
 
-                    # Knowledge routing
-                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
+                    # Knowledge routing - use standardized keys
+                    for key in KNOWLEDGE_ROUTING_KEYS.keys():
                         layer_key = f'L{layer_idx}/{key}'
-                        if weight_key in knowledge:
-                            weights = knowledge[weight_key]
+                        weights = layer.get_weight(key)
+                        if weights is not None:
                             if weights.dim() == 3:
                                 selected = (weights > 0).any(dim=0).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
@@ -336,33 +333,29 @@ class RoutingAnalyzer(BaseAnalyzer):
             return jaccard.cpu().tolist()
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Q/K Overlap')):
                 if i >= n_batches:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                # Get routing_infos directly from outputs tuple
-                if not isinstance(outputs, tuple) or len(outputs) < 2:
-                    continue
-                routing_infos = outputs[1]
-                if not routing_infos:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                for layer_info in routing_infos:
-                    attn = layer_info.get('attention', layer_info)
-
-                    # F-QK Q/K overlap using weights
-                    fqk_q = attn.get('fqk_weights_Q')
-                    fqk_k = attn.get('fqk_weights_K')
+                for layer in routing:
+                    # F-QK Q/K overlap using standardized keys
+                    fqk_q = layer.get_weight('fqk_q')
+                    fqk_k = layer.get_weight('fqk_k')
                     if fqk_q is not None and fqk_k is not None:
                         overlap_data['fqk'].extend(compute_jaccard_from_weights(fqk_q, fqk_k))
 
-                    # R-QK Q/K overlap using weights
-                    rqk_q = attn.get('rqk_weights_Q')
-                    rqk_k = attn.get('rqk_weights_K')
+                    # R-QK Q/K overlap using standardized keys
+                    rqk_q = layer.get_weight('rqk_q')
+                    rqk_k = layer.get_weight('rqk_k')
                     if rqk_q is not None and rqk_k is not None:
                         overlap_data['rqk'].extend(compute_jaccard_from_weights(rqk_q, rqk_k))
 
@@ -394,6 +387,12 @@ class RoutingAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary with Q/K usage statistics
         """
+        # Map pool names to standardized Q/K keys
+        POOL_STD_KEYS = {
+            'feature_qk': ('fqk_q', 'fqk_k'),
+            'restore_qk': ('rqk_q', 'rqk_k'),
+        }
+
         results = {}
         self.model.eval()
 
@@ -402,10 +401,15 @@ class RoutingAnalyzer(BaseAnalyzer):
             if n_neurons == 0:
                 continue
 
+            # Get standardized keys for this pool
+            std_q_key, std_k_key = POOL_STD_KEYS.get(pool_name, (None, None))
+            if std_q_key is None:
+                continue
+
             # Per-layer counts: {lidx: (q_counts, k_counts, overlaps)}
             layer_data = {}
 
-            with torch.no_grad():
+            with self.extractor.analysis_context():
                 for i, batch in enumerate(tqdm(dataloader, desc=f'{pool_info["display"]} Q/K', total=n_batches)):
                     if i >= n_batches:
                         break
@@ -413,26 +417,23 @@ class RoutingAnalyzer(BaseAnalyzer):
                     input_ids = get_batch_input_ids(batch, self.device)
 
                     try:
-                        outputs = self.model(input_ids, return_routing_info=True)
-                        # Get routing_infos directly from outputs tuple
-                        if not isinstance(outputs, tuple) or len(outputs) < 2:
-                            continue
-                        routing_infos = outputs[1]
-                        if not routing_infos:
+                        with torch.no_grad():
+                            outputs = self.model(input_ids, return_routing_info=True)
+                        routing = self.extractor.extract(outputs)
+                        if not routing:
                             continue
                     except Exception:
                         continue
 
-                    # Process ALL layers
-                    for lidx, layer_info in enumerate(routing_infos):
+                    # Process ALL layers using extractor
+                    for layer in routing:
+                        lidx = layer.layer_idx
                         if layer_idx is not None and lidx != layer_idx:
                             continue
 
-                        attn = layer_info.get('attention', layer_info)
-
-                        # Get Q/K weights
-                        w_q = attn.get(pool_info['q_weight'])
-                        w_k = attn.get(pool_info['k_weight'])
+                        # Get Q/K weights using standardized keys
+                        w_q = layer.get_weight(std_q_key)
+                        w_k = layer.get_weight(std_k_key)
 
                         if w_q is None or w_k is None:
                             continue
@@ -540,11 +541,17 @@ class RoutingAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary with entropy statistics per layer
         """
+        # Map pool names to standardized Q/K keys
+        POOL_STD_KEYS = {
+            'feature_qk': ('fqk_q', 'fqk_k'),
+            'restore_qk': ('rqk_q', 'rqk_k'),
+        }
+
         # {pool_name: {layer_idx: {'q': [], 'k': []}}}
         layer_entropy = {pool: {} for pool in QK_POOLS.keys()}
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, desc='Q/K Entropy', total=n_batches)):
                 if i >= n_batches:
                     break
@@ -552,27 +559,30 @@ class RoutingAnalyzer(BaseAnalyzer):
                 input_ids = get_batch_input_ids(batch, self.device)
 
                 try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    # Get routing_infos directly from outputs tuple
-                    if not isinstance(outputs, tuple) or len(outputs) < 2:
-                        continue
-                    routing_infos = outputs[1]
-                    if not routing_infos:
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True)
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
                         continue
                 except Exception:
                     continue
 
-                # Process ALL layers
-                for layer_idx, layer_info in enumerate(routing_infos):
-                    attn = layer_info.get('attention', layer_info)
+                # Process ALL layers using extractor
+                for layer in routing:
+                    layer_idx = layer.layer_idx
 
                     for pool_name, pool_info in QK_POOLS.items():
                         if layer_idx not in layer_entropy[pool_name]:
                             layer_entropy[pool_name][layer_idx] = {'q': [], 'k': []}
 
-                        # Use weight keys instead of pref keys
-                        w_q = attn.get(pool_info['q_weight'])
-                        w_k = attn.get(pool_info['k_weight'])
+                        # Get standardized keys for this pool
+                        std_q_key, std_k_key = POOL_STD_KEYS.get(pool_name, (None, None))
+                        if std_q_key is None:
+                            continue
+
+                        # Use standardized keys
+                        w_q = layer.get_weight(std_q_key)
+                        w_k = layer.get_weight(std_k_key)
 
                         if w_q is not None:
                             ent = calc_entropy_ratio(w_q)
@@ -640,8 +650,12 @@ class RoutingAnalyzer(BaseAnalyzer):
         # {layer_idx: {'attention': [], 'knowledge': []}}
         layer_contributions = defaultdict(lambda: {'attention': [], 'knowledge': []})
 
+        # Standardized keys for attention and knowledge
+        ATTENTION_KEYS = ['fv', 'rv', 'fqk_q', 'fqk_k', 'rqk_q', 'rqk_k']
+        KNOWLEDGE_KEYS = ['fknow', 'rknow']
+
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, desc='Layer Contribution', total=n_batches)):
                 if i >= n_batches:
                     break
@@ -649,33 +663,29 @@ class RoutingAnalyzer(BaseAnalyzer):
                 input_ids = get_batch_input_ids(batch, self.device)
 
                 try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    # Get routing_infos directly from outputs tuple
-                    if not isinstance(outputs, tuple) or len(outputs) < 2:
-                        continue
-                    routing_infos = outputs[1]
-                    if not routing_infos:
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True)
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
                         continue
                 except Exception:
                     continue
 
-                # Process all layers
-                for layer_idx, layer_info in enumerate(routing_infos):
-                    attn = layer_info.get('attention', layer_info)
-                    know = layer_info.get('knowledge', {})
+                # Process all layers using extractor
+                for layer in routing:
+                    layer_idx = layer.layer_idx
 
                     # Attention contribution: sum of all attention routing weights
                     attn_contrib = 0.0
-                    for key in ['fv_weights', 'rv_weights', 'fqk_weights_Q', 'fqk_weights_K',
-                               'rqk_weights_Q', 'rqk_weights_K']:
-                        w = attn.get(key)
+                    for key in ATTENTION_KEYS:
+                        w = layer.get_weight(key)
                         if w is not None:
                             attn_contrib += w.sum().item()
 
                     # Knowledge contribution: sum of knowledge weights
                     know_contrib = 0.0
-                    for key in ['feature_know_w', 'restore_know_w']:
-                        w = know.get(key)
+                    for key in KNOWLEDGE_KEYS:
+                        w = layer.get_weight(key)
                         if w is not None:
                             know_contrib += w.sum().item()
 

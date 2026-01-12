@@ -21,6 +21,7 @@ from .utils import (
     ROUTING_KEYS, KNOWLEDGE_ROUTING_KEYS,
     calc_entropy_ratio, simple_pos_tag,
     get_batch_input_ids,
+    RoutingDataExtractor,  # Schema layer for model-agnostic access
     HAS_MATPLOTLIB, HAS_SKLEARN, HAS_TQDM, tqdm, plt
 )
 
@@ -33,7 +34,7 @@ if HAS_SKLEARN:
 class BehavioralAnalyzer(BaseAnalyzer):
     """Token-level behavioral analyzer."""
 
-    def __init__(self, model, router=None, tokenizer=None, device='cuda'):
+    def __init__(self, model, router=None, tokenizer=None, device='cuda', extractor=None):
         """
         Initialize analyzer.
 
@@ -42,8 +43,10 @@ class BehavioralAnalyzer(BaseAnalyzer):
             router: NeuronRouter instance (auto-detected if None)
             tokenizer: Tokenizer instance
             device: Device for computation
+            extractor: RoutingDataExtractor instance (created if None)
         """
         super().__init__(model, router=router, tokenizer=tokenizer, device=device)
+        self.extractor = extractor or RoutingDataExtractor(model, device=device)
 
     def analyze_single_neuron(self, neuron_id: int, neuron_type: str) -> Dict:
         """
@@ -106,33 +109,28 @@ class BehavioralAnalyzer(BaseAnalyzer):
         layer_position_routing = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Trajectory')):
                 if i >= n_batches:
                     break
 
                 input_ids = get_batch_input_ids(batch, self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                # Get routing_infos directly from outputs tuple
-                if isinstance(outputs, tuple) and len(outputs) >= 2:
-                    routing_infos = outputs[1]
-                else:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                if not routing_infos:
-                    continue
-
-                # Process ALL layers
-                for lidx, layer_info in enumerate(routing_infos):
+                # Process ALL layers using extractor
+                for layer in routing:
+                    lidx = layer.layer_idx
                     if layer_idx is not None and lidx != layer_idx:
                         continue
 
-                    attn = layer_info.get('attention', layer_info)
-
-                    # Use weight keys instead of pref keys
-                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                        weights = attn.get(weight_key)
+                    # Use standardized keys
+                    for key in ROUTING_KEYS.keys():
+                        weights = layer.get_weight(key)
                         if weights is None:
                             continue
 
@@ -216,7 +214,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
         y_labels = defaultdict(list)
 
         self.model.eval()
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc='Probing', total=max_batches)):
                 if batch_idx >= max_batches:
                     break
@@ -231,13 +229,10 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     attention_mask = torch.ones_like(input_ids)
 
                 try:
-                    outputs = self.model(input_ids, return_routing_info=True)
-                    # Get routing_infos directly from outputs tuple
-                    if isinstance(outputs, tuple) and len(outputs) >= 2:
-                        routing_infos = outputs[1]
-                    else:
-                        continue
-                    if not routing_infos:
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True)
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
                         continue
                 except Exception:
                     continue
@@ -255,19 +250,18 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 valid_tokens = self.tokenizer.convert_ids_to_tokens(valid_token_ids)
                 batch_pos_labels = [simple_pos_tag(t) for t in valid_tokens]
 
-                # Process ALL layers
-                for lidx, layer_info in enumerate(routing_infos):
+                # Process ALL layers using extractor
+                for layer in routing:
+                    lidx = layer.layer_idx
                     if layer_idx is not None and lidx != layer_idx:
                         continue
 
                     layer_key = f'L{lidx}'
-                    attn = layer_info.get('attention', layer_info)
-                    knowledge = layer_info.get('knowledge', {})
 
-                    # Collect attention routing weights - vectorized
-                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                        if weight_key in attn:
-                            w = attn[weight_key]
+                    # Collect attention routing weights - vectorized, using standardized keys
+                    for key in ROUTING_KEYS.keys():
+                        w = layer.get_weight(key)
+                        if w is not None:
                             if w.dim() == 3:  # [B, S, N] token-level
                                 flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
                                 valid_w = flat_w[flat_mask]  # [valid_count, N]
@@ -280,10 +274,10 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                 continue
                             X_tensors[layer_key][key].append(valid_w.cpu())
 
-                    # Collect knowledge routing weights - vectorized
-                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
-                        if weight_key in knowledge:
-                            w = knowledge[weight_key]
+                    # Collect knowledge routing weights - vectorized, using standardized keys
+                    for key in KNOWLEDGE_ROUTING_KEYS.keys():
+                        w = layer.get_weight(key)
+                        if w is not None:
                             if w.dim() == 3:  # [B, S, N] token-level
                                 flat_w = w.view(-1, w.shape[-1])  # [B*S, N]
                                 valid_w = flat_w[flat_mask]  # [valid_count, N]
@@ -515,19 +509,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
             'per_target': {},
         }
 
-        # Map pool_type to routing info keys
-        mask_key_map = {
-            'fv': 'fv_mask', 'rv': 'rv_mask',
-            'fqk_q': 'fqk_mask_Q', 'fqk_k': 'fqk_mask_K',
-            'rqk_q': 'rqk_mask_Q', 'rqk_k': 'rqk_mask_K',
-        }
-        weight_key_map = {
-            'fv': 'fv_weights', 'rv': 'rv_weights',
-            'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
-            'rqk_q': 'rqk_weights_Q', 'rqk_k': 'rqk_weights_K',
-        }
-        mask_key = mask_key_map.get(pool_type, 'fv_mask')
-        weight_key = weight_key_map.get(pool_type, 'fv_weights')
+        # pool_type is already a standardized key (fv, rv, fqk_q, etc.)
+        # The extractor will handle the mapping to raw keys
 
         self.model.eval()
 
@@ -547,14 +530,16 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     prompt, add_special_tokens=False, return_tensors='pt'
                 ).to(self.device)
 
-                with torch.no_grad():
-                    outputs = self.model(input_ids, return_routing_info=True)
+                with self.extractor.analysis_context():
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True)
 
                     if isinstance(outputs, tuple) and len(outputs) >= 2:
-                        logits, routing_infos = outputs[0], outputs[1]
+                        logits = outputs[0]
+                        routing = self.extractor.extract(outputs)
                     else:
                         logits = outputs
-                        routing_infos = None
+                        routing = None
 
                     # Get predicted token and top-k info
                     last_logits = logits[:, -1, :]
@@ -576,13 +561,10 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     if next_token == target_id:
                         matching_runs += 1
 
-                        # Extract active neurons from routing info
-                        if routing_infos:
-                            for layer_info in routing_infos:
-                                attn = layer_info.get('attention', layer_info)
-
-                                # Try weights directly
-                                weights = attn.get(weight_key)
+                        # Extract active neurons from routing info using standardized key
+                        if routing:
+                            for layer in routing:
+                                weights = layer.get_weight(pool_type)
                                 if weights is not None:
                                     if weights.dim() == 3:
                                         w = weights[0, -1]

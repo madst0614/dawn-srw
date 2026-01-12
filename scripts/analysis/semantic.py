@@ -37,6 +37,7 @@ from .utils import (
     calc_entropy,
     convert_to_serializable,
     get_batch_input_ids, get_routing_from_outputs,
+    RoutingDataExtractor,  # Schema layer for model-agnostic access
     HAS_TQDM, tqdm
 )
 
@@ -54,7 +55,7 @@ MIN_HEALTHY_ENTROPY = 10.0  # 10% of max entropy
 class SemanticAnalyzer(BaseAnalyzer):
     """Semantic analysis for DAWN routing patterns."""
 
-    def __init__(self, model, router=None, tokenizer=None, device='cuda'):
+    def __init__(self, model, router=None, tokenizer=None, device='cuda', extractor=None):
         """
         Initialize analyzer.
 
@@ -63,8 +64,10 @@ class SemanticAnalyzer(BaseAnalyzer):
             router: NeuronRouter instance (auto-detected if None)
             tokenizer: Tokenizer instance
             device: Device for computation
+            extractor: RoutingDataExtractor instance (created if None)
         """
         super().__init__(model, router=router, tokenizer=tokenizer, device=device)
+        self.extractor = extractor or RoutingDataExtractor(model, device=device)
 
         # Load spaCy for POS tagging
         self.nlp = None
@@ -192,18 +195,16 @@ class SemanticAnalyzer(BaseAnalyzer):
         input_ids = enc['input_ids'].to(self.device)
         attention_mask = enc.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
 
-        # Single forward pass
+        # Single forward pass with analysis context
         self.model.eval()
 
-        with torch.no_grad():
-            outputs = self.model(input_ids, return_routing_info=True)
+        with self.extractor.analysis_context():
+            with torch.no_grad():
+                outputs = self.model(input_ids, return_routing_info=True)
 
-        # Get routing_infos directly from outputs tuple
-        if not isinstance(outputs, tuple) or len(outputs) < 2:
-            return [{} for _ in texts]
-        routing_infos = outputs[1]
-        if routing_infos is None or len(routing_infos) == 0:
-            return [{} for _ in texts]
+            routing = self.extractor.extract(outputs)
+            if not routing:
+                return [{} for _ in texts]
 
         batch_size = input_ids.shape[0]
         results = []
@@ -211,16 +212,15 @@ class SemanticAnalyzer(BaseAnalyzer):
         # Process each sample in batch
         for b in range(batch_size):
             result = {}
-            seq_len = attention_mask[b].sum().item()
+            seq_len = int(attention_mask[b].sum().item())
 
-            for layer_idx, layer_info in enumerate(routing_infos):
-                layer_key = f'layer_{layer_idx}'
+            for layer in routing:
+                layer_key = f'layer_{layer.layer_idx}'
                 result[layer_key] = {}
 
-                # Attention routing
-                attn = layer_info.get('attention', layer_info)
-                for key, (display, pref_key, weight_key, pool) in ROUTING_KEYS.items():
-                    weights = attn.get(weight_key)
+                # Attention routing using standardized keys
+                for key in ROUTING_KEYS.keys():
+                    weights = layer.get_weight(key)
                     if weights is not None:
                         if weights.dim() == 3:
                             w = weights[b, :seq_len]  # [B,S,N] → [S, N]
@@ -231,10 +231,9 @@ class SemanticAnalyzer(BaseAnalyzer):
                             continue
                         result[layer_key][key] = w if keep_on_gpu else w.cpu()
 
-                # Knowledge routing
-                knowledge = layer_info.get('knowledge', {})
-                for key, (display, weight_key, pool) in KNOWLEDGE_ROUTING_KEYS.items():
-                    weights = knowledge.get(weight_key)
+                # Knowledge routing using standardized keys
+                for key in KNOWLEDGE_ROUTING_KEYS.keys():
+                    weights = layer.get_weight(key)
                     if weights is not None:
                         if weights.dim() == 3:
                             w = weights[b, :seq_len]  # [B,S,N] → [S, N]
@@ -682,7 +681,7 @@ class SemanticAnalyzer(BaseAnalyzer):
 
         self.model.eval()
 
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for sent_data in tqdm(ud_data, desc='POS Analysis (UD)'):
                 pos_tags, token_ids = self._align_tokens_to_pos(
                     sent_data['tokens'], sent_data['upos']
@@ -691,32 +690,28 @@ class SemanticAnalyzer(BaseAnalyzer):
                     continue
 
                 input_ids = torch.tensor([token_ids], device=self.device)
-                outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                # Get routing_infos directly from outputs tuple
-                if not isinstance(outputs, tuple) or len(outputs) < 2:
-                    continue
-                routing_infos = outputs[1]
-                if routing_infos is None:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                # Process selected layers
-                for layer_idx, layer_info in enumerate(routing_infos):
+                # Process selected layers using extractor
+                for layer in routing:
+                    layer_idx = layer.layer_idx
                     if layer_idx not in target_layers_set:
                         continue
 
-                    attn = layer_info.get('attention', layer_info)
-                    knowledge = layer_info.get('knowledge', {})
-
-                    # Collect weights
+                    # Collect weights using standardized keys
                     all_routing = {}
-                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                        w = attn.get(weight_key)
+                    for key in ROUTING_KEYS.keys():
+                        w = layer.get_weight(key)
                         if w is not None:
                             all_routing[f'L{layer_idx}/{key}'] = w
 
-                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
-                        w = knowledge.get(weight_key)
+                    for key in KNOWLEDGE_ROUTING_KEYS.keys():
+                        w = layer.get_weight(key)
                         if w is not None:
                             all_routing[f'L{layer_idx}/{key}'] = w
 
@@ -957,7 +952,7 @@ class SemanticAnalyzer(BaseAnalyzer):
 
         self.model.eval()
 
-        with torch.no_grad():
+        with self.extractor.analysis_context():
             for i, batch in enumerate(tqdm(dataloader, desc='Neuron-Token Heatmap', total=max_batches)):
                 if i >= max_batches:
                     break
@@ -965,31 +960,29 @@ class SemanticAnalyzer(BaseAnalyzer):
                 input_ids = get_batch_input_ids(batch, self.device)
                 B, S = input_ids.shape
 
-                outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
-                # Get routing_infos directly from outputs tuple
-                if not isinstance(outputs, tuple) or len(outputs) < 2:
-                    continue
-                routing_infos = outputs[1]
-                if routing_infos is None:
+                routing = self.extractor.extract(outputs)
+                if not routing:
                     continue
 
-                for layer_idx, layer_info in enumerate(routing_infos):
-                    attn = layer_info.get('attention', layer_info)
-                    knowledge = layer_info.get('knowledge', {})
-
+                for layer in routing:
+                    layer_idx = layer.layer_idx
                     routing_weights = {}
 
-                    for key, (_, _, weight_key, _) in ROUTING_KEYS.items():
-                        w = attn.get(weight_key)
+                    # Collect attention weights using standardized keys
+                    for key in ROUTING_KEYS.keys():
+                        w = layer.get_weight(key)
                         if w is not None:
                             if w.dim() == 3:
                                 routing_weights[f'L{layer_idx}/{key}'] = w
                             elif w.dim() == 2:
                                 routing_weights[f'L{layer_idx}/{key}'] = w.unsqueeze(1).expand(-1, S, -1)
 
-                    for key, (_, weight_key, _) in KNOWLEDGE_ROUTING_KEYS.items():
-                        w = knowledge.get(weight_key)
+                    # Collect knowledge weights using standardized keys
+                    for key in KNOWLEDGE_ROUTING_KEYS.keys():
+                        w = layer.get_weight(key)
                         if w is not None:
                             if w.dim() == 3:
                                 routing_weights[f'L{layer_idx}/{key}'] = w
