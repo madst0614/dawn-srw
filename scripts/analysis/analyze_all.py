@@ -765,17 +765,25 @@ class ModelAnalyzer:
         per_target = results.get('per_target', {})
         if per_target:
             print(f"\n  ┌─ Factual Analysis Results ─────────────────────────────────────────────")
-            print(f"  │ {'Target':<12} {'Match%':>8} {'Common80':>10} {'Common100':>11} {'Avg Act':>10}")
-            print(f"  │ {'─'*12} {'─'*8} {'─'*10} {'─'*11} {'─'*10}")
+            print(f"  │ {'Target':<10} {'Predicted':<12} {'Rank':>6} {'Match%':>8} {'Common':>8}")
+            print(f"  │ {'─'*10} {'─'*12} {'─'*6} {'─'*8} {'─'*8}")
             for target, data in per_target.items():
                 if isinstance(data, dict):
                     match_rate = data.get('match_rate', 0) * 100
-                    n_common_80 = len(data.get('common_neurons_80', []))
-                    n_common_100 = len(data.get('common_neurons_100', []))
-                    avg_act = data.get('avg_activation', 0)
-                    print(f"  │ {target:<12} {match_rate:>7.0f}% {n_common_80:>10d} {n_common_100:>11d} {avg_act:>10.4f}")
+                    predicted = data.get('predicted_token', 'N/A')[:10]
+                    rank = data.get('target_rank', -1)
+                    rank_str = str(rank) if rank > 0 else '>20'
+                    n_common = len(data.get('common_neurons_80', []))
+                    print(f"  │ {target:<10} {predicted:<12} {rank_str:>6} {match_rate:>7.0f}% {n_common:>8d}")
 
-            # Show top common neurons
+            # Interpretation
+            any_match = any(d.get('match_rate', 0) > 0 for d in per_target.values())
+            if not any_match:
+                print(f"  │")
+                print(f"  │ Note: Model not generating target tokens (likely undertrained)")
+                print(f"  │       Check 'Rank' column - lower is better (1=top prediction)")
+
+            # Show top common neurons if any matches
             all_common = results.get('all_common_neurons', [])
             if all_common:
                 print(f"  │")

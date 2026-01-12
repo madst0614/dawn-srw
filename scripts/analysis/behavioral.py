@@ -556,10 +556,21 @@ class BehavioralAnalyzer(BaseAnalyzer):
                             logits = outputs
                             routing_infos = None
 
-                        # Get predicted token
+                        # Get predicted token and top-k info
+                        last_logits = logits[:, -1, :]
                         if temperature != 1.0:
-                            logits = logits / temperature
-                        next_token = logits[:, -1, :].argmax(dim=-1).item()
+                            last_logits = last_logits / temperature
+
+                        next_token = last_logits.argmax(dim=-1).item()
+
+                        # Check top-k accuracy
+                        top_k_tokens = last_logits.topk(20, dim=-1).indices[0].tolist()
+                        target_rank = top_k_tokens.index(target_id) + 1 if target_id in top_k_tokens else -1
+
+                        # Store prediction info on first run
+                        if run_idx == 0:
+                            predicted_text = self.tokenizer.decode([next_token])
+                            target_text = self.tokenizer.decode([target_id])
 
                         # Check if matches target
                         if next_token == target_id:
@@ -593,37 +604,44 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                                 neuron_counts[n] += 1
 
                 # Store results for this target
+                base_result = {
+                    'prompt': prompt,
+                    'target_token': target_text if 'target_text' in dir() else target,
+                    'predicted_token': predicted_text if 'predicted_text' in dir() else 'N/A',
+                    'target_rank': target_rank if 'target_rank' in dir() else -1,
+                    'matching_runs': matching_runs,
+                    'total_runs': n_runs,
+                    'match_rate': matching_runs / n_runs,
+                }
+
                 if matching_runs > 0:
                     # Calculate frequency (fraction of matching runs)
                     neuron_freq = {
                         n: count / matching_runs
                         for n, count in neuron_counts.items()
                     }
-                    # Filter to neurons appearing in >80% of runs
-                    common_neurons = [
+                    # Filter to neurons appearing in >80% and 100% of runs
+                    common_neurons_80 = [
                         n for n, freq in neuron_freq.items()
                         if freq >= 0.8
                     ]
+                    common_neurons_100 = [
+                        n for n, freq in neuron_freq.items()
+                        if freq >= 1.0
+                    ]
 
-                    results['per_target'][target] = {
-                        'prompt': prompt,
-                        'matching_runs': matching_runs,
-                        'total_runs': n_runs,
-                        'match_rate': matching_runs / n_runs,
+                    base_result.update({
                         'neuron_frequencies': sorted(
                             [(n, f) for n, f in neuron_freq.items()],
                             key=lambda x: -x[1]
                         )[:50],
-                        'common_neurons_80': common_neurons,
-                    }
+                        'common_neurons_80': common_neurons_80,
+                        'common_neurons_100': common_neurons_100,
+                    })
                 else:
-                    results['per_target'][target] = {
-                        'prompt': prompt,
-                        'matching_runs': 0,
-                        'total_runs': n_runs,
-                        'match_rate': 0,
-                        'error': 'No matching runs',
-                    }
+                    base_result['note'] = f'Model predicted "{predicted_text}" (rank={target_rank})' if 'predicted_text' in dir() else 'No matching runs'
+
+                results['per_target'][target] = base_result
 
         finally:
             self.disable_pref_tensors()
