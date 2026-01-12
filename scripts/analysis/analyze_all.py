@@ -9,6 +9,7 @@ Supports:
 - Multi-checkpoint comparison
 - Paper-ready figures and tables
 - Selective analysis modes
+- Configurable batch sizes and analysis parameters
 
 Usage:
     # Single analysis
@@ -36,6 +37,42 @@ Usage:
         --val_data val.pt \
         --output results/ \
         --only health,routing,performance
+
+    # Custom batch settings (faster)
+    python scripts/analysis/analyze_all.py \
+        --checkpoint dawn.pt \
+        --val_data val.pt \
+        --output results/ \
+        --n_batches 50 --val_batches 100
+
+    # Large-scale analysis
+    python scripts/analysis/analyze_all.py \
+        --checkpoint dawn.pt \
+        --val_data val.pt \
+        --output results/ \
+        --n_batches 200 --max_sentences 5000 --batch_size 32
+
+CLI Arguments:
+    Input/Output:
+        --checkpoint      Single checkpoint path
+        --checkpoints     Multiple checkpoint paths
+        --val_data        Validation data path (required)
+        --output          Output directory (default: analysis_results)
+        --device          Device: cuda/cpu (default: cuda, auto-fallback to cpu)
+
+    Analysis Mode:
+        --paper-only      Generate paper outputs only (faster)
+        --only            Run only specific analyses (comma-separated)
+                          Options: health,routing,embedding,semantic,pos,
+                                   factual,behavioral,coselection,weight
+
+    Analysis Parameters:
+        --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
+        --val_batches     Batches for validation performance (default: 200)
+        --max_sentences   Max sentences for POS analysis (default: 2000)
+        --n_runs          Runs for factual analysis (default: 10)
+        --batch_size      Dataloader batch size (default: 16)
+        --max_samples     Max samples for dataloader (default: 5000)
 """
 
 import os
@@ -71,11 +108,32 @@ except ImportError:
 class ModelAnalyzer:
     """Single model analyzer."""
 
-    def __init__(self, checkpoint_path: str, val_data_path: str, output_dir: str, device: str = 'cuda'):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        val_data_path: str,
+        output_dir: str,
+        device: str = 'cuda',
+        # Analysis parameters
+        n_batches: int = 100,
+        val_batches: int = 200,
+        max_sentences: int = 2000,
+        n_runs: int = 10,
+        batch_size: int = 16,
+        max_samples: int = 5000,
+    ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
         self.output_dir = Path(output_dir)
         self.device = device
+
+        # Analysis parameters
+        self.n_batches = n_batches
+        self.val_batches = val_batches
+        self.max_sentences = max_sentences
+        self.n_runs = n_runs
+        self.batch_size = batch_size
+        self.max_samples = max_samples
 
         self.model = None
         self.tokenizer = None
@@ -110,13 +168,13 @@ class ModelAnalyzer:
 
         print(f"Loaded: {self.name} ({self.model_type}, v{self.version})")
 
-    def _get_dataloader(self, batch_size: int = 16, max_samples: int = 5000):
+    def _get_dataloader(self):
         """Get or create dataloader."""
         if self._dataloader is None:
             from scripts.analysis.utils import create_dataloader
             self._dataloader = create_dataloader(
                 self.val_data_path, self.tokenizer,
-                batch_size=batch_size, max_samples=max_samples
+                batch_size=self.batch_size, max_samples=self.max_samples
             )
         return self._dataloader
 
@@ -828,28 +886,29 @@ class ModelAnalyzer:
 
         self.load_model()
 
-        # Define all analyses
+        # Define all analyses using instance parameters
         analyses = [
             ('model_info', self.analyze_model_info, {}),
-            ('performance', self.analyze_performance, {'n_batches': 200}),
+            ('performance', self.analyze_performance, {'n_batches': self.val_batches}),
             ('health', self.analyze_health, {}),
-            ('routing', self.analyze_routing, {'n_batches': 100}),
+            ('routing', self.analyze_routing, {'n_batches': self.n_batches}),
             ('embedding', self.analyze_embedding, {}),
-            ('semantic', self.analyze_semantic, {'n_batches': 50}),
-            ('pos', self.analyze_pos, {'max_sentences': 2000}),
-            ('factual', self.analyze_factual, {'n_runs': 10}),
-            ('behavioral', self.analyze_behavioral, {'n_batches': 50}),
-            ('coselection', self.analyze_coselection, {'n_batches': 50}),
+            ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
+            ('pos', self.analyze_pos, {'max_sentences': self.max_sentences}),
+            ('factual', self.analyze_factual, {'n_runs': self.n_runs}),
+            ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
+            ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
             ('weight', self.analyze_weight, {}),
         ]
 
         if paper_only:
+            # Reduced params for faster paper-only mode
             analyses = [
                 ('model_info', self.analyze_model_info, {}),
-                ('performance', self.analyze_performance, {'n_batches': 100}),
+                ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
                 ('health', self.analyze_health, {}),
-                ('routing', self.analyze_routing, {'n_batches': 50}),
-                ('factual', self.analyze_factual, {'n_runs': 5}),
+                ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
+                ('factual', self.analyze_factual, {'n_runs': max(5, self.n_runs // 2)}),
             ]
 
         if only:
@@ -922,12 +981,32 @@ class ModelAnalyzer:
 class MultiModelAnalyzer:
     """Multi-model comparison analyzer."""
 
-    def __init__(self, checkpoint_paths: List[str], val_data_path: str,
-                 output_dir: str, device: str = 'cuda'):
+    def __init__(
+        self,
+        checkpoint_paths: List[str],
+        val_data_path: str,
+        output_dir: str,
+        device: str = 'cuda',
+        # Analysis parameters
+        n_batches: int = 100,
+        val_batches: int = 200,
+        max_sentences: int = 2000,
+        n_runs: int = 10,
+        batch_size: int = 16,
+        max_samples: int = 5000,
+    ):
         self.checkpoint_paths = checkpoint_paths
         self.val_data_path = val_data_path
         self.output_dir = Path(output_dir)
         self.device = device
+
+        # Analysis parameters
+        self.n_batches = n_batches
+        self.val_batches = val_batches
+        self.max_sentences = max_sentences
+        self.n_runs = n_runs
+        self.batch_size = batch_size
+        self.max_samples = max_samples
 
         self.analyzers = []
         self.results = {}
@@ -952,7 +1031,13 @@ class MultiModelAnalyzer:
 
             analyzer = ModelAnalyzer(
                 ckpt_path, self.val_data_path,
-                str(model_dir), self.device
+                str(model_dir), self.device,
+                n_batches=self.n_batches,
+                val_batches=self.val_batches,
+                max_sentences=self.max_sentences,
+                n_runs=self.n_runs,
+                batch_size=self.batch_size,
+                max_samples=self.max_samples,
             )
             analyzer.run_all(paper_only=paper_only, only=only)
 
@@ -1228,17 +1313,47 @@ Examples:
 
   # Specific analyses
   python scripts/analysis/analyze_all.py --checkpoint dawn.pt --val_data val.pt --output results/ --only health,routing
+
+  # Custom batch settings (faster)
+  python scripts/analysis/analyze_all.py --checkpoint dawn.pt --val_data val.pt --output results/ --n_batches 50 --val_batches 100
+
+  # Large-scale analysis
+  python scripts/analysis/analyze_all.py --checkpoint dawn.pt --val_data val.pt --output results/ --n_batches 200 --max_sentences 5000 --batch_size 32
         """
     )
+    # Input/output
     parser.add_argument('--checkpoint', type=str, help='Single checkpoint path')
     parser.add_argument('--checkpoints', type=str, nargs='+', help='Multiple checkpoint paths')
     parser.add_argument('--val_data', type=str, required=True, help='Validation data path')
     parser.add_argument('--output', type=str, default='analysis_results', help='Output directory')
-    parser.add_argument('--device', type=str, default='cuda', help='Device')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
+
+    # Analysis mode
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
-    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated)')
+    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: health,routing,embedding,semantic,pos,factual,behavioral,coselection,weight)')
+
+    # Analysis parameters
+    parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
+    parser.add_argument('--val_batches', type=int, default=200, help='Number of batches for validation performance (default: 200)')
+    parser.add_argument('--max_sentences', type=int, default=2000, help='Max sentences for POS analysis (default: 2000)')
+    parser.add_argument('--n_runs', type=int, default=10, help='Number of runs for factual analysis (default: 10)')
+    parser.add_argument('--batch_size', type=int, default=16, help='Dataloader batch size (default: 16)')
+    parser.add_argument('--max_samples', type=int, default=5000, help='Max samples for dataloader (default: 5000)')
 
     args = parser.parse_args()
+
+    # Print settings
+    print("\n" + "=" * 60)
+    print("DAWN Analysis Tool")
+    print("=" * 60)
+    print(f"Device: {args.device}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"n_batches: {args.n_batches}")
+    print(f"val_batches: {args.val_batches}")
+    print(f"max_sentences: {args.max_sentences}")
+    print(f"n_runs: {args.n_runs}")
+    print(f"max_samples: {args.max_samples}")
+    print("=" * 60 + "\n")
 
     # Device check
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -1259,13 +1374,25 @@ Examples:
     if len(checkpoint_paths) == 1:
         analyzer = ModelAnalyzer(
             checkpoint_paths[0], args.val_data,
-            args.output, args.device
+            args.output, args.device,
+            n_batches=args.n_batches,
+            val_batches=args.val_batches,
+            max_sentences=args.max_sentences,
+            n_runs=args.n_runs,
+            batch_size=args.batch_size,
+            max_samples=args.max_samples,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
     else:
         analyzer = MultiModelAnalyzer(
             checkpoint_paths, args.val_data,
-            args.output, args.device
+            args.output, args.device,
+            n_batches=args.n_batches,
+            val_batches=args.val_batches,
+            max_sentences=args.max_sentences,
+            n_runs=args.n_runs,
+            batch_size=args.batch_size,
+            max_samples=args.max_samples,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
 
