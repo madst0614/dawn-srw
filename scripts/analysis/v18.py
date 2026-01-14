@@ -32,14 +32,14 @@ class V18Analyzer(BaseAnalyzer):
         super().__init__(model, device)
         self.model_version = getattr(model, '__version__', '18.2')
 
-        # Detect v18 structure
+        # Detect v18 structure (use different name to avoid property conflict)
         self.has_old_tau = hasattr(model, 'router') and hasattr(model.router, 'tau_proj')
         self.has_new_tau = hasattr(model, 'router') and hasattr(model.router, 'tau_proj_feature')
-        self.is_v18 = self.has_old_tau or self.has_new_tau
+        self._has_tau = self.has_old_tau or self.has_new_tau
 
     def analyze_tau_parameters(self) -> Dict:
         """Analyze static tau parameters (bias, weight norm, weight std)."""
-        if not self.is_v18:
+        if not self._has_tau:
             return {'error': 'Not a v18.x model with learnable tau'}
 
         results = {'model_version': self.model_version}
@@ -111,8 +111,8 @@ class V18Analyzer(BaseAnalyzer):
 
     def analyze_runtime(self, dataloader, n_batches: int = 50) -> Dict:
         """Analyze runtime gate/tau statistics from forward passes."""
-        if not self.is_v18:
-            return {'error': 'Not a v18.x model'}
+        if not self._has_tau:
+            return {'error': 'Not a v18.x model with learnable tau'}
 
         gate_stats = defaultdict(list)
         tau_runtime = defaultdict(list)

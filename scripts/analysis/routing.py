@@ -101,11 +101,13 @@ class RoutingAnalyzer(BaseAnalyzer):
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
+            threshold: Weight threshold for "selected" (for soft gating models)
 
         Returns:
             Dictionary with selection frequency statistics
         """
         selection_counts = {name: Counter() for name in ROUTING_KEYS.keys()}
+        threshold = 0.01  # Threshold for soft gating
 
         self.model.eval()
         with self.extractor.analysis_context():
@@ -128,8 +130,8 @@ class RoutingAnalyzer(BaseAnalyzer):
                         if weights is None:
                             continue
 
-                        # Get indices of active neurons (weight > 0)
-                        active_mask = weights > 0
+                        # Get indices of active neurons (weight > threshold for soft gating)
+                        active_mask = weights > threshold
                         active_indices = active_mask.nonzero(as_tuple=False)[:, -1].cpu().numpy()
 
                         for idx in active_indices:
@@ -161,7 +163,7 @@ class RoutingAnalyzer(BaseAnalyzer):
 
         return results
 
-    def analyze_selection_diversity(self, dataloader, n_batches: int = 100) -> Dict:
+    def analyze_selection_diversity(self, dataloader, n_batches: int = 100, threshold: float = 0.01) -> Dict:
         """
         Analyze selection diversity across batches.
 
@@ -171,6 +173,7 @@ class RoutingAnalyzer(BaseAnalyzer):
         Args:
             dataloader: DataLoader for input data
             n_batches: Number of batches to process
+            threshold: Weight threshold for "selected" (for soft gating models)
 
         Returns:
             Dictionary with diversity metrics
@@ -205,12 +208,13 @@ class RoutingAnalyzer(BaseAnalyzer):
                         layer_key = f'L{layer_idx}/{key}'
                         weights = layer.get_weight(key)
                         if weights is not None:
+                            # Use threshold for soft gating (v18.5+)
                             if weights.dim() == 3:
-                                selected = (weights > 0).any(dim=0).any(dim=0).cpu()
+                                selected = (weights > threshold).any(dim=0).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
                                 per_batch_counts[layer_key].append(selected.sum().item())
                             elif weights.dim() == 2:
-                                selected = (weights > 0).any(dim=0).cpu()
+                                selected = (weights > threshold).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
                                 per_batch_counts[layer_key].append(selected.sum().item())
 
@@ -219,12 +223,13 @@ class RoutingAnalyzer(BaseAnalyzer):
                         layer_key = f'L{layer_idx}/{key}'
                         weights = layer.get_weight(key)
                         if weights is not None:
+                            # Use threshold for soft gating (v18.5+)
                             if weights.dim() == 3:
-                                selected = (weights > 0).any(dim=0).any(dim=0).cpu()
+                                selected = (weights > threshold).any(dim=0).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
                                 per_batch_counts[layer_key].append(selected.sum().item())
                             elif weights.dim() == 2:
-                                selected = (weights > 0).any(dim=0).cpu()
+                                selected = (weights > threshold).any(dim=0).cpu()
                                 union_selected[layer_key].update(selected.nonzero().flatten().tolist())
                                 per_batch_counts[layer_key].append(selected.sum().item())
 

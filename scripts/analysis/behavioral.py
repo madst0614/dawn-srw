@@ -551,14 +551,6 @@ class BehavioralAnalyzer(BaseAnalyzer):
             'per_target': {},
         }
 
-        # Map pool_type to routing info keys
-        weight_key_map = {
-            'fv': 'fv_weights', 'rv': 'rv_weights',
-            'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
-            'rqk_q': 'rqk_weights_Q', 'rqk_k': 'rqk_weights_K',
-        }
-        weight_key = weight_key_map.get(pool_type, 'fv_weights')
-
         self.model.eval()
 
         for prompt, target in zip(prompts, targets):
@@ -571,63 +563,67 @@ class BehavioralAnalyzer(BaseAnalyzer):
             else:
                 continue
 
+            predicted_text = None
+            target_text = None
+            target_rank = -1
+
             for run_idx in range(n_runs):
                 # Encode prompt
                 input_ids = self.tokenizer.encode(
                     prompt, add_special_tokens=False, return_tensors='pt'
                 ).to(self.device)
 
+                # Use extractor for standardized access
                 with torch.no_grad():
                     outputs = self.model(input_ids, return_routing_info=True)
 
-                    if isinstance(outputs, tuple) and len(outputs) >= 2:
-                        logits, routing_infos = outputs[0], outputs[1]
-                    else:
-                        logits = outputs
-                        routing_infos = None
+                if isinstance(outputs, tuple) and len(outputs) >= 2:
+                    logits = outputs[0]
+                    routing = self.extractor.extract(outputs)
+                else:
+                    logits = outputs
+                    routing = None
 
-                    # Get predicted token and top-k info
-                    last_logits = logits[:, -1, :]
-                    if temperature != 1.0:
-                        last_logits = last_logits / temperature
+                # Get predicted token and top-k info
+                last_logits = logits[:, -1, :]
+                if temperature != 1.0:
+                    last_logits = last_logits / temperature
 
-                    next_token = last_logits.argmax(dim=-1).item()
+                next_token = last_logits.argmax(dim=-1).item()
 
-                    # Check top-k accuracy
-                    top_k_tokens = last_logits.topk(20, dim=-1).indices[0].tolist()
-                    target_rank = top_k_tokens.index(target_id) + 1 if target_id in top_k_tokens else -1
+                # Check top-k accuracy
+                top_k_tokens = last_logits.topk(20, dim=-1).indices[0].tolist()
+                target_rank = top_k_tokens.index(target_id) + 1 if target_id in top_k_tokens else -1
 
-                    # Store prediction info on first run
-                    if run_idx == 0:
-                        predicted_text = self.tokenizer.decode([next_token])
-                        target_text = self.tokenizer.decode([target_id])
+                # Store prediction info on first run
+                if run_idx == 0:
+                    predicted_text = self.tokenizer.decode([next_token])
+                    target_text = self.tokenizer.decode([target_id])
 
-                    # Check if matches target
-                    if next_token == target_id:
-                        matching_runs += 1
+                # Check if matches target
+                if next_token == target_id:
+                    matching_runs += 1
 
-                        # Extract active neurons from routing info
-                        if routing_infos:
-                            for layer_info in routing_infos:
-                                attn = layer_info.get('attention', layer_info)
-
-                                # Try weights directly
-                                weights = attn.get(weight_key)
-                                if weights is not None:
-                                    if weights.dim() == 3:
-                                        w = weights[0, -1]
-                                    else:
-                                        w = weights[0]
-                                    active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                                    for n in active:
-                                        neuron_counts[n] += 1
+                    # Extract active neurons using extractor
+                    if routing:
+                        for layer in routing:
+                            weights = layer.get_weight(pool_type)
+                            if weights is not None:
+                                if weights.dim() == 3:
+                                    w = weights[0, -1]
+                                else:
+                                    w = weights[0]
+                                # Use threshold for soft gating (v18.5+)
+                                active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
+                                for n in active:
+                                    neuron_counts[n] += 1
 
             # Store results for this target
             base_result = {
                 'prompt': prompt,
-                'target_token': target_text if 'target_text' in dir() else target,
-                'predicted_token': predicted_text if 'predicted_text' in dir() else 'N/A',
-                'target_rank': target_rank if 'target_rank' in dir() else -1,
+                'target_token': target_text if target_text else target,
+                'predicted_token': predicted_text if predicted_text else 'N/A',
+                'target_rank': target_rank,
                 'matching_runs': matching_runs,
                 'total_runs': n_runs,
                 'match_rate': matching_runs / n_runs,
@@ -658,7 +654,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     'common_neurons_100': common_neurons_100,
                 })
             else:
-                base_result['note'] = f'Model predicted "{predicted_text}" (rank={target_rank})' if 'predicted_text' in dir() else 'No matching runs'
+                base_result['note'] = f'Model predicted "{predicted_text}" (rank={target_rank})' if predicted_text else 'No matching runs'
 
             results['per_target'][target] = base_result
 
