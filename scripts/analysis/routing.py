@@ -313,7 +313,6 @@ class RoutingAnalyzer(BaseAnalyzer):
         """
         overlap_data = {'fqk': [], 'rqk': []}
         debug_info = {'fqk_retrieved': 0, 'rqk_retrieved': 0, 'fqk_samples': [], 'rqk_samples': []}
-        threshold = 0.01  # For soft gating
 
         def compute_jaccard_from_weights(q_weights, k_weights, debug_key=None):
             """Compute Jaccard similarity from weight tensors (active neurons)."""
@@ -325,9 +324,10 @@ class RoutingAnalyzer(BaseAnalyzer):
                 q_flat = q_weights
                 k_flat = k_weights
 
-            # Active neurons (weight > threshold for soft gating)
-            q_active = (q_flat > threshold).float()
-            k_active = (k_flat > threshold).float()
+            # Active neurons: non-zero weights (sparse from top-k selection)
+            # v18.5 uses scatter_ so selected neurons have weight > 0
+            q_active = (q_flat > 0).float()
+            k_active = (k_flat > 0).float()
 
             # Debug: store sample info (first batch only)
             if debug_key and len(debug_info[f'{debug_key}_samples']) < 5:
