@@ -106,8 +106,8 @@ class RoutingAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary with selection frequency statistics
         """
-        selection_counts = {name: Counter() for name in ROUTING_KEYS.keys()}
-        threshold = 0.01  # Threshold for soft gating
+        # Use tensor accumulators instead of Counter for speed
+        selection_tensors = {}  # key -> tensor of counts
 
         self.model.eval()
         with self.extractor.analysis_context():
@@ -130,12 +130,28 @@ class RoutingAnalyzer(BaseAnalyzer):
                         if weights is None:
                             continue
 
-                        # Get indices of active neurons (weight > threshold for soft gating)
-                        active_mask = weights > threshold
-                        active_indices = active_mask.nonzero(as_tuple=False)[:, -1].cpu().numpy()
+                        # Get pool size for initialization
+                        pool = ROUTING_KEYS[key][3]
+                        n_attr = POOL_N_ATTR.get(pool)
+                        n_neurons = getattr(self.router, n_attr, 0) if n_attr else weights.shape[-1]
 
-                        for idx in active_indices:
-                            selection_counts[key][int(idx)] += 1
+                        # Initialize tensor if needed
+                        if key not in selection_tensors:
+                            selection_tensors[key] = torch.zeros(n_neurons, device=self.device, dtype=torch.long)
+
+                        # Vectorized count: sum active neurons across batch/seq dims
+                        active_mask = weights > 0
+                        if active_mask.dim() == 3:  # [B, S, N]
+                            counts = active_mask.sum(dim=[0, 1])
+                        else:  # [B, N]
+                            counts = active_mask.sum(dim=0)
+                        selection_tensors[key] += counts
+
+        # Convert tensors to Counters for result
+        selection_counts = {}
+        for key, tensor in selection_tensors.items():
+            counts_np = tensor.cpu().numpy()
+            selection_counts[key] = Counter({i: int(c) for i, c in enumerate(counts_np) if c > 0})
 
         results = {}
         for key, (display, _, _, pool) in ROUTING_KEYS.items():
@@ -178,8 +194,8 @@ class RoutingAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary with diversity metrics
         """
-        # Use defaultdict for dynamic layer keys
-        union_selected = defaultdict(set)
+        # Use tensor accumulators instead of sets for speed
+        union_tensors = {}  # layer_key -> bool tensor tracking ever-selected neurons
         per_batch_counts = defaultdict(list)
 
         self.model.eval()
@@ -208,35 +224,45 @@ class RoutingAnalyzer(BaseAnalyzer):
                         layer_key = f'L{layer_idx}/{key}'
                         weights = layer.get_weight(key)
                         if weights is not None:
+                            n_neurons = weights.shape[-1]
+                            # Initialize tensor if needed
+                            if layer_key not in union_tensors:
+                                union_tensors[layer_key] = torch.zeros(n_neurons, dtype=torch.bool, device=self.device)
+
                             # Use threshold for soft gating (v18.5+)
                             if weights.dim() == 3:
-                                selected = (weights > threshold).any(dim=0).any(dim=0).cpu()
-                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
-                                per_batch_counts[layer_key].append(selected.sum().item())
-                            elif weights.dim() == 2:
-                                selected = (weights > threshold).any(dim=0).cpu()
-                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
-                                per_batch_counts[layer_key].append(selected.sum().item())
+                                selected = (weights > threshold).any(dim=0).any(dim=0)
+                            else:  # dim == 2
+                                selected = (weights > threshold).any(dim=0)
+
+                            # OR accumulate (vectorized union)
+                            union_tensors[layer_key] |= selected
+                            per_batch_counts[layer_key].append(selected.sum().item())
 
                     # Knowledge routing - use standardized keys
                     for key in KNOWLEDGE_ROUTING_KEYS.keys():
                         layer_key = f'L{layer_idx}/{key}'
                         weights = layer.get_weight(key)
                         if weights is not None:
+                            n_neurons = weights.shape[-1]
+                            # Initialize tensor if needed
+                            if layer_key not in union_tensors:
+                                union_tensors[layer_key] = torch.zeros(n_neurons, dtype=torch.bool, device=self.device)
+
                             # Use threshold for soft gating (v18.5+)
                             if weights.dim() == 3:
-                                selected = (weights > threshold).any(dim=0).any(dim=0).cpu()
-                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
-                                per_batch_counts[layer_key].append(selected.sum().item())
-                            elif weights.dim() == 2:
-                                selected = (weights > threshold).any(dim=0).cpu()
-                                union_selected[layer_key].update(selected.nonzero().flatten().tolist())
-                                per_batch_counts[layer_key].append(selected.sum().item())
+                                selected = (weights > threshold).any(dim=0).any(dim=0)
+                            else:  # dim == 2
+                                selected = (weights > threshold).any(dim=0)
+
+                            # OR accumulate (vectorized union)
+                            union_tensors[layer_key] |= selected
+                            per_batch_counts[layer_key].append(selected.sum().item())
 
         # Build results for all layer/key combinations
         results = {}
 
-        for layer_key in union_selected.keys():
+        for layer_key, union_tensor in union_tensors.items():
             # Parse layer_key: L{layer_idx}/{routing_key}
             parts = layer_key.split('/')
             if len(parts) != 2:
@@ -259,7 +285,8 @@ class RoutingAnalyzer(BaseAnalyzer):
             n_attr = POOL_N_ATTR.get(pool)
             n_total = getattr(self.router, n_attr, 0) if n_attr else 0
 
-            union_count = len(union_selected[layer_key])
+            # Count from tensor (fast)
+            union_count = union_tensor.sum().item()
             batch_counts = per_batch_counts[layer_key]
 
             if len(batch_counts) > 0:
@@ -276,12 +303,12 @@ class RoutingAnalyzer(BaseAnalyzer):
                 'n_total': n_total,
                 'per_batch_avg': float(per_batch_avg),
                 'per_batch_std': float(per_batch_std),
-                'union_count': union_count,
+                'union_count': int(union_count),
                 'union_coverage': float(union_count / n_total) if n_total > 0 else 0,
                 'diversity_ratio': float(union_count / per_batch_avg) if per_batch_avg > 0 else 0,
             }
 
-        total_union = sum(len(union_selected[k]) for k in union_selected)
+        total_union = sum(t.sum().item() for t in union_tensors.values())
         n_batches_processed = 0
         if per_batch_counts:
             first_key = next(iter(per_batch_counts))
@@ -289,8 +316,8 @@ class RoutingAnalyzer(BaseAnalyzer):
 
         results['summary'] = {
             'n_batches_processed': min(n_batches, n_batches_processed),
-            'n_layers': len(set(k.split('/')[0] for k in union_selected.keys())),
-            'total_keys_analyzed': len(union_selected),
+            'n_layers': len(set(k.split('/')[0] for k in union_tensors.keys())),
+            'total_keys_analyzed': len(union_tensors),
             'interpretation': (
                 'High diversity_ratio (>2) = many neurons selected differently per batch\n'
                 'Low diversity_ratio (~1) = same neurons always selected'
@@ -762,9 +789,9 @@ class RoutingAnalyzer(BaseAnalyzer):
             - dead: neurons never selected (true dead)
             - union_coverage: (q_only + k_only + shared) / total
         """
-        # Track which neurons are ever selected by Q or K
-        q_selected = defaultdict(set)  # pool -> set of neuron indices
-        k_selected = defaultdict(set)
+        # Use tensor accumulators instead of sets (vectorized)
+        q_tensors = {}  # pool -> bool tensor
+        k_tensors = {}
 
         # Pool info mapping
         pool_info = {
@@ -787,50 +814,64 @@ class RoutingAnalyzer(BaseAnalyzer):
                     continue
 
                 for layer in routing:
-                    for pool_name, (q_key, k_key, _) in pool_info.items():
+                    for pool_name, (q_key, k_key, n_attr) in pool_info.items():
                         w_q = layer.get_weight(q_key)
                         w_k = layer.get_weight(k_key)
 
                         if w_q is not None:
-                            # Get indices of selected neurons (weight > 0)
+                            n_neurons = w_q.shape[-1]
+                            # Initialize tensor if needed
+                            if pool_name not in q_tensors:
+                                q_tensors[pool_name] = torch.zeros(n_neurons, dtype=torch.bool, device=self.device)
+
+                            # Get selected neurons (weight > 0) - vectorized OR
                             if w_q.dim() == 3:
                                 selected = (w_q > 0).any(dim=0).any(dim=0)
                             else:
                                 selected = (w_q > 0).any(dim=0)
-                            q_selected[pool_name].update(selected.nonzero().flatten().tolist())
+                            q_tensors[pool_name] |= selected
 
                         if w_k is not None:
+                            n_neurons = w_k.shape[-1]
+                            # Initialize tensor if needed
+                            if pool_name not in k_tensors:
+                                k_tensors[pool_name] = torch.zeros(n_neurons, dtype=torch.bool, device=self.device)
+
                             if w_k.dim() == 3:
                                 selected = (w_k > 0).any(dim=0).any(dim=0)
                             else:
                                 selected = (w_k > 0).any(dim=0)
-                            k_selected[pool_name].update(selected.nonzero().flatten().tolist())
+                            k_tensors[pool_name] |= selected
 
-        # Compute statistics
+        # Compute statistics using tensor operations
         results = {}
         for pool_name, (_, _, n_attr) in pool_info.items():
             n_total = getattr(self.router, n_attr, 0)
             if n_total == 0:
                 continue
 
-            q_set = q_selected[pool_name]
-            k_set = k_selected[pool_name]
+            q_mask = q_tensors.get(pool_name)
+            k_mask = k_tensors.get(pool_name)
 
-            q_only = len(q_set - k_set)
-            k_only = len(k_set - q_set)
-            shared = len(q_set & k_set)
-            union = len(q_set | k_set)
+            if q_mask is None or k_mask is None:
+                continue
+
+            # Vectorized set operations using tensor logic
+            q_only = (q_mask & ~k_mask).sum().item()
+            k_only = (k_mask & ~q_mask).sum().item()
+            shared = (q_mask & k_mask).sum().item()
+            union = (q_mask | k_mask).sum().item()
             dead = n_total - union
 
             results[pool_name] = {
                 'n_total': n_total,
-                'q_only': q_only,
-                'k_only': k_only,
-                'shared': shared,
-                'dead': dead,
+                'q_only': int(q_only),
+                'k_only': int(k_only),
+                'shared': int(shared),
+                'dead': int(dead),
                 'union_coverage': union / n_total if n_total > 0 else 0,
-                'q_coverage': len(q_set) / n_total if n_total > 0 else 0,
-                'k_coverage': len(k_set) / n_total if n_total > 0 else 0,
+                'q_coverage': q_mask.sum().item() / n_total if n_total > 0 else 0,
+                'k_coverage': k_mask.sum().item() / n_total if n_total > 0 else 0,
                 'separation_ratio': (q_only + k_only) / union if union > 0 else 0,
             }
 
