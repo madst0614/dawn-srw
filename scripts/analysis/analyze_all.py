@@ -632,6 +632,79 @@ class ModelAnalyzer:
                         print(f"  │ {pool}: Q={q_ent:.1f}%, K={k_ent:.1f}%, diff={data.get('entropy_diff', 0):.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
+        # Q/K Union Coverage (true dead neurons)
+        qk_union = results.get('qk_union_coverage', {})
+        if qk_union and 'n_batches' in qk_union:
+            print(f"\n  ┌─ Q/K Union Coverage (True Dead) ──────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Total':>8} {'Q-only':>8} {'K-only':>8} {'Shared':>8} {'Dead':>8} {'Union%':>8}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+            for pool, data in qk_union.items():
+                if isinstance(data, dict) and 'n_total' in data:
+                    print(f"  │ {pool:<12} {data['n_total']:>8d} {data['q_only']:>8d} {data['k_only']:>8d} "
+                          f"{data['shared']:>8d} {data['dead']:>8d} {data['union_coverage']*100:>7.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Activation Sparsity
+        sparsity = results.get('activation_sparsity', {})
+        if sparsity and 'n_batches' in sparsity:
+            print(f"\n  ┌─ Activation Sparsity ─────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Avg Active':>12} {'Total':>8} {'Sparsity':>10} {'Wgt Sum':>10}")
+            print(f"  │ {'─'*12} {'─'*12} {'─'*8} {'─'*10} {'─'*10}")
+            for key, data in sparsity.items():
+                if isinstance(data, dict) and 'avg_active_per_token' in data:
+                    print(f"  │ {data.get('display', key):<12} {data['avg_active_per_token']:>12.1f} {data['n_total']:>8d} "
+                          f"{data['sparsity_ratio']*100:>9.1f}% {data['avg_weight_sum']:>10.3f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Token Co-selection
+        coselect = results.get('token_coselection', {})
+        if coselect and 'n_batches' in coselect:
+            print(f"\n  ┌─ Per-Token Q/K Co-selection ──────────────────────────────────────────")
+            for pool, data in coselect.items():
+                if isinstance(data, dict) and 'mean_coselect_per_token' in data:
+                    print(f"  │ {pool}:")
+                    print(f"  │   Coselect: {data['mean_coselect_per_token']:.1f}/token  |  "
+                          f"Rate: {data['coselect_rate']*100:.1f}%  |  "
+                          f"Q: {data['mean_q_active']:.1f}  K: {data['mean_k_active']:.1f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Weight Concentration
+        concentration = results.get('weight_concentration', {})
+        if concentration and 'n_batches' in concentration:
+            print(f"\n  ┌─ Weight Concentration ─────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Top1%':>8} {'Top5%':>8} {'Gini':>8} {'AvgActive':>10}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*10}")
+            for key, data in concentration.items():
+                if isinstance(data, dict) and 'top1_weight_ratio' in data:
+                    print(f"  │ {data.get('display', key):<12} {data['top1_weight_ratio']*100:>7.1f}% "
+                          f"{data['top5_weight_ratio']*100:>7.1f}% {data['weight_gini']:>8.3f} "
+                          f"{data['avg_active_neurons']:>10.1f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Path Usage (v18.5)
+        path_usage = results.get('path_usage', {})
+        if path_usage and 'per_path' in path_usage and path_usage['per_path']:
+            print(f"\n  ┌─ Path Usage (v18.5) ──────────────────────────────────────────────────")
+            print(f"  │ Max paths: {path_usage.get('max_paths', 'N/A')}")
+            for key, data in path_usage.get('per_path', {}).items():
+                if isinstance(data, dict) and 'activation_rate' in data:
+                    print(f"  │ {key}: activation={data['activation_rate']*100:.1f}%")
+            for pool, data in path_usage.get('per_pool', {}).items():
+                if isinstance(data, dict) and 'avg_active_paths' in data:
+                    print(f"  │ {pool}: avg_active_paths={data['avg_active_paths']:.2f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Coverage Progression
+        progression = results.get('coverage_progression', {})
+        if progression and 'n_batches' in progression:
+            print(f"\n  ┌─ Coverage Progression ─────────────────────────────────────────────────")
+            for pool, data in progression.items():
+                if isinstance(data, dict) and 'trend' in data:
+                    print(f"  │ {pool}: early={data['early_coverage']*100:.1f}% → "
+                          f"mid={data['mid_coverage']*100:.1f}% → late={data['late_coverage']*100:.1f}% "
+                          f"({data['trend']}, {data['growth_ratio']:.2f}x)")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
         self.results['routing'] = results
         return results
 

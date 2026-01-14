@@ -743,6 +743,568 @@ class RoutingAnalyzer(BaseAnalyzer):
 
         return results
 
+    def analyze_qk_union_coverage(self, dataloader, n_batches: int = 100) -> Dict:
+        """
+        Analyze Q/K union coverage to find true dead neurons.
+
+        Computes Q ∪ K to determine which neurons are never selected
+        by either Q or K routing.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with union coverage statistics:
+            - q_only: neurons selected only by Q
+            - k_only: neurons selected only by K
+            - shared: neurons selected by both
+            - dead: neurons never selected (true dead)
+            - union_coverage: (q_only + k_only + shared) / total
+        """
+        # Track which neurons are ever selected by Q or K
+        q_selected = defaultdict(set)  # pool -> set of neuron indices
+        k_selected = defaultdict(set)
+
+        # Pool info mapping
+        pool_info = {
+            'feature_qk': ('fqk_q', 'fqk_k', 'n_feature_qk'),
+            'restore_qk': ('rqk_q', 'rqk_k', 'n_restore_qk'),
+        }
+
+        self.model.eval()
+        with self.extractor.analysis_context():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Q/K Union Coverage')):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
+
+                routing = self.extractor.extract(outputs)
+                if not routing:
+                    continue
+
+                for layer in routing:
+                    for pool_name, (q_key, k_key, _) in pool_info.items():
+                        w_q = layer.get_weight(q_key)
+                        w_k = layer.get_weight(k_key)
+
+                        if w_q is not None:
+                            # Get indices of selected neurons (weight > 0)
+                            if w_q.dim() == 3:
+                                selected = (w_q > 0).any(dim=0).any(dim=0)
+                            else:
+                                selected = (w_q > 0).any(dim=0)
+                            q_selected[pool_name].update(selected.nonzero().flatten().tolist())
+
+                        if w_k is not None:
+                            if w_k.dim() == 3:
+                                selected = (w_k > 0).any(dim=0).any(dim=0)
+                            else:
+                                selected = (w_k > 0).any(dim=0)
+                            k_selected[pool_name].update(selected.nonzero().flatten().tolist())
+
+        # Compute statistics
+        results = {}
+        for pool_name, (_, _, n_attr) in pool_info.items():
+            n_total = getattr(self.router, n_attr, 0)
+            if n_total == 0:
+                continue
+
+            q_set = q_selected[pool_name]
+            k_set = k_selected[pool_name]
+
+            q_only = len(q_set - k_set)
+            k_only = len(k_set - q_set)
+            shared = len(q_set & k_set)
+            union = len(q_set | k_set)
+            dead = n_total - union
+
+            results[pool_name] = {
+                'n_total': n_total,
+                'q_only': q_only,
+                'k_only': k_only,
+                'shared': shared,
+                'dead': dead,
+                'union_coverage': union / n_total if n_total > 0 else 0,
+                'q_coverage': len(q_set) / n_total if n_total > 0 else 0,
+                'k_coverage': len(k_set) / n_total if n_total > 0 else 0,
+                'separation_ratio': (q_only + k_only) / union if union > 0 else 0,
+            }
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_path_usage(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze v18.5 multi-path usage patterns.
+
+        Examines how different paths are utilized in the routing.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with path usage statistics:
+            - path_activation_rate: percentage of tokens using each path
+            - avg_active_paths: average number of active paths per token
+            - path_weight_distribution: weight ratio between paths
+        """
+        # Check if model supports multi-path (v18.5+)
+        max_paths = getattr(self.router, 'max_paths', 1)
+        if max_paths <= 1:
+            return {'note': 'Model does not support multi-path routing'}
+
+        path_stats = defaultdict(lambda: {'active_count': 0, 'weight_sum': 0.0, 'total_tokens': 0})
+
+        self.model.eval()
+        # Enable path weight storage
+        if hasattr(self.router, 'store_path_weights'):
+            self.router.store_path_weights = True
+
+        try:
+            with self.extractor.analysis_context():
+                for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Path Usage')):
+                    if i >= n_batches:
+                        break
+
+                    input_ids = get_batch_input_ids(batch, self.device)
+                    with torch.no_grad():
+                        outputs = self.model(input_ids, return_routing_info=True, return_path_weights=True)
+
+                    routing = self.extractor.extract(outputs)
+                    if not routing:
+                        continue
+
+                    for layer in routing:
+                        # Check for path_weights in layer data
+                        path_weights = layer.raw.get('path_weights', {})
+                        if not path_weights:
+                            continue
+
+                        for pool_name, weights_list in path_weights.items():
+                            if not isinstance(weights_list, list):
+                                continue
+
+                            for path_idx, path_w in enumerate(weights_list):
+                                if path_w is None:
+                                    continue
+
+                                key = f'{pool_name}_path{path_idx}'
+                                # Count active tokens (any neuron selected)
+                                if path_w.dim() == 3:  # [B, S, N]
+                                    active = (path_w > 0).any(dim=-1)  # [B, S]
+                                    active_count = active.sum().item()
+                                    total_tokens = path_w.shape[0] * path_w.shape[1]
+                                    weight_sum = path_w.sum().item()
+                                else:  # [B, N]
+                                    active = (path_w > 0).any(dim=-1)  # [B]
+                                    active_count = active.sum().item()
+                                    total_tokens = path_w.shape[0]
+                                    weight_sum = path_w.sum().item()
+
+                                path_stats[key]['active_count'] += active_count
+                                path_stats[key]['total_tokens'] += total_tokens
+                                path_stats[key]['weight_sum'] += weight_sum
+        finally:
+            if hasattr(self.router, 'store_path_weights'):
+                self.router.store_path_weights = False
+
+        # Compute results
+        results = {'per_path': {}}
+        pool_totals = defaultdict(lambda: {'active': 0, 'total': 0, 'weight': 0.0})
+
+        for key, stats in path_stats.items():
+            if stats['total_tokens'] > 0:
+                activation_rate = stats['active_count'] / stats['total_tokens']
+                results['per_path'][key] = {
+                    'activation_rate': activation_rate,
+                    'weight_sum': stats['weight_sum'],
+                    'active_count': stats['active_count'],
+                    'total_tokens': stats['total_tokens'],
+                }
+
+                # Aggregate by pool
+                pool_name = '_'.join(key.split('_')[:-1])
+                pool_totals[pool_name]['active'] += stats['active_count']
+                pool_totals[pool_name]['total'] += stats['total_tokens']
+                pool_totals[pool_name]['weight'] += stats['weight_sum']
+
+        # Per-pool summary
+        results['per_pool'] = {}
+        for pool_name, totals in pool_totals.items():
+            if totals['total'] > 0:
+                results['per_pool'][pool_name] = {
+                    'avg_active_paths': totals['active'] / (totals['total'] / max_paths),
+                    'total_weight': totals['weight'],
+                }
+
+        results['max_paths'] = max_paths
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_activation_sparsity(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze per-token activation sparsity.
+
+        Measures how many neurons are actually active per token.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with sparsity statistics:
+            - avg_active_per_token: average active neurons per token
+            - sparsity_ratio: percentage of inactive neurons
+            - active_weight_sum: average weight sum of active neurons
+        """
+        sparsity_data = defaultdict(list)
+
+        self.model.eval()
+        with self.extractor.analysis_context():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Activation Sparsity')):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
+
+                routing = self.extractor.extract(outputs)
+                if not routing:
+                    continue
+
+                for layer in routing:
+                    for key in ROUTING_KEYS.keys():
+                        weights = layer.get_weight(key)
+                        if weights is None:
+                            continue
+
+                        pool = ROUTING_KEYS[key][3]
+                        n_attr = POOL_N_ATTR.get(pool)
+                        n_total = getattr(self.router, n_attr, 0) if n_attr else 0
+
+                        if n_total == 0:
+                            continue
+
+                        # Per-token statistics
+                        if weights.dim() == 3:  # [B, S, N]
+                            # Flatten to [B*S, N]
+                            w_flat = weights.view(-1, weights.shape[-1])
+                        else:  # [B, N]
+                            w_flat = weights
+
+                        for token_w in w_flat:
+                            active_mask = token_w > 0
+                            active_count = active_mask.sum().item()
+                            weight_sum = token_w[active_mask].sum().item() if active_count > 0 else 0
+
+                            sparsity_data[key].append({
+                                'active': active_count,
+                                'total': n_total,
+                                'weight_sum': weight_sum,
+                            })
+
+        # Aggregate results
+        results = {}
+        for key, data in sparsity_data.items():
+            if not data:
+                continue
+
+            avg_active = np.mean([d['active'] for d in data])
+            n_total = data[0]['total']
+            avg_weight_sum = np.mean([d['weight_sum'] for d in data])
+
+            results[key] = {
+                'display': ROUTING_KEYS[key][0],
+                'avg_active_per_token': avg_active,
+                'n_total': n_total,
+                'sparsity_ratio': 1 - (avg_active / n_total) if n_total > 0 else 0,
+                'avg_weight_sum': avg_weight_sum,
+                'active_ratio_pct': (avg_active / n_total * 100) if n_total > 0 else 0,
+            }
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_token_coselection(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze per-token Q/K co-selection patterns.
+
+        Measures how many neurons are selected by BOTH Q and K
+        for the same token position.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with co-selection statistics:
+            - mean_coselect_per_token: average shared neurons per token
+            - coselect_rate: ratio of shared to union
+            - per_layer: layer-wise patterns
+        """
+        coselect_data = defaultdict(list)
+        per_layer_data = defaultdict(lambda: defaultdict(list))
+
+        pool_info = {
+            'feature_qk': ('fqk_q', 'fqk_k'),
+            'restore_qk': ('rqk_q', 'rqk_k'),
+        }
+
+        self.model.eval()
+        with self.extractor.analysis_context():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Token Co-selection')):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
+
+                routing = self.extractor.extract(outputs)
+                if not routing:
+                    continue
+
+                for layer in routing:
+                    layer_idx = layer.layer_idx
+
+                    for pool_name, (q_key, k_key) in pool_info.items():
+                        w_q = layer.get_weight(q_key)
+                        w_k = layer.get_weight(k_key)
+
+                        if w_q is None or w_k is None:
+                            continue
+
+                        # Compute per-token co-selection
+                        if w_q.dim() == 3:  # [B, S, N]
+                            q_flat = w_q.view(-1, w_q.shape[-1])
+                            k_flat = w_k.view(-1, w_k.shape[-1])
+                        else:
+                            q_flat = w_q
+                            k_flat = w_k
+
+                        q_active = (q_flat > 0)
+                        k_active = (k_flat > 0)
+
+                        # Per-token metrics
+                        coselect = (q_active & k_active).sum(dim=-1).float()  # [B*S]
+                        union = (q_active | k_active).sum(dim=-1).float()
+                        q_count = q_active.sum(dim=-1).float()
+                        k_count = k_active.sum(dim=-1).float()
+
+                        for j in range(coselect.shape[0]):
+                            coselect_data[pool_name].append({
+                                'coselect': coselect[j].item(),
+                                'union': union[j].item(),
+                                'q_count': q_count[j].item(),
+                                'k_count': k_count[j].item(),
+                            })
+                            per_layer_data[pool_name][layer_idx].append(coselect[j].item())
+
+        # Aggregate results
+        results = {}
+        for pool_name, data in coselect_data.items():
+            if not data:
+                continue
+
+            mean_coselect = np.mean([d['coselect'] for d in data])
+            mean_union = np.mean([d['union'] for d in data])
+            mean_q = np.mean([d['q_count'] for d in data])
+            mean_k = np.mean([d['k_count'] for d in data])
+
+            # Per-layer breakdown
+            per_layer = {}
+            for layer_idx, layer_data in sorted(per_layer_data[pool_name].items()):
+                per_layer[f'L{layer_idx}'] = {
+                    'mean_coselect': np.mean(layer_data),
+                    'std_coselect': np.std(layer_data),
+                }
+
+            results[pool_name] = {
+                'mean_coselect_per_token': mean_coselect,
+                'mean_union_per_token': mean_union,
+                'coselect_rate': mean_coselect / mean_union if mean_union > 0 else 0,
+                'mean_q_active': mean_q,
+                'mean_k_active': mean_k,
+                'per_layer': per_layer,
+            }
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_coverage_progression(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze how coverage changes across layers.
+
+        Summarizes selection diversity trends from early to late layers.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with coverage progression:
+            - early_layers: average coverage for first 1/3 layers
+            - mid_layers: average coverage for middle 1/3 layers
+            - late_layers: average coverage for last 1/3 layers
+            - trend: increasing/decreasing/stable
+        """
+        # Get selection diversity data
+        diversity_results = self.analyze_selection_diversity(dataloader, n_batches)
+
+        # Extract per-layer coverages
+        layer_coverages = defaultdict(dict)
+
+        for layer_key, data in diversity_results.items():
+            if layer_key == 'summary' or not isinstance(data, dict):
+                continue
+
+            if 'layer' in data and 'union_coverage' in data:
+                layer_idx = data['layer']
+                pool = data.get('pool', 'unknown')
+                layer_coverages[pool][layer_idx] = data['union_coverage']
+
+        # Analyze progression per pool
+        results = {}
+        for pool, coverages in layer_coverages.items():
+            if not coverages:
+                continue
+
+            sorted_layers = sorted(coverages.keys())
+            n_layers = len(sorted_layers)
+
+            if n_layers < 3:
+                continue
+
+            # Split into thirds
+            third = n_layers // 3
+            early_layers = sorted_layers[:third]
+            mid_layers = sorted_layers[third:2*third]
+            late_layers = sorted_layers[2*third:]
+
+            early_cov = np.mean([coverages[l] for l in early_layers])
+            mid_cov = np.mean([coverages[l] for l in mid_layers])
+            late_cov = np.mean([coverages[l] for l in late_layers])
+
+            # Determine trend
+            if late_cov > early_cov * 1.1:
+                trend = 'increasing'
+            elif late_cov < early_cov * 0.9:
+                trend = 'decreasing'
+            else:
+                trend = 'stable'
+
+            growth_ratio = late_cov / early_cov if early_cov > 0 else 1.0
+
+            results[pool] = {
+                'early_coverage': early_cov,
+                'mid_coverage': mid_cov,
+                'late_coverage': late_cov,
+                'trend': trend,
+                'growth_ratio': growth_ratio,
+                'early_layers': list(early_layers),
+                'late_layers': list(late_layers),
+            }
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_weight_concentration(self, dataloader, n_batches: int = 50) -> Dict:
+        """
+        Analyze weight concentration among selected neurons.
+
+        Measures how much weight is concentrated in top neurons.
+
+        Args:
+            dataloader: DataLoader for input data
+            n_batches: Number of batches to process
+
+        Returns:
+            Dictionary with concentration statistics:
+            - top1_weight_ratio: fraction of weight in top-1 neuron
+            - top5_weight_ratio: fraction of weight in top-5 neurons
+            - weight_gini: gini coefficient among active neurons
+        """
+        concentration_data = defaultdict(list)
+
+        self.model.eval()
+        with self.extractor.analysis_context():
+            for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Weight Concentration')):
+                if i >= n_batches:
+                    break
+
+                input_ids = get_batch_input_ids(batch, self.device)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
+
+                routing = self.extractor.extract(outputs)
+                if not routing:
+                    continue
+
+                for layer in routing:
+                    for key in ROUTING_KEYS.keys():
+                        weights = layer.get_weight(key)
+                        if weights is None:
+                            continue
+
+                        # Flatten to [B*S, N] or [B, N]
+                        if weights.dim() == 3:
+                            w_flat = weights.view(-1, weights.shape[-1])
+                        else:
+                            w_flat = weights
+
+                        for token_w in w_flat:
+                            # Only consider active (non-zero) weights
+                            active_mask = token_w > 0
+                            active_weights = token_w[active_mask]
+
+                            if active_weights.numel() == 0:
+                                continue
+
+                            total_w = active_weights.sum().item()
+                            if total_w <= 0:
+                                continue
+
+                            # Sort descending
+                            sorted_w, _ = active_weights.sort(descending=True)
+                            sorted_w = sorted_w.cpu().numpy()
+
+                            # Top-k ratios
+                            top1_ratio = sorted_w[0] / total_w if len(sorted_w) >= 1 else 0
+                            top5_ratio = sorted_w[:5].sum() / total_w if len(sorted_w) >= 5 else sorted_w.sum() / total_w
+
+                            # Gini coefficient
+                            gini = gini_coefficient(sorted_w)
+
+                            concentration_data[key].append({
+                                'top1_ratio': top1_ratio,
+                                'top5_ratio': top5_ratio,
+                                'gini': gini,
+                                'n_active': len(sorted_w),
+                            })
+
+        # Aggregate results
+        results = {}
+        for key, data in concentration_data.items():
+            if not data:
+                continue
+
+            results[key] = {
+                'display': ROUTING_KEYS[key][0],
+                'top1_weight_ratio': np.mean([d['top1_ratio'] for d in data]),
+                'top5_weight_ratio': np.mean([d['top5_ratio'] for d in data]),
+                'weight_gini': np.mean([d['gini'] for d in data]),
+                'avg_active_neurons': np.mean([d['n_active'] for d in data]),
+            }
+
+        results['n_batches'] = n_batches
+        return results
+
     def visualize_qk_usage(self, usage_results: Dict, output_dir: str) -> Optional[str]:
         """
         Visualize Q/K usage patterns.
@@ -780,6 +1342,13 @@ class RoutingAnalyzer(BaseAnalyzer):
             'qk_overlap': self.analyze_qk_overlap(dataloader, n_batches),
             'qk_usage': self.analyze_qk_usage(dataloader, n_batches * 2),
             'qk_entropy': self.analyze_qk_entropy(dataloader, n_batches),
+            # New analyses
+            'qk_union_coverage': self.analyze_qk_union_coverage(dataloader, n_batches * 2),
+            'activation_sparsity': self.analyze_activation_sparsity(dataloader, n_batches),
+            'token_coselection': self.analyze_token_coselection(dataloader, n_batches),
+            'weight_concentration': self.analyze_weight_concentration(dataloader, n_batches),
+            'path_usage': self.analyze_path_usage(dataloader, n_batches),
+            'coverage_progression': self.analyze_coverage_progression(dataloader, n_batches),
         }
 
         # Visualizations
