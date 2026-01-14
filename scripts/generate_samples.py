@@ -72,6 +72,8 @@ def load_model(checkpoint_path):
     version = model_config.get('model_version', None)
     if version is None:
         # Check for version-specific keys (most specific first)
+        # v18.5: context-aware restore routing with separate tau projections
+        v18_5_keys = ['router.tau_proj_feature.weight', 'router.tau_proj_restore_Q.weight']
         # v18.2/v18.1: has tau_proj and separate norm layers per projection
         v18_2_keys = ['router.tau_proj.weight', 'router.neuron_router.norm_fqk_Q.weight']
         # v18.0: has multi-path but no learnable tau
@@ -79,12 +81,14 @@ def load_model(checkpoint_path):
         # DAWN generic keys
         dawn_keys = ['shared_neurons.f_neurons', 'router.neuron_router.neuron_emb']
 
-        if all(k in state_dict for k in v18_2_keys):
+        if all(k in state_dict for k in v18_5_keys):
+            version = '18.5'  # v18.5 with context-aware restore routing
+        elif all(k in state_dict for k in v18_2_keys):
             version = '18.2'  # v18.2 with learnable tau and separate norms
         elif any(k in state_dict for k in dawn_keys):
             # Check if it's v18.x by looking at the config
             if model_config.get('learnable_tau', False) or model_config.get('max_paths'):
-                version = '18.2'  # Assume latest v18 if has v18 config params
+                version = '18.5'  # Assume latest v18 if has v18 config params
             else:
                 version = '17.1'  # Default DAWN version
         else:
