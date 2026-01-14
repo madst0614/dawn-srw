@@ -551,8 +551,13 @@ class BehavioralAnalyzer(BaseAnalyzer):
             'per_target': {},
         }
 
-        # pool_type is already a standardized key (fv, rv, fqk_q, etc.)
-        # The extractor will handle the mapping to raw keys
+        # Map pool_type to routing info keys
+        weight_key_map = {
+            'fv': 'fv_weights', 'rv': 'rv_weights',
+            'fqk_q': 'fqk_weights_Q', 'fqk_k': 'fqk_weights_K',
+            'rqk_q': 'rqk_weights_Q', 'rqk_k': 'rqk_weights_K',
+        }
+        weight_key = weight_key_map.get(pool_type, 'fv_weights')
 
         self.model.eval()
 
@@ -572,16 +577,14 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     prompt, add_special_tokens=False, return_tensors='pt'
                 ).to(self.device)
 
-                with self.extractor.analysis_context():
-                    with torch.no_grad():
-                        outputs = self.model(input_ids, return_routing_info=True)
+                with torch.no_grad():
+                    outputs = self.model(input_ids, return_routing_info=True)
 
                     if isinstance(outputs, tuple) and len(outputs) >= 2:
-                        logits = outputs[0]
-                        routing = self.extractor.extract(outputs)
+                        logits, routing_infos = outputs[0], outputs[1]
                     else:
                         logits = outputs
-                        routing = None
+                        routing_infos = None
 
                     # Get predicted token and top-k info
                     last_logits = logits[:, -1, :]
@@ -603,10 +606,13 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     if next_token == target_id:
                         matching_runs += 1
 
-                        # Extract active neurons from routing info using standardized key
-                        if routing:
-                            for layer in routing:
-                                weights = layer.get_weight(pool_type)
+                        # Extract active neurons from routing info
+                        if routing_infos:
+                            for layer_info in routing_infos:
+                                attn = layer_info.get('attention', layer_info)
+
+                                # Try weights directly
+                                weights = attn.get(weight_key)
                                 if weights is not None:
                                     if weights.dim() == 3:
                                         w = weights[0, -1]
