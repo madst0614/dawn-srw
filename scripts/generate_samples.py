@@ -250,7 +250,7 @@ def compute_perplexity(model, val_tokens, num_seqs=50, seq_len=512, device='cuda
     return avg_loss, ppl
 
 
-def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
+def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda', gen_tokens=50):
     """Test a single checkpoint and return results"""
     results = {}
 
@@ -309,7 +309,7 @@ def test_single_checkpoint(ckpt_path, tokenizer, val_tokens, device='cuda'):
     for category, prompt_list in prompts.items():
         results['generations'][category] = []
         for prompt in prompt_list:
-            output = generate_text(model, tokenizer, prompt, max_new_tokens=30, device=device)
+            output = generate_text(model, tokenizer, prompt, max_new_tokens=gen_tokens, device=device)
             results['generations'][category].append({'prompt': prompt, 'output': output})
 
     # 2. C4 continuation
@@ -342,6 +342,7 @@ def main():
     parser.add_argument('--val_data', type=str, required=True, help='Path to validation data')
     parser.add_argument('--output', type=str, default='generation_results.txt', help='Output file')
     parser.add_argument('--device', type=str, default='cuda', help='Device')
+    parser.add_argument('--gen_tokens', type=int, default=50, help='Max tokens to generate per sample')
     args = parser.parse_args()
 
     # Device check
@@ -372,7 +373,7 @@ def main():
         print('='*60)
 
         try:
-            results = test_single_checkpoint(ckpt_path, tokenizer, val_tokens, args.device)
+            results = test_single_checkpoint(ckpt_path, tokenizer, val_tokens, args.device, args.gen_tokens)
             all_results.append(results)
 
             # Format output
