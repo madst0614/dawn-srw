@@ -63,8 +63,9 @@ CLI Arguments:
     Analysis Mode:
         --paper-only      Generate paper outputs only (faster)
         --only            Run only specific analyses (comma-separated)
-                          Options: health,routing,embedding,semantic,pos,
-                                   factual,behavioral,coselection,weight,v18
+                          Options: model_info,performance,health,routing,embedding,
+                                   semantic,pos,factual,behavioral,coselection,
+                                   weight,v18,paper,report
 
     Analysis Parameters:
         --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
@@ -1852,7 +1853,7 @@ Examples:
 
     # Analysis mode
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
-    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: health,routing,embedding,semantic,pos,factual,behavioral,coselection,weight,v18)')
+    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: model_info,performance,health,routing,embedding,semantic,pos,factual,behavioral,coselection,weight,v18,paper,report)')
 
     # Analysis parameters
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
