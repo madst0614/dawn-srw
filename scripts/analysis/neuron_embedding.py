@@ -14,6 +14,7 @@ Includes:
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
@@ -63,9 +64,11 @@ class NeuronEmbeddingAnalyzer(BaseAnalyzer):
         self.pool_boundaries = self._get_pool_boundaries()
 
     def _get_neuron_embeddings(self) -> Optional[torch.Tensor]:
-        """Extract neuron embeddings from model."""
+        """Extract neuron embeddings from model (normalized to match routing)."""
         if hasattr(self.router, 'neuron_emb'):
-            return self.router.neuron_emb.detach()
+            emb = self.router.neuron_emb.detach()
+            # Normalize to match actual routing (cosine similarity based)
+            return F.normalize(emb, dim=-1)
         return None
 
     def _get_pool_boundaries(self) -> Dict[str, Tuple[int, int]]:
