@@ -422,101 +422,104 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             mean_weight = np.where(
                 self.weight_count > 0,
                 self.weight_sum / self.weight_count,
-                0.0
+                np.nan  # Use NaN for missing values to exclude from mean
             )
 
-        # Compute global mean weight per neuron (across all POS)
-        # global_mean[neuron] = sum(weight_sum[all_pos]) / sum(weight_count[all_pos])
-        total_weight_sum = self.weight_sum.sum(axis=0)  # [n_neurons]
-        total_weight_count = self.weight_count.sum(axis=0)  # [n_neurons]
-
+        # Compute selectivity using average of per-POS means (treats each POS equally)
+        # neuron_avg[neuron] = mean of mean_weight[:, neuron] across active POS
+        # selectivity[pos, neuron] = mean_weight[pos, neuron] / neuron_avg[neuron]
         with np.errstate(divide='ignore', invalid='ignore'):
-            global_mean = np.where(
-                total_weight_count > 0,
-                total_weight_sum / total_weight_count,
-                0.0
-            )
+            # Use nanmean to ignore POS where neuron wasn't active
+            neuron_avg = np.nanmean(mean_weight, axis=0)  # [n_neurons]
 
-        # Compute selectivity: mean_weight[pos, neuron] / global_mean[neuron]
-        # selectivity > 1: selective for this POS
-        # selectivity = 1: uniform
-        # selectivity < 1: avoids this POS
-        with np.errstate(divide='ignore', invalid='ignore'):
             selectivity = np.where(
-                global_mean > 0,
-                mean_weight / global_mean,
+                neuron_avg > 0,
+                mean_weight / neuron_avg,
                 0.0
             )
 
-        # Replace inf/nan with 0
+        # Replace NaN in mean_weight with 0 for output
+        mean_weight = np.nan_to_num(mean_weight, nan=0.0)
+
+        # Replace inf/nan in selectivity with 0
         selectivity = np.nan_to_num(selectivity, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Find highly selective neurons per POS (selectivity > threshold)
-        threshold = 2.0
-        selective_neurons_per_pos = {}
-        for pos_i, pos in enumerate(UPOS_TAGS):
-            if self.pos_token_counts[pos_i] == 0:
-                continue
+        # Compute global stats for reference
+        total_weight_count = self.weight_count.sum(axis=0)  # [n_neurons]
+        active_neuron_mask = total_weight_count > 0
 
-            sel = selectivity[pos_i]
-            high_sel_mask = sel > threshold
-            high_sel_indices = np.where(high_sel_mask)[0]
-
-            if len(high_sel_indices) > 0:
-                # Sort by selectivity descending
-                sorted_idx = high_sel_indices[np.argsort(sel[high_sel_indices])[::-1]]
-                top_neurons = [
-                    {
-                        'neuron': int(n),
-                        'selectivity': float(sel[n]),
-                        'mean_weight': float(mean_weight[pos_i, n]),
-                        'occurrences': int(self.weight_count[pos_i, n]),
-                    }
-                    for n in sorted_idx[:20]  # Top 20
-                ]
-                selective_neurons_per_pos[pos] = top_neurons
-
-        # Top neurons per POS by mean weight (for comparison with old method)
+        # Find top neurons per POS (both high selectivity AND high mean_weight)
+        # Thresholds: selectivity > 1.5 AND mean_weight >= percentile threshold
+        selectivity_threshold = 1.5
         top_neurons_per_pos = {}
+
         for pos_i, pos in enumerate(UPOS_TAGS):
             if self.pos_token_counts[pos_i] == 0:
                 continue
 
             mw = mean_weight[pos_i]
-            top_indices = np.argsort(mw)[::-1][:20]
-            top_neurons_per_pos[pos] = [
-                (int(n), float(mw[n])) for n in top_indices if mw[n] > 0
-            ]
+            sel = selectivity[pos_i]
 
-        # Neuron-level specificity analysis
-        # For each neuron, find the POS with highest selectivity
+            # Get active neurons for this POS
+            active_mask = mw > 0
+            if not active_mask.any():
+                continue
+
+            # Weight threshold: top 25% of active neurons by mean_weight
+            active_weights = mw[active_mask]
+            weight_threshold = np.percentile(active_weights, 75) if len(active_weights) > 4 else 0
+
+            # Combined filter: high selectivity AND meaningful weight
+            combined_mask = (sel > selectivity_threshold) & (mw >= weight_threshold)
+            high_neurons = np.where(combined_mask)[0]
+
+            if len(high_neurons) > 0:
+                # Sort by selectivity * mean_weight (balance both)
+                scores = sel[high_neurons] * mw[high_neurons]
+                sorted_idx = high_neurons[np.argsort(scores)[::-1]]
+
+                top_neurons_per_pos[pos] = [
+                    {
+                        'neuron': int(n),
+                        'selectivity': float(sel[n]),
+                        'mean_weight': float(mw[n]),
+                        'score': float(sel[n] * mw[n]),
+                        'occurrences': int(self.weight_count[pos_i, n]),
+                    }
+                    for n in sorted_idx[:20]  # Top 20
+                ]
+
+        # Neuron-level analysis: for each neuron, find its most selective POS
         neuron_specificity = {}
-        active_neurons = np.where(total_weight_count > 0)[0]
+        active_neurons = np.where(active_neuron_mask)[0]
 
         for neuron in active_neurons:
             sel = selectivity[:, neuron]
-            if sel.max() <= 1.0:
-                continue  # No selectivity
+            mw = mean_weight[:, neuron]
 
-            top_pos_i = int(np.argmax(sel))
+            # Skip if no selectivity
+            if np.nanmax(sel) <= 1.0:
+                continue
+
+            top_pos_i = int(np.nanargmax(sel))
             top_pos = UPOS_TAGS[top_pos_i]
             top_sel = float(sel[top_pos_i])
+            top_mw = float(mw[top_pos_i])
 
-            if top_sel > 1.5:  # Minimum threshold for specificity
+            if top_sel > 1.5 and top_mw > 0:
                 neuron_specificity[int(neuron)] = {
                     'top_pos': top_pos,
                     'selectivity': top_sel,
-                    'mean_weight': float(mean_weight[top_pos_i, neuron]),
-                    'global_mean_weight': float(global_mean[neuron]),
+                    'mean_weight': top_mw,
+                    'neuron_avg': float(neuron_avg[neuron]),
                 }
 
-        # Sort by selectivity
+        # Sort by selectivity descending, keep top 100
         neuron_specificity = dict(
             sorted(neuron_specificity.items(), key=lambda x: -x[1]['selectivity'])[:100]
         )
 
         # POS similarity based on selectivity patterns
-        # Cosine similarity between POS selectivity vectors
         pos_similarity = {}
         active_pos = [i for i in range(self.n_pos) if self.pos_token_counts[i] > 0]
 
@@ -525,7 +528,6 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                 sel_i = selectivity[pos_i]
                 sel_j = selectivity[pos_j]
 
-                # Cosine similarity
                 norm_i = np.linalg.norm(sel_i)
                 norm_j = np.linalg.norm(sel_j)
 
@@ -533,19 +535,21 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                     cos_sim = float(np.dot(sel_i, sel_j) / (norm_i * norm_j))
                     pos_similarity[f"{UPOS_TAGS[pos_i]}-{UPOS_TAGS[pos_j]}"] = cos_sim
 
-        # Build selectivity matrix for output (only active POS and neurons with activity)
-        active_neuron_mask = total_weight_count > 0
-        n_active_neurons = active_neuron_mask.sum()
-
+        # Selectivity summary
+        n_active_neurons = int(active_neuron_mask.sum())
         selectivity_summary = {
-            'shape': [len(active_pos), int(n_active_neurons)],
+            'shape': [len(active_pos), n_active_neurons],
             'pos_labels': [UPOS_TAGS[i] for i in active_pos],
             'mean_selectivity_per_pos': {
-                UPOS_TAGS[i]: float(selectivity[i, active_neuron_mask].mean())
+                UPOS_TAGS[i]: float(np.nanmean(selectivity[i, active_neuron_mask]))
                 for i in active_pos
             },
             'max_selectivity_per_pos': {
-                UPOS_TAGS[i]: float(selectivity[i].max())
+                UPOS_TAGS[i]: float(np.nanmax(selectivity[i]))
+                for i in active_pos
+            },
+            'mean_weight_per_pos': {
+                UPOS_TAGS[i]: float(np.nanmean(mean_weight[i, active_neuron_mask]))
                 for i in active_pos
             },
         }
@@ -556,14 +560,13 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                 for i in range(self.n_pos) if self.pos_token_counts[i] > 0
             },
             'selectivity_summary': selectivity_summary,
-            'selective_neurons_per_pos': selective_neurons_per_pos,
             'top_neurons_per_pos': top_neurons_per_pos,
             'neuron_specificity': {
                 str(k): v for k, v in neuron_specificity.items()
             },
             'pos_similarity': pos_similarity,
-            'total_neurons_analyzed': int(n_active_neurons),
-            # Store raw data for visualization
+            'total_neurons_analyzed': n_active_neurons,
+            # Store raw matrices for visualization
             '_selectivity_matrix': selectivity,
             '_mean_weight_matrix': mean_weight,
             '_pos_indices': active_pos,
@@ -626,7 +629,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         return paths
 
     def _plot_selectivity_heatmap(self, results: Dict, output_path: str) -> Optional[str]:
-        """Plot selectivity heatmap: POS x Neuron clusters."""
+        """Plot selectivity heatmap: POS x Neuron."""
         try:
             import matplotlib.pyplot as plt
             import matplotlib
@@ -635,6 +638,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             return None
 
         selectivity = results.get('_selectivity_matrix')
+        mean_weight = results.get('_mean_weight_matrix')
         if selectivity is None:
             return None
 
@@ -644,6 +648,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         # Filter to active neurons and sample if too many
         active_mask = selectivity.max(axis=0) > 0
         selectivity_active = selectivity[np.ix_(pos_indices, active_mask)]
+        mean_weight_active = mean_weight[np.ix_(pos_indices, active_mask)] if mean_weight is not None else None
 
         n_neurons = selectivity_active.shape[1]
         if n_neurons > 200:
@@ -651,23 +656,34 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             max_sel = selectivity_active.max(axis=0)
             top_indices = np.argsort(max_sel)[-200:]
             selectivity_active = selectivity_active[:, top_indices]
+            if mean_weight_active is not None:
+                mean_weight_active = mean_weight_active[:, top_indices]
 
-        fig, ax = plt.subplots(figsize=(14, 8))
+        # Create figure with 2 subplots
+        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 
-        # Clip for better visualization
+        # Left: Selectivity heatmap
+        ax = axes[0]
         sel_clipped = np.clip(selectivity_active, 0, 5)
-
-        im = ax.imshow(sel_clipped, aspect='auto', cmap='RdYlBu_r',
-                       vmin=0, vmax=5)
+        im1 = ax.imshow(sel_clipped, aspect='auto', cmap='RdYlBu_r', vmin=0, vmax=5)
         ax.set_yticks(range(len(pos_labels)))
         ax.set_yticklabels(pos_labels)
         ax.set_xlabel('Neuron (top 200 by max selectivity)')
         ax.set_ylabel('POS')
-        ax.set_title('POS Selectivity (E[weight|POS] / E[weight|all])\n'
-                     'Red: selective (>1), Blue: avoids (<1), White: uniform (=1)')
+        ax.set_title('Selectivity = mean_weight[pos] / avg(mean_weight)\n'
+                     'Red: selective (>1), Blue: avoids (<1)')
+        plt.colorbar(im1, ax=ax, label='Selectivity')
 
-        cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('Selectivity')
+        # Right: Mean weight heatmap
+        ax = axes[1]
+        if mean_weight_active is not None:
+            im2 = ax.imshow(mean_weight_active, aspect='auto', cmap='viridis')
+            ax.set_yticks(range(len(pos_labels)))
+            ax.set_yticklabels(pos_labels)
+            ax.set_xlabel('Neuron (top 200 by max selectivity)')
+            ax.set_ylabel('POS')
+            ax.set_title('Mean Weight (activation strength)')
+            plt.colorbar(im2, ax=ax, label='Mean Weight')
 
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -676,7 +692,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         return output_path
 
     def _plot_selective_neurons(self, results: Dict, output_path: str) -> Optional[str]:
-        """Plot high-selectivity neurons per POS."""
+        """Plot top neurons per POS (high selectivity AND high mean_weight)."""
         try:
             import matplotlib.pyplot as plt
             import matplotlib
@@ -684,21 +700,28 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         except ImportError:
             return None
 
-        selective = results.get('selective_neurons_per_pos', {})
-        if not selective:
+        top_neurons = results.get('top_neurons_per_pos', {})
+        if not top_neurons:
             return None
 
-        # Prepare data
-        pos_list = list(selective.keys())
+        pos_list = list(top_neurons.keys())
         if not pos_list:
             return None
 
-        fig, axes = plt.subplots(2, (len(pos_list) + 1) // 2, figsize=(16, 10))
-        axes = axes.flatten()
+        n_cols = min(4, len(pos_list))
+        n_rows = (len(pos_list) + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
 
-        for i, pos in enumerate(pos_list[:len(axes)]):
-            ax = axes[i]
-            neurons = selective[pos][:10]  # Top 10
+        for i, pos in enumerate(pos_list):
+            row, col = i // n_cols, i % n_cols
+            ax = axes[row, col]
+            neurons = top_neurons[pos][:10]  # Top 10
 
             if not neurons:
                 ax.set_visible(False)
@@ -706,20 +729,24 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
             neuron_ids = [n['neuron'] for n in neurons]
             selectivities = [n['selectivity'] for n in neurons]
+            mean_weights = [n['mean_weight'] for n in neurons]
 
-            ax.barh(range(len(neuron_ids)), selectivities, color='steelblue')
+            # Bar chart with selectivity, color by mean_weight
+            colors = plt.cm.viridis([mw / max(mean_weights) for mw in mean_weights])
+            bars = ax.barh(range(len(neuron_ids)), selectivities, color=colors)
             ax.set_yticks(range(len(neuron_ids)))
-            ax.set_yticklabels([f'N{n}' for n in neuron_ids])
+            ax.set_yticklabels([f'N{n}' for n in neuron_ids], fontsize=8)
             ax.set_xlabel('Selectivity')
-            ax.set_title(f'{pos}')
-            ax.axvline(x=1, color='red', linestyle='--', alpha=0.5)
-            ax.axvline(x=2, color='orange', linestyle='--', alpha=0.5)
+            ax.set_title(f'{pos}', fontsize=10)
+            ax.axvline(x=1, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
+            ax.axvline(x=1.5, color='orange', linestyle='--', alpha=0.5, linewidth=0.8)
 
         # Hide unused axes
-        for i in range(len(pos_list), len(axes)):
-            axes[i].set_visible(False)
+        for i in range(len(pos_list), n_rows * n_cols):
+            row, col = i // n_cols, i % n_cols
+            axes[row, col].set_visible(False)
 
-        plt.suptitle('High-Selectivity Neurons per POS (selectivity > 2.0)', fontsize=14)
+        plt.suptitle('Top Neurons per POS (selectivity > 1.5 AND top 25% weight)\nColor = mean_weight', fontsize=12)
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
