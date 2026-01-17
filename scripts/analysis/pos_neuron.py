@@ -448,10 +448,13 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         total_weight_count = self.weight_count.sum(axis=0)  # [n_neurons]
         active_neuron_mask = total_weight_count > 0
 
-        # Find top neurons per POS (both high selectivity AND high mean_weight)
-        # Thresholds: selectivity > 1.5 AND mean_weight >= percentile threshold
-        selectivity_threshold = 1.5
+        # Find top neurons per POS with detailed statistics
+        # Specialist = selectivity > 2.0 AND mean_weight > 0.1
+        SPECIALIST_SEL_THRESHOLD = 2.0
+        SPECIALIST_MW_THRESHOLD = 0.1
+
         top_neurons_per_pos = {}
+        pos_specialist_stats = {}  # Summary stats per POS
 
         for pos_i, pos in enumerate(UPOS_TAGS):
             if self.pos_token_counts[pos_i] == 0:
@@ -465,12 +468,22 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             if not active_mask.any():
                 continue
 
-            # Weight threshold: top 25% of active neurons by mean_weight
+            # Count neurons at different thresholds
+            n_sel_gt_1_5 = int(((sel > 1.5) & active_mask).sum())
+            n_sel_gt_2 = int(((sel > SPECIALIST_SEL_THRESHOLD) & active_mask).sum())
+            n_specialists = int(((sel > SPECIALIST_SEL_THRESHOLD) & (mw > SPECIALIST_MW_THRESHOLD)).sum())
+
+            pos_specialist_stats[pos] = {
+                'n_active': int(active_mask.sum()),
+                'n_sel_gt_1_5': n_sel_gt_1_5,
+                'n_sel_gt_2': n_sel_gt_2,
+                'n_specialists': n_specialists,  # sel > 2.0 AND mw > 0.1
+            }
+
+            # Combined filter for top neurons: selectivity > 1.5 AND meaningful weight
             active_weights = mw[active_mask]
             weight_threshold = np.percentile(active_weights, 75) if len(active_weights) > 4 else 0
-
-            # Combined filter: high selectivity AND meaningful weight
-            combined_mask = (sel > selectivity_threshold) & (mw >= weight_threshold)
+            combined_mask = (sel > 1.5) & (mw >= weight_threshold)
             high_neurons = np.where(combined_mask)[0]
 
             if len(high_neurons) > 0:
@@ -478,6 +491,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                 scores = sel[high_neurons] * mw[high_neurons]
                 sorted_idx = high_neurons[np.argsort(scores)[::-1]]
 
+                # Mark specialists
                 top_neurons_per_pos[pos] = [
                     {
                         'neuron': int(n),
@@ -485,6 +499,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                         'mean_weight': float(mw[n]),
                         'score': float(sel[n] * mw[n]),
                         'occurrences': int(self.weight_count[pos_i, n]),
+                        'is_specialist': bool(sel[n] > SPECIALIST_SEL_THRESHOLD and mw[n] > SPECIALIST_MW_THRESHOLD),
                     }
                     for n in sorted_idx[:20]  # Top 20
                 ]
@@ -560,6 +575,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                 for i in range(self.n_pos) if self.pos_token_counts[i] > 0
             },
             'selectivity_summary': selectivity_summary,
+            'pos_specialist_stats': pos_specialist_stats,
             'top_neurons_per_pos': top_neurons_per_pos,
             'neuron_specificity': {
                 str(k): v for k, v in neuron_specificity.items()
@@ -571,6 +587,78 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             '_mean_weight_matrix': mean_weight,
             '_pos_indices': active_pos,
         }
+
+    def print_summary(self, results: Dict):
+        """Print detailed summary of POS neuron analysis."""
+        print("\n" + "=" * 70)
+        print("POS NEURON SELECTIVITY ANALYSIS")
+        print("=" * 70)
+
+        # 1. Summary statistics table
+        stats = results.get('pos_specialist_stats', {})
+        if stats:
+            print("\n┌─ Summary: Specialist Neurons per POS ─────────────────────────────────┐")
+            print("│  Specialist = selectivity > 2.0 AND mean_weight > 0.1")
+            print("│")
+            print(f"│  {'POS':<8} {'Tokens':>8} {'Active':>8} {'Sel>1.5':>8} {'Sel>2.0':>8} {'Specialist':>10}")
+            print(f"│  {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*10}")
+
+            pos_counts = results.get('pos_token_counts', {})
+            total_specialists = 0
+            for pos in UPOS_TAGS:
+                if pos in stats:
+                    s = stats[pos]
+                    n_tokens = pos_counts.get(pos, 0)
+                    print(f"│  {pos:<8} {n_tokens:>8} {s['n_active']:>8} {s['n_sel_gt_1_5']:>8} {s['n_sel_gt_2']:>8} {s['n_specialists']:>10}")
+                    total_specialists += s['n_specialists']
+
+            print(f"│  {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*10}")
+            print(f"│  {'TOTAL':<8} {'':<8} {'':<8} {'':<8} {'':<8} {total_specialists:>10}")
+            print("└───────────────────────────────────────────────────────────────────────┘")
+
+        # 2. Top neurons per POS (detailed table)
+        top_neurons = results.get('top_neurons_per_pos', {})
+        if top_neurons:
+            print("\n┌─ Top Neurons per POS (selectivity > 1.5, top 25% weight) ────────────┐")
+
+            for pos in UPOS_TAGS:
+                if pos not in top_neurons:
+                    continue
+
+                neurons = top_neurons[pos][:10]  # Show top 10
+                if not neurons:
+                    continue
+
+                n_specialists = sum(1 for n in neurons if n.get('is_specialist', False))
+                print(f"│")
+                print(f"│  {pos} ({n_specialists} specialists in top 10)")
+                print(f"│  {'Neuron':<10} {'Selectivity':>12} {'Mean Weight':>12} {'Occurrences':>12} {'Specialist':>10}")
+                print(f"│  {'─'*10} {'─'*12} {'─'*12} {'─'*12} {'─'*10}")
+
+                for n in neurons:
+                    specialist_mark = "★" if n.get('is_specialist', False) else ""
+                    print(f"│  N{n['neuron']:<9} {n['selectivity']:>12.3f} {n['mean_weight']:>12.4f} {n['occurrences']:>12} {specialist_mark:>10}")
+
+            print("└───────────────────────────────────────────────────────────────────────┘")
+
+        # 3. Overall statistics
+        summary = results.get('selectivity_summary', {})
+        if summary:
+            print("\n┌─ Mean Selectivity & Weight per POS ──────────────────────────────────┐")
+            mean_sel = summary.get('mean_selectivity_per_pos', {})
+            max_sel = summary.get('max_selectivity_per_pos', {})
+            mean_mw = summary.get('mean_weight_per_pos', {})
+
+            print(f"│  {'POS':<8} {'Mean Sel':>10} {'Max Sel':>10} {'Mean Weight':>12}")
+            print(f"│  {'─'*8} {'─'*10} {'─'*10} {'─'*12}")
+
+            for pos in UPOS_TAGS:
+                if pos in mean_sel:
+                    print(f"│  {pos:<8} {mean_sel[pos]:>10.3f} {max_sel.get(pos, 0):>10.3f} {mean_mw.get(pos, 0):>12.5f}")
+
+            print("└───────────────────────────────────────────────────────────────────────┘")
+
+        print("\n" + "=" * 70)
 
     def visualize(self, results: Dict, output_dir: str) -> Dict[str, str]:
         """
@@ -813,6 +901,9 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
         # Analyze
         results = self.analyze_dataset(dataset, pool_type, max_sentences)
+
+        # Print detailed summary
+        self.print_summary(results)
 
         # Remove internal matrices before saving JSON
         results_for_json = {
