@@ -5,6 +5,11 @@ Analyze neuron specialization by Part-of-Speech tags.
 
 Uses Universal Dependencies English Web Treebank to show that
 different POS categories activate different neurons.
+
+Key metric: Selectivity = E[weight|POS] / E[weight|all]
+- > 1: neuron is selective for this POS
+- = 1: neuron is uniform across POS
+- < 1: neuron avoids this POS
 """
 
 import os
@@ -34,9 +39,12 @@ POS_GROUPS = {
     'Other': ['NUM', 'PUNCT', 'SYM', 'INTJ', 'X'],
 }
 
+# POS tag to index mapping
+POS_TO_IDX = {pos: i for i, pos in enumerate(UPOS_TAGS)}
+
 
 class POSNeuronAnalyzer(BaseAnalyzer):
-    """Analyze neuron activations by POS tags."""
+    """Analyze neuron activations by POS tags using continuous weights."""
 
     def __init__(
         self,
@@ -63,16 +71,32 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         self.target_layer = target_layer
         self.model.eval()
 
-        # Storage for analysis
-        self.pos_neuron_counts = defaultdict(lambda: defaultdict(int))
-        self.pos_total_tokens = defaultdict(int)
-        self.layer_pos_neurons = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        # Get neuron count from router
+        self.n_neurons = self._get_neuron_count()
+        self.n_pos = len(UPOS_TAGS)
+
+        # Storage for weight accumulation (will be initialized in reset_stats)
+        self.weight_sum = None  # [n_pos, n_neurons]
+        self.weight_count = None  # [n_pos, n_neurons]
+        self.pos_token_counts = None  # [n_pos]
+
+    def _get_neuron_count(self) -> int:
+        """Get total neuron count from router."""
+        if hasattr(self.router, 'neuron_emb'):
+            return self.router.neuron_emb.shape[0]
+        # Fallback: sum of pool sizes
+        total = 0
+        for attr in ['n_feature_qk', 'n_feature_v', 'n_restore_qk', 'n_restore_v',
+                     'n_feature_know', 'n_restore_know']:
+            total += getattr(self.router, attr, 0)
+        return total if total > 0 else 4000  # Default fallback
 
     def reset_stats(self):
         """Reset analysis statistics."""
-        self.pos_neuron_counts = defaultdict(lambda: defaultdict(int))
-        self.pos_total_tokens = defaultdict(int)
-        self.layer_pos_neurons = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        # Use float32 numpy arrays for accumulation
+        self.weight_sum = np.zeros((self.n_pos, self.n_neurons), dtype=np.float32)
+        self.weight_count = np.zeros((self.n_pos, self.n_neurons), dtype=np.int32)
+        self.pos_token_counts = np.zeros(self.n_pos, dtype=np.int32)
 
     def load_ud_dataset(
         self,
@@ -235,22 +259,23 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
             return dawn_pos_tags, token_ids
 
-    def extract_routing_for_tokens(
+    def extract_routing_weights(
         self,
         token_ids: List[int],
         pool_type: str = 'fv',
-    ) -> Dict[int, List[int]]:
+    ) -> Optional[np.ndarray]:
         """
-        Get routing indices for each token position.
+        Get routing weights for each token position.
 
         Args:
             token_ids: List of token IDs
-            pool_type: Pool to analyze ('fv', 'rv', 'fqk_q', etc.) - uses standardized keys
+            pool_type: Pool to analyze ('fv', 'rv', 'fqk_q', etc.)
 
         Returns:
-            {position: [neuron_indices]}
+            weights: [seq_len, n_neurons] array of routing weights (averaged across layers)
         """
         input_ids = torch.tensor([token_ids], device=self.device)
+        seq_len = len(token_ids)
 
         with self.extractor.analysis_context():
             with torch.no_grad():
@@ -258,12 +283,12 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
             routing = self.extractor.extract(outputs)
             if not routing:
-                return {}
+                return None
 
-        position_neurons = defaultdict(set)
-        seq_len = input_ids.shape[1]
+        # Accumulate weights across layers
+        weight_sum = None
+        layer_count = 0
 
-        # pool_type is already a standardized key, extractor handles mapping
         for layer in routing:
             if self.target_layer is not None and layer.layer_idx != self.target_layer:
                 continue
@@ -271,21 +296,44 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             # Get weights using standardized key
             weights = layer.get_weight(pool_type)
 
-            if weights is not None:
-                # weights: [B, T, N] or [B, N]
-                if weights.dim() == 3:
-                    for pos in range(min(seq_len, weights.shape[1])):
-                        w = weights[0, pos]  # [N]
-                        active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                        position_neurons[pos].update(active_neurons)
-                elif weights.dim() == 2:
-                    # Batch-level routing - same for all positions
-                    w = weights[0]  # [N]
-                    active_neurons = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
-                    for pos in range(seq_len):
-                        position_neurons[pos].update(active_neurons)
+            if weights is None:
+                continue
 
-        return {pos: list(neurons) for pos, neurons in position_neurons.items()}
+            # weights: [B, T, N] or [B, N]
+            if weights.dim() == 3:
+                w = weights[0].cpu().numpy()  # [T, N]
+            elif weights.dim() == 2:
+                # Batch-level routing - expand to all positions
+                w = weights[0].unsqueeze(0).expand(seq_len, -1).cpu().numpy()  # [T, N]
+            else:
+                continue
+
+            # Truncate or pad to match sequence length
+            if w.shape[0] > seq_len:
+                w = w[:seq_len]
+            elif w.shape[0] < seq_len:
+                pad = np.zeros((seq_len - w.shape[0], w.shape[1]), dtype=np.float32)
+                w = np.vstack([w, pad])
+
+            # Check neuron dimension
+            if w.shape[1] > self.n_neurons:
+                w = w[:, :self.n_neurons]
+            elif w.shape[1] < self.n_neurons:
+                pad = np.zeros((w.shape[0], self.n_neurons - w.shape[1]), dtype=np.float32)
+                w = np.hstack([w, pad])
+
+            if weight_sum is None:
+                weight_sum = w.astype(np.float32)
+            else:
+                weight_sum += w
+
+            layer_count += 1
+
+        if weight_sum is None or layer_count == 0:
+            return None
+
+        # Average across layers
+        return weight_sum / layer_count
 
     def analyze_sentence(
         self,
@@ -293,7 +341,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         ud_pos: List[str],
         pool_type: str = 'fv',
     ):
-        """Analyze a single sentence and update statistics."""
+        """Analyze a single sentence and update statistics with continuous weights."""
         try:
             pos_tags, token_ids = self.get_pos_for_tokens(ud_tokens, ud_pos)
         except Exception:
@@ -302,13 +350,32 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         if not token_ids:
             return
 
-        position_neurons = self.extract_routing_for_tokens(token_ids, pool_type)
+        # Get routing weights: [seq_len, n_neurons]
+        weights = self.extract_routing_weights(token_ids, pool_type)
 
-        for pos_idx, pos in enumerate(pos_tags):
-            neurons = position_neurons.get(pos_idx, [])
-            self.pos_total_tokens[pos] += 1
-            for neuron in neurons:
-                self.pos_neuron_counts[pos][neuron] += 1
+        if weights is None:
+            return
+
+        seq_len = min(len(pos_tags), weights.shape[0])
+
+        # Vectorized accumulation per POS
+        for pos_idx in range(seq_len):
+            pos = pos_tags[pos_idx]
+            if pos not in POS_TO_IDX:
+                continue
+
+            pos_i = POS_TO_IDX[pos]
+            w = weights[pos_idx]  # [n_neurons]
+
+            # Only count neurons with non-zero weight
+            active_mask = w > 0
+            if not active_mask.any():
+                continue
+
+            # Accumulate weights
+            self.weight_sum[pos_i] += w
+            self.weight_count[pos_i] += active_mask.astype(np.int32)
+            self.pos_token_counts[pos_i] += 1
 
     def analyze_dataset(
         self,
@@ -347,86 +414,159 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         return self.get_results()
 
     def get_results(self) -> Dict:
-        """Compile analysis results."""
-        # Per-POS neuron frequency
-        pos_neuron_freq = {}
-        for pos in UPOS_TAGS:
-            if self.pos_total_tokens[pos] > 0:
-                neuron_counts = self.pos_neuron_counts[pos]
-                total = self.pos_total_tokens[pos]
-                freq = {neuron: count / total for neuron, count in neuron_counts.items()}
-                pos_neuron_freq[pos] = freq
+        """Compile analysis results with selectivity metrics."""
 
-        # Top neurons per POS
-        top_neurons_per_pos = {}
-        for pos, freq in pos_neuron_freq.items():
-            sorted_neurons = sorted(freq.items(), key=lambda x: -x[1])[:20]
-            top_neurons_per_pos[pos] = sorted_neurons
+        # Compute mean weight per (POS, neuron)
+        # mean_weight[pos, neuron] = weight_sum / weight_count
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mean_weight = np.where(
+                self.weight_count > 0,
+                self.weight_sum / self.weight_count,
+                0.0
+            )
 
-        # Find POS-specific neurons
-        all_neurons = set()
-        for freq in pos_neuron_freq.values():
-            all_neurons.update(freq.keys())
+        # Compute global mean weight per neuron (across all POS)
+        # global_mean[neuron] = sum(weight_sum[all_pos]) / sum(weight_count[all_pos])
+        total_weight_sum = self.weight_sum.sum(axis=0)  # [n_neurons]
+        total_weight_count = self.weight_count.sum(axis=0)  # [n_neurons]
 
-        neuron_specificity = {}
-        for neuron in all_neurons:
-            scores = []
-            for pos in UPOS_TAGS:
-                if pos in pos_neuron_freq:
-                    scores.append((pos, pos_neuron_freq[pos].get(neuron, 0)))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            global_mean = np.where(
+                total_weight_count > 0,
+                total_weight_sum / total_weight_count,
+                0.0
+            )
 
-            if scores:
-                scores.sort(key=lambda x: -x[1])
-                top_pos, top_score = scores[0]
-                if len(scores) > 1:
-                    second_score = scores[1][1]
-                    specificity = top_score / (second_score + 1e-6)
-                else:
-                    specificity = float('inf')
+        # Compute selectivity: mean_weight[pos, neuron] / global_mean[neuron]
+        # selectivity > 1: selective for this POS
+        # selectivity = 1: uniform
+        # selectivity < 1: avoids this POS
+        with np.errstate(divide='ignore', invalid='ignore'):
+            selectivity = np.where(
+                global_mean > 0,
+                mean_weight / global_mean,
+                0.0
+            )
 
-                if top_score > 0.1:
-                    neuron_specificity[neuron] = {
-                        'top_pos': top_pos,
-                        'top_score': top_score,
-                        'specificity': min(specificity, 100),
-                    }
+        # Replace inf/nan with 0
+        selectivity = np.nan_to_num(selectivity, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # POS overlap matrix
-        overlap_matrix = {}
-        for pos1 in UPOS_TAGS:
-            if pos1 not in pos_neuron_freq:
+        # Find highly selective neurons per POS (selectivity > threshold)
+        threshold = 2.0
+        selective_neurons_per_pos = {}
+        for pos_i, pos in enumerate(UPOS_TAGS):
+            if self.pos_token_counts[pos_i] == 0:
                 continue
-            neurons1 = set(n for n, f in pos_neuron_freq[pos1].items() if f > 0.1)
 
-            for pos2 in UPOS_TAGS:
-                if pos2 not in pos_neuron_freq:
-                    continue
-                neurons2 = set(n for n, f in pos_neuron_freq[pos2].items() if f > 0.1)
+            sel = selectivity[pos_i]
+            high_sel_mask = sel > threshold
+            high_sel_indices = np.where(high_sel_mask)[0]
 
-                if neurons1 and neurons2:
-                    overlap = len(neurons1 & neurons2)
-                    union = len(neurons1 | neurons2)
-                    jaccard = overlap / union if union > 0 else 0
-                    overlap_matrix[f"{pos1}-{pos2}"] = jaccard
+            if len(high_sel_indices) > 0:
+                # Sort by selectivity descending
+                sorted_idx = high_sel_indices[np.argsort(sel[high_sel_indices])[::-1]]
+                top_neurons = [
+                    {
+                        'neuron': int(n),
+                        'selectivity': float(sel[n]),
+                        'mean_weight': float(mean_weight[pos_i, n]),
+                        'occurrences': int(self.weight_count[pos_i, n]),
+                    }
+                    for n in sorted_idx[:20]  # Top 20
+                ]
+                selective_neurons_per_pos[pos] = top_neurons
+
+        # Top neurons per POS by mean weight (for comparison with old method)
+        top_neurons_per_pos = {}
+        for pos_i, pos in enumerate(UPOS_TAGS):
+            if self.pos_token_counts[pos_i] == 0:
+                continue
+
+            mw = mean_weight[pos_i]
+            top_indices = np.argsort(mw)[::-1][:20]
+            top_neurons_per_pos[pos] = [
+                (int(n), float(mw[n])) for n in top_indices if mw[n] > 0
+            ]
+
+        # Neuron-level specificity analysis
+        # For each neuron, find the POS with highest selectivity
+        neuron_specificity = {}
+        active_neurons = np.where(total_weight_count > 0)[0]
+
+        for neuron in active_neurons:
+            sel = selectivity[:, neuron]
+            if sel.max() <= 1.0:
+                continue  # No selectivity
+
+            top_pos_i = int(np.argmax(sel))
+            top_pos = UPOS_TAGS[top_pos_i]
+            top_sel = float(sel[top_pos_i])
+
+            if top_sel > 1.5:  # Minimum threshold for specificity
+                neuron_specificity[int(neuron)] = {
+                    'top_pos': top_pos,
+                    'selectivity': top_sel,
+                    'mean_weight': float(mean_weight[top_pos_i, neuron]),
+                    'global_mean_weight': float(global_mean[neuron]),
+                }
+
+        # Sort by selectivity
+        neuron_specificity = dict(
+            sorted(neuron_specificity.items(), key=lambda x: -x[1]['selectivity'])[:100]
+        )
+
+        # POS similarity based on selectivity patterns
+        # Cosine similarity between POS selectivity vectors
+        pos_similarity = {}
+        active_pos = [i for i in range(self.n_pos) if self.pos_token_counts[i] > 0]
+
+        for i, pos_i in enumerate(active_pos):
+            for pos_j in active_pos[i+1:]:
+                sel_i = selectivity[pos_i]
+                sel_j = selectivity[pos_j]
+
+                # Cosine similarity
+                norm_i = np.linalg.norm(sel_i)
+                norm_j = np.linalg.norm(sel_j)
+
+                if norm_i > 0 and norm_j > 0:
+                    cos_sim = float(np.dot(sel_i, sel_j) / (norm_i * norm_j))
+                    pos_similarity[f"{UPOS_TAGS[pos_i]}-{UPOS_TAGS[pos_j]}"] = cos_sim
+
+        # Build selectivity matrix for output (only active POS and neurons with activity)
+        active_neuron_mask = total_weight_count > 0
+        n_active_neurons = active_neuron_mask.sum()
+
+        selectivity_summary = {
+            'shape': [len(active_pos), int(n_active_neurons)],
+            'pos_labels': [UPOS_TAGS[i] for i in active_pos],
+            'mean_selectivity_per_pos': {
+                UPOS_TAGS[i]: float(selectivity[i, active_neuron_mask].mean())
+                for i in active_pos
+            },
+            'max_selectivity_per_pos': {
+                UPOS_TAGS[i]: float(selectivity[i].max())
+                for i in active_pos
+            },
+        }
 
         return {
-            'pos_token_counts': dict(self.pos_total_tokens),
-            'pos_neuron_freq': {
-                pos: {str(k): v for k, v in freq.items()}
-                for pos, freq in pos_neuron_freq.items()
+            'pos_token_counts': {
+                UPOS_TAGS[i]: int(self.pos_token_counts[i])
+                for i in range(self.n_pos) if self.pos_token_counts[i] > 0
             },
-            'top_neurons_per_pos': {
-                pos: [(int(n), f) for n, f in neurons]
-                for pos, neurons in top_neurons_per_pos.items()
-            },
+            'selectivity_summary': selectivity_summary,
+            'selective_neurons_per_pos': selective_neurons_per_pos,
+            'top_neurons_per_pos': top_neurons_per_pos,
             'neuron_specificity': {
-                str(k): v for k, v in sorted(
-                    neuron_specificity.items(),
-                    key=lambda x: -x[1]['specificity']
-                )[:50]
+                str(k): v for k, v in neuron_specificity.items()
             },
-            'overlap_matrix': overlap_matrix,
-            'total_neurons_seen': len(all_neurons),
+            'pos_similarity': pos_similarity,
+            'total_neurons_analyzed': int(n_active_neurons),
+            # Store raw data for visualization
+            '_selectivity_matrix': selectivity,
+            '_mean_weight_matrix': mean_weight,
+            '_pos_indices': active_pos,
         }
 
     def visualize(self, results: Dict, output_dir: str) -> Dict[str, str]:
@@ -440,31 +580,198 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         Returns:
             Dictionary of {plot_name: path}
         """
-        from .visualizers.pos_neurons import (
-            plot_pos_heatmap, plot_pos_clustering,
-            plot_top_neurons_by_pos, plot_pos_specificity
-        )
-
         os.makedirs(output_dir, exist_ok=True)
         paths = {}
 
-        path = plot_pos_heatmap(results, os.path.join(output_dir, 'pos_neuron_heatmap.png'))
+        # Selectivity heatmap (new)
+        path = self._plot_selectivity_heatmap(results, os.path.join(output_dir, 'selectivity_heatmap.png'))
         if path:
-            paths['heatmap'] = path
+            paths['selectivity_heatmap'] = path
 
-        path = plot_pos_clustering(results, os.path.join(output_dir, 'pos_clustering.png'))
+        # High-selectivity neurons per POS
+        path = self._plot_selective_neurons(results, os.path.join(output_dir, 'selective_neurons.png'))
         if path:
-            paths['clustering'] = path
+            paths['selective_neurons'] = path
 
-        path = plot_top_neurons_by_pos(results, os.path.join(output_dir, 'top_neurons_by_pos.png'))
+        # POS similarity matrix
+        path = self._plot_pos_similarity(results, os.path.join(output_dir, 'pos_similarity.png'))
         if path:
-            paths['top_neurons'] = path
+            paths['pos_similarity'] = path
 
-        path = plot_pos_specificity(results, os.path.join(output_dir, 'neuron_specificity.png'))
-        if path:
-            paths['specificity'] = path
+        # Legacy visualizations (adapted)
+        try:
+            from .visualizers.pos_neurons import (
+                plot_pos_heatmap, plot_pos_clustering,
+                plot_top_neurons_by_pos, plot_pos_specificity
+            )
+
+            path = plot_pos_heatmap(results, os.path.join(output_dir, 'pos_neuron_heatmap.png'))
+            if path:
+                paths['heatmap'] = path
+
+            path = plot_pos_clustering(results, os.path.join(output_dir, 'pos_clustering.png'))
+            if path:
+                paths['clustering'] = path
+
+            path = plot_top_neurons_by_pos(results, os.path.join(output_dir, 'top_neurons_by_pos.png'))
+            if path:
+                paths['top_neurons'] = path
+
+            path = plot_pos_specificity(results, os.path.join(output_dir, 'neuron_specificity.png'))
+            if path:
+                paths['specificity'] = path
+        except ImportError:
+            pass
 
         return paths
+
+    def _plot_selectivity_heatmap(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot selectivity heatmap: POS x Neuron clusters."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        selectivity = results.get('_selectivity_matrix')
+        if selectivity is None:
+            return None
+
+        pos_indices = results.get('_pos_indices', list(range(self.n_pos)))
+        pos_labels = [UPOS_TAGS[i] for i in pos_indices]
+
+        # Filter to active neurons and sample if too many
+        active_mask = selectivity.max(axis=0) > 0
+        selectivity_active = selectivity[np.ix_(pos_indices, active_mask)]
+
+        n_neurons = selectivity_active.shape[1]
+        if n_neurons > 200:
+            # Sample neurons with highest max selectivity
+            max_sel = selectivity_active.max(axis=0)
+            top_indices = np.argsort(max_sel)[-200:]
+            selectivity_active = selectivity_active[:, top_indices]
+
+        fig, ax = plt.subplots(figsize=(14, 8))
+
+        # Clip for better visualization
+        sel_clipped = np.clip(selectivity_active, 0, 5)
+
+        im = ax.imshow(sel_clipped, aspect='auto', cmap='RdYlBu_r',
+                       vmin=0, vmax=5)
+        ax.set_yticks(range(len(pos_labels)))
+        ax.set_yticklabels(pos_labels)
+        ax.set_xlabel('Neuron (top 200 by max selectivity)')
+        ax.set_ylabel('POS')
+        ax.set_title('POS Selectivity (E[weight|POS] / E[weight|all])\n'
+                     'Red: selective (>1), Blue: avoids (<1), White: uniform (=1)')
+
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Selectivity')
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
+    def _plot_selective_neurons(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot high-selectivity neurons per POS."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        selective = results.get('selective_neurons_per_pos', {})
+        if not selective:
+            return None
+
+        # Prepare data
+        pos_list = list(selective.keys())
+        if not pos_list:
+            return None
+
+        fig, axes = plt.subplots(2, (len(pos_list) + 1) // 2, figsize=(16, 10))
+        axes = axes.flatten()
+
+        for i, pos in enumerate(pos_list[:len(axes)]):
+            ax = axes[i]
+            neurons = selective[pos][:10]  # Top 10
+
+            if not neurons:
+                ax.set_visible(False)
+                continue
+
+            neuron_ids = [n['neuron'] for n in neurons]
+            selectivities = [n['selectivity'] for n in neurons]
+
+            ax.barh(range(len(neuron_ids)), selectivities, color='steelblue')
+            ax.set_yticks(range(len(neuron_ids)))
+            ax.set_yticklabels([f'N{n}' for n in neuron_ids])
+            ax.set_xlabel('Selectivity')
+            ax.set_title(f'{pos}')
+            ax.axvline(x=1, color='red', linestyle='--', alpha=0.5)
+            ax.axvline(x=2, color='orange', linestyle='--', alpha=0.5)
+
+        # Hide unused axes
+        for i in range(len(pos_list), len(axes)):
+            axes[i].set_visible(False)
+
+        plt.suptitle('High-Selectivity Neurons per POS (selectivity > 2.0)', fontsize=14)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
+    def _plot_pos_similarity(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot POS similarity matrix based on selectivity patterns."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        pos_similarity = results.get('pos_similarity', {})
+        if not pos_similarity:
+            return None
+
+        # Build similarity matrix
+        active_pos = list(results.get('pos_token_counts', {}).keys())
+        n = len(active_pos)
+
+        sim_matrix = np.eye(n)
+        for key, val in pos_similarity.items():
+            parts = key.split('-')
+            if len(parts) == 2:
+                try:
+                    i = active_pos.index(parts[0])
+                    j = active_pos.index(parts[1])
+                    sim_matrix[i, j] = val
+                    sim_matrix[j, i] = val
+                except ValueError:
+                    continue
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        im = ax.imshow(sim_matrix, cmap='coolwarm', vmin=-1, vmax=1)
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(active_pos, rotation=45, ha='right')
+        ax.set_yticklabels(active_pos)
+        ax.set_title('POS Similarity (based on selectivity patterns)')
+
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Cosine Similarity')
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
 
     def run_all(
         self,
@@ -495,14 +802,22 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         # Analyze
         results = self.analyze_dataset(dataset, pool_type, max_sentences)
 
+        # Remove internal matrices before saving JSON
+        results_for_json = {
+            k: v for k, v in results.items()
+            if not k.startswith('_')
+        }
+
         # Visualize
         viz_paths = self.visualize(results, output_dir)
-        results['visualizations'] = viz_paths
+        results_for_json['visualizations'] = viz_paths
 
         # Save results
         import json
         results_path = os.path.join(output_dir, f'pos_analysis_{pool_type}.json')
         with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(results_for_json, f, indent=2)
 
+        # Keep internal matrices in returned results for further analysis
+        results['visualizations'] = viz_paths
         return results
