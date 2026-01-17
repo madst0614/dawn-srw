@@ -64,8 +64,8 @@ CLI Arguments:
         --paper-only      Generate paper outputs only (faster)
         --only            Run only specific analyses (comma-separated)
                           Options: model_info,performance,health,routing,embedding,
-                                   semantic,pos,factual,behavioral,coselection,
-                                   weight,v18,paper,report
+                                   neuron_embedding,semantic,pos,factual,behavioral,
+                                   coselection,weight,v18,paper,report
 
     Analysis Parameters:
         --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
@@ -759,6 +759,72 @@ class ModelAnalyzer:
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         self.results['embedding'] = results
+        return results
+
+    def analyze_neuron_embedding(self, n_batches: int = 50, k_range: Tuple[int, int] = (5, 20)) -> Dict:
+        """Analyze neuron embeddings with clustering and token projections (DAWN only)."""
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.neuron_embedding import NeuronEmbeddingAnalyzer
+
+        output_dir = self.output_dir / 'neuron_embedding'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"  Analyzing neuron embeddings (k_range={k_range}, {n_batches} batches)...")
+        dataloader = self._get_dataloader()
+        analyzer = NeuronEmbeddingAnalyzer(self.model, device=self.device)
+        analyzer.tokenizer = self.tokenizer
+
+        results = analyzer.run_full_analysis(
+            dataloader,
+            output_dir=str(output_dir),
+            n_batches=n_batches,
+            k_range=k_range,
+            tokenizer=self.tokenizer
+        )
+
+        # Print summary
+        pool_dist = results.get('pool_distribution', {})
+        clustering = results.get('clustering', {})
+        pos_analysis = results.get('pos_projection_analysis', {})
+        neuron_pos = results.get('neuron_pos_similarity', {})
+
+        if pool_dist.get('pools'):
+            print(f"\n  ┌─ Pool Distribution ────────────────────────────────────────────────────")
+            print(f"  │ {'Pool':<12} {'N':>8} {'Norm μ':>10} {'CosSim μ':>10}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*10} {'─'*10}")
+            for pool, data in pool_dist['pools'].items():
+                print(f"  │ {data.get('display', pool):<12} {data['n_neurons']:>8} "
+                      f"{data['norm_mean']:>10.4f} {data['mean_cosine_sim']:>10.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if clustering:
+            print(f"\n  ┌─ Clustering ────────────────────────────────────────────────────────────")
+            print(f"  │ Optimal k: {clustering.get('optimal_k', 'N/A')}")
+            print(f"  │ Best silhouette: {clustering.get('best_silhouette', 0):.4f}")
+            print(f"  │ Total embeddings: {clustering.get('n_embeddings', 0)}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if pos_analysis and 'pos_stats' in pos_analysis:
+            print(f"\n  ┌─ POS Projection Analysis ──────────────────────────────────────────────")
+            print(f"  │ POS categories: {pos_analysis.get('n_pos_categories', 0)}")
+            print(f"  │ Silhouette score: {pos_analysis.get('silhouette_score', 'N/A')}")
+            top_pos = sorted(pos_analysis['pos_stats'].items(),
+                           key=lambda x: x[1].get('n_tokens', 0), reverse=True)[:5]
+            for pos, data in top_pos:
+                print(f"  │   {pos}: n={data['n_tokens']}, dist={data['mean_dist_to_centroid']:.3f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        if neuron_pos and 'pos_pool_affinity' in neuron_pos:
+            print(f"\n  ┌─ Neuron-POS Affinity ──────────────────────────────────────────────────")
+            for pos, affinity in list(neuron_pos['pos_pool_affinity'].items())[:5]:
+                pools = ', '.join(f"{p}:{d['count']}" for p, d in affinity.items())
+                print(f"  │ {pos}: {pools}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        self.results['neuron_embedding'] = results
         return results
 
     def analyze_semantic(self, n_batches: int = 50) -> Dict:
@@ -1483,6 +1549,7 @@ class ModelAnalyzer:
             ('health', self.analyze_health, {}),
             ('routing', self.analyze_routing, {'n_batches': self.n_batches}),
             ('embedding', self.analyze_embedding, {'n_clusters': self.n_clusters}),
+            ('neuron_embedding', self.analyze_neuron_embedding, {'n_batches': self.n_batches // 2}),
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
             ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type, 'target_layer': self.target_layer}),
             ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),

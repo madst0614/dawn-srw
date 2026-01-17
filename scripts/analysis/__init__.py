@@ -95,6 +95,9 @@ from .standalone.routing_analysis import (
 # POS Neuron Analyzer (refactored)
 from .pos_neuron import POSNeuronAnalyzer
 
+# Neuron Embedding Analyzer (clustering, token projections, neuron-POS mapping)
+from .neuron_embedding import NeuronEmbeddingAnalyzer
+
 # V18.x Specific Analyzer
 from .v18 import V18Analyzer
 
@@ -167,6 +170,9 @@ __all__ = [
     'plot_pos_clustering',
     'plot_top_neurons_by_pos',
     'plot_specificity',
+
+    # Neuron embedding analysis
+    'NeuronEmbeddingAnalyzer',
 
     # V18.x analysis
     'V18Analyzer',
