@@ -80,6 +80,12 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         self.weight_count = None  # [n_pos, n_neurons]
         self.pos_token_counts = None  # [n_pos]
 
+        # Co-activation storage (online covariance computation)
+        self.coact_sum_xy = None  # [n_neurons, n_neurons] - sum of w_i * w_j
+        self.coact_sum_x = None   # [n_neurons] - sum of w_i
+        self.coact_sum_x2 = None  # [n_neurons] - sum of w_i^2
+        self.coact_count = 0      # number of tokens
+
     def _get_neuron_count(self) -> int:
         """Get total neuron count from router."""
         if hasattr(self.router, 'neuron_emb'):
@@ -91,12 +97,30 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             total += getattr(self.router, attr, 0)
         return total if total > 0 else 4000  # Default fallback
 
-    def reset_stats(self):
-        """Reset analysis statistics."""
+    def reset_stats(self, compute_coactivation: bool = False):
+        """Reset analysis statistics.
+
+        Args:
+            compute_coactivation: Whether to compute co-activation statistics
+        """
         # Use float32 numpy arrays for accumulation
         self.weight_sum = np.zeros((self.n_pos, self.n_neurons), dtype=np.float32)
         self.weight_count = np.zeros((self.n_pos, self.n_neurons), dtype=np.int32)
         self.pos_token_counts = np.zeros(self.n_pos, dtype=np.int32)
+
+        # Co-activation storage (only allocate if needed - memory intensive)
+        self.compute_coactivation = compute_coactivation
+        if compute_coactivation:
+            # Use float64 for numerical stability in covariance
+            self.coact_sum_xy = np.zeros((self.n_neurons, self.n_neurons), dtype=np.float64)
+            self.coact_sum_x = np.zeros(self.n_neurons, dtype=np.float64)
+            self.coact_sum_x2 = np.zeros(self.n_neurons, dtype=np.float64)
+            self.coact_count = 0
+        else:
+            self.coact_sum_xy = None
+            self.coact_sum_x = None
+            self.coact_sum_x2 = None
+            self.coact_count = 0
 
     def load_ud_dataset(
         self,
@@ -357,31 +381,43 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             return
 
         seq_len = min(len(pos_tags), weights.shape[0])
+        weights = weights[:seq_len]
 
-        # Vectorized accumulation per POS
-        for pos_idx in range(seq_len):
-            pos = pos_tags[pos_idx]
-            if pos not in POS_TO_IDX:
-                continue
+        # Build POS index array for vectorized accumulation
+        pos_indices = np.array([
+            POS_TO_IDX.get(pos_tags[i], -1) for i in range(seq_len)
+        ], dtype=np.int32)
 
-            pos_i = POS_TO_IDX[pos]
-            w = weights[pos_idx]  # [n_neurons]
+        # Vectorized POS weight accumulation using np.add.at
+        valid_mask = pos_indices >= 0
+        valid_pos = pos_indices[valid_mask]
+        valid_weights = weights[valid_mask]
 
-            # Only count neurons with non-zero weight
-            active_mask = w > 0
-            if not active_mask.any():
-                continue
+        if len(valid_pos) > 0:
+            # Active mask per token: [n_valid, n_neurons]
+            active_masks = (valid_weights > 0).astype(np.int32)
 
-            # Accumulate weights
-            self.weight_sum[pos_i] += w
-            self.weight_count[pos_i] += active_mask.astype(np.int32)
-            self.pos_token_counts[pos_i] += 1
+            # Accumulate using np.add.at for efficient scatter-add
+            np.add.at(self.weight_sum, valid_pos, valid_weights)
+            np.add.at(self.weight_count, valid_pos, active_masks)
+            np.add.at(self.pos_token_counts, valid_pos, 1)
+
+        # Co-activation: vectorized outer product accumulation
+        if self.compute_coactivation and weights.shape[0] > 0:
+            # Batch outer product: sum over all tokens in sentence
+            # Using einsum for efficient batch outer product
+            # weights: [T, N] -> sum of w_i * w_j for all T
+            self.coact_sum_xy += np.einsum('ti,tj->ij', weights, weights)  # [N, N]
+            self.coact_sum_x += weights.sum(axis=0)  # [N]
+            self.coact_sum_x2 += (weights ** 2).sum(axis=0)  # [N]
+            self.coact_count += weights.shape[0]
 
     def analyze_dataset(
         self,
         dataset: List[Dict],
         pool_type: str = 'fv',
         max_sentences: int = None,
+        compute_coactivation: bool = False,
     ) -> Dict:
         """
         Analyze full dataset.
@@ -390,6 +426,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             dataset: List of {'tokens': [...], 'upos': [...]}
             pool_type: Pool to analyze (fv, fqk, fqk_q, fqk_k, rv, rqk, rqk_q, rqk_k, fknow, rknow)
             max_sentences: Maximum sentences to process
+            compute_coactivation: Whether to compute neuron co-activation correlation
 
         Returns:
             Analysis results dictionary
@@ -397,12 +434,14 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         # Resolve pool type alias (e.g., 'fqk' -> 'fqk_q')
         pool_type = resolve_pool_type(pool_type)
 
-        self.reset_stats()
+        self.reset_stats(compute_coactivation=compute_coactivation)
         n_sentences = min(len(dataset), max_sentences) if max_sentences else len(dataset)
 
         print(f"\nAnalyzing {n_sentences} sentences...")
         print(f"Pool: {pool_type.upper()}")
         print(f"Layer: {self.target_layer if self.target_layer is not None else 'all'}")
+        if compute_coactivation:
+            print("Co-activation analysis: ENABLED")
 
         for i in tqdm(range(n_sentences), desc="Processing"):
             example = dataset[i]
@@ -412,6 +451,210 @@ class POSNeuronAnalyzer(BaseAnalyzer):
                 continue
 
         return self.get_results()
+
+    def get_coactivation_matrix(self, min_occurrences: int = 10) -> Optional[Dict]:
+        """
+        Compute neuron co-activation correlation matrix from accumulated statistics.
+
+        Uses online covariance formula:
+            Cov[X,Y] = E[XY] - E[X]E[Y]
+            Corr[X,Y] = Cov[X,Y] / sqrt(Var[X] * Var[Y])
+
+        Args:
+            min_occurrences: Minimum token count to consider (for statistical significance)
+
+        Returns:
+            Dictionary with correlation matrix and highly correlated pairs, or None
+        """
+        if self.coact_sum_xy is None or self.coact_count < min_occurrences:
+            return None
+
+        n = self.coact_count
+
+        # Vectorized computation of correlation matrix
+        # E[X], E[Y]
+        mean_x = self.coact_sum_x / n  # [N]
+
+        # E[XY]
+        mean_xy = self.coact_sum_xy / n  # [N, N]
+
+        # E[X^2]
+        mean_x2 = self.coact_sum_x2 / n  # [N]
+
+        # Var[X] = E[X^2] - E[X]^2
+        var_x = mean_x2 - mean_x ** 2  # [N]
+        var_x = np.maximum(var_x, 1e-10)  # Avoid division by zero
+
+        # Cov[X,Y] = E[XY] - E[X]E[Y]  (using outer product for E[X]E[Y])
+        cov_xy = mean_xy - np.outer(mean_x, mean_x)  # [N, N]
+
+        # Corr[X,Y] = Cov[X,Y] / sqrt(Var[X] * Var[Y])
+        std_x = np.sqrt(var_x)  # [N]
+        std_outer = np.outer(std_x, std_x)  # [N, N]
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            corr_matrix = np.where(
+                std_outer > 1e-10,
+                cov_xy / std_outer,
+                0.0
+            )
+
+        # Set diagonal to 1
+        np.fill_diagonal(corr_matrix, 1.0)
+
+        # Replace NaN/Inf
+        corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Clip to [-1, 1]
+        corr_matrix = np.clip(corr_matrix, -1.0, 1.0)
+
+        # Find highly correlated pairs (excluding diagonal)
+        # Use upper triangle to avoid duplicates
+        upper_tri = np.triu(corr_matrix, k=1)
+
+        # Get pairs with |correlation| > 0.5
+        high_corr_mask = np.abs(upper_tri) > 0.5
+        high_corr_indices = np.where(high_corr_mask)
+
+        high_corr_pairs = []
+        for i, j in zip(high_corr_indices[0], high_corr_indices[1]):
+            high_corr_pairs.append({
+                'neuron_i': int(i),
+                'neuron_j': int(j),
+                'correlation': float(corr_matrix[i, j])
+            })
+
+        # Sort by absolute correlation descending
+        high_corr_pairs.sort(key=lambda x: -abs(x['correlation']))
+
+        # Summary statistics
+        off_diag = upper_tri[upper_tri != 0]
+        summary = {
+            'n_tokens': int(n),
+            'n_neurons': int(corr_matrix.shape[0]),
+            'mean_correlation': float(np.mean(off_diag)) if len(off_diag) > 0 else 0.0,
+            'std_correlation': float(np.std(off_diag)) if len(off_diag) > 0 else 0.0,
+            'n_high_corr_pairs': len(high_corr_pairs),
+            'n_positive_corr': int(np.sum(upper_tri > 0.3)),
+            'n_negative_corr': int(np.sum(upper_tri < -0.3)),
+        }
+
+        return {
+            'summary': summary,
+            'high_corr_pairs': high_corr_pairs[:100],  # Top 100
+            '_correlation_matrix': corr_matrix,  # For visualization
+        }
+
+    def analyze_pos_profile_clustering(
+        self,
+        selectivity_matrix: np.ndarray,
+        n_clusters: int = 8,
+        min_selectivity: float = 0.5,
+    ) -> Dict:
+        """
+        Cluster neurons by their POS selectivity profiles.
+
+        Each neuron has a selectivity vector [sel_NOUN, sel_VERB, sel_ADJ, ...]
+        that defines its "POS profile". Clustering finds groups with similar profiles.
+
+        Args:
+            selectivity_matrix: [n_pos, n_neurons] selectivity values
+            n_clusters: Number of clusters for K-means
+            min_selectivity: Minimum max-selectivity to include neuron
+
+        Returns:
+            Dictionary with cluster assignments and profiles
+        """
+        try:
+            from sklearn.cluster import KMeans
+            from sklearn.preprocessing import StandardScaler
+            HAS_SKLEARN = True
+        except ImportError:
+            HAS_SKLEARN = False
+
+        # Transpose to [n_neurons, n_pos] - each row is a neuron's profile
+        profiles = selectivity_matrix.T  # [n_neurons, n_pos]
+
+        # Filter neurons with meaningful selectivity
+        max_sel = profiles.max(axis=1)  # [n_neurons]
+        active_mask = max_sel >= min_selectivity
+        active_indices = np.where(active_mask)[0]
+
+        if len(active_indices) < n_clusters:
+            print(f"  Warning: Only {len(active_indices)} active neurons, reducing clusters")
+            n_clusters = max(2, len(active_indices) // 2)
+
+        if len(active_indices) < 2:
+            return {'error': 'Not enough active neurons for clustering'}
+
+        active_profiles = profiles[active_mask]  # [n_active, n_pos]
+
+        if HAS_SKLEARN:
+            # Normalize profiles for better clustering
+            scaler = StandardScaler()
+            scaled_profiles = scaler.fit_transform(active_profiles)
+
+            # K-means clustering
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(scaled_profiles)
+            cluster_centers = scaler.inverse_transform(kmeans.cluster_centers_)  # [k, n_pos]
+        else:
+            # Simple fallback: assign by dominant POS
+            cluster_labels = active_profiles.argmax(axis=1)  # Cluster by dominant POS
+            n_clusters = len(UPOS_TAGS)
+            cluster_centers = None
+
+        # Analyze each cluster
+        clusters = {}
+        for c in range(n_clusters):
+            mask = cluster_labels == c
+            if not mask.any():
+                continue
+
+            cluster_neurons = active_indices[mask]
+            cluster_profiles = active_profiles[mask]  # [n_cluster, n_pos]
+
+            # Mean profile for this cluster
+            mean_profile = cluster_profiles.mean(axis=0)  # [n_pos]
+
+            # Find dominant POS for this cluster
+            top_pos_indices = np.argsort(mean_profile)[::-1][:3]
+            dominant_pos = [UPOS_TAGS[i] for i in top_pos_indices if mean_profile[i] > 1.0]
+
+            # Label the cluster by its dominant POS pattern
+            if dominant_pos:
+                cluster_name = "/".join(dominant_pos[:2])
+            else:
+                cluster_name = f"Cluster_{c}"
+
+            clusters[cluster_name] = {
+                'cluster_id': int(c),
+                'n_neurons': int(mask.sum()),
+                'neuron_ids': [int(n) for n in cluster_neurons[:20]],  # Sample
+                'mean_selectivity_profile': {
+                    UPOS_TAGS[i]: float(mean_profile[i])
+                    for i in range(len(UPOS_TAGS))
+                },
+                'dominant_pos': dominant_pos,
+                'profile_variance': float(cluster_profiles.var()),
+            }
+
+        # Summary statistics
+        summary = {
+            'n_clusters': len(clusters),
+            'n_neurons_clustered': len(active_indices),
+            'cluster_sizes': {
+                name: data['n_neurons'] for name, data in clusters.items()
+            },
+        }
+
+        return {
+            'summary': summary,
+            'clusters': clusters,
+            '_cluster_labels': cluster_labels,
+            '_cluster_centers': cluster_centers,
+            '_active_indices': active_indices,
+        }
 
     def get_results(self) -> Dict:
         """Compile analysis results with selectivity metrics."""
@@ -569,6 +812,14 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             },
         }
 
+        # POS profile clustering
+        pos_profile_clustering = self.analyze_pos_profile_clustering(
+            selectivity, n_clusters=8, min_selectivity=0.5
+        )
+
+        # Co-activation analysis (if enabled)
+        coactivation_results = self.get_coactivation_matrix(min_occurrences=10)
+
         return {
             'pos_token_counts': {
                 UPOS_TAGS[i]: int(self.pos_token_counts[i])
@@ -582,10 +833,20 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             },
             'pos_similarity': pos_similarity,
             'total_neurons_analyzed': n_active_neurons,
+            # New: POS profile clustering
+            'pos_profile_clustering': {
+                k: v for k, v in pos_profile_clustering.items() if not k.startswith('_')
+            },
+            # New: Co-activation analysis
+            'coactivation': {
+                k: v for k, v in coactivation_results.items() if not k.startswith('_')
+            } if coactivation_results else None,
             # Store raw matrices for visualization
             '_selectivity_matrix': selectivity,
             '_mean_weight_matrix': mean_weight,
             '_pos_indices': active_pos,
+            '_pos_profile_clustering': pos_profile_clustering,
+            '_coactivation': coactivation_results,
         }
 
     def print_summary(self, results: Dict):
@@ -658,6 +919,49 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
             print("└───────────────────────────────────────────────────────────────────────┘")
 
+        # 4. POS Profile Clustering
+        clustering = results.get('pos_profile_clustering', {})
+        if clustering and 'clusters' in clustering:
+            print("\n┌─ POS Profile Clustering (neurons grouped by selectivity patterns) ───┐")
+            summary = clustering.get('summary', {})
+            print(f"│  Clusters: {summary.get('n_clusters', 0)}, "
+                  f"Neurons clustered: {summary.get('n_neurons_clustered', 0)}")
+            print(f"│")
+
+            for name, data in clustering['clusters'].items():
+                dominant = ", ".join(data.get('dominant_pos', [])[:3]) or "Mixed"
+                n_neurons = data.get('n_neurons', 0)
+                sample_ids = data.get('neuron_ids', [])[:5]
+                sample_str = ", ".join(f"N{n}" for n in sample_ids)
+                print(f"│  {name:<15} ({n_neurons:>4} neurons) - dominant: {dominant}")
+                if sample_ids:
+                    print(f"│     sample: {sample_str}")
+
+            print("└───────────────────────────────────────────────────────────────────────┘")
+
+        # 5. Co-activation Analysis
+        coactivation = results.get('coactivation')
+        if coactivation:
+            print("\n┌─ Co-activation Analysis (neuron correlation) ────────────────────────┐")
+            summary = coactivation.get('summary', {})
+            print(f"│  Tokens analyzed: {summary.get('n_tokens', 0):,}")
+            print(f"│  Mean correlation: {summary.get('mean_correlation', 0):.4f}")
+            print(f"│  High correlation pairs (|r|>0.5): {summary.get('n_high_corr_pairs', 0)}")
+            print(f"│  Positive corr (r>0.3): {summary.get('n_positive_corr', 0)}")
+            print(f"│  Negative corr (r<-0.3): {summary.get('n_negative_corr', 0)}")
+            print(f"│")
+
+            # Show top correlated pairs
+            pairs = coactivation.get('high_corr_pairs', [])[:10]
+            if pairs:
+                print(f"│  Top correlated pairs:")
+                print(f"│  {'Neuron i':>10} {'Neuron j':>10} {'Correlation':>12}")
+                print(f"│  {'─'*10} {'─'*10} {'─'*12}")
+                for p in pairs:
+                    print(f"│  N{p['neuron_i']:<9} N{p['neuron_j']:<9} {p['correlation']:>12.4f}")
+
+            print("└───────────────────────────────────────────────────────────────────────┘")
+
         print("\n" + "=" * 70)
 
     def visualize(self, results: Dict, output_dir: str) -> Dict[str, str]:
@@ -688,6 +992,16 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         path = self._plot_pos_similarity(results, os.path.join(output_dir, 'pos_similarity.png'))
         if path:
             paths['pos_similarity'] = path
+
+        # POS profile clustering visualization
+        path = self._plot_pos_profile_clustering(results, os.path.join(output_dir, 'pos_profile_clusters.png'))
+        if path:
+            paths['pos_profile_clusters'] = path
+
+        # Co-activation heatmap
+        path = self._plot_coactivation_heatmap(results, os.path.join(output_dir, 'coactivation_heatmap.png'))
+        if path:
+            paths['coactivation_heatmap'] = path
 
         # Legacy visualizations - only call plot_pos_specificity (compatible with new format)
         try:
@@ -873,6 +1187,142 @@ class POSNeuronAnalyzer(BaseAnalyzer):
 
         return output_path
 
+    def _plot_pos_profile_clustering(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot POS profile clustering results."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        clustering = results.get('_pos_profile_clustering')
+        if not clustering or 'error' in clustering:
+            return None
+
+        clusters = clustering.get('clusters', {})
+        if not clusters:
+            return None
+
+        cluster_centers = clustering.get('_cluster_centers')
+
+        # Create figure with subplots
+        n_clusters = len(clusters)
+        n_cols = min(4, n_clusters)
+        n_rows = (n_clusters + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+        if n_rows == 1 and n_cols == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes.reshape(1, -1)
+        elif n_cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        for idx, (name, data) in enumerate(clusters.items()):
+            row, col = idx // n_cols, idx % n_cols
+            ax = axes[row, col]
+
+            # Get mean profile for this cluster
+            profile = data.get('mean_selectivity_profile', {})
+            pos_labels = [p for p in UPOS_TAGS if p in profile]
+            values = [profile.get(p, 0) for p in pos_labels]
+
+            # Bar chart of selectivity profile
+            colors = ['coral' if v > 1.5 else 'steelblue' for v in values]
+            ax.barh(range(len(pos_labels)), values, color=colors)
+            ax.set_yticks(range(len(pos_labels)))
+            ax.set_yticklabels(pos_labels, fontsize=8)
+            ax.axvline(x=1, color='red', linestyle='--', alpha=0.5, linewidth=0.8)
+            ax.set_xlabel('Mean Selectivity')
+            ax.set_title(f'{name}\n({data["n_neurons"]} neurons)', fontsize=10)
+
+        # Hide unused axes
+        for idx in range(len(clusters), n_rows * n_cols):
+            row, col = idx // n_cols, idx % n_cols
+            axes[row, col].set_visible(False)
+
+        plt.suptitle('POS Profile Clusters\n(neurons grouped by selectivity patterns)', fontsize=12)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
+    def _plot_coactivation_heatmap(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot neuron co-activation correlation heatmap."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        coactivation = results.get('_coactivation')
+        if not coactivation:
+            return None
+
+        corr_matrix = coactivation.get('_correlation_matrix')
+        if corr_matrix is None:
+            return None
+
+        # Sample neurons if too many (for visualization)
+        n_neurons = corr_matrix.shape[0]
+        if n_neurons > 200:
+            # Select neurons with highest variance in correlation
+            corr_var = np.var(corr_matrix, axis=1)
+            top_indices = np.argsort(corr_var)[-200:]
+            corr_matrix = corr_matrix[np.ix_(top_indices, top_indices)]
+            sampled = True
+        else:
+            sampled = False
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+        # Left: Full correlation heatmap
+        ax = axes[0]
+        im1 = ax.imshow(corr_matrix, cmap='RdBu_r', vmin=-1, vmax=1, aspect='auto')
+        ax.set_xlabel('Neuron')
+        ax.set_ylabel('Neuron')
+        title = 'Neuron Co-activation Correlation'
+        if sampled:
+            title += '\n(top 200 by correlation variance)'
+        ax.set_title(title)
+        plt.colorbar(im1, ax=ax, label='Correlation')
+
+        # Right: Histogram of correlations
+        ax = axes[1]
+        # Get upper triangle (excluding diagonal)
+        upper_tri = corr_matrix[np.triu_indices_from(corr_matrix, k=1)]
+
+        ax.hist(upper_tri, bins=50, color='steelblue', edgecolor='white', alpha=0.8)
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
+        ax.axvline(x=0.3, color='green', linestyle='--', alpha=0.7, label='r=0.3')
+        ax.axvline(x=-0.3, color='red', linestyle='--', alpha=0.7, label='r=-0.3')
+        ax.axvline(x=0.5, color='green', linestyle='-', alpha=0.7, label='r=0.5')
+        ax.axvline(x=-0.5, color='red', linestyle='-', alpha=0.7, label='r=-0.5')
+        ax.set_xlabel('Correlation')
+        ax.set_ylabel('Count')
+        ax.set_title('Distribution of Pairwise Correlations')
+        ax.legend()
+
+        # Add summary stats
+        summary = coactivation.get('summary', {})
+        stats_text = (
+            f"Mean: {summary.get('mean_correlation', 0):.4f}\n"
+            f"Std: {summary.get('std_correlation', 0):.4f}\n"
+            f"|r|>0.5: {summary.get('n_high_corr_pairs', 0)}"
+        )
+        ax.text(0.98, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
     def run_all(
         self,
         output_dir: str = './pos_analysis',
@@ -880,6 +1330,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         max_sentences: int = 2000,
         split: str = 'train',
         data_path: str = None,
+        compute_coactivation: bool = False,
     ) -> Dict:
         """
         Run full POS neuron analysis.
@@ -890,6 +1341,7 @@ class POSNeuronAnalyzer(BaseAnalyzer):
             max_sentences: Maximum sentences
             split: Dataset split
             data_path: Path to local conllu file
+            compute_coactivation: Whether to compute neuron co-activation correlation
 
         Returns:
             Combined results dictionary
@@ -900,7 +1352,10 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         dataset = self.load_ud_dataset(split, max_sentences, data_path)
 
         # Analyze
-        results = self.analyze_dataset(dataset, pool_type, max_sentences)
+        results = self.analyze_dataset(
+            dataset, pool_type, max_sentences,
+            compute_coactivation=compute_coactivation
+        )
 
         # Print detailed summary
         self.print_summary(results)
