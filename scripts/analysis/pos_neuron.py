@@ -1488,10 +1488,30 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         return temp.get_pos_for_tokens(ud_tokens, ud_pos)
 
     def _is_whole_word(self, token_str: str) -> bool:
-        """Check if token represents a whole word (starts with space/Ġ)."""
+        """
+        Check if token represents a whole word (not a subword continuation).
+
+        Handles multiple tokenizer formats:
+        - GPT/tiktoken: 'Ġ' prefix for word-initial
+        - SentencePiece: '▁' prefix for word-initial
+        - BERT: '##' prefix for subword continuation (NOT whole word)
+        - Space prefix: ' word' for word-initial
+        """
         if not token_str:
             return False
-        return token_str.startswith(('Ġ', '▁', ' ')) or token_str[0].isupper()
+
+        # BERT-style: ## means continuation (NOT whole word)
+        if token_str.startswith('##'):
+            return False
+
+        # GPT/SentencePiece: Ġ or ▁ or space means word-initial (IS whole word)
+        if token_str.startswith(('Ġ', '▁', ' ')):
+            return True
+
+        # If none of the above, check if it looks like a word start
+        # (uppercase or the tokenizer doesn't use special markers)
+        # For BERT without ##, assume it's word-initial
+        return True  # Default to whole word if no continuation marker
 
     def _extract_layer_mask(self, layer, seq_len: int) -> np.ndarray:
         """Extract concatenated mask from a single layer (optimized)."""
@@ -1710,21 +1730,24 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         # 1. POS-based similarity analysis
         pos_similarity = self._compute_pos_similarity(masks, pos_labels)
 
-        # 2. Silhouette score
+        # 2. Silhouette score (all POS)
         silhouette = self._compute_silhouette(masks, pos_labels)
 
-        # 3. Content vs Function word analysis
+        # 3. Function word only silhouette (should be higher)
+        function_silhouette = self._compute_function_word_silhouette(masks, pos_labels)
+
+        # 4. Content vs Function word analysis
         content_analysis = self._analyze_content_vs_function(masks, pos_labels, is_whole_word)
 
-        # 4. Token statistics
+        # 5. Token statistics
         token_stats = self._compute_token_stats()
 
-        # 5. Layer divergence analysis
+        # 6. Layer divergence analysis
         layer_divergence = None
         if analyze_layer_divergence and self.layer_token_data:
             layer_divergence = self._compute_layer_divergence()
 
-        # 6. Content word hierarchical clustering
+        # 7. Content word hierarchical clustering
         content_hierarchy = self._compute_content_hierarchy(masks, pos_labels, is_whole_word)
 
         return {
@@ -1732,6 +1755,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             'n_neurons': n_neurons,
             'pos_similarity': pos_similarity,
             'silhouette_score': silhouette,
+            'function_word_silhouette': function_silhouette,
             'content_analysis': content_analysis,
             'token_stats': token_stats,
             'layer_divergence': layer_divergence,
@@ -1857,6 +1881,69 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 'per_pos': per_pos,
                 'n_samples': len(filtered_masks),
                 'n_pos_categories': len(valid_pos),
+            }
+        except Exception as e:
+            return {'score': None, 'error': str(e)}
+
+    def _compute_function_word_silhouette(self, masks: np.ndarray, pos_labels: np.ndarray) -> Dict:
+        """Compute silhouette score for function words only.
+
+        Function words (DET, AUX, CCONJ, ADP, etc.) should cluster better
+        than content words since they have more consistent activation patterns.
+        """
+        try:
+            from sklearn.metrics import silhouette_score, silhouette_samples
+        except ImportError:
+            return {'score': None, 'error': 'sklearn not available'}
+
+        # Filter to function words only
+        function_pos_indices = [POS_TO_IDX[p] for p in POS_GROUPS['Function Words'] if p in POS_TO_IDX]
+        function_mask = np.isin(pos_labels, function_pos_indices)
+
+        if function_mask.sum() < 50:
+            return {'score': None, 'error': 'Not enough function words'}
+
+        func_masks = masks[function_mask]
+        func_labels = pos_labels[function_mask]
+
+        # Filter POS with enough samples
+        unique_pos, counts = np.unique(func_labels, return_counts=True)
+        valid_pos = unique_pos[counts >= 5]
+
+        if len(valid_pos) < 2:
+            return {'score': None, 'error': 'Not enough function word POS categories'}
+
+        valid_mask = np.isin(func_labels, valid_pos)
+        filtered_masks = func_masks[valid_mask]
+        filtered_labels = func_labels[valid_mask]
+
+        # Sample for speed
+        max_samples = 1000
+        if len(filtered_masks) > max_samples:
+            indices = np.random.choice(len(filtered_masks), max_samples, replace=False)
+            filtered_masks = filtered_masks[indices]
+            filtered_labels = filtered_labels[indices]
+
+        print("  Computing function word silhouette...")
+        jaccard_dist = 1.0 - self._compute_jaccard_matrix(filtered_masks)
+
+        try:
+            score = silhouette_score(jaccard_dist, filtered_labels, metric='precomputed')
+            samples = silhouette_samples(jaccard_dist, filtered_labels, metric='precomputed')
+
+            per_pos = {}
+            for pos_idx in valid_pos:
+                pos_name = UPOS_TAGS[pos_idx]
+                pos_mask = filtered_labels == pos_idx
+                if pos_mask.sum() > 0:
+                    per_pos[pos_name] = float(samples[pos_mask].mean())
+
+            return {
+                'score': float(score),
+                'per_pos': per_pos,
+                'n_samples': len(filtered_masks),
+                'n_pos_categories': len(valid_pos),
+                'pos_included': [UPOS_TAGS[i] for i in valid_pos],
             }
         except Exception as e:
             return {'score': None, 'error': str(e)}
@@ -2090,6 +2177,25 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 print(f"│  Per-POS silhouette:")
                 sorted_pos = sorted(per_pos.items(), key=lambda x: -x[1])
                 for pos, score in sorted_pos[:8]:
+                    bar = "█" * int(max(0, score + 1) * 10)
+                    print(f"│    {pos:<8} {score:>7.3f} {bar}")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+
+        # Function word silhouette (should be higher than overall)
+        func_sil = results.get('function_word_silhouette', {})
+        if func_sil.get('score') is not None:
+            print(f"\n┌─ Function Word Silhouette (DET/AUX/CCONJ/ADP/etc.) ────────────────────┐")
+            print(f"│  Score: {func_sil['score']:.4f}  (expected higher than overall)")
+            print(f"│  Samples: {func_sil.get('n_samples', 0)}, Categories: {func_sil.get('n_pos_categories', 0)}")
+            pos_list = func_sil.get('pos_included', [])
+            if pos_list:
+                print(f"│  POS: {', '.join(pos_list)}")
+
+            per_pos = func_sil.get('per_pos', {})
+            if per_pos:
+                print(f"│")
+                sorted_pos = sorted(per_pos.items(), key=lambda x: -x[1])
+                for pos, score in sorted_pos:
                     bar = "█" * int(max(0, score + 1) * 10)
                     print(f"│    {pos:<8} {score:>7.3f} {bar}")
             print(f"└───────────────────────────────────────────────────────────────────────┘")
