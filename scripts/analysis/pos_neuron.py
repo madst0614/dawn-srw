@@ -1767,6 +1767,187 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         print(f"Collected {len(self.token_data)} tokens")
         return self.compute_results(analyze_layer_divergence)
 
+    def extract_token_masks_all_layers(
+        self,
+        token_ids: List[int],
+        pos_tags: List[str],
+        n_layers: int,
+    ) -> Dict[int, List[Dict]]:
+        """
+        Extract masks/weights for ALL layers in a single forward pass.
+
+        Args:
+            token_ids: List of token IDs
+            pos_tags: List of POS tags for each token
+            n_layers: Number of layers in model
+
+        Returns:
+            Dict mapping layer_idx -> List of token data dicts
+        """
+        input_ids = torch.tensor([token_ids], device=self.device)
+        seq_len = len(token_ids)
+
+        with self.extractor.analysis_context():
+            with torch.no_grad():
+                outputs = self.model(input_ids, return_routing_info=True)
+
+            routing = self.extractor.extract(outputs)
+            if not routing:
+                return {}
+
+        # Extract masks and weights for ALL layers
+        layer_masks = {}
+        layer_weights = {}
+        for layer in routing:
+            layer_idx = layer.layer_idx
+            layer_masks[layer_idx] = self._extract_layer_mask(layer, seq_len)
+            layer_weights[layer_idx] = self._extract_layer_weights(layer, seq_len)
+
+        if not layer_masks:
+            return {}
+
+        # Build token strings once
+        token_strs = [self.tokenizer.decode([tid]) for tid in token_ids]
+
+        # Organize data by layer
+        results_by_layer = {i: [] for i in range(n_layers)}
+        n_pos = min(seq_len, len(pos_tags))
+
+        for layer_idx in range(n_layers):
+            if layer_idx not in layer_masks:
+                continue
+
+            masks = layer_masks[layer_idx]
+            weights = layer_weights[layer_idx]
+
+            for i in range(n_pos):
+                token_str = token_strs[i]
+                next_token_str = token_strs[i + 1] if i + 1 < len(token_strs) else None
+
+                entry = {
+                    'token_id': token_ids[i],
+                    'token_str': token_str,
+                    'pos': pos_tags[i],
+                    'mask': masks[i],
+                    'weights': weights[i],
+                    'is_whole_word': self._is_whole_word(token_str, next_token_str),
+                    'n_active': int(masks[i].sum()),
+                }
+                results_by_layer[layer_idx].append(entry)
+
+        return results_by_layer
+
+    def analyze_dataset_all_layers(
+        self,
+        dataset: List[Dict],
+        n_layers: int,
+        max_sentences: int = None,
+    ) -> Dict[int, List[Dict]]:
+        """
+        Process dataset ONCE and collect token data for ALL layers.
+
+        This is much more efficient than running analyze_dataset separately
+        for each layer, as it only does ONE forward pass per sentence.
+
+        Args:
+            dataset: List of {'tokens': [...], 'upos': [...]}
+            n_layers: Number of layers in model
+            max_sentences: Maximum sentences to process
+
+        Returns:
+            Dict mapping layer_idx -> List of token data dicts
+        """
+        n_sentences = min(len(dataset), max_sentences) if max_sentences else len(dataset)
+
+        # Initialize storage for all layers
+        all_layer_data = {i: [] for i in range(n_layers)}
+
+        print(f"\nCollecting token activations from {n_sentences} sentences (ALL {n_layers} layers)...")
+        print("  Single forward pass per sentence - efficient batch processing")
+
+        for i in tqdm(range(n_sentences), desc="Processing"):
+            example = dataset[i]
+            try:
+                pos_tags, token_ids = self.get_pos_for_tokens(
+                    example['tokens'], example['upos']
+                )
+            except Exception:
+                continue
+
+            if not token_ids:
+                continue
+
+            # Extract all layers in one forward pass
+            layer_data = self.extract_token_masks_all_layers(
+                token_ids, pos_tags, n_layers
+            )
+
+            # Append to respective layer collections
+            for layer_idx, tokens in layer_data.items():
+                all_layer_data[layer_idx].extend(tokens)
+
+        for layer_idx in range(n_layers):
+            print(f"  Layer {layer_idx}: {len(all_layer_data[layer_idx])} tokens")
+
+        return all_layer_data
+
+    def compute_layer_results(self, token_data: List[Dict], layer_idx: int) -> Dict:
+        """
+        Compute silhouette and semantic correlation for a single layer's data.
+
+        This is a lightweight version of compute_results() focused on the
+        metrics needed for layer-wise analysis.
+
+        Args:
+            token_data: List of token data dicts for this layer
+            layer_idx: Layer index (for logging)
+
+        Returns:
+            Dict with silhouette, function_silhouette, semantic_correlation
+        """
+        if not token_data:
+            return {'error': 'No token data'}
+
+        # Build arrays
+        n_tokens = len(token_data)
+        n_neurons = len(token_data[0]['mask']) if n_tokens > 0 else 0
+
+        masks = np.empty((n_tokens, n_neurons), dtype=np.bool_)
+        weights = np.empty((n_tokens, n_neurons), dtype=np.float32)
+        pos_labels = np.empty(n_tokens, dtype=np.int32)
+        is_whole_word = np.empty(n_tokens, dtype=np.bool_)
+
+        for i, t in enumerate(token_data):
+            masks[i] = t['mask']
+            weights[i] = t['weights']
+            pos_labels[i] = POS_TO_IDX.get(t['pos'], -1)
+            is_whole_word[i] = t['is_whole_word']
+
+        # Filter valid POS
+        valid_mask = pos_labels >= 0
+        masks = masks[valid_mask]
+        weights = weights[valid_mask]
+        pos_labels = pos_labels[valid_mask]
+        is_whole_word = is_whole_word[valid_mask]
+
+        n_tokens = len(masks)
+        if n_tokens < 10:
+            return {'error': f'Too few tokens: {n_tokens}'}
+
+        # Compute key metrics
+        silhouette = self._compute_silhouette(masks, pos_labels)
+        function_silhouette = self._compute_function_word_silhouette(masks, pos_labels)
+        semantic_correlation = self._compute_semantic_correlation(
+            masks, weights, pos_labels, is_whole_word
+        )
+
+        return {
+            'n_tokens': n_tokens,
+            'silhouette_score': silhouette,
+            'function_word_silhouette': function_silhouette,
+            'semantic_correlation': semantic_correlation,
+        }
+
     def _compute_jaccard_matrix(self, masks: np.ndarray) -> np.ndarray:
         """
         Compute pairwise Jaccard similarity matrix (optimized).
@@ -2884,7 +3065,10 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         device: str = 'cuda',
     ) -> Dict:
         """
-        Run layer-wise semantic emergence analysis.
+        Run layer-wise semantic emergence analysis (OPTIMIZED).
+
+        Uses single forward pass per sentence to extract ALL layer data at once,
+        instead of running separate forward passes for each layer.
 
         Analyzes how semantic information emerges across layers by measuring:
         1. Semantic correlation: GloVe similarity vs neuron weight similarity
@@ -2900,80 +3084,95 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             tokenizer: Tokenizer
             n_layers: Number of layers in the model
             output_dir: Output directory
-            max_sentences: Max sentences to process per layer
+            max_sentences: Max sentences to process
             device: Device for computation
 
         Returns:
             Dict with per-layer results and summary
         """
         import json as json_module
+        import torch
         os.makedirs(output_dir, exist_ok=True)
 
-        layer_results_list = []
-        dataset = None  # Reuse dataset across layers
-
         print("=" * 70)
-        print("LAYER-WISE SEMANTIC EMERGENCE ANALYSIS")
+        print("LAYER-WISE SEMANTIC EMERGENCE ANALYSIS (OPTIMIZED)")
         print("=" * 70)
         print(f"Layers: 0-{n_layers-1}")
         print(f"Max sentences: {max_sentences}")
+        print(f"Forward passes: 1 per sentence (not {n_layers})")
         print()
 
+        # Create single analyzer instance (no specific target layer)
+        analyzer = cls(
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            target_layer=None,  # Will extract ALL layers
+        )
+
+        # Load dataset once
+        dataset = analyzer.load_ud_dataset('train', max_sentences)
+        print(f"Loaded {len(dataset)} sentences")
+
+        # Process ALL sentences with ALL layers in ONE pass
+        print("\n" + "=" * 50)
+        print("PHASE 1: Extract all layers (single pass)")
+        print("=" * 50)
+        all_layer_data = analyzer.analyze_dataset_all_layers(
+            dataset, n_layers, max_sentences
+        )
+
+        # Now compute metrics for each layer from stored data
+        print("\n" + "=" * 50)
+        print("PHASE 2: Compute per-layer metrics")
+        print("=" * 50)
+
+        layer_results_list = []
         for layer_idx in range(n_layers):
-            print(f"\n{'='*50}")
-            print(f"LAYER {layer_idx}")
-            print(f"{'='*50}")
+            print(f"\nLayer {layer_idx}:")
+            token_data = all_layer_data.get(layer_idx, [])
 
-            # Create analyzer for this specific layer
-            analyzer = cls(
-                model=model,
-                tokenizer=tokenizer,
-                device=device,
-                target_layer=layer_idx,
-            )
+            if not token_data:
+                print(f"  No data collected")
+                layer_data = {
+                    'layer': layer_idx,
+                    'n_tokens': 0,
+                    'semantic_correlation': None,
+                    'semantic_p_value': None,
+                    'silhouette': None,
+                    'function_silhouette': None,
+                }
+            else:
+                # Compute results for this layer
+                layer_results = analyzer.compute_layer_results(token_data, layer_idx)
 
-            # Load dataset once
-            if dataset is None:
-                dataset = analyzer.load_ud_dataset('train', max_sentences)
-                print(f"Loaded {len(dataset)} sentences")
+                sem_corr = layer_results.get('semantic_correlation', {})
+                silhouette = layer_results.get('silhouette_score', {})
+                func_sil = layer_results.get('function_word_silhouette', {})
 
-            # Analyze
-            layer_results = analyzer.analyze_dataset(
-                dataset,
-                max_sentences=max_sentences,
-                analyze_layer_divergence=False,
-            )
+                layer_data = {
+                    'layer': layer_idx,
+                    'n_tokens': layer_results.get('n_tokens', 0),
+                    'semantic_correlation': sem_corr.get('correlation', None),
+                    'semantic_p_value': sem_corr.get('p_value', None),
+                    'silhouette': silhouette.get('score', None),
+                    'function_silhouette': func_sil.get('score', None),
+                }
 
-            # Extract key metrics
-            sem_corr = layer_results.get('semantic_correlation', {})
-            silhouette = layer_results.get('silhouette_score', {})
-            func_sil = layer_results.get('function_word_silhouette', {})
-
-            layer_data = {
-                'layer': layer_idx,
-                'n_tokens': layer_results.get('n_tokens', 0),
-                'semantic_correlation': sem_corr.get('correlation', None),
-                'semantic_p_value': sem_corr.get('p_value', None),
-                'silhouette': silhouette.get('score', None),
-                'function_silhouette': func_sil.get('score', None),
-            }
-
-            # Print summary
-            print(f"\nLayer {layer_idx} Results:")
-            if layer_data['semantic_correlation'] is not None:
-                print(f"  Semantic correlation: {layer_data['semantic_correlation']:.4f}")
-            if layer_data['silhouette'] is not None:
-                print(f"  POS silhouette: {layer_data['silhouette']:.4f}")
-            if layer_data['function_silhouette'] is not None:
-                print(f"  Function silhouette: {layer_data['function_silhouette']:.4f}")
+                # Print summary
+                if layer_data['semantic_correlation'] is not None:
+                    print(f"  Semantic correlation: {layer_data['semantic_correlation']:.4f}")
+                if layer_data['silhouette'] is not None:
+                    print(f"  POS silhouette: {layer_data['silhouette']:.4f}")
+                if layer_data['function_silhouette'] is not None:
+                    print(f"  Function silhouette: {layer_data['function_silhouette']:.4f}")
 
             layer_results_list.append(layer_data)
 
-            # Clear to free memory
-            del analyzer
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # Clear memory
+        del all_layer_data
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Summary table
         print("\n" + "=" * 70)
