@@ -1603,6 +1603,35 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         return np.concatenate(masks, axis=-1) if masks else np.zeros((seq_len, 0), dtype=np.bool_)
 
+    def _extract_layer_weights(self, layer, seq_len: int) -> np.ndarray:
+        """
+        Extract concatenated continuous weights from a single layer.
+
+        Returns continuous routing weights for cosine similarity analysis.
+        """
+        weights_list = []
+
+        for pool_key, expected_size in self.pool_order:
+            weights = layer.get_weight(pool_key)
+
+            if weights is None:
+                weights_list.append(np.zeros((seq_len, expected_size), dtype=np.float32))
+            else:
+                if weights.dim() == 3:
+                    w = weights[0, :seq_len].cpu().numpy().astype(np.float32)
+                else:
+                    w = np.broadcast_to(
+                        weights[0].cpu().numpy().astype(np.float32),
+                        (seq_len, weights.shape[-1])
+                    )
+
+                if w.shape[0] < seq_len:
+                    w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+
+                weights_list.append(w)
+
+        return np.concatenate(weights_list, axis=-1) if weights_list else np.zeros((seq_len, 0), dtype=np.float32)
+
     def extract_token_masks(
         self,
         token_ids: List[int],
@@ -1631,25 +1660,31 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             if not routing:
                 return []
 
-        # Collect masks per layer
+        # Collect masks and weights per layer
         layer_masks = {}
+        layer_weights = {}
         for layer in routing:
             layer_idx = layer.layer_idx
             if self.target_layer is not None and layer_idx != self.target_layer:
                 continue
             layer_masks[layer_idx] = self._extract_layer_mask(layer, seq_len)
+            layer_weights[layer_idx] = self._extract_layer_weights(layer, seq_len)
 
         if not layer_masks:
             return []
 
         # Combined mask (majority vote or single layer)
+        # Combined weights (mean across layers)
         if self.target_layer is not None:
             combined_mask = layer_masks.get(self.target_layer)
+            combined_weights = layer_weights.get(self.target_layer)
             if combined_mask is None:
                 return []
         else:
             all_masks = np.stack(list(layer_masks.values()), axis=0)
             combined_mask = all_masks.mean(axis=0) > 0.5
+            all_weights = np.stack(list(layer_weights.values()), axis=0)
+            combined_weights = all_weights.mean(axis=0)
 
         # Build token data (vectorized token string decode)
         token_strs = [self.tokenizer.decode([tid]) for tid in token_ids]
@@ -1666,6 +1701,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 'token_str': token_str,
                 'pos': pos_tags[i],
                 'mask': combined_mask[i],
+                'weights': combined_weights[i],  # continuous weights for cosine similarity
                 'is_whole_word': self._is_whole_word(token_str, next_token_str),
                 'n_active': int(combined_mask[i].sum()),
             }
@@ -1780,17 +1816,20 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         n_neurons = len(self.token_data[0]['mask']) if n_tokens > 0 else 0
 
         masks = np.empty((n_tokens, n_neurons), dtype=np.bool_)
+        weights = np.empty((n_tokens, n_neurons), dtype=np.float32)
         pos_labels = np.empty(n_tokens, dtype=np.int32)
         is_whole_word = np.empty(n_tokens, dtype=np.bool_)
 
         for i, t in enumerate(self.token_data):
             masks[i] = t['mask']
+            weights[i] = t['weights']
             pos_labels[i] = POS_TO_IDX.get(t['pos'], -1)
             is_whole_word[i] = t['is_whole_word']
 
         # Filter valid POS
         valid_mask = pos_labels >= 0
         masks = masks[valid_mask]
+        weights = weights[valid_mask]
         pos_labels = pos_labels[valid_mask]
         is_whole_word = is_whole_word[valid_mask]
 
@@ -1821,7 +1860,8 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         content_hierarchy = self._compute_content_hierarchy(masks, pos_labels, is_whole_word)
 
         # 8. Semantic correlation analysis (neuron sim vs GloVe sim)
-        semantic_correlation = self._compute_semantic_correlation(masks, pos_labels, is_whole_word)
+        # Use continuous weights for cosine similarity
+        semantic_correlation = self._compute_semantic_correlation(masks, weights, pos_labels, is_whole_word)
 
         return {
             'n_tokens': n_tokens,
@@ -1835,6 +1875,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             'content_hierarchy': content_hierarchy,
             'semantic_correlation': semantic_correlation,
             '_masks': masks,
+            '_weights': weights,
             '_pos_labels': pos_labels,
             '_is_whole_word': is_whole_word,
         }
@@ -2229,15 +2270,17 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         except Exception as e:
             return {'error': str(e)}
 
-    def _compute_semantic_correlation(self, masks: np.ndarray, pos_labels: np.ndarray,
-                                       is_whole_word: np.ndarray) -> Dict:
+    def _compute_semantic_correlation(self, masks: np.ndarray, weights: np.ndarray,
+                                       pos_labels: np.ndarray, is_whole_word: np.ndarray) -> Dict:
         """
         Compute correlation between neuron combination similarity and semantic similarity.
 
         Hypothesis: Neuron combinations encode semantic similarity, not just POS.
         If true, tokens with similar meanings should have similar neuron patterns.
 
-        Uses GloVe embeddings for semantic similarity.
+        Uses:
+        - GloVe embeddings for semantic similarity (cosine)
+        - Continuous weights for neuron similarity (cosine)
 
         Returns:
             Dict with correlation, p-value, scatter data for plotting
@@ -2247,7 +2290,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         except ImportError:
             return {'error': 'scipy not available'}
 
-        print("  Computing semantic correlation...")
+        print("  Computing semantic correlation (using continuous weights)...")
 
         # Filter to content words (NOUN, VERB, ADJ) that are whole words
         content_pos_indices = [POS_TO_IDX[p] for p in ['NOUN', 'VERB', 'ADJ'] if p in POS_TO_IDX]
@@ -2294,7 +2337,6 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         scatter_data = []
 
         # Generate random pairs
-        indices = list(range(len(tokens_with_emb)))
         pairs_sampled = set()
 
         while len(semantic_sims) < n_pairs and len(pairs_sampled) < n_pairs * 10:
@@ -2308,15 +2350,18 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             idx1, token1, emb1 = tokens_with_emb[i]
             idx2, token2, emb2 = tokens_with_emb[j]
 
-            # Semantic similarity (cosine)
+            # Semantic similarity (cosine on GloVe)
             sem_sim = float(np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2) + 1e-8))
 
-            # Neuron similarity (Jaccard)
-            mask1 = masks[idx1]
-            mask2 = masks[idx2]
-            intersection = (mask1 & mask2).sum()
-            union = (mask1 | mask2).sum()
-            neu_sim = float(intersection / union) if union > 0 else 0.0
+            # Neuron similarity (cosine on continuous weights)
+            w1 = weights[idx1]
+            w2 = weights[idx2]
+            norm1 = np.linalg.norm(w1)
+            norm2 = np.linalg.norm(w2)
+            if norm1 > 1e-8 and norm2 > 1e-8:
+                neu_sim = float(np.dot(w1, w2) / (norm1 * norm2))
+            else:
+                neu_sim = 0.0
 
             semantic_sims.append(sem_sim)
             neuron_sims.append(neu_sim)
