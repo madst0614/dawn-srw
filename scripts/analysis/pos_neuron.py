@@ -2872,3 +2872,192 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         results['visualizations'] = viz_paths
         return results
+
+    @classmethod
+    def run_layerwise_analysis(
+        cls,
+        model,
+        tokenizer,
+        n_layers: int,
+        output_dir: str = './layerwise_results',
+        max_sentences: int = 500,
+        device: str = 'cuda',
+    ) -> Dict:
+        """
+        Run layer-wise semantic emergence analysis.
+
+        Analyzes how semantic information emerges across layers by measuring:
+        1. Semantic correlation: GloVe similarity vs neuron weight similarity
+        2. POS silhouette: How well neurons cluster by part-of-speech
+
+        Hypothesis:
+        - Early layers: Strong POS clustering (syntax)
+        - Later layers: Strong semantic correlation (semantics)
+        - Crossover point = syntax→semantics transition
+
+        Args:
+            model: DAWN model
+            tokenizer: Tokenizer
+            n_layers: Number of layers in the model
+            output_dir: Output directory
+            max_sentences: Max sentences to process per layer
+            device: Device for computation
+
+        Returns:
+            Dict with per-layer results and summary
+        """
+        import json as json_module
+        os.makedirs(output_dir, exist_ok=True)
+
+        layer_results_list = []
+        dataset = None  # Reuse dataset across layers
+
+        print("=" * 70)
+        print("LAYER-WISE SEMANTIC EMERGENCE ANALYSIS")
+        print("=" * 70)
+        print(f"Layers: 0-{n_layers-1}")
+        print(f"Max sentences: {max_sentences}")
+        print()
+
+        for layer_idx in range(n_layers):
+            print(f"\n{'='*50}")
+            print(f"LAYER {layer_idx}")
+            print(f"{'='*50}")
+
+            # Create analyzer for this specific layer
+            analyzer = cls(
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                target_layer=layer_idx,
+            )
+
+            # Load dataset once
+            if dataset is None:
+                dataset = analyzer.load_ud_dataset('train', max_sentences)
+                print(f"Loaded {len(dataset)} sentences")
+
+            # Analyze
+            layer_results = analyzer.analyze_dataset(
+                dataset,
+                max_sentences=max_sentences,
+                analyze_layer_divergence=False,
+            )
+
+            # Extract key metrics
+            sem_corr = layer_results.get('semantic_correlation', {})
+            silhouette = layer_results.get('silhouette_score', {})
+            func_sil = layer_results.get('function_word_silhouette', {})
+
+            layer_data = {
+                'layer': layer_idx,
+                'n_tokens': layer_results.get('n_tokens', 0),
+                'semantic_correlation': sem_corr.get('correlation', None),
+                'semantic_p_value': sem_corr.get('p_value', None),
+                'silhouette': silhouette.get('score', None),
+                'function_silhouette': func_sil.get('score', None),
+            }
+
+            # Print summary
+            print(f"\nLayer {layer_idx} Results:")
+            if layer_data['semantic_correlation'] is not None:
+                print(f"  Semantic correlation: {layer_data['semantic_correlation']:.4f}")
+            if layer_data['silhouette'] is not None:
+                print(f"  POS silhouette: {layer_data['silhouette']:.4f}")
+            if layer_data['function_silhouette'] is not None:
+                print(f"  Function silhouette: {layer_data['function_silhouette']:.4f}")
+
+            layer_results_list.append(layer_data)
+
+            # Clear to free memory
+            del analyzer
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Summary table
+        print("\n" + "=" * 70)
+        print("SUMMARY: Layer-wise Metrics")
+        print("=" * 70)
+        print(f"{'Layer':>5} | {'Semantic Corr':>13} | {'POS Silhouette':>14} | {'Func Sil':>10}")
+        print("-" * 55)
+
+        for r in layer_results_list:
+            sem = f"{r['semantic_correlation']:.4f}" if r['semantic_correlation'] is not None else "N/A"
+            sil = f"{r['silhouette']:.4f}" if r['silhouette'] is not None else "N/A"
+            fsil = f"{r['function_silhouette']:.4f}" if r['function_silhouette'] is not None else "N/A"
+            print(f"{r['layer']:>5} | {sem:>13} | {sil:>14} | {fsil:>10}")
+
+        # Save results
+        output = {
+            'per_layer': layer_results_list,
+            'n_layers': n_layers,
+            'max_sentences': max_sentences,
+        }
+
+        results_path = os.path.join(output_dir, 'layerwise_results.json')
+        with open(results_path, 'w') as f:
+            json_module.dump(output, f, indent=2)
+        print(f"\nResults saved to: {results_path}")
+
+        # Generate plot
+        plot_path = cls._plot_layerwise_results(layer_results_list, output_dir)
+        if plot_path:
+            print(f"Plot saved to: {plot_path}")
+            output['plot_path'] = plot_path
+
+        return output
+
+    @staticmethod
+    def _plot_layerwise_results(results: List[Dict], output_dir: str) -> Optional[str]:
+        """Generate layer-wise plot with dual y-axis."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        valid_results = [r for r in results if r['semantic_correlation'] is not None and r['silhouette'] is not None]
+        if len(valid_results) < 2:
+            return None
+
+        layers = [r['layer'] for r in valid_results]
+        sem_corrs = [r['semantic_correlation'] for r in valid_results]
+        silhouettes = [r['silhouette'] for r in valid_results]
+        func_sils = [r['function_silhouette'] for r in valid_results if r['function_silhouette'] is not None]
+
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+
+        # Semantic correlation (left y-axis)
+        color1 = 'tab:blue'
+        ax1.set_xlabel('Layer', fontsize=12)
+        ax1.set_ylabel('Semantic Correlation (Spearman ρ)', color=color1, fontsize=12)
+        line1 = ax1.plot(layers, sem_corrs, 'o-', color=color1, linewidth=2, markersize=8, label='Semantic Corr')
+        ax1.tick_params(axis='y', labelcolor=color1)
+
+        # POS silhouette (right y-axis)
+        ax2 = ax1.twinx()
+        color2 = 'tab:red'
+        ax2.set_ylabel('Silhouette Score', color=color2, fontsize=12)
+        line2 = ax2.plot(layers, silhouettes, 's--', color=color2, linewidth=2, markersize=8, label='POS Silhouette')
+
+        if len(func_sils) == len(layers):
+            line3 = ax2.plot(layers, func_sils, '^:', color='tab:orange', linewidth=2, markersize=6, label='Func Silhouette')
+            lines = line1 + line2 + line3
+        else:
+            lines = line1 + line2
+
+        ax2.tick_params(axis='y', labelcolor=color2)
+
+        plt.title('Layer-wise Semantic Emergence\n(Syntax vs Semantics)', fontsize=14)
+        ax1.legend(lines, [l.get_label() for l in lines], loc='center right')
+        ax1.set_xticks(layers)
+        ax1.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plot_path = os.path.join(output_dir, 'layerwise_semantic.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return plot_path
