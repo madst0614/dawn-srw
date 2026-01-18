@@ -837,6 +837,10 @@ class GlobalRouters(nn.Module):
             routing_info['fqk_weights_Q'] = fqk_weights_Q
             routing_info['fqk_weights_K'] = fqk_weights_K
             routing_info['fv_weights'] = fv_weights
+            # Binary masks (scores > tau) - for clean neuron selection
+            routing_info['fqk_mask_Q'] = fqk_mask_Q
+            routing_info['fqk_mask_K'] = fqk_mask_K
+            routing_info['fv_mask'] = fv_mask
 
         # Update usage
         if self.training:
@@ -955,9 +959,13 @@ class GlobalRouters(nn.Module):
                 routing_info[key] = logits
                 # Store weights for Q/K analysis
                 routing_info[f'rqk_weights_{qk_type}'] = weights
+                # Binary mask (scores > tau)
+                routing_info[f'rqk_mask_{qk_type}'] = mask
             else:
                 routing_info['rv_pref'] = logits
                 routing_info['rv_weights'] = weights
+                # Binary mask (scores > tau)
+                routing_info['rv_mask'] = mask
 
         return weights, aux_loss, routing_info
 
@@ -1021,6 +1029,8 @@ class GlobalRouters(nn.Module):
         # Store weights for analysis
         if self.store_pref_tensors:
             know_info['feature_know_w'] = f_weights  # [B, S, N_feature_know]
+            # Binary mask (scores > tau)
+            know_info['feature_know_mask'] = f_mask
 
         # Debug info
         if self.debug_mode:
@@ -1113,6 +1123,8 @@ class GlobalRouters(nn.Module):
         # Store weights for analysis
         if self.store_pref_tensors:
             routing_info['restore_know_w'] = weights  # [B, S, N_restore_know]
+            # Binary mask (scores > tau)
+            routing_info['restore_know_mask'] = mask
 
         # Debug info
         if self.debug_mode:
