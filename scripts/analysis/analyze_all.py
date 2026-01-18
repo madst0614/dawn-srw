@@ -1282,7 +1282,8 @@ class ModelAnalyzer:
             n_runs=n_runs,
             pool_type=pool_type,
             max_new_tokens=max_tokens,
-            top_k=0,  # Greedy for more consistent results
+            temperature=0.8,  # Sampling for variation
+            top_k=50,         # Top-k sampling
         )
 
         # Print detailed summary
