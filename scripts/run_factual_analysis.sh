@@ -50,7 +50,7 @@ for i in "${!PROMPTS[@]}"; do
     echo "Prompt: '$PROMPT'"
     echo "Target: '$TARGET'"
 
-    python scripts/analysis/routing_analysis.py \
+    python scripts/analysis/standalone/routing_analysis.py \
         --checkpoint "$CHECKPOINT" \
         --prompt "$PROMPT" \
         --target_token "$TARGET" \

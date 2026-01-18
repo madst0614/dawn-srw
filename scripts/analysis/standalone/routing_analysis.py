@@ -238,62 +238,108 @@ class GenerationRoutingAnalyzer:
                 extract_indices_from_paths(path_weights.get('feature_know'), fknow_indices_all)
                 extract_indices_from_paths(path_weights.get('restore_know'), rknow_indices_all)
             else:
-                # v17.1 format: weights in attention/knowledge dicts
+                # v17.1/v18.5 format: weights or masks in attention/knowledge dicts
                 attn = layer_info.get('attention', layer_info)
                 know = layer_info.get('knowledge', {})
 
+                # v18.5: Try masks first (binary, cleaner signal)
+                fv_m = attn.get('fv_mask')
+                if fv_m is not None:
+                    fv_last = fv_m[0, -1]  # [N_v] boolean mask
+                    fv_idx = fv_last.nonzero(as_tuple=True)[0].cpu().tolist()
+                    fv_indices_all.extend(fv_idx)
+                    fv_weights_last = fv_last.float().cpu()
+
+                rv_m = attn.get('rv_mask')
+                if rv_m is not None:
+                    rv_last = rv_m[0, -1]
+                    rv_idx = rv_last.nonzero(as_tuple=True)[0].cpu().tolist()
+                    rv_indices_all.extend(rv_idx)
+                    rv_weights_last = rv_last.float().cpu()
+
+                fqk_q_m = attn.get('fqk_mask_Q')
+                if fqk_q_m is not None:
+                    fqk_q_idx = fqk_q_m[0, -1].nonzero(as_tuple=True)[0].cpu().tolist()
+                    fqk_q_indices_all.extend(fqk_q_idx)
+
+                fqk_k_m = attn.get('fqk_mask_K')
+                if fqk_k_m is not None:
+                    fqk_k_idx = fqk_k_m[0, -1].nonzero(as_tuple=True)[0].cpu().tolist()
+                    fqk_k_indices_all.extend(fqk_k_idx)
+
+                rqk_q_m = attn.get('rqk_mask_Q')
+                if rqk_q_m is not None:
+                    rqk_q_idx = rqk_q_m[0, -1].nonzero(as_tuple=True)[0].cpu().tolist()
+                    rqk_q_indices_all.extend(rqk_q_idx)
+
+                rqk_k_m = attn.get('rqk_mask_K')
+                if rqk_k_m is not None:
+                    rqk_k_idx = rqk_k_m[0, -1].nonzero(as_tuple=True)[0].cpu().tolist()
+                    rqk_k_indices_all.extend(rqk_k_idx)
+
+                fknow_m = know.get('feature_know_mask')
+                if fknow_m is not None:
+                    fknow_idx = fknow_m[0, -1].nonzero(as_tuple=True)[0].cpu().tolist()
+                    fknow_indices_all.extend(fknow_idx)
+
+                rknow_m = know.get('restore_know_mask')
+                if rknow_m is not None:
+                    rknow_idx = rknow_m[0, -1].nonzero(as_tuple=True)[0].cpu().tolist()
+                    rknow_indices_all.extend(rknow_idx)
+
+                # v17.1 fallback: weights (if masks not available)
                 # Feature V weights -> indices
                 fv_w = attn.get('fv_weights')
-                if fv_w is not None:
+                if fv_w is not None and fv_m is None:
                     # Get indices for last token position
                     fv_last = fv_w[0, -1]  # [N_v]
                     fv_idx = (fv_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     fv_indices_all.extend(fv_idx)
                     fv_weights_last = fv_last.cpu()
 
-                # Restore V weights -> indices
+                # Restore V weights -> indices (fallback)
                 rv_w = attn.get('rv_weights')
-                if rv_w is not None:
+                if rv_w is not None and rv_m is None:
                     rv_last = rv_w[0, -1]
                     rv_idx = (rv_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     rv_indices_all.extend(rv_idx)
                     rv_weights_last = rv_last.cpu()
 
-                # Feature QK (Q/K)
+                # Feature QK (Q/K) fallback
                 fqk_q_w = attn.get('fqk_weights_Q')
-                if fqk_q_w is not None:
+                if fqk_q_w is not None and fqk_q_m is None:
                     fqk_q_last = fqk_q_w[0, -1]
                     fqk_q_idx = (fqk_q_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     fqk_q_indices_all.extend(fqk_q_idx)
 
                 fqk_k_w = attn.get('fqk_weights_K')
-                if fqk_k_w is not None:
+                if fqk_k_w is not None and fqk_k_m is None:
                     fqk_k_last = fqk_k_w[0, -1]
                     fqk_k_idx = (fqk_k_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     fqk_k_indices_all.extend(fqk_k_idx)
 
-                # Restore QK (Q/K)
+                # Restore QK (Q/K) fallback
                 rqk_q_w = attn.get('rqk_weights_Q')
-                if rqk_q_w is not None:
+                if rqk_q_w is not None and rqk_q_m is None:
                     rqk_q_last = rqk_q_w[0, -1]
                     rqk_q_idx = (rqk_q_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     rqk_q_indices_all.extend(rqk_q_idx)
 
                 rqk_k_w = attn.get('rqk_weights_K')
-                if rqk_k_w is not None:
+                if rqk_k_w is not None and rqk_k_m is None:
                     rqk_k_last = rqk_k_w[0, -1]
                     rqk_k_idx = (rqk_k_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     rqk_k_indices_all.extend(rqk_k_idx)
 
-                # Knowledge
+                # Knowledge fallback
                 fknow_w = know.get('feature_know_w')
-                if fknow_w is not None:
+                if fknow_w is not None and fknow_m is None:
                     fknow_last = fknow_w[0, -1]
                     fknow_idx = (fknow_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     fknow_indices_all.extend(fknow_idx)
 
                 rknow_w = know.get('restore_know_w')
-                if rknow_w is not None:
+                if rknow_w is not None and rknow_m is None:
                     rknow_last = rknow_w[0, -1]
                     rknow_idx = (rknow_last > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                     rknow_indices_all.extend(rknow_idx)
