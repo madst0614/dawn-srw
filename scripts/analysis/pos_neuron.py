@@ -1761,6 +1761,9 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         # 7. Content word hierarchical clustering
         content_hierarchy = self._compute_content_hierarchy(masks, pos_labels, is_whole_word)
 
+        # 8. Semantic correlation analysis (neuron sim vs GloVe sim)
+        semantic_correlation = self._compute_semantic_correlation(masks, pos_labels, is_whole_word)
+
         return {
             'n_tokens': n_tokens,
             'n_neurons': n_neurons,
@@ -1771,6 +1774,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             'token_stats': token_stats,
             'layer_divergence': layer_divergence,
             'content_hierarchy': content_hierarchy,
+            'semantic_correlation': semantic_correlation,
             '_masks': masks,
             '_pos_labels': pos_labels,
             '_is_whole_word': is_whole_word,
@@ -2166,6 +2170,183 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         except Exception as e:
             return {'error': str(e)}
 
+    def _compute_semantic_correlation(self, masks: np.ndarray, pos_labels: np.ndarray,
+                                       is_whole_word: np.ndarray) -> Dict:
+        """
+        Compute correlation between neuron combination similarity and semantic similarity.
+
+        Hypothesis: Neuron combinations encode semantic similarity, not just POS.
+        If true, tokens with similar meanings should have similar neuron patterns.
+
+        Uses GloVe embeddings for semantic similarity.
+
+        Returns:
+            Dict with correlation, p-value, scatter data for plotting
+        """
+        try:
+            from scipy.stats import spearmanr
+        except ImportError:
+            return {'error': 'scipy not available'}
+
+        print("  Computing semantic correlation...")
+
+        # Filter to content words (NOUN, VERB, ADJ) that are whole words
+        content_pos_indices = [POS_TO_IDX[p] for p in ['NOUN', 'VERB', 'ADJ'] if p in POS_TO_IDX]
+        content_mask = np.isin(pos_labels, content_pos_indices) & is_whole_word
+
+        if content_mask.sum() < 50:
+            return {'error': 'Not enough content whole words'}
+
+        content_indices = np.where(content_mask)[0]
+
+        # Get token strings for content words
+        content_tokens = []
+        for idx in content_indices:
+            token_str = self.token_data[idx]['token_str'].lower().strip()
+            # Clean token (remove ## prefix if any, strip whitespace markers)
+            token_str = token_str.lstrip('##').lstrip('Ġ').lstrip('▁').strip()
+            if len(token_str) >= 2:  # Skip single chars
+                content_tokens.append((idx, token_str))
+
+        if len(content_tokens) < 50:
+            return {'error': 'Not enough valid content tokens'}
+
+        # Try to load GloVe embeddings
+        embeddings = self._load_glove_embeddings()
+        if embeddings is None:
+            return {'error': 'Could not load embeddings (GloVe not available)'}
+
+        # Filter to tokens with embeddings
+        tokens_with_emb = []
+        for idx, token in content_tokens:
+            if token in embeddings:
+                tokens_with_emb.append((idx, token, embeddings[token]))
+
+        if len(tokens_with_emb) < 30:
+            return {'error': f'Only {len(tokens_with_emb)} tokens have embeddings'}
+
+        print(f"    {len(tokens_with_emb)} tokens with embeddings")
+
+        # Sample pairs for correlation (avoid O(n^2) explosion)
+        n_pairs = min(2000, len(tokens_with_emb) * (len(tokens_with_emb) - 1) // 2)
+
+        semantic_sims = []
+        neuron_sims = []
+        scatter_data = []
+
+        # Generate random pairs
+        indices = list(range(len(tokens_with_emb)))
+        pairs_sampled = set()
+
+        while len(semantic_sims) < n_pairs and len(pairs_sampled) < n_pairs * 10:
+            i, j = np.random.choice(len(tokens_with_emb), 2, replace=False)
+            if i > j:
+                i, j = j, i
+            if (i, j) in pairs_sampled:
+                continue
+            pairs_sampled.add((i, j))
+
+            idx1, token1, emb1 = tokens_with_emb[i]
+            idx2, token2, emb2 = tokens_with_emb[j]
+
+            # Semantic similarity (cosine)
+            sem_sim = float(np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2) + 1e-8))
+
+            # Neuron similarity (Jaccard)
+            mask1 = masks[idx1]
+            mask2 = masks[idx2]
+            intersection = (mask1 & mask2).sum()
+            union = (mask1 | mask2).sum()
+            neu_sim = float(intersection / union) if union > 0 else 0.0
+
+            semantic_sims.append(sem_sim)
+            neuron_sims.append(neu_sim)
+            scatter_data.append({
+                'token1': token1,
+                'token2': token2,
+                'semantic_sim': sem_sim,
+                'neuron_sim': neu_sim,
+            })
+
+        if len(semantic_sims) < 30:
+            return {'error': 'Not enough pairs sampled'}
+
+        # Compute Spearman correlation
+        correlation, p_value = spearmanr(semantic_sims, neuron_sims)
+
+        # Summary stats
+        semantic_arr = np.array(semantic_sims)
+        neuron_arr = np.array(neuron_sims)
+
+        return {
+            'correlation': float(correlation),
+            'p_value': float(p_value),
+            'n_pairs': len(semantic_sims),
+            'n_tokens_with_embeddings': len(tokens_with_emb),
+            'semantic_sim_mean': float(semantic_arr.mean()),
+            'semantic_sim_std': float(semantic_arr.std()),
+            'neuron_sim_mean': float(neuron_arr.mean()),
+            'neuron_sim_std': float(neuron_arr.std()),
+            '_scatter_data': scatter_data[:500],  # Limit for JSON
+            '_semantic_sims': semantic_arr,
+            '_neuron_sims': neuron_arr,
+        }
+
+    def _load_glove_embeddings(self, dim: int = 50) -> Optional[Dict[str, np.ndarray]]:
+        """
+        Load GloVe embeddings. Tries multiple sources.
+
+        Args:
+            dim: Embedding dimension (50, 100, 200, 300)
+
+        Returns:
+            Dict mapping words to embedding vectors, or None
+        """
+        # Try gensim first (if installed)
+        try:
+            import gensim.downloader as api
+            print("    Loading GloVe via gensim...")
+            model = api.load(f'glove-wiki-gigaword-{dim}')
+
+            # Convert to dict
+            embeddings = {}
+            for word in model.key_to_index:
+                embeddings[word] = model[word]
+            print(f"    Loaded {len(embeddings)} embeddings")
+            return embeddings
+        except Exception:
+            pass
+
+        # Try loading from file (common paths)
+        glove_paths = [
+            f'/content/glove.6B.{dim}d.txt',
+            f'./glove.6B.{dim}d.txt',
+            f'~/glove.6B.{dim}d.txt',
+            f'/tmp/glove.6B.{dim}d.txt',
+        ]
+
+        for path in glove_paths:
+            path = os.path.expanduser(path)
+            if os.path.exists(path):
+                print(f"    Loading GloVe from {path}...")
+                embeddings = {}
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) > dim:
+                                word = parts[0]
+                                vec = np.array([float(x) for x in parts[1:dim+1]])
+                                embeddings[word] = vec
+                    print(f"    Loaded {len(embeddings)} embeddings")
+                    return embeddings
+                except Exception:
+                    continue
+
+        # Try nltk wordnet (fallback - not as good)
+        print("    GloVe not found. Semantic correlation skipped.")
+        return None
+
     def print_summary(self, results: Dict):
         """Print analysis summary."""
         print("\n" + "=" * 70)
@@ -2265,6 +2446,38 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             print(f"│  Function word density: {content.get('function_word_density', 0):.4f} ({content.get('n_function', 0)} tokens)")
             print(f"└───────────────────────────────────────────────────────────────────────┘")
 
+        # Semantic correlation
+        sem_corr = results.get('semantic_correlation', {})
+        if sem_corr and not sem_corr.get('error'):
+            corr = sem_corr.get('correlation', 0)
+            p_val = sem_corr.get('p_value', 1)
+            n_pairs = sem_corr.get('n_pairs', 0)
+            n_tokens = sem_corr.get('n_tokens_with_embeddings', 0)
+
+            print(f"\n┌─ Semantic Correlation (GloVe vs Neuron Similarity) ───────────────────┐")
+            print(f"│  Spearman correlation: {corr:+.4f} (p={p_val:.2e})")
+            print(f"│  {'***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''}")
+            print(f"│")
+            print(f"│  Tokens with embeddings: {n_tokens}")
+            print(f"│  Pairs sampled: {n_pairs}")
+            print(f"│")
+            print(f"│  Semantic sim:  mean={sem_corr.get('semantic_sim_mean', 0):.3f}, std={sem_corr.get('semantic_sim_std', 0):.3f}")
+            print(f"│  Neuron sim:    mean={sem_corr.get('neuron_sim_mean', 0):.3f}, std={sem_corr.get('neuron_sim_std', 0):.3f}")
+            print(f"│")
+            if corr > 0.3:
+                print(f"│  → Strong positive: similar meanings → similar neurons")
+            elif corr > 0.1:
+                print(f"│  → Weak positive: some semantic encoding in neuron patterns")
+            elif corr > -0.1:
+                print(f"│  → Near zero: neurons encode something else (syntax?)")
+            else:
+                print(f"│  → Negative: opposite semantic = similar neurons (?)")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+        elif sem_corr and sem_corr.get('error'):
+            print(f"\n┌─ Semantic Correlation ────────────────────────────────────────────────┐")
+            print(f"│  Skipped: {sem_corr.get('error')}")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+
         print("\n" + "=" * 70)
 
     def visualize(self, results: Dict, output_dir: str) -> Dict[str, str]:
@@ -2287,6 +2500,10 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         path = self._plot_content_dendrogram(results, os.path.join(output_dir, 'content_dendrogram.png'))
         if path:
             paths['content_dendrogram'] = path
+
+        path = self._plot_semantic_correlation(results, os.path.join(output_dir, 'semantic_correlation.png'))
+        if path:
+            paths['semantic_correlation'] = path
 
         return paths
 
@@ -2459,6 +2676,58 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             Patch(facecolor='green', label='ADJ'),
         ]
         ax.legend(handles=legend_elements, loc='upper right')
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
+    def _plot_semantic_correlation(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot semantic vs neuron similarity scatter plot with regression line."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+            from scipy import stats
+        except ImportError:
+            return None
+
+        sem_corr = results.get('semantic_correlation', {})
+        if not sem_corr or sem_corr.get('error'):
+            return None
+
+        semantic_sims = sem_corr.get('_semantic_sims')
+        neuron_sims = sem_corr.get('_neuron_sims')
+
+        if semantic_sims is None or neuron_sims is None:
+            return None
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Scatter plot with alpha for density
+        ax.scatter(semantic_sims, neuron_sims, alpha=0.3, s=10, c='steelblue')
+
+        # Add regression line
+        slope, intercept, r_value, p_value, std_err = stats.linregress(semantic_sims, neuron_sims)
+        x_line = np.linspace(semantic_sims.min(), semantic_sims.max(), 100)
+        y_line = slope * x_line + intercept
+        ax.plot(x_line, y_line, 'r-', linewidth=2, label=f'Regression (r={r_value:.3f})')
+
+        # Add Spearman correlation annotation
+        corr = sem_corr.get('correlation', 0)
+        p_val = sem_corr.get('p_value', 1)
+        n_pairs = sem_corr.get('n_pairs', 0)
+
+        ax.text(0.05, 0.95, f"Spearman ρ = {corr:.3f}\np = {p_val:.2e}\nn = {n_pairs} pairs",
+                transform=ax.transAxes, fontsize=12, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        ax.set_xlabel('Semantic Similarity (GloVe cosine)', fontsize=12)
+        ax.set_ylabel('Neuron Similarity (Jaccard)', fontsize=12)
+        ax.set_title('Semantic vs Neuron Combination Similarity\n(Do similar meanings activate similar neurons?)', fontsize=14)
+        ax.legend(loc='lower right')
+        ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
