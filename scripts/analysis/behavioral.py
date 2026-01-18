@@ -561,7 +561,14 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
         self.model.eval()
 
-        for prompt, target in zip(prompts, targets):
+        # Progress tracking
+        try:
+            from tqdm import tqdm
+            prompt_iter = tqdm(zip(prompts, targets), total=len(prompts), desc="Prompts")
+        except ImportError:
+            prompt_iter = zip(prompts, targets)
+
+        for prompt_idx, (prompt, target) in enumerate(prompt_iter):
             target_neuron_counts = Counter()  # Neurons when target generated
             baseline_neuron_counts = Counter()  # Neurons at other steps
             matching_runs = 0
@@ -570,6 +577,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
             first_predicted_text = None
             sample_generations = []
+
+            # Show prompt being processed
+            print(f"\n    [{prompt_idx+1}/{len(prompts)}] \"{prompt}\" → target: \"{target}\"")
 
             for run_idx in range(n_runs):
                 # Encode prompt
@@ -668,6 +678,17 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         'text': gen_text,
                         'position': target_position,
                     })
+
+                # Progress update every 10 runs
+                if (run_idx + 1) % 10 == 0 or run_idx == n_runs - 1:
+                    match_pct = matching_runs / (run_idx + 1) * 100
+                    status = f"✓{matching_runs}" if matching_runs > 0 else "✗"
+                    print(f"      Run {run_idx+1:3d}/{n_runs}: {status} ({match_pct:.0f}% match rate)", end='\r')
+
+            # Final summary for this prompt
+            match_pct = matching_runs / n_runs * 100
+            n_unique = len(target_neuron_counts)
+            print(f"      Completed: {matching_runs}/{n_runs} found ({match_pct:.0f}%), {n_unique} unique neurons")
 
             # Compute contrastive scores
             # Score = (freq in target) - (freq in baseline)
