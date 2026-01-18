@@ -1521,26 +1521,49 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         return True
 
     def _extract_layer_mask(self, layer, seq_len: int) -> np.ndarray:
-        """Extract concatenated mask from a single layer (optimized)."""
+        """
+        Extract concatenated mask from a single layer.
+
+        Uses actual binary masks from routing (scores > learnable tau) if available.
+        Falls back to weight > threshold only if masks unavailable.
+        """
         masks = []
         for pool_key, expected_size in self.pool_order:
-            weights = layer.get_weight(pool_key)
-            if weights is None:
-                masks.append(np.zeros((seq_len, expected_size), dtype=np.bool_))
-            else:
-                # Fast path: direct numpy conversion
-                if weights.dim() == 3:
-                    w = weights[0, :seq_len].cpu().numpy()
+            # Try to get actual binary mask first (scores > tau)
+            mask = layer.get_mask(pool_key)
+
+            if mask is not None:
+                # Use actual model mask (cleaner signal)
+                if mask.dim() == 3:
+                    m = mask[0, :seq_len].cpu().numpy().astype(np.bool_)
                 else:
-                    w = np.broadcast_to(
-                        weights[0].cpu().numpy(),
-                        (seq_len, weights.shape[-1])
+                    m = np.broadcast_to(
+                        mask[0].cpu().numpy().astype(np.bool_),
+                        (seq_len, mask.shape[-1])
                     )
 
-                if w.shape[0] < seq_len:
-                    w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+                if m.shape[0] < seq_len:
+                    m = np.pad(m, ((0, seq_len - m.shape[0]), (0, 0)))
 
-                masks.append(w > self.activation_threshold)
+                masks.append(m)
+            else:
+                # Fallback: use weights > threshold
+                weights = layer.get_weight(pool_key)
+                if weights is None:
+                    masks.append(np.zeros((seq_len, expected_size), dtype=np.bool_))
+                else:
+                    if weights.dim() == 3:
+                        w = weights[0, :seq_len].cpu().numpy()
+                    else:
+                        w = np.broadcast_to(
+                            weights[0].cpu().numpy(),
+                            (seq_len, weights.shape[-1])
+                        )
+
+                    if w.shape[0] < seq_len:
+                        w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+
+                    masks.append(w > self.activation_threshold)
 
         return np.concatenate(masks, axis=-1) if masks else np.zeros((seq_len, 0), dtype=np.bool_)
 

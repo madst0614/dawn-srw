@@ -652,6 +652,21 @@ WEIGHT_KEY_MAP = {
     'rknow': 'restore_know_w',
 }
 
+# Mask key mapping: standard_key -> raw_key in routing_info
+# Binary masks (scores > tau) - for clean neuron selection
+MASK_KEY_MAP = {
+    # Attention masks
+    'fqk_q': 'fqk_mask_Q',
+    'fqk_k': 'fqk_mask_K',
+    'fv': 'fv_mask',
+    'rqk_q': 'rqk_mask_Q',
+    'rqk_k': 'rqk_mask_K',
+    'rv': 'rv_mask',
+    # Knowledge masks
+    'fknow': 'feature_know_mask',
+    'rknow': 'restore_know_mask',
+}
+
 # Inverse mapping for quick lookup
 RAW_KEY_TO_STD = {v: k for k, v in WEIGHT_KEY_MAP.items()}
 
@@ -845,6 +860,27 @@ class LayerRoutingData:
 
         return result
 
+    def get_mask(self, key: str) -> Optional[torch.Tensor]:
+        """
+        Get binary mask tensor by standardized key.
+
+        Binary masks indicate which neurons passed the learnable tau threshold.
+        These are cleaner than using weights > arbitrary_threshold.
+
+        Standard keys: 'fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv', 'fknow', 'rknow'
+
+        Returns:
+            Boolean mask tensor [B, S, N] or [B, N], or None if not found
+        """
+        raw_key = MASK_KEY_MAP.get(key, key)
+
+        # Try attention first, then knowledge
+        result = self.attention.get(raw_key)
+        if result is None:
+            result = self.knowledge.get(raw_key)
+
+        return result
+
     def get_all_attention_weights(self) -> Dict[str, torch.Tensor]:
         """Get all available attention weights (using ROUTING_KEYS)."""
         weights = {}
@@ -874,6 +910,36 @@ class LayerRoutingData:
     def has_weights(self) -> bool:
         """Check if any weights are available."""
         return bool(self.get_all_weights())
+
+    def get_all_attention_masks(self) -> Dict[str, torch.Tensor]:
+        """Get all available attention masks (binary, scores > tau)."""
+        masks = {}
+        for std_key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
+            raw_key = MASK_KEY_MAP.get(std_key)
+            if raw_key:
+                m = self.attention.get(raw_key)
+                if m is not None:
+                    masks[std_key] = m
+        return masks
+
+    def get_all_knowledge_masks(self) -> Dict[str, torch.Tensor]:
+        """Get all available knowledge masks (binary, scores > tau)."""
+        masks = {}
+        for std_key in ['fknow', 'rknow']:
+            raw_key = MASK_KEY_MAP.get(std_key)
+            if raw_key:
+                m = self.knowledge.get(raw_key)
+                if m is not None:
+                    masks[std_key] = m
+        return masks
+
+    def get_all_masks(self) -> Dict[str, torch.Tensor]:
+        """Get all available binary masks."""
+        return {**self.get_all_attention_masks(), **self.get_all_knowledge_masks()}
+
+    def has_masks(self) -> bool:
+        """Check if any masks are available."""
+        return bool(self.get_all_masks())
 
 
 # Convenience function for simple extraction
