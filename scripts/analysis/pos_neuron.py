@@ -1438,8 +1438,24 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         self.pool_sizes = self._get_pool_sizes()
         self.total_neurons = sum(self.pool_sizes.values())
 
+        # Precompute pool order for fast concatenation
+        self.pool_order = [
+            ('fqk_q', self.pool_sizes.get('fqk', 0)),
+            ('fqk_k', self.pool_sizes.get('fqk', 0)),
+            ('fv', self.pool_sizes.get('fv', 0)),
+            ('rqk_q', self.pool_sizes.get('rqk', 0)),
+            ('rqk_k', self.pool_sizes.get('rqk', 0)),
+            ('rv', self.pool_sizes.get('rv', 0)),
+            ('fknow', self.pool_sizes.get('fknow', 0)),
+            ('rknow', self.pool_sizes.get('rknow', 0)),
+        ]
+        self.pool_order = [(k, s) for k, s in self.pool_order if s > 0]
+
         # Storage for token activations
         self.token_data = []  # List of {token_str, pos, mask, ...}
+
+        # Storage for layer divergence analysis
+        self.layer_token_data = defaultdict(list)  # {token_str: [{layer_masks: {...}, ...}]}
 
     def _get_pool_sizes(self) -> Dict[str, int]:
         """Get sizes of each pool for concatenation."""
@@ -1458,11 +1474,11 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
     def reset_stats(self):
         """Reset collected token data."""
         self.token_data = []
+        self.layer_token_data = defaultdict(list)
 
     def load_ud_dataset(self, split: str = 'train', max_sentences: int = None,
                         data_path: str = None) -> List[Dict]:
         """Load UD dataset (reuse from POSNeuronAnalyzer)."""
-        # Create temporary POSNeuronAnalyzer to reuse its load function
         temp = POSNeuronAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
         return temp.load_ud_dataset(split, max_sentences, data_path)
 
@@ -1475,14 +1491,37 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         """Check if token represents a whole word (starts with space/Ġ)."""
         if not token_str:
             return False
-        # GPT-style tokenizers use 'Ġ' for word-initial tokens
-        # Other tokenizers may use '▁' or leading space
         return token_str.startswith(('Ġ', '▁', ' ')) or token_str[0].isupper()
+
+    def _extract_layer_mask(self, layer, seq_len: int) -> np.ndarray:
+        """Extract concatenated mask from a single layer (optimized)."""
+        masks = []
+        for pool_key, expected_size in self.pool_order:
+            weights = layer.get_weight(pool_key)
+            if weights is None:
+                masks.append(np.zeros((seq_len, expected_size), dtype=np.bool_))
+            else:
+                # Fast path: direct numpy conversion
+                if weights.dim() == 3:
+                    w = weights[0, :seq_len].cpu().numpy()
+                else:
+                    w = np.broadcast_to(
+                        weights[0].cpu().numpy(),
+                        (seq_len, weights.shape[-1])
+                    )
+
+                if w.shape[0] < seq_len:
+                    w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+
+                masks.append(w > self.activation_threshold)
+
+        return np.concatenate(masks, axis=-1) if masks else np.zeros((seq_len, 0), dtype=np.bool_)
 
     def extract_token_masks(
         self,
         token_ids: List[int],
         pos_tags: List[str],
+        store_layer_masks: bool = False,
     ) -> List[Dict]:
         """
         Extract binary activation masks for each token.
@@ -1490,9 +1529,10 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         Args:
             token_ids: List of token IDs
             pos_tags: List of POS tags for each token
+            store_layer_masks: Whether to store per-layer masks for divergence analysis
 
         Returns:
-            List of {token_id, token_str, pos, mask, is_whole_word}
+            List of {token_id, token_str, pos, mask, is_whole_word, layer_masks?}
         """
         input_ids = torch.tensor([token_ids], device=self.device)
         seq_len = len(token_ids)
@@ -1506,87 +1546,49 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 return []
 
         # Collect masks per layer
-        layer_masks = {}  # layer_idx -> [seq_len, total_neurons]
-
+        layer_masks = {}
         for layer in routing:
             layer_idx = layer.layer_idx
             if self.target_layer is not None and layer_idx != self.target_layer:
                 continue
-
-            # Concatenate all pools into single mask
-            masks = []
-
-            # Pool order: fqk_q, fqk_k, fv, rqk_q, rqk_k, rv, fknow, rknow
-            pool_keys = [
-                ('fqk_q', self.pool_sizes.get('fqk', 0)),
-                ('fqk_k', self.pool_sizes.get('fqk', 0)),
-                ('fv', self.pool_sizes.get('fv', 0)),
-                ('rqk_q', self.pool_sizes.get('rqk', 0)),
-                ('rqk_k', self.pool_sizes.get('rqk', 0)),
-                ('rv', self.pool_sizes.get('rv', 0)),
-                ('fknow', self.pool_sizes.get('fknow', 0)),
-                ('rknow', self.pool_sizes.get('rknow', 0)),
-            ]
-
-            for pool_key, expected_size in pool_keys:
-                if expected_size == 0:
-                    continue
-
-                weights = layer.get_weight(pool_key)
-                if weights is None:
-                    # Fill with zeros if not available
-                    mask = np.zeros((seq_len, expected_size), dtype=np.bool_)
-                else:
-                    # weights: [B, T, N] or [B, N]
-                    if weights.dim() == 3:
-                        w = weights[0].cpu().numpy()  # [T, N]
-                    else:
-                        w = weights[0].unsqueeze(0).expand(seq_len, -1).cpu().numpy()
-
-                    # Adjust dimensions
-                    if w.shape[0] > seq_len:
-                        w = w[:seq_len]
-                    elif w.shape[0] < seq_len:
-                        pad = np.zeros((seq_len - w.shape[0], w.shape[1]), dtype=np.float32)
-                        w = np.vstack([w, pad])
-
-                    # Binary mask
-                    mask = w > self.activation_threshold
-
-                masks.append(mask)
-
-            if masks:
-                layer_masks[layer_idx] = np.concatenate(masks, axis=-1)  # [seq_len, total]
+            layer_masks[layer_idx] = self._extract_layer_mask(layer, seq_len)
 
         if not layer_masks:
             return []
 
-        # Average across layers (majority vote for binary)
+        # Combined mask (majority vote or single layer)
         if self.target_layer is not None:
             combined_mask = layer_masks.get(self.target_layer)
             if combined_mask is None:
                 return []
         else:
-            # Stack and take majority vote
-            all_masks = np.stack(list(layer_masks.values()), axis=0)  # [n_layers, seq, neurons]
-            combined_mask = (all_masks.mean(axis=0) > 0.5)  # Majority vote
+            all_masks = np.stack(list(layer_masks.values()), axis=0)
+            combined_mask = all_masks.mean(axis=0) > 0.5
 
-        # Build token data
+        # Build token data (vectorized token string decode)
+        token_strs = [self.tokenizer.decode([tid]) for tid in token_ids]
+
         results = []
         for i in range(min(seq_len, len(pos_tags))):
-            token_str = self.tokenizer.decode([token_ids[i]])
-            results.append({
+            token_str = token_strs[i]
+            entry = {
                 'token_id': token_ids[i],
                 'token_str': token_str,
                 'pos': pos_tags[i],
-                'mask': combined_mask[i],  # [total_neurons] bool
+                'mask': combined_mask[i],
                 'is_whole_word': self._is_whole_word(token_str),
                 'n_active': int(combined_mask[i].sum()),
-            })
+            }
+
+            if store_layer_masks:
+                entry['layer_masks'] = {k: v[i] for k, v in layer_masks.items()}
+
+            results.append(entry)
 
         return results
 
-    def analyze_sentence(self, ud_tokens: List[str], ud_pos: List[str]):
+    def analyze_sentence(self, ud_tokens: List[str], ud_pos: List[str],
+                         store_layer_masks: bool = False):
         """Analyze a single sentence and collect token activations."""
         try:
             pos_tags, token_ids = self.get_pos_for_tokens(ud_tokens, ud_pos)
@@ -1596,16 +1598,24 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         if not token_ids:
             return
 
-        token_masks = self.extract_token_masks(token_ids, pos_tags)
+        token_masks = self.extract_token_masks(token_ids, pos_tags, store_layer_masks)
         self.token_data.extend(token_masks)
 
-    def analyze_dataset(self, dataset: List[Dict], max_sentences: int = None) -> Dict:
+        # Store for layer divergence analysis
+        if store_layer_masks:
+            for t in token_masks:
+                if 'layer_masks' in t:
+                    self.layer_token_data[t['token_str'].lower().strip()].append(t)
+
+    def analyze_dataset(self, dataset: List[Dict], max_sentences: int = None,
+                        analyze_layer_divergence: bool = True) -> Dict:
         """
         Analyze full dataset.
 
         Args:
             dataset: List of {'tokens': [...], 'upos': [...]}
             max_sentences: Maximum sentences to process
+            analyze_layer_divergence: Whether to store per-layer masks for divergence
 
         Returns:
             Analysis results dictionary
@@ -1616,20 +1626,24 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         print(f"\nCollecting token activations from {n_sentences} sentences...")
         print(f"Activation threshold: {self.activation_threshold}")
         print(f"Layer: {self.target_layer if self.target_layer is not None else 'all (majority vote)'}")
+        print(f"Layer divergence analysis: {'ON' if analyze_layer_divergence else 'OFF'}")
 
         for i in tqdm(range(n_sentences), desc="Processing"):
             example = dataset[i]
             try:
-                self.analyze_sentence(example['tokens'], example['upos'])
+                self.analyze_sentence(
+                    example['tokens'], example['upos'],
+                    store_layer_masks=analyze_layer_divergence
+                )
             except Exception:
                 continue
 
         print(f"Collected {len(self.token_data)} tokens")
-        return self.compute_results()
+        return self.compute_results(analyze_layer_divergence)
 
     def _compute_jaccard_matrix(self, masks: np.ndarray) -> np.ndarray:
         """
-        Compute pairwise Jaccard similarity matrix.
+        Compute pairwise Jaccard similarity matrix (optimized).
 
         Args:
             masks: [n_samples, n_features] boolean array
@@ -1637,34 +1651,52 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         Returns:
             [n_samples, n_samples] Jaccard similarity matrix
         """
-        n = masks.shape[0]
-
-        # Vectorized: intersection = A @ B.T, union = |A| + |B| - intersection
-        # For boolean, sum gives count
+        # Use float32 for memory efficiency
         masks_float = masks.astype(np.float32)
-        intersection = masks_float @ masks_float.T  # [n, n]
+
+        # Vectorized: intersection = A @ B.T
+        intersection = masks_float @ masks_float.T
 
         # |A| for each sample
-        counts = masks.sum(axis=1).reshape(-1, 1)  # [n, 1]
+        counts = masks.sum(axis=1, keepdims=True).astype(np.float32)
 
         # Union = |A| + |B| - intersection
         union = counts + counts.T - intersection
 
-        # Jaccard = intersection / union
-        with np.errstate(divide='ignore', invalid='ignore'):
-            jaccard = np.where(union > 0, intersection / union, 0.0)
+        # Jaccard = intersection / union (avoid division by zero)
+        return np.divide(intersection, union, out=np.zeros_like(intersection), where=union > 0)
 
-        return jaccard
+    def _compute_jaccard_pairwise(self, masks_a: np.ndarray, masks_b: np.ndarray) -> float:
+        """Compute mean Jaccard between two groups (optimized)."""
+        # Use broadcasting for efficiency
+        a_float = masks_a.astype(np.float32)
+        b_float = masks_b.astype(np.float32)
 
-    def compute_results(self) -> Dict:
+        intersection = a_float @ b_float.T
+        counts_a = masks_a.sum(axis=1, keepdims=True)
+        counts_b = masks_b.sum(axis=1, keepdims=True)
+        union = counts_a + counts_b.T - intersection
+
+        jaccard = np.divide(intersection, union, out=np.zeros_like(intersection), where=union > 0)
+        return float(jaccard.mean())
+
+    def compute_results(self, analyze_layer_divergence: bool = True) -> Dict:
         """Compute all analysis results."""
         if not self.token_data:
             return {'error': 'No token data collected'}
 
-        # Build arrays
-        masks = np.array([t['mask'] for t in self.token_data])  # [n_tokens, n_neurons]
-        pos_labels = np.array([POS_TO_IDX.get(t['pos'], -1) for t in self.token_data])
-        is_whole_word = np.array([t['is_whole_word'] for t in self.token_data])
+        # Build arrays efficiently
+        n_tokens = len(self.token_data)
+        n_neurons = len(self.token_data[0]['mask']) if n_tokens > 0 else 0
+
+        masks = np.empty((n_tokens, n_neurons), dtype=np.bool_)
+        pos_labels = np.empty(n_tokens, dtype=np.int32)
+        is_whole_word = np.empty(n_tokens, dtype=np.bool_)
+
+        for i, t in enumerate(self.token_data):
+            masks[i] = t['mask']
+            pos_labels[i] = POS_TO_IDX.get(t['pos'], -1)
+            is_whole_word[i] = t['is_whole_word']
 
         # Filter valid POS
         valid_mask = pos_labels >= 0
@@ -1687,48 +1719,55 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         # 4. Token statistics
         token_stats = self._compute_token_stats()
 
+        # 5. Layer divergence analysis
+        layer_divergence = None
+        if analyze_layer_divergence and self.layer_token_data:
+            layer_divergence = self._compute_layer_divergence()
+
+        # 6. Content word hierarchical clustering
+        content_hierarchy = self._compute_content_hierarchy(masks, pos_labels, is_whole_word)
+
         return {
             'n_tokens': n_tokens,
-            'n_neurons': masks.shape[1] if len(masks) > 0 else 0,
+            'n_neurons': n_neurons,
             'pos_similarity': pos_similarity,
             'silhouette_score': silhouette,
             'content_analysis': content_analysis,
             'token_stats': token_stats,
+            'layer_divergence': layer_divergence,
+            'content_hierarchy': content_hierarchy,
             '_masks': masks,
             '_pos_labels': pos_labels,
             '_is_whole_word': is_whole_word,
         }
 
     def _compute_pos_similarity(self, masks: np.ndarray, pos_labels: np.ndarray) -> Dict:
-        """Compute within-POS and between-POS Jaccard similarity."""
+        """Compute within-POS and between-POS Jaccard similarity (optimized)."""
         unique_pos = np.unique(pos_labels)
 
-        # Sample for efficiency if too many tokens
-        max_per_pos = 200
-        sampled_masks = []
+        # Sample for efficiency
+        max_per_pos = 150
+        sampled_indices = []
         sampled_labels = []
 
         for pos_idx in unique_pos:
-            pos_mask = pos_labels == pos_idx
-            pos_indices = np.where(pos_mask)[0]
-
+            pos_indices = np.where(pos_labels == pos_idx)[0]
             if len(pos_indices) > max_per_pos:
                 pos_indices = np.random.choice(pos_indices, max_per_pos, replace=False)
-
-            sampled_masks.append(masks[pos_indices])
+            sampled_indices.extend(pos_indices)
             sampled_labels.extend([pos_idx] * len(pos_indices))
 
-        if not sampled_masks:
+        if not sampled_indices:
             return {}
 
-        sampled_masks = np.vstack(sampled_masks)
+        sampled_masks = masks[sampled_indices]
         sampled_labels = np.array(sampled_labels)
 
-        # Compute Jaccard matrix
+        # Compute Jaccard matrix once
         print("  Computing Jaccard similarity matrix...")
         jaccard = self._compute_jaccard_matrix(sampled_masks)
 
-        # Within-POS similarity (diagonal blocks)
+        # Within-POS similarity
         within_sim = {}
         for pos_idx in unique_pos:
             pos_name = UPOS_TAGS[pos_idx]
@@ -1737,40 +1776,33 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
                 continue
 
             pos_jaccard = jaccard[np.ix_(mask, mask)]
-            # Upper triangle excluding diagonal
-            triu_idx = np.triu_indices_from(pos_jaccard, k=1)
-            within_values = pos_jaccard[triu_idx]
+            triu_vals = pos_jaccard[np.triu_indices_from(pos_jaccard, k=1)]
 
-            if len(within_values) > 0:
+            if len(triu_vals) > 0:
                 within_sim[pos_name] = {
-                    'mean': float(np.mean(within_values)),
-                    'std': float(np.std(within_values)),
-                    'n_pairs': len(within_values),
+                    'mean': float(triu_vals.mean()),
+                    'std': float(triu_vals.std()),
+                    'n_pairs': len(triu_vals),
                 }
 
-        # Between-POS similarity (off-diagonal blocks)
+        # Between-POS similarity (sample pairs for speed)
         between_sim = {}
-        for i, pos_i in enumerate(unique_pos):
-            for pos_j in unique_pos[i+1:]:
-                pos_name_i = UPOS_TAGS[pos_i]
-                pos_name_j = UPOS_TAGS[pos_j]
-
+        pos_list = list(unique_pos)
+        for i, pos_i in enumerate(pos_list):
+            for pos_j in pos_list[i+1:]:
                 mask_i = sampled_labels == pos_i
                 mask_j = sampled_labels == pos_j
 
                 if mask_i.sum() == 0 or mask_j.sum() == 0:
                     continue
 
-                between_jaccard = jaccard[np.ix_(mask_i, mask_j)]
-                between_values = between_jaccard.flatten()
-
-                if len(between_values) > 0:
-                    between_sim[f"{pos_name_i}-{pos_name_j}"] = {
-                        'mean': float(np.mean(between_values)),
-                        'std': float(np.std(between_values)),
+                between_vals = jaccard[np.ix_(mask_i, mask_j)].flatten()
+                if len(between_vals) > 0:
+                    between_sim[f"{UPOS_TAGS[pos_i]}-{UPOS_TAGS[pos_j]}"] = {
+                        'mean': float(between_vals.mean()),
+                        'std': float(between_vals.std()),
                     }
 
-        # Summary: mean within vs mean between
         all_within = [v['mean'] for v in within_sim.values()]
         all_between = [v['mean'] for v in between_sim.values()]
 
@@ -1786,47 +1818,39 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         """Compute silhouette score using Jaccard distance."""
         try:
             from sklearn.metrics import silhouette_score, silhouette_samples
-            HAS_SKLEARN = True
         except ImportError:
-            HAS_SKLEARN = False
             return {'score': None, 'error': 'sklearn not available'}
 
-        # Filter to POS with enough samples
         unique_pos, counts = np.unique(pos_labels, return_counts=True)
         valid_pos = unique_pos[counts >= 5]
 
         if len(valid_pos) < 2:
-            return {'score': None, 'error': 'Not enough POS categories with 5+ samples'}
+            return {'score': None, 'error': 'Not enough POS categories'}
 
-        # Filter to valid POS only
         valid_mask = np.isin(pos_labels, valid_pos)
         filtered_masks = masks[valid_mask]
         filtered_labels = pos_labels[valid_mask]
 
-        # Sample if too large
-        max_samples = 2000
+        # Sample for speed
+        max_samples = 1500
         if len(filtered_masks) > max_samples:
             indices = np.random.choice(len(filtered_masks), max_samples, replace=False)
             filtered_masks = filtered_masks[indices]
             filtered_labels = filtered_labels[indices]
 
-        # Compute Jaccard distance matrix (1 - similarity)
         print("  Computing silhouette score...")
-        jaccard_sim = self._compute_jaccard_matrix(filtered_masks)
-        jaccard_dist = 1.0 - jaccard_sim
+        jaccard_dist = 1.0 - self._compute_jaccard_matrix(filtered_masks)
 
-        # Silhouette with precomputed distance
         try:
             score = silhouette_score(jaccard_dist, filtered_labels, metric='precomputed')
             samples = silhouette_samples(jaccard_dist, filtered_labels, metric='precomputed')
 
-            # Per-POS silhouette
             per_pos = {}
             for pos_idx in valid_pos:
                 pos_name = UPOS_TAGS[pos_idx]
                 pos_mask = filtered_labels == pos_idx
                 if pos_mask.sum() > 0:
-                    per_pos[pos_name] = float(np.mean(samples[pos_mask]))
+                    per_pos[pos_name] = float(samples[pos_mask].mean())
 
             return {
                 'score': float(score),
@@ -1846,24 +1870,19 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         content_mask = np.isin(pos_labels, content_pos)
         function_mask = np.isin(pos_labels, function_pos)
 
-        # Mean activation density
         content_density = masks[content_mask].mean() if content_mask.sum() > 0 else 0
         function_density = masks[function_mask].mean() if function_mask.sum() > 0 else 0
 
-        # Whole word analysis for content words
         content_whole = content_mask & is_whole_word
         content_partial = content_mask & ~is_whole_word
-
-        whole_density = masks[content_whole].mean() if content_whole.sum() > 0 else 0
-        partial_density = masks[content_partial].mean() if content_partial.sum() > 0 else 0
 
         return {
             'content_word_density': float(content_density),
             'function_word_density': float(function_density),
             'n_content': int(content_mask.sum()),
             'n_function': int(function_mask.sum()),
-            'whole_word_density': float(whole_density),
-            'partial_word_density': float(partial_density),
+            'whole_word_density': float(masks[content_whole].mean()) if content_whole.sum() > 0 else 0,
+            'partial_word_density': float(masks[content_partial].mean()) if content_partial.sum() > 0 else 0,
             'n_whole_content': int(content_whole.sum()),
             'n_partial_content': int(content_partial.sum()),
         }
@@ -1883,6 +1902,171 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             'std_active_neurons': float(np.std(activation_counts)) if activation_counts else 0,
             'total_neurons': self.total_neurons,
         }
+
+    def _compute_layer_divergence(self, target_tokens: List[str] = None) -> Dict:
+        """
+        Compute layer-wise divergence for same tokens.
+
+        Measures how activations of the same token diverge across layers.
+        Early layers should show high similarity, later layers more divergence.
+
+        Args:
+            target_tokens: Specific tokens to analyze (default: common function words)
+
+        Returns:
+            Dict with divergence curves per token
+        """
+        if target_tokens is None:
+            target_tokens = ['the', 'is', 'a', 'to', 'and', 'of', 'in', 'that', 'it', 'for']
+
+        print("  Computing layer divergence...")
+
+        results = {}
+        for token in target_tokens:
+            token_lower = token.lower().strip()
+            occurrences = self.layer_token_data.get(token_lower, [])
+
+            if len(occurrences) < 5:
+                continue
+
+            # Get all layer indices
+            layer_indices = sorted(occurrences[0].get('layer_masks', {}).keys())
+            if not layer_indices:
+                continue
+
+            # Compute within-occurrence similarity per layer
+            layer_sims = []
+            for layer_idx in layer_indices:
+                # Collect masks for this layer across all occurrences
+                layer_masks = []
+                for occ in occurrences[:50]:  # Limit for speed
+                    lm = occ.get('layer_masks', {}).get(layer_idx)
+                    if lm is not None:
+                        layer_masks.append(lm)
+
+                if len(layer_masks) < 2:
+                    layer_sims.append(None)
+                    continue
+
+                # Compute mean pairwise Jaccard
+                masks_arr = np.array(layer_masks)
+                jaccard = self._compute_jaccard_matrix(masks_arr)
+                triu_vals = jaccard[np.triu_indices_from(jaccard, k=1)]
+                layer_sims.append(float(triu_vals.mean()) if len(triu_vals) > 0 else None)
+
+            results[token] = {
+                'layer_indices': layer_indices,
+                'similarities': layer_sims,
+                'n_occurrences': len(occurrences),
+                'divergence': layer_sims[0] - layer_sims[-1] if layer_sims[0] and layer_sims[-1] else None,
+            }
+
+        # Summary
+        divergences = [r['divergence'] for r in results.values() if r['divergence'] is not None]
+
+        return {
+            'per_token': results,
+            'mean_divergence': float(np.mean(divergences)) if divergences else None,
+            'tokens_analyzed': list(results.keys()),
+        }
+
+    def _compute_content_hierarchy(self, masks: np.ndarray, pos_labels: np.ndarray,
+                                    is_whole_word: np.ndarray) -> Dict:
+        """
+        Compute hierarchical clustering for content words.
+
+        Uses scipy hierarchical clustering to find structure among
+        NOUN, VERB, ADJ tokens (whole words only).
+
+        Returns:
+            Dict with linkage data and cluster quality metrics
+        """
+        try:
+            from scipy.cluster.hierarchy import linkage, fcluster
+            from scipy.spatial.distance import pdist, squareform
+        except ImportError:
+            return {'error': 'scipy not available'}
+
+        print("  Computing content word hierarchy...")
+
+        # Filter to content words (whole words only)
+        content_pos_indices = [POS_TO_IDX[p] for p in ['NOUN', 'VERB', 'ADJ'] if p in POS_TO_IDX]
+        content_mask = np.isin(pos_labels, content_pos_indices) & is_whole_word
+
+        if content_mask.sum() < 20:
+            return {'error': 'Not enough content words'}
+
+        content_masks = masks[content_mask]
+        content_labels = pos_labels[content_mask]
+
+        # Sample if too large
+        max_samples = 300
+        if len(content_masks) > max_samples:
+            indices = np.random.choice(len(content_masks), max_samples, replace=False)
+            content_masks = content_masks[indices]
+            content_labels = content_labels[indices]
+
+        # Compute Jaccard distance matrix
+        jaccard_sim = self._compute_jaccard_matrix(content_masks)
+        jaccard_dist = 1.0 - jaccard_sim
+        np.fill_diagonal(jaccard_dist, 0)  # Ensure diagonal is 0
+
+        # Hierarchical clustering (Ward's method on distances)
+        try:
+            # Convert to condensed form for linkage
+            condensed_dist = squareform(jaccard_dist, checks=False)
+            Z = linkage(condensed_dist, method='average')
+
+            # Cut at different levels and measure POS purity
+            purities = {}
+            for n_clusters in [3, 5, 8, 10]:
+                if n_clusters >= len(content_masks):
+                    continue
+                cluster_labels = fcluster(Z, n_clusters, criterion='maxclust')
+
+                # Compute POS purity per cluster
+                cluster_purities = []
+                for c in range(1, n_clusters + 1):
+                    c_mask = cluster_labels == c
+                    if c_mask.sum() == 0:
+                        continue
+                    c_labels = content_labels[c_mask]
+                    _, counts = np.unique(c_labels, return_counts=True)
+                    cluster_purities.append(counts.max() / counts.sum())
+
+                purities[n_clusters] = float(np.mean(cluster_purities)) if cluster_purities else 0
+
+            # POS separation quality
+            pos_separation = {}
+            for pos_idx in content_pos_indices:
+                pos_name = UPOS_TAGS[pos_idx]
+                pos_mask = content_labels == pos_idx
+                if pos_mask.sum() < 3:
+                    continue
+
+                # Within vs between POS distance
+                pos_dist = jaccard_dist[np.ix_(pos_mask, pos_mask)]
+                other_dist = jaccard_dist[np.ix_(pos_mask, ~pos_mask)]
+
+                within_mean = pos_dist[np.triu_indices_from(pos_dist, k=1)].mean()
+                between_mean = other_dist.mean() if other_dist.size > 0 else 0
+
+                pos_separation[pos_name] = {
+                    'within_dist': float(within_mean),
+                    'between_dist': float(between_mean),
+                    'separation': float(between_mean - within_mean),
+                    'n_samples': int(pos_mask.sum()),
+                }
+
+            return {
+                'n_samples': len(content_masks),
+                'cluster_purities': purities,
+                'pos_separation': pos_separation,
+                '_linkage': Z,  # For dendrogram plotting
+                '_labels': content_labels,
+            }
+        except Exception as e:
+            return {'error': str(e)}
 
     def print_summary(self, results: Dict):
         """Print analysis summary."""
@@ -1917,34 +2101,51 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             print(f"│  Mean within-POS:  {pos_sim.get('mean_within', 0):.4f}")
             print(f"│  Mean between-POS: {pos_sim.get('mean_between', 0):.4f}")
             print(f"│  Separation:       {pos_sim.get('separation', 0):.4f}")
-            print(f"│")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
 
-            within = pos_sim.get('within_pos', {})
-            if within:
-                print(f"│  Within-POS similarity (higher = more consistent):")
-                sorted_within = sorted(within.items(), key=lambda x: -x[1]['mean'])[:8]
-                for pos, data in sorted_within:
-                    print(f"│    {pos:<8} {data['mean']:.4f} ± {data['std']:.3f}")
+        # Layer divergence
+        layer_div = results.get('layer_divergence')
+        if layer_div and layer_div.get('per_token'):
+            print(f"\n┌─ Layer Divergence (same token across layers) ─────────────────────────┐")
+            print(f"│  Mean divergence (L0 - Lmax): {layer_div.get('mean_divergence', 0):.4f}")
+            print(f"│")
+            print(f"│  {'Token':<10} {'L0 sim':>8} {'Lmax sim':>9} {'Divergence':>11}")
+            print(f"│  {'─'*10} {'─'*8} {'─'*9} {'─'*11}")
+
+            for token, data in list(layer_div['per_token'].items())[:8]:
+                sims = data['similarities']
+                l0 = sims[0] if sims[0] is not None else 0
+                lmax = sims[-1] if sims[-1] is not None else 0
+                div = data['divergence'] if data['divergence'] is not None else 0
+                print(f"│  {token:<10} {l0:>8.3f} {lmax:>9.3f} {div:>+11.3f}")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+
+        # Content hierarchy
+        hierarchy = results.get('content_hierarchy', {})
+        if hierarchy and not hierarchy.get('error'):
+            print(f"\n┌─ Content Word Hierarchy (NOUN/VERB/ADJ) ──────────────────────────────┐")
+            print(f"│  Samples: {hierarchy.get('n_samples', 0)}")
+
+            purities = hierarchy.get('cluster_purities', {})
+            if purities:
+                print(f"│  Cluster purity by k:")
+                for k, p in sorted(purities.items()):
+                    print(f"│    k={k}: {p:.3f}")
+
+            pos_sep = hierarchy.get('pos_separation', {})
+            if pos_sep:
+                print(f"│")
+                print(f"│  POS separation (between - within distance):")
+                for pos, data in pos_sep.items():
+                    print(f"│    {pos:<6} sep={data['separation']:>+.3f} (n={data['n_samples']})")
             print(f"└───────────────────────────────────────────────────────────────────────┘")
 
         # Content vs Function
         content = results.get('content_analysis', {})
         if content:
             print(f"\n┌─ Content vs Function Words ───────────────────────────────────────────┐")
-            print(f"│  Content word activation density:  {content.get('content_word_density', 0):.4f} ({content.get('n_content', 0)} tokens)")
-            print(f"│  Function word activation density: {content.get('function_word_density', 0):.4f} ({content.get('n_function', 0)} tokens)")
-            print(f"│")
-            print(f"│  Content words - whole vs partial:")
-            print(f"│    Whole words:   {content.get('whole_word_density', 0):.4f} ({content.get('n_whole_content', 0)} tokens)")
-            print(f"│    Partial words: {content.get('partial_word_density', 0):.4f} ({content.get('n_partial_content', 0)} tokens)")
-            print(f"└───────────────────────────────────────────────────────────────────────┘")
-
-        # Token stats
-        stats = results.get('token_stats', {})
-        if stats:
-            print(f"\n┌─ Activation Statistics ───────────────────────────────────────────────┐")
-            print(f"│  Mean active neurons per token: {stats.get('mean_active_neurons', 0):.1f} / {stats.get('total_neurons', 0)}")
-            print(f"│  Std active neurons: {stats.get('std_active_neurons', 0):.1f}")
+            print(f"│  Content word density:  {content.get('content_word_density', 0):.4f} ({content.get('n_content', 0)} tokens)")
+            print(f"│  Function word density: {content.get('function_word_density', 0):.4f} ({content.get('n_function', 0)} tokens)")
             print(f"└───────────────────────────────────────────────────────────────────────┘")
 
         print("\n" + "=" * 70)
@@ -1954,20 +2155,21 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         os.makedirs(output_dir, exist_ok=True)
         paths = {}
 
-        # 1. POS similarity heatmap
         path = self._plot_pos_similarity_heatmap(results, os.path.join(output_dir, 'pos_jaccard_heatmap.png'))
         if path:
             paths['pos_similarity_heatmap'] = path
 
-        # 2. Silhouette per POS
         path = self._plot_silhouette_per_pos(results, os.path.join(output_dir, 'silhouette_per_pos.png'))
         if path:
             paths['silhouette_per_pos'] = path
 
-        # 3. Content vs Function comparison
-        path = self._plot_content_vs_function(results, os.path.join(output_dir, 'content_vs_function.png'))
+        path = self._plot_layer_divergence(results, os.path.join(output_dir, 'layer_divergence.png'))
         if path:
-            paths['content_vs_function'] = path
+            paths['layer_divergence'] = path
+
+        path = self._plot_content_dendrogram(results, os.path.join(output_dir, 'content_dendrogram.png'))
+        if path:
+            paths['content_dendrogram'] = path
 
         return paths
 
@@ -1987,7 +2189,6 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         if not within:
             return None
 
-        # Build matrix
         active_pos = list(within.keys())
         n = len(active_pos)
 
@@ -2009,7 +2210,6 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         ax.set_yticklabels(active_pos)
         ax.set_title('POS Jaccard Similarity\n(diagonal=within, off-diagonal=between)')
 
-        # Add values
         for i in range(n):
             for j in range(n):
                 ax.text(j, i, f'{sim_matrix[i, j]:.2f}', ha='center', va='center',
@@ -2044,7 +2244,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         scores = [p[1] for p in sorted_pos]
 
         colors = ['green' if s > 0 else 'red' for s in scores]
-        bars = ax.barh(range(len(pos_names)), scores, color=colors, alpha=0.7)
+        ax.barh(range(len(pos_names)), scores, color=colors, alpha=0.7)
         ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
         ax.axvline(x=sil.get('score', 0), color='blue', linestyle='--', linewidth=2,
                    label=f"Overall: {sil.get('score', 0):.3f}")
@@ -2052,7 +2252,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         ax.set_yticks(range(len(pos_names)))
         ax.set_yticklabels(pos_names)
         ax.set_xlabel('Silhouette Score')
-        ax.set_title('Silhouette Score per POS\n(higher = better cluster separation)')
+        ax.set_title('Silhouette Score per POS')
         ax.legend()
         ax.set_xlim(-0.5, 0.5)
 
@@ -2062,8 +2262,8 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         return output_path
 
-    def _plot_content_vs_function(self, results: Dict, output_path: str) -> Optional[str]:
-        """Plot content vs function word analysis."""
+    def _plot_layer_divergence(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot layer divergence curves."""
         try:
             import matplotlib.pyplot as plt
             import matplotlib
@@ -2071,39 +2271,77 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         except ImportError:
             return None
 
-        content = results.get('content_analysis', {})
-        if not content:
+        layer_div = results.get('layer_divergence')
+        if not layer_div or not layer_div.get('per_token'):
             return None
 
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        fig, ax = plt.subplots(figsize=(10, 6))
 
-        # Left: Content vs Function
-        ax = axes[0]
-        categories = ['Content\nWords', 'Function\nWords']
-        densities = [content.get('content_word_density', 0), content.get('function_word_density', 0)]
-        counts = [content.get('n_content', 0), content.get('n_function', 0)]
+        for token, data in layer_div['per_token'].items():
+            sims = data['similarities']
+            layers = data['layer_indices']
+            valid = [(l, s) for l, s in zip(layers, sims) if s is not None]
+            if len(valid) >= 2:
+                ls, ss = zip(*valid)
+                ax.plot(ls, ss, 'o-', label=f"'{token}' (n={data['n_occurrences']})", alpha=0.7)
 
-        bars = ax.bar(categories, densities, color=['steelblue', 'coral'])
-        ax.set_ylabel('Activation Density')
-        ax.set_title('Activation Density by Word Type')
+        ax.set_xlabel('Layer')
+        ax.set_ylabel('Within-token Jaccard Similarity')
+        ax.set_title('Layer Divergence: Same Token Similarity Across Layers\n(decreasing = context specialization)')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
 
-        for bar, count in zip(bars, counts):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                    f'n={count}', ha='center', fontsize=10)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
 
-        # Right: Whole vs Partial (content words only)
-        ax = axes[1]
-        categories = ['Whole\nWords', 'Partial\n(subword)']
-        densities = [content.get('whole_word_density', 0), content.get('partial_word_density', 0)]
-        counts = [content.get('n_whole_content', 0), content.get('n_partial_content', 0)]
+        return output_path
 
-        bars = ax.bar(categories, densities, color=['darkgreen', 'lightgreen'])
-        ax.set_ylabel('Activation Density')
-        ax.set_title('Content Words: Whole vs Partial')
+    def _plot_content_dendrogram(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot content word dendrogram."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+            from scipy.cluster.hierarchy import dendrogram
+        except ImportError:
+            return None
 
-        for bar, count in zip(bars, counts):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                    f'n={count}', ha='center', fontsize=10)
+        hierarchy = results.get('content_hierarchy', {})
+        if not hierarchy or hierarchy.get('error') or '_linkage' not in hierarchy:
+            return None
+
+        Z = hierarchy['_linkage']
+        labels = hierarchy['_labels']
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+
+        # Color by POS
+        label_colors = {
+            POS_TO_IDX.get('NOUN', -1): 'blue',
+            POS_TO_IDX.get('VERB', -1): 'red',
+            POS_TO_IDX.get('ADJ', -1): 'green',
+        }
+
+        dendrogram(
+            Z, ax=ax,
+            leaf_rotation=90,
+            leaf_font_size=6,
+            color_threshold=0.7 * max(Z[:, 2]),
+        )
+
+        ax.set_xlabel('Token Index')
+        ax.set_ylabel('Jaccard Distance')
+        ax.set_title('Content Word Hierarchical Clustering (NOUN/VERB/ADJ)')
+
+        # Add legend for POS
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='blue', label='NOUN'),
+            Patch(facecolor='red', label='VERB'),
+            Patch(facecolor='green', label='ADJ'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper right')
 
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -2117,6 +2355,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         max_sentences: int = 2000,
         split: str = 'train',
         data_path: str = None,
+        analyze_layer_divergence: bool = True,
     ) -> Dict:
         """
         Run full token combination analysis.
@@ -2126,32 +2365,26 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             max_sentences: Maximum sentences to process
             split: Dataset split ('train', 'dev', 'test')
             data_path: Path to local conllu file
+            analyze_layer_divergence: Whether to analyze layer divergence
 
         Returns:
             Analysis results dictionary
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # Load dataset
         dataset = self.load_ud_dataset(split, max_sentences, data_path)
+        results = self.analyze_dataset(dataset, max_sentences, analyze_layer_divergence)
 
-        # Analyze
-        results = self.analyze_dataset(dataset, max_sentences)
-
-        # Print summary
         self.print_summary(results)
 
-        # Remove internal data before saving JSON
         results_for_json = {
             k: v for k, v in results.items()
             if not k.startswith('_')
         }
 
-        # Visualize
         viz_paths = self.visualize(results, output_dir)
         results_for_json['visualizations'] = viz_paths
 
-        # Save results
         import json
         results_path = os.path.join(output_dir, 'token_combination_analysis.json')
         with open(results_path, 'w') as f:
