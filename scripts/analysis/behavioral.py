@@ -579,9 +579,13 @@ class BehavioralAnalyzer(BaseAnalyzer):
             sample_generations = []
 
             # Show prompt being processed
-            print(f"\n    [{prompt_idx+1}/{len(prompts)}] \"{prompt}\" → target: \"{target}\"")
+            print(f"\n    [{prompt_idx+1}/{len(prompts)}] \"{prompt}\" → target: \"{target}\"", flush=True)
 
             for run_idx in range(n_runs):
+                # Progress at start of each run (first few runs for debugging)
+                if run_idx < 3:
+                    print(f"      Starting run {run_idx+1}...", flush=True)
+
                 # Encode prompt
                 input_ids = self.tokenizer.encode(
                     prompt, add_special_tokens=False, return_tensors='pt'
@@ -597,9 +601,15 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         # Forward pass with routing info
                         outputs = self.model(generated, return_routing_info=True)
 
+                        # Debug on first step of first run
+                        if run_idx == 0 and step == 0:
+                            print(f"      [Debug] output type: {type(outputs)}, len: {len(outputs) if isinstance(outputs, tuple) else 'N/A'}", flush=True)
+
                         if isinstance(outputs, tuple) and len(outputs) >= 2:
                             logits = outputs[0]
                             routing = self.extractor.extract(outputs)
+                            if run_idx == 0 and step == 0:
+                                print(f"      [Debug] routing layers: {len(routing) if routing else 0}", flush=True)
                         else:
                             logits = outputs
                             routing = None
@@ -673,6 +683,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 gen_text = self.tokenizer.decode(generated[0], skip_special_tokens=True)
                 if run_idx == 0:
                     first_predicted_text = gen_text
+                    # Show first generation
+                    print(f"      First gen: \"{gen_text[:60]}...\"", flush=True)
                 if found_target and len(sample_generations) < 3:
                     sample_generations.append({
                         'text': gen_text,
@@ -683,12 +695,13 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 if (run_idx + 1) % 10 == 0 or run_idx == n_runs - 1:
                     match_pct = matching_runs / (run_idx + 1) * 100
                     status = f"✓{matching_runs}" if matching_runs > 0 else "✗"
-                    print(f"      Run {run_idx+1:3d}/{n_runs}: {status} ({match_pct:.0f}% match rate)", end='\r')
+                    print(f"      Run {run_idx+1:3d}/{n_runs}: {status} ({match_pct:.0f}% match)", flush=True)
 
             # Final summary for this prompt
             match_pct = matching_runs / n_runs * 100
             n_unique = len(target_neuron_counts)
-            print(f"      Completed: {matching_runs}/{n_runs} found ({match_pct:.0f}%), {n_unique} unique neurons")
+            print(f"      ─────────────────────────────────────────────────────", flush=True)
+            print(f"      Done: {matching_runs}/{n_runs} found ({match_pct:.0f}%), {n_unique} unique neurons", flush=True)
 
             # Compute contrastive scores
             # Score = (freq in target) - (freq in baseline)
