@@ -65,7 +65,7 @@ CLI Arguments:
         --only            Run only specific analyses (comma-separated)
                           Options: model_info,performance,health,routing,embedding,
                                    neuron_embedding,semantic,pos,token_combination,
-                                   layerwise_semantic,factual,behavioral,
+                                   neuron_features,layerwise_semantic,factual,behavioral,
                                    coselection,weight,v18,paper,report
 
     Analysis Parameters:
@@ -1126,6 +1126,68 @@ class ModelAnalyzer:
         self.results['token_combination'] = results
         return results
 
+    def analyze_neuron_features(self, max_sentences: int = 2000, target_layer: int = None) -> Dict:
+        """Analyze neuron-centric features (DAWN only).
+
+        Inverts the token->neuron perspective to analyze what features each neuron responds to.
+
+        Analyzes per neuron:
+        - POS distribution of activating tokens
+        - Sentence position distribution
+        - Token frequency (high/med/low)
+        - Subword position (word-initial vs continuation)
+        - Next token POS patterns
+
+        Args:
+            max_sentences: Number of sentences to analyze (default: 2000)
+            target_layer: Specific layer to analyze (default: None = all layers)
+
+        Returns:
+            Dict with neuron profiles, specialized neurons, clusters
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer, NeuronFeatureAnalyzer
+
+        output_dir = self.output_dir / 'neuron_features'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
+        print(f"  Analyzing neuron features ({max_sentences} sentences, {layer_str})...")
+
+        # First collect token data
+        tca = TokenCombinationAnalyzer(
+            self.model, tokenizer=self.tokenizer, device=self.device,
+            target_layer=target_layer
+        )
+        dataset = tca.load_ud_dataset('train', max_sentences)
+        tca.analyze_dataset(dataset, max_sentences=max_sentences, analyze_layer_divergence=False)
+
+        # Then run neuron feature analysis
+        nfa = NeuronFeatureAnalyzer.from_token_combination_analyzer(tca)
+        results = nfa.run_full_analysis(output_dir=str(output_dir))
+
+        # Print key metrics
+        specialized = results.get('specialized_neurons', {})
+        clusters = results.get('clusters', {})
+
+        print(f"\n  ┌─ Neuron Feature Analysis Results ─────────────────────────────────────")
+        print(f"  │ Neurons profiled: {results.get('n_neurons_profiled', 0)}")
+        print(f"  │")
+        print(f"  │ Specialized neurons (80%+ concentration):")
+        for feature, neurons in specialized.items():
+            if neurons:
+                print(f"  │   {feature:12s}: {len(neurons)} neurons")
+        print(f"  │")
+        if clusters.get('silhouette_score'):
+            print(f"  │ Cluster silhouette: {clusters['silhouette_score']:.4f}")
+        print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        self.results['neuron_features'] = results
+        return results
+
     def analyze_layerwise_semantic(self, max_sentences: int = 500) -> Dict:
         """Analyze layer-wise semantic emergence (DAWN only).
 
@@ -1783,6 +1845,7 @@ class ModelAnalyzer:
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
             ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type, 'target_layer': self.target_layer}),
             ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
+            ('neuron_features', self.analyze_neuron_features, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('layerwise_semantic', self.analyze_layerwise_semantic, {'max_sentences': self.max_sentences // 4}),
             ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
@@ -2234,7 +2297,7 @@ Examples:
 
     # Analysis mode
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
-    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: model_info,performance,health,routing,embedding,semantic,pos,token_combination,layerwise_semantic,factual,behavioral,coselection,weight,v18,paper,report)')
+    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: model_info,performance,health,routing,embedding,semantic,pos,token_combination,neuron_features,layerwise_semantic,factual,behavioral,coselection,weight,v18,paper,report)')
 
     # Analysis parameters
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
