@@ -1531,6 +1531,10 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
     - Analyzes layer-wise divergence for same tokens
     """
 
+    # Class-level cache for GloVe embeddings (shared across all instances)
+    _glove_cache = None
+    _glove_cache_dim = None
+
     def __init__(
         self,
         model,
@@ -2822,12 +2826,20 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         """
         Load GloVe embeddings via gensim (auto-downloads and caches).
 
+        Uses class-level cache to avoid reloading across layers/instances.
+
         Args:
             dim: Embedding dimension (50, 100, 200, 300)
 
         Returns:
             Dict mapping words to embedding vectors, or None
         """
+        # Check class-level cache first
+        if (TokenCombinationAnalyzer._glove_cache is not None and
+            TokenCombinationAnalyzer._glove_cache_dim == dim):
+            print(f"    Using cached GloVe-{dim}d embeddings")
+            return TokenCombinationAnalyzer._glove_cache
+
         try:
             import gensim.downloader as api
             print(f"    Loading GloVe-{dim}d via gensim (auto-download if needed)...")
@@ -2836,6 +2848,11 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             # Convert to dict for fast lookup
             embeddings = {word: model[word] for word in model.key_to_index}
             print(f"    Loaded {len(embeddings):,} word embeddings")
+
+            # Cache at class level
+            TokenCombinationAnalyzer._glove_cache = embeddings
+            TokenCombinationAnalyzer._glove_cache_dim = dim
+
             return embeddings
         except Exception as e:
             print(f"    GloVe loading failed: {e}")
