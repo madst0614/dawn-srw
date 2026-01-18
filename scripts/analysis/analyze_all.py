@@ -64,7 +64,8 @@ CLI Arguments:
         --paper-only      Generate paper outputs only (faster)
         --only            Run only specific analyses (comma-separated)
                           Options: model_info,performance,health,routing,embedding,
-                                   neuron_embedding,semantic,pos,factual,behavioral,
+                                   neuron_embedding,semantic,pos,token_combination,
+                                   layerwise_semantic,factual,behavioral,
                                    coselection,weight,v18,paper,report
 
     Analysis Parameters:
@@ -1782,6 +1783,7 @@ class ModelAnalyzer:
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
             ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type, 'target_layer': self.target_layer}),
             ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
+            ('layerwise_semantic', self.analyze_layerwise_semantic, {'max_sentences': self.max_sentences // 4}),
             ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
@@ -2232,7 +2234,7 @@ Examples:
 
     # Analysis mode
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
-    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: model_info,performance,health,routing,embedding,semantic,pos,factual,behavioral,coselection,weight,v18,paper,report)')
+    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: model_info,performance,health,routing,embedding,semantic,pos,token_combination,layerwise_semantic,factual,behavioral,coselection,weight,v18,paper,report)')
 
     # Analysis parameters
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')
