@@ -1065,6 +1065,66 @@ class ModelAnalyzer:
         self.results['pos'] = results
         return results
 
+    def analyze_token_combination(self, max_sentences: int = 2000, target_layer: int = None,
+                                   activation_threshold: float = 1e-6) -> Dict:
+        """Analyze token-based neuron combinations (DAWN only).
+
+        Token-centric analysis: which neuron combinations each token activates.
+        Uses Jaccard similarity and silhouette score to measure POS clustering quality.
+
+        Args:
+            max_sentences: Number of sentences to analyze (default: 2000)
+                - 500: Quick test (~2 min)
+                - 2000: Standard analysis (~8 min)
+                - 5000+: Comprehensive analysis
+            target_layer: Specific layer to analyze (default: None = all layers majority vote)
+                - 0-11: Specific layer index
+                - None: Majority vote across all layers
+            activation_threshold: Threshold for binary activation (default: 1e-6)
+                - 1e-6: Include all non-zero weights
+                - 0.01: Only strong activations
+                - 0.1: Only very strong activations
+
+        Returns:
+            Dict with silhouette score, Jaccard similarities, content/function analysis
+        """
+        if self.model_type != 'dawn':
+            print("  Skipping (not DAWN model)")
+            return {}
+
+        from scripts.analysis.pos_neuron import TokenCombinationAnalyzer
+
+        output_dir = self.output_dir / 'token_combination'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        layer_str = f"layer={target_layer}" if target_layer is not None else "all layers"
+        print(f"  Analyzing token neuron combinations ({max_sentences} sentences, {layer_str})...")
+
+        analyzer = TokenCombinationAnalyzer(
+            self.model, tokenizer=self.tokenizer, device=self.device,
+            target_layer=target_layer, activation_threshold=activation_threshold
+        )
+        results = analyzer.run_all(str(output_dir), max_sentences=max_sentences)
+
+        # Print key metrics
+        sil = results.get('silhouette_score', {})
+        pos_sim = results.get('pos_similarity', {})
+
+        if sil.get('score') is not None:
+            print(f"\n  ┌─ Token Combination Results ────────────────────────────────────────────")
+            print(f"  │ Silhouette Score: {sil['score']:.4f}  (target: > 0.3)")
+            print(f"  │ Samples: {sil.get('n_samples', 0)}, POS categories: {sil.get('n_pos_categories', 0)}")
+            if pos_sim:
+                print(f"  │")
+                print(f"  │ Jaccard Similarity:")
+                print(f"  │   Within-POS mean:  {pos_sim.get('mean_within', 0):.4f}")
+                print(f"  │   Between-POS mean: {pos_sim.get('mean_between', 0):.4f}")
+                print(f"  │   Separation:       {pos_sim.get('separation', 0):.4f}")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        self.results['token_combination'] = results
+        return results
+
     def analyze_factual(self, n_runs: int = 10, pool_type: str = 'fv') -> Dict:
         """Analyze factual knowledge neurons (DAWN only).
 
@@ -1674,6 +1734,7 @@ class ModelAnalyzer:
             ('neuron_embedding', self.analyze_neuron_embedding, {'n_batches': self.n_batches // 2}),
             ('semantic', self.analyze_semantic, {'n_batches': self.n_batches // 2}),
             ('pos', self.analyze_pos, {'max_sentences': self.max_sentences, 'pool_type': self.pool_type, 'target_layer': self.target_layer}),
+            ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('factual', self.analyze_factual, {'n_runs': self.n_runs, 'pool_type': self.pool_type}),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),

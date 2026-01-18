@@ -1389,3 +1389,773 @@ class POSNeuronAnalyzer(BaseAnalyzer):
         # Keep internal matrices in returned results for further analysis
         results['visualizations'] = viz_paths
         return results
+
+
+class TokenCombinationAnalyzer(BaseAnalyzer):
+    """
+    Token-based neuron combination analysis.
+
+    Instead of analyzing which POS each neuron prefers (neuron -> POS),
+    this analyzes which neuron combinations each token activates (token -> neurons).
+
+    Goal: Higher silhouette score by clustering tokens based on their
+    neuron activation patterns, expecting POS to emerge as natural clusters.
+
+    Key differences from POSNeuronAnalyzer:
+    - Collects per-token binary activation masks (not per-neuron weight sums)
+    - Concatenates all pools into single vector per token
+    - Uses Jaccard similarity for binary vectors
+    - Analyzes layer-wise divergence for same tokens
+    """
+
+    def __init__(
+        self,
+        model,
+        router=None,
+        tokenizer=None,
+        device: str = 'cuda',
+        target_layer: int = None,
+        activation_threshold: float = 1e-6,
+    ):
+        """
+        Initialize analyzer.
+
+        Args:
+            model: DAWN model
+            router: NeuronRouter (auto-detected if None)
+            tokenizer: Tokenizer instance
+            device: Device for computation
+            target_layer: Specific layer to analyze (None = all layers averaged)
+            activation_threshold: Threshold for binary activation (weight > threshold)
+        """
+        super().__init__(model, router=router, tokenizer=tokenizer, device=device)
+        self.extractor = RoutingDataExtractor(model, device=device)
+        self.target_layer = target_layer
+        self.activation_threshold = activation_threshold
+        self.model.eval()
+
+        # Get pool sizes for concatenation
+        self.pool_sizes = self._get_pool_sizes()
+        self.total_neurons = sum(self.pool_sizes.values())
+
+        # Storage for token activations
+        self.token_data = []  # List of {token_str, pos, mask, ...}
+
+    def _get_pool_sizes(self) -> Dict[str, int]:
+        """Get sizes of each pool for concatenation."""
+        sizes = {}
+        for attr, key in [
+            ('n_feature_qk', 'fqk'),
+            ('n_feature_v', 'fv'),
+            ('n_restore_qk', 'rqk'),
+            ('n_restore_v', 'rv'),
+            ('n_feature_know', 'fknow'),
+            ('n_restore_know', 'rknow'),
+        ]:
+            sizes[key] = getattr(self.router, attr, 0)
+        return sizes
+
+    def reset_stats(self):
+        """Reset collected token data."""
+        self.token_data = []
+
+    def load_ud_dataset(self, split: str = 'train', max_sentences: int = None,
+                        data_path: str = None) -> List[Dict]:
+        """Load UD dataset (reuse from POSNeuronAnalyzer)."""
+        # Create temporary POSNeuronAnalyzer to reuse its load function
+        temp = POSNeuronAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
+        return temp.load_ud_dataset(split, max_sentences, data_path)
+
+    def get_pos_for_tokens(self, ud_tokens: List[str], ud_pos: List[str]) -> Tuple[List[str], List[int]]:
+        """Map tokenizer tokens to POS tags (reuse from POSNeuronAnalyzer)."""
+        temp = POSNeuronAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
+        return temp.get_pos_for_tokens(ud_tokens, ud_pos)
+
+    def _is_whole_word(self, token_str: str) -> bool:
+        """Check if token represents a whole word (starts with space/Ġ)."""
+        if not token_str:
+            return False
+        # GPT-style tokenizers use 'Ġ' for word-initial tokens
+        # Other tokenizers may use '▁' or leading space
+        return token_str.startswith(('Ġ', '▁', ' ')) or token_str[0].isupper()
+
+    def extract_token_masks(
+        self,
+        token_ids: List[int],
+        pos_tags: List[str],
+    ) -> List[Dict]:
+        """
+        Extract binary activation masks for each token.
+
+        Args:
+            token_ids: List of token IDs
+            pos_tags: List of POS tags for each token
+
+        Returns:
+            List of {token_id, token_str, pos, mask, is_whole_word}
+        """
+        input_ids = torch.tensor([token_ids], device=self.device)
+        seq_len = len(token_ids)
+
+        with self.extractor.analysis_context():
+            with torch.no_grad():
+                outputs = self.model(input_ids, return_routing_info=True)
+
+            routing = self.extractor.extract(outputs)
+            if not routing:
+                return []
+
+        # Collect masks per layer
+        layer_masks = {}  # layer_idx -> [seq_len, total_neurons]
+
+        for layer in routing:
+            layer_idx = layer.layer_idx
+            if self.target_layer is not None and layer_idx != self.target_layer:
+                continue
+
+            # Concatenate all pools into single mask
+            masks = []
+
+            # Pool order: fqk_q, fqk_k, fv, rqk_q, rqk_k, rv, fknow, rknow
+            pool_keys = [
+                ('fqk_q', self.pool_sizes.get('fqk', 0)),
+                ('fqk_k', self.pool_sizes.get('fqk', 0)),
+                ('fv', self.pool_sizes.get('fv', 0)),
+                ('rqk_q', self.pool_sizes.get('rqk', 0)),
+                ('rqk_k', self.pool_sizes.get('rqk', 0)),
+                ('rv', self.pool_sizes.get('rv', 0)),
+                ('fknow', self.pool_sizes.get('fknow', 0)),
+                ('rknow', self.pool_sizes.get('rknow', 0)),
+            ]
+
+            for pool_key, expected_size in pool_keys:
+                if expected_size == 0:
+                    continue
+
+                weights = layer.get_weight(pool_key)
+                if weights is None:
+                    # Fill with zeros if not available
+                    mask = np.zeros((seq_len, expected_size), dtype=np.bool_)
+                else:
+                    # weights: [B, T, N] or [B, N]
+                    if weights.dim() == 3:
+                        w = weights[0].cpu().numpy()  # [T, N]
+                    else:
+                        w = weights[0].unsqueeze(0).expand(seq_len, -1).cpu().numpy()
+
+                    # Adjust dimensions
+                    if w.shape[0] > seq_len:
+                        w = w[:seq_len]
+                    elif w.shape[0] < seq_len:
+                        pad = np.zeros((seq_len - w.shape[0], w.shape[1]), dtype=np.float32)
+                        w = np.vstack([w, pad])
+
+                    # Binary mask
+                    mask = w > self.activation_threshold
+
+                masks.append(mask)
+
+            if masks:
+                layer_masks[layer_idx] = np.concatenate(masks, axis=-1)  # [seq_len, total]
+
+        if not layer_masks:
+            return []
+
+        # Average across layers (majority vote for binary)
+        if self.target_layer is not None:
+            combined_mask = layer_masks.get(self.target_layer)
+            if combined_mask is None:
+                return []
+        else:
+            # Stack and take majority vote
+            all_masks = np.stack(list(layer_masks.values()), axis=0)  # [n_layers, seq, neurons]
+            combined_mask = (all_masks.mean(axis=0) > 0.5)  # Majority vote
+
+        # Build token data
+        results = []
+        for i in range(min(seq_len, len(pos_tags))):
+            token_str = self.tokenizer.decode([token_ids[i]])
+            results.append({
+                'token_id': token_ids[i],
+                'token_str': token_str,
+                'pos': pos_tags[i],
+                'mask': combined_mask[i],  # [total_neurons] bool
+                'is_whole_word': self._is_whole_word(token_str),
+                'n_active': int(combined_mask[i].sum()),
+            })
+
+        return results
+
+    def analyze_sentence(self, ud_tokens: List[str], ud_pos: List[str]):
+        """Analyze a single sentence and collect token activations."""
+        try:
+            pos_tags, token_ids = self.get_pos_for_tokens(ud_tokens, ud_pos)
+        except Exception:
+            return
+
+        if not token_ids:
+            return
+
+        token_masks = self.extract_token_masks(token_ids, pos_tags)
+        self.token_data.extend(token_masks)
+
+    def analyze_dataset(self, dataset: List[Dict], max_sentences: int = None) -> Dict:
+        """
+        Analyze full dataset.
+
+        Args:
+            dataset: List of {'tokens': [...], 'upos': [...]}
+            max_sentences: Maximum sentences to process
+
+        Returns:
+            Analysis results dictionary
+        """
+        self.reset_stats()
+        n_sentences = min(len(dataset), max_sentences) if max_sentences else len(dataset)
+
+        print(f"\nCollecting token activations from {n_sentences} sentences...")
+        print(f"Activation threshold: {self.activation_threshold}")
+        print(f"Layer: {self.target_layer if self.target_layer is not None else 'all (majority vote)'}")
+
+        for i in tqdm(range(n_sentences), desc="Processing"):
+            example = dataset[i]
+            try:
+                self.analyze_sentence(example['tokens'], example['upos'])
+            except Exception:
+                continue
+
+        print(f"Collected {len(self.token_data)} tokens")
+        return self.compute_results()
+
+    def _compute_jaccard_matrix(self, masks: np.ndarray) -> np.ndarray:
+        """
+        Compute pairwise Jaccard similarity matrix.
+
+        Args:
+            masks: [n_samples, n_features] boolean array
+
+        Returns:
+            [n_samples, n_samples] Jaccard similarity matrix
+        """
+        n = masks.shape[0]
+
+        # Vectorized: intersection = A @ B.T, union = |A| + |B| - intersection
+        # For boolean, sum gives count
+        masks_float = masks.astype(np.float32)
+        intersection = masks_float @ masks_float.T  # [n, n]
+
+        # |A| for each sample
+        counts = masks.sum(axis=1).reshape(-1, 1)  # [n, 1]
+
+        # Union = |A| + |B| - intersection
+        union = counts + counts.T - intersection
+
+        # Jaccard = intersection / union
+        with np.errstate(divide='ignore', invalid='ignore'):
+            jaccard = np.where(union > 0, intersection / union, 0.0)
+
+        return jaccard
+
+    def compute_results(self) -> Dict:
+        """Compute all analysis results."""
+        if not self.token_data:
+            return {'error': 'No token data collected'}
+
+        # Build arrays
+        masks = np.array([t['mask'] for t in self.token_data])  # [n_tokens, n_neurons]
+        pos_labels = np.array([POS_TO_IDX.get(t['pos'], -1) for t in self.token_data])
+        is_whole_word = np.array([t['is_whole_word'] for t in self.token_data])
+
+        # Filter valid POS
+        valid_mask = pos_labels >= 0
+        masks = masks[valid_mask]
+        pos_labels = pos_labels[valid_mask]
+        is_whole_word = is_whole_word[valid_mask]
+
+        n_tokens = len(masks)
+        print(f"\nAnalyzing {n_tokens} tokens with valid POS tags...")
+
+        # 1. POS-based similarity analysis
+        pos_similarity = self._compute_pos_similarity(masks, pos_labels)
+
+        # 2. Silhouette score
+        silhouette = self._compute_silhouette(masks, pos_labels)
+
+        # 3. Content vs Function word analysis
+        content_analysis = self._analyze_content_vs_function(masks, pos_labels, is_whole_word)
+
+        # 4. Token statistics
+        token_stats = self._compute_token_stats()
+
+        return {
+            'n_tokens': n_tokens,
+            'n_neurons': masks.shape[1] if len(masks) > 0 else 0,
+            'pos_similarity': pos_similarity,
+            'silhouette_score': silhouette,
+            'content_analysis': content_analysis,
+            'token_stats': token_stats,
+            '_masks': masks,
+            '_pos_labels': pos_labels,
+            '_is_whole_word': is_whole_word,
+        }
+
+    def _compute_pos_similarity(self, masks: np.ndarray, pos_labels: np.ndarray) -> Dict:
+        """Compute within-POS and between-POS Jaccard similarity."""
+        unique_pos = np.unique(pos_labels)
+
+        # Sample for efficiency if too many tokens
+        max_per_pos = 200
+        sampled_masks = []
+        sampled_labels = []
+
+        for pos_idx in unique_pos:
+            pos_mask = pos_labels == pos_idx
+            pos_indices = np.where(pos_mask)[0]
+
+            if len(pos_indices) > max_per_pos:
+                pos_indices = np.random.choice(pos_indices, max_per_pos, replace=False)
+
+            sampled_masks.append(masks[pos_indices])
+            sampled_labels.extend([pos_idx] * len(pos_indices))
+
+        if not sampled_masks:
+            return {}
+
+        sampled_masks = np.vstack(sampled_masks)
+        sampled_labels = np.array(sampled_labels)
+
+        # Compute Jaccard matrix
+        print("  Computing Jaccard similarity matrix...")
+        jaccard = self._compute_jaccard_matrix(sampled_masks)
+
+        # Within-POS similarity (diagonal blocks)
+        within_sim = {}
+        for pos_idx in unique_pos:
+            pos_name = UPOS_TAGS[pos_idx]
+            mask = sampled_labels == pos_idx
+            if mask.sum() < 2:
+                continue
+
+            pos_jaccard = jaccard[np.ix_(mask, mask)]
+            # Upper triangle excluding diagonal
+            triu_idx = np.triu_indices_from(pos_jaccard, k=1)
+            within_values = pos_jaccard[triu_idx]
+
+            if len(within_values) > 0:
+                within_sim[pos_name] = {
+                    'mean': float(np.mean(within_values)),
+                    'std': float(np.std(within_values)),
+                    'n_pairs': len(within_values),
+                }
+
+        # Between-POS similarity (off-diagonal blocks)
+        between_sim = {}
+        for i, pos_i in enumerate(unique_pos):
+            for pos_j in unique_pos[i+1:]:
+                pos_name_i = UPOS_TAGS[pos_i]
+                pos_name_j = UPOS_TAGS[pos_j]
+
+                mask_i = sampled_labels == pos_i
+                mask_j = sampled_labels == pos_j
+
+                if mask_i.sum() == 0 or mask_j.sum() == 0:
+                    continue
+
+                between_jaccard = jaccard[np.ix_(mask_i, mask_j)]
+                between_values = between_jaccard.flatten()
+
+                if len(between_values) > 0:
+                    between_sim[f"{pos_name_i}-{pos_name_j}"] = {
+                        'mean': float(np.mean(between_values)),
+                        'std': float(np.std(between_values)),
+                    }
+
+        # Summary: mean within vs mean between
+        all_within = [v['mean'] for v in within_sim.values()]
+        all_between = [v['mean'] for v in between_sim.values()]
+
+        return {
+            'within_pos': within_sim,
+            'between_pos': between_sim,
+            'mean_within': float(np.mean(all_within)) if all_within else 0.0,
+            'mean_between': float(np.mean(all_between)) if all_between else 0.0,
+            'separation': float(np.mean(all_within) - np.mean(all_between)) if all_within and all_between else 0.0,
+        }
+
+    def _compute_silhouette(self, masks: np.ndarray, pos_labels: np.ndarray) -> Dict:
+        """Compute silhouette score using Jaccard distance."""
+        try:
+            from sklearn.metrics import silhouette_score, silhouette_samples
+            HAS_SKLEARN = True
+        except ImportError:
+            HAS_SKLEARN = False
+            return {'score': None, 'error': 'sklearn not available'}
+
+        # Filter to POS with enough samples
+        unique_pos, counts = np.unique(pos_labels, return_counts=True)
+        valid_pos = unique_pos[counts >= 5]
+
+        if len(valid_pos) < 2:
+            return {'score': None, 'error': 'Not enough POS categories with 5+ samples'}
+
+        # Filter to valid POS only
+        valid_mask = np.isin(pos_labels, valid_pos)
+        filtered_masks = masks[valid_mask]
+        filtered_labels = pos_labels[valid_mask]
+
+        # Sample if too large
+        max_samples = 2000
+        if len(filtered_masks) > max_samples:
+            indices = np.random.choice(len(filtered_masks), max_samples, replace=False)
+            filtered_masks = filtered_masks[indices]
+            filtered_labels = filtered_labels[indices]
+
+        # Compute Jaccard distance matrix (1 - similarity)
+        print("  Computing silhouette score...")
+        jaccard_sim = self._compute_jaccard_matrix(filtered_masks)
+        jaccard_dist = 1.0 - jaccard_sim
+
+        # Silhouette with precomputed distance
+        try:
+            score = silhouette_score(jaccard_dist, filtered_labels, metric='precomputed')
+            samples = silhouette_samples(jaccard_dist, filtered_labels, metric='precomputed')
+
+            # Per-POS silhouette
+            per_pos = {}
+            for pos_idx in valid_pos:
+                pos_name = UPOS_TAGS[pos_idx]
+                pos_mask = filtered_labels == pos_idx
+                if pos_mask.sum() > 0:
+                    per_pos[pos_name] = float(np.mean(samples[pos_mask]))
+
+            return {
+                'score': float(score),
+                'per_pos': per_pos,
+                'n_samples': len(filtered_masks),
+                'n_pos_categories': len(valid_pos),
+            }
+        except Exception as e:
+            return {'score': None, 'error': str(e)}
+
+    def _analyze_content_vs_function(self, masks: np.ndarray, pos_labels: np.ndarray,
+                                      is_whole_word: np.ndarray) -> Dict:
+        """Analyze content words vs function words."""
+        content_pos = [POS_TO_IDX[p] for p in POS_GROUPS['Content Words'] if p in POS_TO_IDX]
+        function_pos = [POS_TO_IDX[p] for p in POS_GROUPS['Function Words'] if p in POS_TO_IDX]
+
+        content_mask = np.isin(pos_labels, content_pos)
+        function_mask = np.isin(pos_labels, function_pos)
+
+        # Mean activation density
+        content_density = masks[content_mask].mean() if content_mask.sum() > 0 else 0
+        function_density = masks[function_mask].mean() if function_mask.sum() > 0 else 0
+
+        # Whole word analysis for content words
+        content_whole = content_mask & is_whole_word
+        content_partial = content_mask & ~is_whole_word
+
+        whole_density = masks[content_whole].mean() if content_whole.sum() > 0 else 0
+        partial_density = masks[content_partial].mean() if content_partial.sum() > 0 else 0
+
+        return {
+            'content_word_density': float(content_density),
+            'function_word_density': float(function_density),
+            'n_content': int(content_mask.sum()),
+            'n_function': int(function_mask.sum()),
+            'whole_word_density': float(whole_density),
+            'partial_word_density': float(partial_density),
+            'n_whole_content': int(content_whole.sum()),
+            'n_partial_content': int(content_partial.sum()),
+        }
+
+    def _compute_token_stats(self) -> Dict:
+        """Compute basic token statistics."""
+        pos_counts = defaultdict(int)
+        activation_counts = []
+
+        for t in self.token_data:
+            pos_counts[t['pos']] += 1
+            activation_counts.append(t['n_active'])
+
+        return {
+            'pos_distribution': dict(pos_counts),
+            'mean_active_neurons': float(np.mean(activation_counts)) if activation_counts else 0,
+            'std_active_neurons': float(np.std(activation_counts)) if activation_counts else 0,
+            'total_neurons': self.total_neurons,
+        }
+
+    def print_summary(self, results: Dict):
+        """Print analysis summary."""
+        print("\n" + "=" * 70)
+        print("TOKEN-BASED NEURON COMBINATION ANALYSIS")
+        print("=" * 70)
+
+        print(f"\nTokens analyzed: {results.get('n_tokens', 0):,}")
+        print(f"Total neurons: {results.get('n_neurons', 0):,}")
+
+        # Silhouette score
+        sil = results.get('silhouette_score', {})
+        if sil.get('score') is not None:
+            print(f"\n┌─ Silhouette Score (POS clustering quality) ───────────────────────────┐")
+            print(f"│  Overall: {sil['score']:.4f}  (range: -1 to 1, higher = better)")
+            print(f"│  Samples: {sil.get('n_samples', 0)}, POS categories: {sil.get('n_pos_categories', 0)}")
+
+            per_pos = sil.get('per_pos', {})
+            if per_pos:
+                print(f"│")
+                print(f"│  Per-POS silhouette:")
+                sorted_pos = sorted(per_pos.items(), key=lambda x: -x[1])
+                for pos, score in sorted_pos[:8]:
+                    bar = "█" * int(max(0, score + 1) * 10)
+                    print(f"│    {pos:<8} {score:>7.3f} {bar}")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+
+        # POS similarity
+        pos_sim = results.get('pos_similarity', {})
+        if pos_sim:
+            print(f"\n┌─ POS Jaccard Similarity ──────────────────────────────────────────────┐")
+            print(f"│  Mean within-POS:  {pos_sim.get('mean_within', 0):.4f}")
+            print(f"│  Mean between-POS: {pos_sim.get('mean_between', 0):.4f}")
+            print(f"│  Separation:       {pos_sim.get('separation', 0):.4f}")
+            print(f"│")
+
+            within = pos_sim.get('within_pos', {})
+            if within:
+                print(f"│  Within-POS similarity (higher = more consistent):")
+                sorted_within = sorted(within.items(), key=lambda x: -x[1]['mean'])[:8]
+                for pos, data in sorted_within:
+                    print(f"│    {pos:<8} {data['mean']:.4f} ± {data['std']:.3f}")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+
+        # Content vs Function
+        content = results.get('content_analysis', {})
+        if content:
+            print(f"\n┌─ Content vs Function Words ───────────────────────────────────────────┐")
+            print(f"│  Content word activation density:  {content.get('content_word_density', 0):.4f} ({content.get('n_content', 0)} tokens)")
+            print(f"│  Function word activation density: {content.get('function_word_density', 0):.4f} ({content.get('n_function', 0)} tokens)")
+            print(f"│")
+            print(f"│  Content words - whole vs partial:")
+            print(f"│    Whole words:   {content.get('whole_word_density', 0):.4f} ({content.get('n_whole_content', 0)} tokens)")
+            print(f"│    Partial words: {content.get('partial_word_density', 0):.4f} ({content.get('n_partial_content', 0)} tokens)")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+
+        # Token stats
+        stats = results.get('token_stats', {})
+        if stats:
+            print(f"\n┌─ Activation Statistics ───────────────────────────────────────────────┐")
+            print(f"│  Mean active neurons per token: {stats.get('mean_active_neurons', 0):.1f} / {stats.get('total_neurons', 0)}")
+            print(f"│  Std active neurons: {stats.get('std_active_neurons', 0):.1f}")
+            print(f"└───────────────────────────────────────────────────────────────────────┘")
+
+        print("\n" + "=" * 70)
+
+    def visualize(self, results: Dict, output_dir: str) -> Dict[str, str]:
+        """Generate visualizations."""
+        os.makedirs(output_dir, exist_ok=True)
+        paths = {}
+
+        # 1. POS similarity heatmap
+        path = self._plot_pos_similarity_heatmap(results, os.path.join(output_dir, 'pos_jaccard_heatmap.png'))
+        if path:
+            paths['pos_similarity_heatmap'] = path
+
+        # 2. Silhouette per POS
+        path = self._plot_silhouette_per_pos(results, os.path.join(output_dir, 'silhouette_per_pos.png'))
+        if path:
+            paths['silhouette_per_pos'] = path
+
+        # 3. Content vs Function comparison
+        path = self._plot_content_vs_function(results, os.path.join(output_dir, 'content_vs_function.png'))
+        if path:
+            paths['content_vs_function'] = path
+
+        return paths
+
+    def _plot_pos_similarity_heatmap(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot POS similarity matrix."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        pos_sim = results.get('pos_similarity', {})
+        within = pos_sim.get('within_pos', {})
+        between = pos_sim.get('between_pos', {})
+
+        if not within:
+            return None
+
+        # Build matrix
+        active_pos = list(within.keys())
+        n = len(active_pos)
+
+        sim_matrix = np.zeros((n, n))
+        for i, pos_i in enumerate(active_pos):
+            sim_matrix[i, i] = within[pos_i]['mean']
+            for j, pos_j in enumerate(active_pos[i+1:], i+1):
+                key = f"{pos_i}-{pos_j}"
+                key_rev = f"{pos_j}-{pos_i}"
+                val = between.get(key, between.get(key_rev, {})).get('mean', 0)
+                sim_matrix[i, j] = val
+                sim_matrix[j, i] = val
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(sim_matrix, cmap='YlOrRd', vmin=0, vmax=0.5)
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(active_pos, rotation=45, ha='right')
+        ax.set_yticklabels(active_pos)
+        ax.set_title('POS Jaccard Similarity\n(diagonal=within, off-diagonal=between)')
+
+        # Add values
+        for i in range(n):
+            for j in range(n):
+                ax.text(j, i, f'{sim_matrix[i, j]:.2f}', ha='center', va='center',
+                        fontsize=8, color='white' if sim_matrix[i, j] > 0.25 else 'black')
+
+        plt.colorbar(im, ax=ax, label='Jaccard Similarity')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
+    def _plot_silhouette_per_pos(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot silhouette score per POS."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        sil = results.get('silhouette_score', {})
+        per_pos = sil.get('per_pos', {})
+
+        if not per_pos:
+            return None
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        sorted_pos = sorted(per_pos.items(), key=lambda x: -x[1])
+        pos_names = [p[0] for p in sorted_pos]
+        scores = [p[1] for p in sorted_pos]
+
+        colors = ['green' if s > 0 else 'red' for s in scores]
+        bars = ax.barh(range(len(pos_names)), scores, color=colors, alpha=0.7)
+        ax.axvline(x=0, color='black', linestyle='-', linewidth=1)
+        ax.axvline(x=sil.get('score', 0), color='blue', linestyle='--', linewidth=2,
+                   label=f"Overall: {sil.get('score', 0):.3f}")
+
+        ax.set_yticks(range(len(pos_names)))
+        ax.set_yticklabels(pos_names)
+        ax.set_xlabel('Silhouette Score')
+        ax.set_title('Silhouette Score per POS\n(higher = better cluster separation)')
+        ax.legend()
+        ax.set_xlim(-0.5, 0.5)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
+    def _plot_content_vs_function(self, results: Dict, output_path: str) -> Optional[str]:
+        """Plot content vs function word analysis."""
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib
+            matplotlib.use('Agg')
+        except ImportError:
+            return None
+
+        content = results.get('content_analysis', {})
+        if not content:
+            return None
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Left: Content vs Function
+        ax = axes[0]
+        categories = ['Content\nWords', 'Function\nWords']
+        densities = [content.get('content_word_density', 0), content.get('function_word_density', 0)]
+        counts = [content.get('n_content', 0), content.get('n_function', 0)]
+
+        bars = ax.bar(categories, densities, color=['steelblue', 'coral'])
+        ax.set_ylabel('Activation Density')
+        ax.set_title('Activation Density by Word Type')
+
+        for bar, count in zip(bars, counts):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f'n={count}', ha='center', fontsize=10)
+
+        # Right: Whole vs Partial (content words only)
+        ax = axes[1]
+        categories = ['Whole\nWords', 'Partial\n(subword)']
+        densities = [content.get('whole_word_density', 0), content.get('partial_word_density', 0)]
+        counts = [content.get('n_whole_content', 0), content.get('n_partial_content', 0)]
+
+        bars = ax.bar(categories, densities, color=['darkgreen', 'lightgreen'])
+        ax.set_ylabel('Activation Density')
+        ax.set_title('Content Words: Whole vs Partial')
+
+        for bar, count in zip(bars, counts):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                    f'n={count}', ha='center', fontsize=10)
+
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        return output_path
+
+    def run_all(
+        self,
+        output_dir: str = './token_combination',
+        max_sentences: int = 2000,
+        split: str = 'train',
+        data_path: str = None,
+    ) -> Dict:
+        """
+        Run full token combination analysis.
+
+        Args:
+            output_dir: Output directory
+            max_sentences: Maximum sentences to process
+            split: Dataset split ('train', 'dev', 'test')
+            data_path: Path to local conllu file
+
+        Returns:
+            Analysis results dictionary
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Load dataset
+        dataset = self.load_ud_dataset(split, max_sentences, data_path)
+
+        # Analyze
+        results = self.analyze_dataset(dataset, max_sentences)
+
+        # Print summary
+        self.print_summary(results)
+
+        # Remove internal data before saving JSON
+        results_for_json = {
+            k: v for k, v in results.items()
+            if not k.startswith('_')
+        }
+
+        # Visualize
+        viz_paths = self.visualize(results, output_dir)
+        results_for_json['visualizations'] = viz_paths
+
+        # Save results
+        import json
+        results_path = os.path.join(output_dir, 'token_combination_analysis.json')
+        with open(results_path, 'w') as f:
+            json.dump(results_for_json, f, indent=2, default=str)
+
+        results['visualizations'] = viz_paths
+        return results
