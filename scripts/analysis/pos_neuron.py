@@ -3524,3 +3524,743 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         plt.close()
 
         return plot_path
+
+
+# =============================================================================
+# NEURON FEATURE ANALYZER
+# =============================================================================
+
+class NeuronFeatureAnalyzer:
+    """
+    Analyze what features each neuron responds to.
+
+    Inverts the token->neuron perspective to neuron->token features.
+    For each neuron, analyzes:
+    - POS distribution of activating tokens
+    - Sentence position distribution
+    - Token frequency characteristics
+    - Subword position (word-initial vs continuation)
+    - Next token POS patterns
+    - Context window patterns
+
+    Usage:
+        # After running TokenCombinationAnalyzer
+        token_data = analyzer.token_data
+        nfa = NeuronFeatureAnalyzer(token_data, tokenizer)
+        profiles = nfa.build_neuron_profiles()
+        specialized = nfa.detect_specialized_neurons()
+        clusters = nfa.cluster_neurons()
+    """
+
+    # Position bins for sentence position analysis
+    POSITION_BINS = ['start', 'early', 'middle', 'late', 'end']
+
+    def __init__(
+        self,
+        token_data: List[Dict],
+        tokenizer,
+        n_neurons: int = None,
+    ):
+        """
+        Initialize analyzer.
+
+        Args:
+            token_data: List of token dicts from TokenCombinationAnalyzer
+                       Each dict has: token_str, pos, mask, weights, is_whole_word, etc.
+            tokenizer: Tokenizer instance
+            n_neurons: Total number of neurons (auto-detected if None)
+        """
+        self.token_data = token_data
+        self.tokenizer = tokenizer
+
+        if n_neurons is None and token_data:
+            n_neurons = len(token_data[0]['mask'])
+        self.n_neurons = n_neurons
+
+        # Build inverted index: neuron_idx -> list of token indices
+        self.neuron_to_tokens = None
+        self.neuron_profiles = None
+
+        # Token frequency cache (computed lazily)
+        self._token_frequencies = None
+
+    def _build_inverted_index(self):
+        """Build neuron -> tokens mapping."""
+        if self.neuron_to_tokens is not None:
+            return
+
+        print("Building neuron -> token inverted index...")
+        self.neuron_to_tokens = defaultdict(list)
+
+        for token_idx, token in enumerate(self.token_data):
+            mask = token['mask']
+            active_neurons = np.where(mask)[0]
+            for neuron_idx in active_neurons:
+                self.neuron_to_tokens[neuron_idx].append(token_idx)
+
+        # Stats
+        activations = [len(v) for v in self.neuron_to_tokens.values()]
+        if activations:
+            print(f"  Neurons with activations: {len(self.neuron_to_tokens)}/{self.n_neurons}")
+            print(f"  Activations per neuron: mean={np.mean(activations):.1f}, "
+                  f"median={np.median(activations):.1f}, max={max(activations)}")
+
+    def _compute_token_frequencies(self):
+        """Compute token frequency distribution from data."""
+        if self._token_frequencies is not None:
+            return
+
+        freq_counter = defaultdict(int)
+        for token in self.token_data:
+            token_str = token['token_str'].lower().strip()
+            freq_counter[token_str] += 1
+
+        self._token_frequencies = freq_counter
+
+    def _get_position_bin(self, position: int, seq_len: int) -> str:
+        """Map position to bin (start/early/middle/late/end)."""
+        if seq_len <= 1:
+            return 'middle'
+
+        ratio = position / (seq_len - 1) if seq_len > 1 else 0.5
+
+        if ratio < 0.1:
+            return 'start'
+        elif ratio < 0.3:
+            return 'early'
+        elif ratio < 0.7:
+            return 'middle'
+        elif ratio < 0.9:
+            return 'late'
+        else:
+            return 'end'
+
+    def _is_word_initial(self, token_str: str) -> bool:
+        """Check if token is word-initial (not a continuation)."""
+        # GPT/SentencePiece style
+        if token_str.startswith(('Ġ', '▁', ' ')):
+            return True
+        # BERT style (## = continuation)
+        if token_str.startswith('##'):
+            return False
+        # Default: assume word-initial
+        return True
+
+    def analyze_neuron_pos_distribution(self, neuron_idx: int) -> Dict:
+        """
+        Analyze POS distribution of tokens activating this neuron.
+
+        Returns:
+            Dict with POS counts and percentages
+        """
+        self._build_inverted_index()
+
+        token_indices = self.neuron_to_tokens.get(neuron_idx, [])
+        if not token_indices:
+            return {'error': 'No activations', 'n_tokens': 0}
+
+        pos_counts = defaultdict(int)
+        for idx in token_indices:
+            pos = self.token_data[idx].get('pos', 'X')
+            pos_counts[pos] += 1
+
+        total = len(token_indices)
+        pos_dist = {
+            pos: {'count': count, 'pct': count / total * 100}
+            for pos, count in sorted(pos_counts.items(), key=lambda x: -x[1])
+        }
+
+        # Top POS
+        top_pos = max(pos_counts.items(), key=lambda x: x[1])
+
+        return {
+            'n_tokens': total,
+            'distribution': pos_dist,
+            'top_pos': top_pos[0],
+            'top_pos_pct': top_pos[1] / total * 100,
+            'n_pos_types': len(pos_counts),
+        }
+
+    def analyze_neuron_position_distribution(self, neuron_idx: int) -> Dict:
+        """
+        Analyze sentence position distribution of activating tokens.
+
+        Returns:
+            Dict with position bin counts
+        """
+        self._build_inverted_index()
+
+        token_indices = self.neuron_to_tokens.get(neuron_idx, [])
+        if not token_indices:
+            return {'error': 'No activations', 'n_tokens': 0}
+
+        position_counts = defaultdict(int)
+        for idx in token_indices:
+            token = self.token_data[idx]
+            # Position info might be stored, otherwise use index approximation
+            pos_in_seq = token.get('position', idx % 50)  # Approximate
+            seq_len = token.get('seq_len', 50)
+            bin_name = self._get_position_bin(pos_in_seq, seq_len)
+            position_counts[bin_name] += 1
+
+        total = len(token_indices)
+        pos_dist = {
+            bin_name: {'count': position_counts.get(bin_name, 0),
+                      'pct': position_counts.get(bin_name, 0) / total * 100}
+            for bin_name in self.POSITION_BINS
+        }
+
+        # Dominant position
+        top_pos = max(position_counts.items(), key=lambda x: x[1])
+
+        return {
+            'n_tokens': total,
+            'distribution': pos_dist,
+            'dominant_position': top_pos[0],
+            'dominant_pct': top_pos[1] / total * 100,
+        }
+
+    def analyze_neuron_frequency(self, neuron_idx: int) -> Dict:
+        """
+        Analyze token frequency characteristics.
+
+        Returns:
+            Dict with frequency statistics
+        """
+        self._build_inverted_index()
+        self._compute_token_frequencies()
+
+        token_indices = self.neuron_to_tokens.get(neuron_idx, [])
+        if not token_indices:
+            return {'error': 'No activations', 'n_tokens': 0}
+
+        frequencies = []
+        for idx in token_indices:
+            token_str = self.token_data[idx]['token_str'].lower().strip()
+            freq = self._token_frequencies.get(token_str, 1)
+            frequencies.append(freq)
+
+        frequencies = np.array(frequencies)
+
+        # Classify as high/medium/low frequency
+        all_freqs = list(self._token_frequencies.values())
+        q33, q66 = np.percentile(all_freqs, [33, 66])
+
+        high_freq = (frequencies > q66).sum()
+        med_freq = ((frequencies > q33) & (frequencies <= q66)).sum()
+        low_freq = (frequencies <= q33).sum()
+        total = len(frequencies)
+
+        return {
+            'n_tokens': total,
+            'mean_freq': float(frequencies.mean()),
+            'median_freq': float(np.median(frequencies)),
+            'high_freq_pct': high_freq / total * 100,
+            'med_freq_pct': med_freq / total * 100,
+            'low_freq_pct': low_freq / total * 100,
+            'unique_tokens': len(set(
+                self.token_data[idx]['token_str'].lower().strip()
+                for idx in token_indices
+            )),
+        }
+
+    def analyze_neuron_subword_position(self, neuron_idx: int) -> Dict:
+        """
+        Analyze subword position (word-initial vs continuation).
+
+        Returns:
+            Dict with subword position stats
+        """
+        self._build_inverted_index()
+
+        token_indices = self.neuron_to_tokens.get(neuron_idx, [])
+        if not token_indices:
+            return {'error': 'No activations', 'n_tokens': 0}
+
+        word_initial = 0
+        continuation = 0
+
+        for idx in token_indices:
+            token_str = self.token_data[idx]['token_str']
+            if self._is_word_initial(token_str):
+                word_initial += 1
+            else:
+                continuation += 1
+
+        total = len(token_indices)
+
+        return {
+            'n_tokens': total,
+            'word_initial': word_initial,
+            'word_initial_pct': word_initial / total * 100,
+            'continuation': continuation,
+            'continuation_pct': continuation / total * 100,
+            'prefers': 'word_initial' if word_initial > continuation else 'continuation',
+        }
+
+    def analyze_neuron_next_token_pos(self, neuron_idx: int) -> Dict:
+        """
+        Analyze POS of tokens following activations.
+
+        Returns:
+            Dict with next-token POS distribution
+        """
+        self._build_inverted_index()
+
+        token_indices = self.neuron_to_tokens.get(neuron_idx, [])
+        if not token_indices:
+            return {'error': 'No activations', 'n_tokens': 0}
+
+        next_pos_counts = defaultdict(int)
+        valid_count = 0
+
+        for idx in token_indices:
+            # Check if next token exists
+            if idx + 1 < len(self.token_data):
+                next_pos = self.token_data[idx + 1].get('pos', 'X')
+                next_pos_counts[next_pos] += 1
+                valid_count += 1
+
+        if valid_count == 0:
+            return {'error': 'No next tokens', 'n_tokens': 0}
+
+        next_pos_dist = {
+            pos: {'count': count, 'pct': count / valid_count * 100}
+            for pos, count in sorted(next_pos_counts.items(), key=lambda x: -x[1])
+        }
+
+        top_next = max(next_pos_counts.items(), key=lambda x: x[1])
+
+        return {
+            'n_tokens': valid_count,
+            'distribution': next_pos_dist,
+            'top_next_pos': top_next[0],
+            'top_next_pos_pct': top_next[1] / valid_count * 100,
+        }
+
+    def analyze_neuron_context(self, neuron_idx: int, window: int = 2) -> Dict:
+        """
+        Analyze context window around activating tokens.
+
+        Args:
+            neuron_idx: Neuron to analyze
+            window: Context window size (tokens before and after)
+
+        Returns:
+            Dict with context patterns
+        """
+        self._build_inverted_index()
+
+        token_indices = self.neuron_to_tokens.get(neuron_idx, [])
+        if not token_indices:
+            return {'error': 'No activations', 'n_tokens': 0}
+
+        prev_pos_counts = defaultdict(int)
+        next_pos_counts = defaultdict(int)
+        context_patterns = defaultdict(int)
+
+        for idx in token_indices:
+            # Previous tokens
+            prev_poses = []
+            for i in range(1, window + 1):
+                if idx - i >= 0:
+                    prev_pos = self.token_data[idx - i].get('pos', 'X')
+                    prev_pos_counts[prev_pos] += 1
+                    prev_poses.append(prev_pos)
+
+            # Next tokens
+            next_poses = []
+            for i in range(1, window + 1):
+                if idx + i < len(self.token_data):
+                    next_pos = self.token_data[idx + i].get('pos', 'X')
+                    next_pos_counts[next_pos] += 1
+                    next_poses.append(next_pos)
+
+            # Pattern: prev[-1] + current + next[0]
+            if prev_poses and next_poses:
+                current_pos = self.token_data[idx].get('pos', 'X')
+                pattern = f"{prev_poses[0]}→{current_pos}→{next_poses[0]}"
+                context_patterns[pattern] += 1
+
+        # Top patterns
+        top_patterns = sorted(context_patterns.items(), key=lambda x: -x[1])[:10]
+
+        return {
+            'n_tokens': len(token_indices),
+            'prev_pos_distribution': dict(prev_pos_counts),
+            'next_pos_distribution': dict(next_pos_counts),
+            'top_context_patterns': top_patterns,
+        }
+
+    def build_neuron_profiles(self, max_neurons: int = None) -> Dict[int, Dict]:
+        """
+        Build comprehensive feature profiles for all neurons.
+
+        Args:
+            max_neurons: Maximum neurons to profile (None = all)
+
+        Returns:
+            Dict mapping neuron_idx -> feature profile
+        """
+        self._build_inverted_index()
+
+        neurons_to_analyze = list(self.neuron_to_tokens.keys())
+        if max_neurons:
+            neurons_to_analyze = neurons_to_analyze[:max_neurons]
+
+        print(f"\nBuilding feature profiles for {len(neurons_to_analyze)} neurons...")
+
+        profiles = {}
+        for neuron_idx in tqdm(neurons_to_analyze, desc="Profiling neurons"):
+            profile = {
+                'neuron_idx': neuron_idx,
+                'n_activations': len(self.neuron_to_tokens[neuron_idx]),
+                'pos': self.analyze_neuron_pos_distribution(neuron_idx),
+                'position': self.analyze_neuron_position_distribution(neuron_idx),
+                'frequency': self.analyze_neuron_frequency(neuron_idx),
+                'subword': self.analyze_neuron_subword_position(neuron_idx),
+                'next_pos': self.analyze_neuron_next_token_pos(neuron_idx),
+            }
+            profiles[neuron_idx] = profile
+
+        self.neuron_profiles = profiles
+        print(f"Built profiles for {len(profiles)} neurons")
+        return profiles
+
+    def detect_specialized_neurons(
+        self,
+        threshold: float = 0.8,
+        min_activations: int = 10
+    ) -> Dict[str, List[Dict]]:
+        """
+        Detect neurons specialized for specific features.
+
+        A neuron is "specialized" if it has >= threshold concentration
+        on a single feature value.
+
+        Args:
+            threshold: Minimum percentage for specialization (0-1)
+            min_activations: Minimum activations to consider
+
+        Returns:
+            Dict with specialized neurons by feature type
+        """
+        if self.neuron_profiles is None:
+            self.build_neuron_profiles()
+
+        threshold_pct = threshold * 100
+
+        specialized = {
+            'pos': [],           # Specialized for specific POS
+            'position': [],      # Specialized for sentence position
+            'subword': [],       # Specialized for word-initial/continuation
+            'frequency': [],     # Specialized for high/low frequency
+            'next_pos': [],      # Specialized for predicting next POS
+        }
+
+        for neuron_idx, profile in self.neuron_profiles.items():
+            if profile['n_activations'] < min_activations:
+                continue
+
+            # POS specialization
+            pos_info = profile['pos']
+            if pos_info.get('top_pos_pct', 0) >= threshold_pct:
+                specialized['pos'].append({
+                    'neuron': neuron_idx,
+                    'specialized_for': pos_info['top_pos'],
+                    'pct': pos_info['top_pos_pct'],
+                    'n_activations': profile['n_activations'],
+                })
+
+            # Position specialization
+            pos_dist = profile['position']
+            if pos_dist.get('dominant_pct', 0) >= threshold_pct:
+                specialized['position'].append({
+                    'neuron': neuron_idx,
+                    'specialized_for': pos_dist['dominant_position'],
+                    'pct': pos_dist['dominant_pct'],
+                    'n_activations': profile['n_activations'],
+                })
+
+            # Subword specialization
+            subword = profile['subword']
+            word_init_pct = subword.get('word_initial_pct', 50)
+            cont_pct = subword.get('continuation_pct', 50)
+            if word_init_pct >= threshold_pct:
+                specialized['subword'].append({
+                    'neuron': neuron_idx,
+                    'specialized_for': 'word_initial',
+                    'pct': word_init_pct,
+                    'n_activations': profile['n_activations'],
+                })
+            elif cont_pct >= threshold_pct:
+                specialized['subword'].append({
+                    'neuron': neuron_idx,
+                    'specialized_for': 'continuation',
+                    'pct': cont_pct,
+                    'n_activations': profile['n_activations'],
+                })
+
+            # Frequency specialization
+            freq = profile['frequency']
+            if freq.get('high_freq_pct', 0) >= threshold_pct:
+                specialized['frequency'].append({
+                    'neuron': neuron_idx,
+                    'specialized_for': 'high_frequency',
+                    'pct': freq['high_freq_pct'],
+                    'n_activations': profile['n_activations'],
+                })
+            elif freq.get('low_freq_pct', 0) >= threshold_pct:
+                specialized['frequency'].append({
+                    'neuron': neuron_idx,
+                    'specialized_for': 'low_frequency',
+                    'pct': freq['low_freq_pct'],
+                    'n_activations': profile['n_activations'],
+                })
+
+            # Next POS specialization
+            next_pos = profile['next_pos']
+            if next_pos.get('top_next_pos_pct', 0) >= threshold_pct:
+                specialized['next_pos'].append({
+                    'neuron': neuron_idx,
+                    'specialized_for': next_pos['top_next_pos'],
+                    'pct': next_pos['top_next_pos_pct'],
+                    'n_activations': profile['n_activations'],
+                })
+
+        # Sort by percentage
+        for key in specialized:
+            specialized[key] = sorted(specialized[key], key=lambda x: -x['pct'])
+
+        return specialized
+
+    def build_feature_vectors(self) -> Tuple[np.ndarray, List[int]]:
+        """
+        Build feature vectors for neuron clustering.
+
+        Returns:
+            (feature_matrix, neuron_indices) where feature_matrix is [n_neurons, n_features]
+        """
+        if self.neuron_profiles is None:
+            self.build_neuron_profiles()
+
+        neuron_indices = list(self.neuron_profiles.keys())
+        feature_vectors = []
+
+        for neuron_idx in neuron_indices:
+            profile = self.neuron_profiles[neuron_idx]
+
+            # Build feature vector
+            features = []
+
+            # POS distribution (one-hot-ish for top POS categories)
+            pos_dist = profile['pos'].get('distribution', {})
+            for pos in UPOS_TAGS[:10]:  # Top 10 POS
+                features.append(pos_dist.get(pos, {}).get('pct', 0) / 100)
+
+            # Position distribution
+            pos_position = profile['position'].get('distribution', {})
+            for bin_name in self.POSITION_BINS:
+                features.append(pos_position.get(bin_name, {}).get('pct', 0) / 100)
+
+            # Frequency features
+            freq = profile['frequency']
+            features.append(freq.get('high_freq_pct', 0) / 100)
+            features.append(freq.get('med_freq_pct', 0) / 100)
+            features.append(freq.get('low_freq_pct', 0) / 100)
+
+            # Subword position
+            subword = profile['subword']
+            features.append(subword.get('word_initial_pct', 50) / 100)
+
+            # Next POS (top 5)
+            next_pos = profile['next_pos'].get('distribution', {})
+            for pos in UPOS_TAGS[:5]:
+                features.append(next_pos.get(pos, {}).get('pct', 0) / 100)
+
+            feature_vectors.append(features)
+
+        return np.array(feature_vectors), neuron_indices
+
+    def cluster_neurons(self, n_clusters: int = 10, method: str = 'kmeans') -> Dict:
+        """
+        Cluster neurons by feature profile similarity.
+
+        Args:
+            n_clusters: Number of clusters
+            method: Clustering method ('kmeans' or 'hierarchical')
+
+        Returns:
+            Dict with cluster assignments and cluster profiles
+        """
+        print(f"\nClustering neurons into {n_clusters} clusters...")
+
+        feature_matrix, neuron_indices = self.build_feature_vectors()
+
+        if len(feature_matrix) < n_clusters:
+            return {'error': f'Not enough neurons ({len(feature_matrix)}) for {n_clusters} clusters'}
+
+        try:
+            if method == 'kmeans':
+                from sklearn.cluster import KMeans
+                clusterer = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+                labels = clusterer.fit_predict(feature_matrix)
+            else:
+                from sklearn.cluster import AgglomerativeClustering
+                clusterer = AgglomerativeClustering(n_clusters=n_clusters)
+                labels = clusterer.fit_predict(feature_matrix)
+        except ImportError:
+            return {'error': 'sklearn not available'}
+
+        # Build cluster info
+        clusters = defaultdict(list)
+        for neuron_idx, label in zip(neuron_indices, labels):
+            clusters[int(label)].append(neuron_idx)
+
+        # Compute cluster profiles (mean feature vector)
+        cluster_profiles = {}
+        for label in range(n_clusters):
+            cluster_neurons = clusters[label]
+            if cluster_neurons:
+                cluster_features = feature_matrix[[neuron_indices.index(n) for n in cluster_neurons]]
+                mean_features = cluster_features.mean(axis=0)
+                cluster_profiles[label] = {
+                    'n_neurons': len(cluster_neurons),
+                    'neurons': cluster_neurons[:20],  # Sample
+                    'mean_features': mean_features.tolist(),
+                }
+
+        # Compute silhouette score
+        try:
+            from sklearn.metrics import silhouette_score
+            sil_score = silhouette_score(feature_matrix, labels)
+        except:
+            sil_score = None
+
+        return {
+            'n_clusters': n_clusters,
+            'cluster_assignments': {int(n): int(l) for n, l in zip(neuron_indices, labels)},
+            'cluster_sizes': {int(k): len(v) for k, v in clusters.items()},
+            'cluster_profiles': cluster_profiles,
+            'silhouette_score': sil_score,
+        }
+
+    def print_summary(self, specialized: Dict = None, clusters: Dict = None):
+        """Print analysis summary."""
+        print("\n" + "=" * 70)
+        print("NEURON FEATURE ANALYSIS SUMMARY")
+        print("=" * 70)
+
+        if self.neuron_profiles:
+            print(f"\nTotal neurons profiled: {len(self.neuron_profiles)}")
+
+            # Activation stats
+            activations = [p['n_activations'] for p in self.neuron_profiles.values()]
+            print(f"Activations per neuron: mean={np.mean(activations):.1f}, "
+                  f"median={np.median(activations):.1f}")
+
+        if specialized:
+            print("\n" + "-" * 50)
+            print("SPECIALIZED NEURONS (80%+ concentration)")
+            print("-" * 50)
+
+            for feature, neurons in specialized.items():
+                if neurons:
+                    print(f"\n{feature.upper()}: {len(neurons)} specialized neurons")
+                    for info in neurons[:5]:  # Top 5
+                        print(f"  Neuron {info['neuron']:4d}: {info['specialized_for']:12s} "
+                              f"({info['pct']:.1f}%, {info['n_activations']} activations)")
+
+        if clusters:
+            print("\n" + "-" * 50)
+            print("NEURON CLUSTERS")
+            print("-" * 50)
+            print(f"Number of clusters: {clusters.get('n_clusters', 0)}")
+            if clusters.get('silhouette_score'):
+                print(f"Silhouette score: {clusters['silhouette_score']:.4f}")
+            print("\nCluster sizes:")
+            for label, size in sorted(clusters.get('cluster_sizes', {}).items()):
+                print(f"  Cluster {label}: {size} neurons")
+
+    @classmethod
+    def from_token_combination_analyzer(
+        cls,
+        tca: 'TokenCombinationAnalyzer',
+    ) -> 'NeuronFeatureAnalyzer':
+        """
+        Create NeuronFeatureAnalyzer from TokenCombinationAnalyzer.
+
+        Args:
+            tca: TokenCombinationAnalyzer with collected token_data
+
+        Returns:
+            NeuronFeatureAnalyzer instance
+        """
+        if not tca.token_data:
+            raise ValueError("TokenCombinationAnalyzer has no token_data. Run analyze_dataset first.")
+
+        return cls(
+            token_data=tca.token_data,
+            tokenizer=tca.tokenizer,
+            n_neurons=tca.total_neurons,
+        )
+
+    def run_full_analysis(self, output_dir: str = None) -> Dict:
+        """
+        Run complete neuron feature analysis.
+
+        Args:
+            output_dir: Directory to save results (optional)
+
+        Returns:
+            Dict with all analysis results
+        """
+        print("=" * 70)
+        print("NEURON FEATURE ANALYSIS")
+        print("=" * 70)
+
+        # Build profiles
+        profiles = self.build_neuron_profiles()
+
+        # Detect specialized neurons
+        specialized = self.detect_specialized_neurons(threshold=0.8)
+
+        # Cluster neurons
+        clusters = self.cluster_neurons(n_clusters=10)
+
+        # Print summary
+        self.print_summary(specialized, clusters)
+
+        results = {
+            'n_neurons_profiled': len(profiles),
+            'specialized_neurons': specialized,
+            'clusters': clusters,
+            'summary': {
+                'total_tokens': len(self.token_data),
+                'n_neurons': self.n_neurons,
+                'n_specialized': {k: len(v) for k, v in specialized.items()},
+            }
+        }
+
+        # Save if output_dir provided
+        if output_dir:
+            import json
+            os.makedirs(output_dir, exist_ok=True)
+            results_path = os.path.join(output_dir, 'neuron_feature_analysis.json')
+
+            # Convert to JSON-serializable
+            results_json = {
+                'n_neurons_profiled': results['n_neurons_profiled'],
+                'specialized_neurons': results['specialized_neurons'],
+                'clusters': {
+                    k: v for k, v in results['clusters'].items()
+                    if k != 'cluster_profiles'  # Skip large arrays
+                },
+                'summary': results['summary'],
+            }
+
+            with open(results_path, 'w') as f:
+                json.dump(results_json, f, indent=2)
+            print(f"\nResults saved to: {results_path}")
+
+        return results
