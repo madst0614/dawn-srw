@@ -4100,10 +4100,11 @@ class NeuronFeatureAnalyzer:
         if not tca.token_data:
             raise ValueError("TokenCombinationAnalyzer has no token_data. Run analyze_dataset first.")
 
+        # Don't pass n_neurons - let __init__ auto-detect from max mask length
+        # This handles layerwise data where masks have varying sizes
         return cls(
             token_data=tca.token_data,
             tokenizer=tca.tokenizer,
-            n_neurons=tca.total_neurons,
         )
 
     def run_full_analysis(self, output_dir: str = None) -> Dict:
