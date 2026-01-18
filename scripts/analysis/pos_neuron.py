@@ -1929,6 +1929,8 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         weights = weights[valid_mask]
         pos_labels = pos_labels[valid_mask]
         is_whole_word = is_whole_word[valid_mask]
+        # Also filter token_data to keep indices aligned
+        filtered_token_data = [t for i, t in enumerate(token_data) if valid_mask[i]]
 
         n_tokens = len(masks)
         if n_tokens < 10:
@@ -1938,7 +1940,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         silhouette = self._compute_silhouette(masks, pos_labels)
         function_silhouette = self._compute_function_word_silhouette(masks, pos_labels)
         semantic_correlation = self._compute_semantic_correlation(
-            masks, weights, pos_labels, is_whole_word
+            masks, weights, pos_labels, is_whole_word, token_data=filtered_token_data
         )
 
         return {
@@ -2013,6 +2015,8 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         weights = weights[valid_mask]
         pos_labels = pos_labels[valid_mask]
         is_whole_word = is_whole_word[valid_mask]
+        # Also filter token_data to keep indices aligned
+        filtered_token_data = [t for i, t in enumerate(self.token_data) if valid_mask[i]]
 
         n_tokens = len(masks)
         print(f"\nAnalyzing {n_tokens} tokens with valid POS tags...")
@@ -2042,7 +2046,9 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
 
         # 8. Semantic correlation analysis (neuron sim vs GloVe sim)
         # Use continuous weights for cosine similarity
-        semantic_correlation = self._compute_semantic_correlation(masks, weights, pos_labels, is_whole_word)
+        semantic_correlation = self._compute_semantic_correlation(
+            masks, weights, pos_labels, is_whole_word, token_data=filtered_token_data
+        )
 
         return {
             'n_tokens': n_tokens,
@@ -2452,7 +2458,8 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             return {'error': str(e)}
 
     def _compute_semantic_correlation(self, masks: np.ndarray, weights: np.ndarray,
-                                       pos_labels: np.ndarray, is_whole_word: np.ndarray) -> Dict:
+                                       pos_labels: np.ndarray, is_whole_word: np.ndarray,
+                                       token_data: List[Dict] = None) -> Dict:
         """
         Compute correlation between neuron combination similarity and semantic similarity.
 
@@ -2463,6 +2470,13 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         - GloVe embeddings for semantic similarity (cosine)
         - Continuous weights for neuron similarity (cosine)
 
+        Args:
+            masks: Binary masks array
+            weights: Continuous weights array
+            pos_labels: POS label indices
+            is_whole_word: Whole word flags
+            token_data: Token data list (if None, uses self.token_data)
+
         Returns:
             Dict with correlation, p-value, scatter data for plotting
         """
@@ -2472,6 +2486,10 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             return {'error': 'scipy not available'}
 
         print("  Computing semantic correlation (using continuous weights)...")
+
+        # Use provided token_data or fall back to self.token_data
+        if token_data is None:
+            token_data = self.token_data
 
         # Filter to content words (NOUN, VERB, ADJ) that are whole words
         content_pos_indices = [POS_TO_IDX[p] for p in ['NOUN', 'VERB', 'ADJ'] if p in POS_TO_IDX]
@@ -2485,7 +2503,7 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         # Get token strings for content words
         content_tokens = []
         for idx in content_indices:
-            token_str = self.token_data[idx]['token_str'].lower().strip()
+            token_str = token_data[idx]['token_str'].lower().strip()
             # Clean token (remove ## prefix if any, strip whitespace markers)
             token_str = token_str.lstrip('##').lstrip('Ġ').lstrip('▁').strip()
             if len(token_str) >= 2:  # Skip single chars
