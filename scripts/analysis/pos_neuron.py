@@ -1487,31 +1487,38 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         temp = POSNeuronAnalyzer(self.model, tokenizer=self.tokenizer, device=self.device)
         return temp.get_pos_for_tokens(ud_tokens, ud_pos)
 
-    def _is_whole_word(self, token_str: str) -> bool:
+    def _is_whole_word(self, token_str: str, next_token_str: str = None) -> bool:
         """
-        Check if token represents a whole word (not a subword continuation).
+        Check if token represents a complete whole word (not a subword).
 
-        Handles multiple tokenizer formats:
-        - GPT/tiktoken: 'Ġ' prefix for word-initial
-        - SentencePiece: '▁' prefix for word-initial
-        - BERT: '##' prefix for subword continuation (NOT whole word)
-        - Space prefix: ' word' for word-initial
+        For BERT-style tokenizers:
+        - "playing" → ["play", "##ing"]
+        - "play" is NOT whole word (has ## continuation)
+        - "##ing" is NOT whole word (is continuation)
+        - "cat" alone IS whole word
+
+        Args:
+            token_str: Current token string
+            next_token_str: Next token string (to check for ## continuation)
         """
         if not token_str:
             return False
 
-        # BERT-style: ## means continuation (NOT whole word)
+        # BERT-style: ## prefix means this is a continuation piece
         if token_str.startswith('##'):
             return False
 
-        # GPT/SentencePiece: Ġ or ▁ or space means word-initial (IS whole word)
+        # BERT-style: if NEXT token starts with ##, current is NOT whole word
+        # e.g., "play" followed by "##ing" → "play" is not whole word
+        if next_token_str and next_token_str.startswith('##'):
+            return False
+
+        # GPT/SentencePiece: Ġ or ▁ means word-initial (whole word)
         if token_str.startswith(('Ġ', '▁', ' ')):
             return True
 
-        # If none of the above, check if it looks like a word start
-        # (uppercase or the tokenizer doesn't use special markers)
-        # For BERT without ##, assume it's word-initial
-        return True  # Default to whole word if no continuation marker
+        # Default: treat as whole word (single-token word in BERT)
+        return True
 
     def _extract_layer_mask(self, layer, seq_len: int) -> np.ndarray:
         """Extract concatenated mask from a single layer (optimized)."""
@@ -1589,14 +1596,18 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         token_strs = [self.tokenizer.decode([tid]) for tid in token_ids]
 
         results = []
-        for i in range(min(seq_len, len(pos_tags))):
+        n_pos = min(seq_len, len(pos_tags))
+        for i in range(n_pos):
             token_str = token_strs[i]
+            # Get next token for BERT-style whole word detection
+            next_token_str = token_strs[i + 1] if i + 1 < len(token_strs) else None
+
             entry = {
                 'token_id': token_ids[i],
                 'token_str': token_str,
                 'pos': pos_tags[i],
                 'mask': combined_mask[i],
-                'is_whole_word': self._is_whole_word(token_str),
+                'is_whole_word': self._is_whole_word(token_str, next_token_str),
                 'n_active': int(combined_mask[i].sum()),
             }
 
