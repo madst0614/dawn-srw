@@ -38,81 +38,78 @@ COLOR_BLACK = '#2C3E50'
 COLOR_GRAY = '#7F8C8D'
 
 
-def extract_utilization_from_routing(routing_data: Dict) -> Dict:
+def extract_utilization_from_routing(routing_data: Dict, router=None) -> Dict:
     """
-    Extract neuron utilization from routing analysis data.
+    Extract neuron utilization from routing analysis data or router EMA.
 
-    For v17.1 top-k models, calculates utilization from qk_usage or
-    qk_union_coverage results.
+    Priority:
+    1. Router's usage_ema_* attributes (most accurate)
+    2. Pre-computed 'utilization' in routing_data
+    3. qk_usage counts (fallback)
 
     Args:
         routing_data: Results from RoutingAnalyzer
+        router: NeuronRouter instance (optional, for EMA access)
 
     Returns:
         Dict with pool names and utilization percentages
     """
     utilization = {}
 
-    # Try qk_union_coverage first (most accurate for top-k)
-    qk_coverage = routing_data.get('qk_union_coverage', {})
-    if qk_coverage:
-        for pool_name, pool_data in qk_coverage.items():
-            if pool_name == 'n_batches':
-                continue
-            if isinstance(pool_data, dict):
-                # Union coverage gives the true utilization
-                coverage = pool_data.get('union_coverage', 0)
-                if 'feature' in pool_name.lower():
-                    utilization['Feature_Q'] = pool_data.get('q_coverage', 0) * 100
-                    utilization['Feature_K'] = pool_data.get('k_coverage', 0) * 100
-                elif 'restore' in pool_name.lower():
-                    utilization['Restore_Q'] = pool_data.get('q_coverage', 0) * 100
-                    utilization['Restore_K'] = pool_data.get('k_coverage', 0) * 100
+    # Method 1: Get EMA from router directly (most accurate, matches fig4)
+    if router is not None:
+        nr = router.neuron_router if hasattr(router, 'neuron_router') else router
+        ema_attrs = {
+            'Feature_Q': 'usage_ema_feature_q',
+            'Feature_K': 'usage_ema_feature_k',
+            'Feature_V': 'usage_ema_feature_v',
+            'Restore_Q': 'usage_ema_restore_q',
+            'Restore_K': 'usage_ema_restore_k',
+            'Restore_V': 'usage_ema_restore_v',
+            'Feature_Know': 'usage_ema_feature_know',
+            'Restore_Know': 'usage_ema_restore_know',
+        }
 
-    # Try qk_usage data (fallback)
+        for display, attr in ema_attrs.items():
+            if hasattr(nr, attr):
+                ema = getattr(nr, attr)
+                if ema is not None:
+                    # Match fig4: threshold > 0.01
+                    active_ratio = (ema > 0.01).float().mean().item() * 100
+                    utilization[display] = active_ratio
+
+    # Method 2: Pre-computed utilization dict
+    if not utilization:
+        utilization = routing_data.get('utilization', {})
+
+    # Method 3: Calculate from qk_usage counts (less accurate but available)
     if not utilization:
         qk_usage = routing_data.get('qk_usage', {})
         for pool_name, pool_data in qk_usage.items():
-            if pool_name in ['n_batches', 'feature_qk', 'restore_qk'] and isinstance(pool_data, dict):
-                q_counts = pool_data.get('q_counts', [])
-                k_counts = pool_data.get('k_counts', [])
-                n_neurons = pool_data.get('n_neurons', len(q_counts))
-
-                if n_neurons > 0:
-                    # Calculate utilization from non-zero counts
-                    q_counts = np.array(q_counts)
-                    k_counts = np.array(k_counts)
-                    threshold = (q_counts.sum() + k_counts.sum()) / (2 * len(q_counts)) * 0.01
-
-                    q_active = (q_counts > threshold).sum() / n_neurons * 100
-                    k_active = (k_counts > threshold).sum() / n_neurons * 100
-
-                    if 'feature' in pool_name.lower():
-                        utilization['Feature_Q'] = q_active
-                        utilization['Feature_K'] = k_active
-                    elif 'restore' in pool_name.lower():
-                        utilization['Restore_Q'] = q_active
-                        utilization['Restore_K'] = k_active
-
-    # Try selection_diversity data
-    if not utilization:
-        diversity = routing_data.get('selection_diversity', {})
-        for key, data in diversity.items():
-            if key == 'summary' or not isinstance(data, dict):
+            if pool_name == 'n_batches' or not isinstance(pool_data, dict):
                 continue
-            coverage = data.get('union_coverage', 0)
-            pool = data.get('pool', '')
-            if coverage > 0:
-                if 'feature_qk' in pool:
-                    if 'fqk_q' in key:
-                        utilization['Feature_Q'] = coverage * 100
-                    elif 'fqk_k' in key:
-                        utilization['Feature_K'] = coverage * 100
-                elif 'restore_qk' in pool:
-                    if 'rqk_q' in key:
-                        utilization['Restore_Q'] = coverage * 100
-                    elif 'rqk_k' in key:
-                        utilization['Restore_K'] = coverage * 100
+
+            q_counts = pool_data.get('q_counts', [])
+            k_counts = pool_data.get('k_counts', [])
+            n_neurons = pool_data.get('n_neurons', len(q_counts) if q_counts else 0)
+
+            if n_neurons > 0 and q_counts:
+                q_counts = np.array(q_counts)
+                k_counts = np.array(k_counts)
+
+                # Use mean count as threshold (similar to EMA threshold logic)
+                q_threshold = q_counts.mean() * 0.01
+                k_threshold = k_counts.mean() * 0.01
+
+                q_active = (q_counts > q_threshold).sum() / n_neurons * 100
+                k_active = (k_counts > k_threshold).sum() / n_neurons * 100
+
+                if 'feature' in pool_name.lower():
+                    utilization['Feature_Q'] = q_active
+                    utilization['Feature_K'] = k_active
+                elif 'restore' in pool_name.lower():
+                    utilization['Restore_Q'] = q_active
+                    utilization['Restore_K'] = k_active
 
     return utilization
 
@@ -158,6 +155,7 @@ def extract_layer_stats_from_contribution(contribution_data: Dict) -> list:
 def plot_routing_stats(
     routing_data: Dict,
     output_path: str,
+    router=None,
     dpi: int = 300
 ) -> Optional[str]:
     """
@@ -169,10 +167,12 @@ def plot_routing_stats(
 
     Args:
         routing_data: Dict with routing analysis results containing:
-            - 'qk_usage' or 'qk_union_coverage': for utilization
-            - 'layer_contribution': for layer-wise data
-            - Or pre-computed 'utilization' and 'layer_stats'
+            - 'utilization': pre-computed utilization dict
+            - 'layer_stats': pre-computed layer stats list
+            - 'layer_contribution': for layer-wise data extraction
+            - 'qk_usage': fallback for utilization
         output_path: Path for output PNG
+        router: NeuronRouter instance (optional, for EMA access)
         dpi: Output resolution
 
     Returns:
@@ -182,11 +182,12 @@ def plot_routing_stats(
         print("matplotlib not available")
         return None
 
-    # Extract data
+    # Extract utilization (try router EMA first, then routing_data)
     utilization = routing_data.get('utilization', {})
     if not utilization:
-        utilization = extract_utilization_from_routing(routing_data)
+        utilization = extract_utilization_from_routing(routing_data, router)
 
+    # Extract layer stats
     layer_stats = routing_data.get('layer_stats', [])
     if not layer_stats:
         contribution_data = routing_data.get('layer_contribution', {})

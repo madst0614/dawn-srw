@@ -647,10 +647,14 @@ class PaperFigureGenerator:
             'qk_union_coverage': qk_coverage,
         }
 
-        path = plot_routing_stats(combined_data, os.path.join(output_dir, 'fig7_routing_stats.png'))
+        path = plot_routing_stats(
+            combined_data,
+            os.path.join(output_dir, 'fig7_routing_stats.png'),
+            router=self.router
+        )
         print(f"  Saved: {path}", flush=True)
 
-        return {'layer_contribution': contrib_data, 'qk_union_coverage': qk_coverage, 'visualization': path}
+        return {'layer_contribution': contrib_data, 'visualization': path}
 
 
 def main():
