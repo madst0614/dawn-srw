@@ -64,7 +64,13 @@ def plot_factual_heatmap(
     for target, data in per_target.items():
         if 'error' in data:
             continue
-        for neuron, freq in data.get('neuron_frequencies', []):
+        for nf in data.get('neuron_frequencies', []):
+            # Support both dict format and tuple format
+            if isinstance(nf, dict):
+                neuron = nf['neuron']
+                freq = nf['percentage'] / 100.0  # Convert to 0-1 range
+            else:
+                neuron, freq = nf
             all_neurons[target][neuron] = freq
             neuron_total[neuron] += freq
 
