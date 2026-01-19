@@ -224,7 +224,11 @@ def plot_factual_heatmap(
     if capital_targets and other_targets:
         ax.axhline(y=len(capital_targets), color='blue', linewidth=2, linestyle='--')
 
-    # Category labels at top (above the heatmap) - use figure transform for stability
+    # Title FIRST (at the very top)
+    fig.suptitle('Factual Knowledge Neurons: Related outputs share neuron subsets',
+                fontsize=11, fontweight='bold', y=1.12)
+
+    # Category labels BELOW title but above heatmap
     category_names = {0: 'Shared', 1: 'Capital-specific', 2: 'Other-specific', 3: 'Mixed'}
     prev_boundary = 0
     for i, b in enumerate(boundaries + [len(sorted_neurons)]):
@@ -239,11 +243,7 @@ def plot_factual_heatmap(
     ax.set_xlabel('Neuron Index (grouped by semantic category)')
     ax.set_ylabel('Target Token')
 
-    # Title at top with extra padding
-    fig.suptitle('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', y=1.02)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave space for suptitle
+    plt.tight_layout(rect=[0, 0, 1, 0.92])  # Leave more space for suptitle
     plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
     plt.close()
 
