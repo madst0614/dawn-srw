@@ -14,7 +14,7 @@ from .pos_neurons import (
     plot_top_neurons_by_pos, plot_pos_specificity,
     plot_pos_specialization_from_features
 )
-from .layer_contribution import plot_layer_contribution, plot_layer_contribution_detail
+from .layer_contribution import plot_layer_contribution
 from .factual_heatmap import plot_factual_heatmap, plot_factual_comparison
 
 __all__ = [
@@ -31,9 +31,8 @@ __all__ = [
     'plot_dead_neurons',
     'plot_usage_histogram',
     'plot_qk_ema_overlap',
-    # Layer Contribution (Figure 6b)
+    # Layer Contribution (Figure 7)
     'plot_layer_contribution',
-    'plot_layer_contribution_detail',
     # Factual Knowledge (Figure 7)
     'plot_factual_heatmap',
     'plot_factual_comparison',
