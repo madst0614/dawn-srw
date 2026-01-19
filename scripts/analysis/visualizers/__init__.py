@@ -14,8 +14,12 @@ from .pos_neurons import (
     plot_top_neurons_by_pos, plot_pos_specificity,
     plot_pos_specialization_from_features
 )
-from .layer_contribution import plot_layer_contribution
+from .layer_contribution import plot_routing_stats, plot_layer_contribution
 from .factual_heatmap import plot_factual_heatmap, plot_factual_comparison
+from .training_dynamics import (
+    plot_training_dynamics, plot_training_from_logs,
+    plot_training_from_checkpoints, find_training_log, parse_training_log
+)
 
 __all__ = [
     # Q/K Specialization (Figure 3)
@@ -31,7 +35,8 @@ __all__ = [
     'plot_dead_neurons',
     'plot_usage_histogram',
     'plot_qk_ema_overlap',
-    # Layer Contribution (Figure 7)
+    # Routing Stats (Figure 7)
+    'plot_routing_stats',
     'plot_layer_contribution',
     # Factual Knowledge (Figure 7)
     'plot_factual_heatmap',
@@ -40,4 +45,10 @@ __all__ = [
     'plot_similarity_heatmap',
     'plot_clustering',
     'plot_embedding_space',
+    # Training Dynamics (Figure 6)
+    'plot_training_dynamics',
+    'plot_training_from_logs',
+    'plot_training_from_checkpoints',
+    'find_training_log',
+    'parse_training_log',
 ]
