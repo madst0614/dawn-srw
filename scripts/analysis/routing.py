@@ -729,20 +729,14 @@ class RoutingAnalyzer(BaseAnalyzer):
                 for layer in routing:
                     layer_idx = layer.layer_idx
 
-                    # Try masks first (better for top-k), fallback to weights
+                    # Use absolute weight sum (matches fig4 approach)
+                    # This reflects actual contribution magnitude, not just neuron count
                     for key in ALL_KEYS:
-                        m = layer.get_mask(key)
-                        if m is not None:
-                            # Count selected neurons (sum of binary mask)
-                            count = m.sum().item()
-                            layer_pool_counts[layer_idx][key].append(count)
-                        else:
-                            # Fallback to weights
-                            w = layer.get_weight(key)
-                            if w is not None:
-                                # For weights, sum the values
-                                count = w.sum().item()
-                                layer_pool_counts[layer_idx][key].append(count)
+                        w = layer.get_weight(key)
+                        if w is not None:
+                            # Sum of absolute weights = contribution magnitude
+                            contribution = w.abs().sum().item()
+                            layer_pool_counts[layer_idx][key].append(contribution)
 
         # Aggregate results
         results = {'per_layer': {}, 'per_pool': {}}
