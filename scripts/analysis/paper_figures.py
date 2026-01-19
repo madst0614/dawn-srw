@@ -40,9 +40,7 @@ class PaperFigureGenerator:
         '4': 'generate_figure4',   # POS Neurons
         '5': 'generate_figure5',   # Semantic Coherence (Factual Heatmap)
         '6': 'generate_figure6',   # Training Dynamics
-        '7': 'generate_figure7',   # Neuron Utilization + Layer Contribution
-        '7a': 'generate_figure7a', # Neuron Utilization only
-        '7b': 'generate_figure7b', # Layer Contribution only
+        '7': 'generate_figure7',   # Layer Contribution
     }
 
     def __init__(self, checkpoint_path: str, val_data_path: Optional[str] = None,
@@ -588,54 +586,7 @@ class PaperFigureGenerator:
     def generate_figure7(self, output_dir: str, n_batches: int = 50,
                          precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
         """
-        Figure 7: Neuron Utilization + Layer Contribution (Appendix).
-
-        7a: Neuron utilization by pool
-        7b: Layer-wise circuit contribution
-        """
-        precomputed = precomputed or {}
-        config = config or {}
-        results = {}
-        results.update(self.generate_figure7a(output_dir, n_batches, precomputed, config))
-        results.update(self.generate_figure7b(output_dir, n_batches, precomputed, config))
-        return results
-
-    def generate_figure7a(self, output_dir: str, n_batches: int = 50,
-                          precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
-        """
-        Figure 7a: Neuron Utilization.
-
-        Shows EMA distribution across neuron pools.
-        """
-        from .visualizers import plot_usage_histogram
-        precomputed = precomputed or {}
-        config = config or {}
-
-        # Check for pre-computed health data
-        if 'health' in precomputed and 'ema_distribution' in precomputed.get('health', {}):
-            print("  Using pre-computed EMA distribution...", flush=True)
-            health_data = precomputed['health']['ema_distribution']
-        else:
-            print("  Analyzing EMA distribution...", flush=True)
-            health_data = self.health.analyze_ema_distribution()
-
-        # Collect EMA data for visualization
-        neuron_types = self.health.get_neuron_types()
-        ema_data = []
-        for name, (display, ema_attr, _, color) in neuron_types.items():
-            if hasattr(self.router, ema_attr):
-                ema = getattr(self.router, ema_attr)
-                ema_data.append((display, ema.detach().cpu().numpy(), color))
-
-        path = plot_usage_histogram(ema_data, os.path.join(output_dir, 'fig7a_neuron_util.png'))
-        print(f"  Saved: {path}", flush=True)
-
-        return {'ema_distribution': health_data, 'visualization_7a': path}
-
-    def generate_figure7b(self, output_dir: str, n_batches: int = 50,
-                          precomputed: Optional[Dict] = None, config: Optional[Dict] = None) -> Dict:
-        """
-        Figure 7b: Layer-wise Contribution.
+        Figure 7: Layer-wise Circuit Contribution (Appendix).
 
         Shows attention vs knowledge circuit contribution per layer.
         """
@@ -654,10 +605,10 @@ class PaperFigureGenerator:
             print("  Analyzing layer contribution...", flush=True)
             contrib_data = self.routing.analyze_layer_contribution(self.dataloader, n_batches)
 
-        path = plot_layer_contribution(contrib_data, os.path.join(output_dir, 'fig7b_layer_contrib.png'))
+        path = plot_layer_contribution(contrib_data, os.path.join(output_dir, 'fig7_layer_contribution.png'))
         print(f"  Saved: {path}", flush=True)
 
-        return {'layer_contribution': contrib_data, 'visualization_7b': path}
+        return {'layer_contribution': contrib_data, 'visualization': path}
 
 
 def main():

@@ -115,6 +115,8 @@ def plot_qk_specialization(
         ax.xaxis.grid(True, linestyle='--', alpha=0.3)
         ax.yaxis.grid(True, linestyle='--', alpha=0.3)
         ax.set_axisbelow(True)
+        # Disable scientific notation on axes
+        ax.ticklabel_format(style='plain', axis='both')
 
         # 2. Bar: Specialization categories
         ax = axes[row, 1]
@@ -157,10 +159,8 @@ def plot_qk_specialization(
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
-    # Save PNG and PDF
+    # Save PNG only
     plt.savefig(output_path, dpi=dpi, facecolor='white', edgecolor='none')
-    pdf_path = output_path.rsplit('.', 1)[0] + '.pdf'
-    plt.savefig(pdf_path, format='pdf', facecolor='white', edgecolor='none')
     plt.close()
 
     return output_path
