@@ -82,7 +82,7 @@ def extract_utilization_from_routing(routing_data: Dict, router=None) -> Dict:
     if not utilization:
         utilization = routing_data.get('utilization', {})
 
-    # Method 3: Calculate from qk_usage counts (less accurate but available)
+    # Method 3: Calculate from qk_usage counts (from actual forward passes)
     if not utilization:
         qk_usage = routing_data.get('qk_usage', {})
         for pool_name, pool_data in qk_usage.items():
@@ -97,13 +97,12 @@ def extract_utilization_from_routing(routing_data: Dict, router=None) -> Dict:
                 q_counts = np.array(q_counts)
                 k_counts = np.array(k_counts)
 
-                # Use mean count as threshold (similar to EMA threshold logic)
-                q_threshold = q_counts.mean() * 0.01
-                k_threshold = k_counts.mean() * 0.01
+                # Utilization = neurons selected at least once / total neurons
+                # Use count > 0 to match "ever selected during inference"
+                q_active = (q_counts > 0).sum() / n_neurons * 100
+                k_active = (k_counts > 0).sum() / n_neurons * 100
 
-                q_active = (q_counts > q_threshold).sum() / n_neurons * 100
-                k_active = (k_counts > k_threshold).sum() / n_neurons * 100
-
+                # Map pool names: 'feature_qk' -> Feature_Q/K, 'restore_qk' -> Restore_Q/K
                 if 'feature' in pool_name.lower():
                     utilization['Feature_Q'] = q_active
                     utilization['Feature_K'] = k_active

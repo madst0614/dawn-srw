@@ -630,21 +630,21 @@ class PaperFigureGenerator:
             print("  Analyzing layer contribution...", flush=True)
             contrib_data = self.routing.analyze_layer_contribution(self.dataloader, n_batches)
 
-        # Get utilization data from qk_union_coverage or run it
-        if 'qk_union_coverage' in routing_results:
-            print("  Using pre-computed QK union coverage...", flush=True)
-            qk_coverage = routing_results['qk_union_coverage']
+        # Get utilization data from qk_usage (actual forward pass counts)
+        if 'qk_usage' in routing_results:
+            print("  Using pre-computed QK usage...", flush=True)
+            qk_usage = routing_results['qk_usage']
         else:
             if self.dataloader is not None:
-                print("  Analyzing QK union coverage...", flush=True)
-                qk_coverage = self.routing.analyze_qk_union_coverage(self.dataloader, n_batches * 2)
+                print("  Analyzing QK usage (forward pass)...", flush=True)
+                qk_usage = self.routing.analyze_qk_usage(self.dataloader, n_batches * 2)
             else:
-                qk_coverage = {}
+                qk_usage = {}
 
         # Combine data for visualization
         combined_data = {
             'layer_contribution': contrib_data,
-            'qk_union_coverage': qk_coverage,
+            'qk_usage': qk_usage,
         }
 
         path = plot_routing_stats(
