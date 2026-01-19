@@ -58,7 +58,15 @@ def extract_utilization_from_routing(routing_data: Dict, router=None) -> Dict:
 
     # Method 1: Get EMA from router directly (most accurate, matches fig4)
     if router is not None:
-        nr = router.neuron_router if hasattr(router, 'neuron_router') else router
+        # Try multiple paths to find NeuronRouterCore with EMA buffers
+        nr_candidates = [router]
+        if hasattr(router, 'neuron_router'):
+            nr_candidates.append(router.neuron_router)
+        if hasattr(router, 'global_routers'):
+            nr_candidates.append(router.global_routers)
+            if hasattr(router.global_routers, 'neuron_router'):
+                nr_candidates.append(router.global_routers.neuron_router)
+
         ema_attrs = {
             'Feature_Q': 'usage_ema_feature_q',
             'Feature_K': 'usage_ema_feature_k',
@@ -70,13 +78,16 @@ def extract_utilization_from_routing(routing_data: Dict, router=None) -> Dict:
             'Restore_Know': 'usage_ema_restore_know',
         }
 
-        for display, attr in ema_attrs.items():
-            if hasattr(nr, attr):
-                ema = getattr(nr, attr)
-                if ema is not None:
-                    # Match fig4: threshold > 0.01
-                    active_ratio = (ema > 0.01).float().mean().item() * 100
-                    utilization[display] = active_ratio
+        for nr in nr_candidates:
+            if nr is None:
+                continue
+            for display, attr in ema_attrs.items():
+                if display not in utilization and hasattr(nr, attr):
+                    ema = getattr(nr, attr)
+                    if ema is not None:
+                        # Match fig4: threshold > 0.01
+                        active_ratio = (ema > 0.01).float().mean().item() * 100
+                        utilization[display] = active_ratio
 
     # Method 2: Pre-computed utilization dict
     if not utilization:
@@ -193,8 +204,10 @@ def plot_routing_stats(
         if contribution_data:
             layer_stats = extract_layer_stats_from_contribution(contribution_data)
 
-    # Create figure with 2 panels
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7, 3.5), dpi=dpi)
+    # Create figure with 2 panels - adjust height for number of pools
+    n_pools = len(utilization) if utilization else 4
+    fig_height = max(3.5, n_pools * 0.5)  # At least 0.5 inch per pool
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, fig_height), dpi=dpi)
 
     # === (a) Neuron Utilization ===
     if utilization:
@@ -221,13 +234,19 @@ def plot_routing_stats(
         bars = ax1.barh(y_pos, values, height=0.7, color=colors, alpha=0.85,
                        edgecolor='white', linewidth=0.5)
 
-        # Add value labels
+        # Add value labels - inside bar if value > 70, outside otherwise
         for i, (bar, val) in enumerate(zip(bars, values)):
-            ax1.text(val + 1, i, f'{val:.0f}%', va='center', fontsize=8, color=COLOR_BLACK)
+            if val > 70:
+                # Label inside bar (white text)
+                ax1.text(val - 3, i, f'{val:.0f}%', va='center', ha='right',
+                        fontsize=8, color='white', fontweight='bold')
+            else:
+                # Label outside bar
+                ax1.text(val + 1, i, f'{val:.0f}%', va='center', fontsize=8, color=COLOR_BLACK)
 
         ax1.set_yticks(y_pos)
         ax1.set_yticklabels(pools, fontsize=8)
-        ax1.set_xlim(0, 105)
+        ax1.set_xlim(0, 110)  # Extra space for labels
         ax1.set_xlabel('Active Neurons (%)', fontsize=9)
         ax1.set_title('(a) Neuron Utilization', fontsize=10, fontweight='bold', pad=10)
         ax1.xaxis.grid(True, linestyle='--', alpha=0.3)
