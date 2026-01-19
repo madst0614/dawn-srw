@@ -1271,11 +1271,11 @@ class ModelAnalyzer:
 
         prompts = [
             "The capital of France is",
-            "The capital of Germany is",
+            "The capital of England is",
             "The capital of Japan is",
             "The color of the sky is",
         ]
-        targets = ["Paris", "Berlin", "Tokyo", "blue"]
+        targets = ["Paris", "London", "Tokyo", "blue"]
 
         results = analyzer.analyze_factual_neurons(
             prompts, targets,

@@ -498,11 +498,11 @@ class PaperFigureGenerator:
             # Get parameters from config with defaults
             prompts = config.get('prompts', [
                 "The capital of France is",
-                "The capital of Germany is",
+                "The capital of England is",
                 "The capital of Japan is",
                 "The color of the sky is",
             ])
-            targets = config.get('targets', ["Paris", "Berlin", "Tokyo", "blue"])
+            targets = config.get('targets', ["Paris", "London", "Tokyo", "blue"])
             pool_type = config.get('pool_type', 'fv')
             gen_tokens = config.get('gen_tokens', 30)
             temperature = config.get('temperature', 1.0)
