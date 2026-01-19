@@ -40,8 +40,8 @@ if HAS_MATPLOTLIB:
     })
 
 # Color palette
-COLOR_Q = '#E74C3C'      # Red for Q
-COLOR_K = '#3498DB'      # Blue for K
+COLOR_Q = '#C0392B'      # Dark red for Q
+COLOR_K = '#2471A3'      # Dark blue for K
 COLOR_SHARED = '#50C878' # Green for shared
 COLOR_INACTIVE = '#95A5A6'  # Gray for inactive
 COLOR_PURPLE = '#9B59B6'    # Purple for histogram
