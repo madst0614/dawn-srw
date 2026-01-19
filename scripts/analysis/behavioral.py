@@ -561,6 +561,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
         self.model.eval()
 
+        # Enable weight storage for routing analysis (required to get masks/weights)
+        self.extractor.enable_weight_storage()
+
         # Progress tracking
         try:
             from tqdm import tqdm
@@ -774,6 +777,9 @@ class BehavioralAnalyzer(BaseAnalyzer):
                 base_result['note'] = f'Target "{target}" not found in {n_runs} generations (max {max_new_tokens} tokens each)'
 
             results['per_target'][target] = base_result
+
+        # Disable weight storage after analysis
+        self.extractor.disable_weight_storage()
 
         return results
 
