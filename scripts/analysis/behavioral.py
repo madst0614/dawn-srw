@@ -640,7 +640,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         next_token_id = next_token.item()
                         token_text = self.tokenizer.decode([next_token_id])
 
-                        # Extract active neurons
+                        # Extract active neurons as (layer_idx, neuron_idx) tuples
                         step_neurons = set()
                         if routing:
                             for layer_idx, layer in enumerate(routing):
@@ -651,7 +651,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                     else:
                                         m = m[0]
                                     active = m.nonzero(as_tuple=True)[0].cpu().tolist()
-                                    step_neurons.update(active)
+                                    # Store as (layer, neuron) tuples
+                                    step_neurons.update((layer_idx, n) for n in active)
                                     # Debug: first run, first few steps
                                     if total_runs == 1 and step < 3 and layer_idx == 0:
                                         print(f"        [Debug L{layer_idx}] mask shape: {m.shape}, active: {len(active)}", flush=True)
@@ -664,7 +665,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                         else:
                                             w = w[0]
                                         active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
-                                        step_neurons.update(active)
+                                        # Store as (layer, neuron) tuples
+                                        step_neurons.update((layer_idx, n) for n in active)
                                         if total_runs == 1 and step < 3 and layer_idx == 0:
                                             print(f"        [Debug L{layer_idx}] weight fallback, shape: {w.shape}, active: {len(active)}", flush=True)
                                     elif total_runs == 1 and step == 0 and layer_idx == 0:
@@ -725,12 +727,13 @@ class BehavioralAnalyzer(BaseAnalyzer):
             }
 
             if successful_runs > 0:
+                # n is now (layer_idx, neuron_idx) tuple
                 target_freq = {n: c / successful_runs for n, c in target_neuron_counts.items()}
                 common_neurons_100 = [n for n, f in target_freq.items() if f >= 1.0]
                 common_neurons_80 = [n for n, f in target_freq.items() if f >= 0.8]
                 common_neurons_50 = [n for n, f in target_freq.items() if f >= 0.5]
 
-                # Contrastive scores
+                # Contrastive scores - key is (layer, neuron) tuple
                 contrastive_scores = {}
                 if total_baseline_steps > 0:
                     for neuron in set(target_neuron_counts.keys()) | set(baseline_neuron_counts.keys()):
@@ -738,20 +741,26 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         b_freq = baseline_neuron_counts[neuron] / total_baseline_steps
                         contrastive_scores[neuron] = t_freq - b_freq
 
+                # neuron_frequencies with layer info
                 neuron_frequencies = [
-                    {'neuron': n, 'count': c, 'percentage': c / successful_runs * 100}
+                    {'layer': n[0], 'neuron': n[1], 'count': c, 'percentage': c / successful_runs * 100}
                     for n, c in sorted(target_neuron_counts.items(), key=lambda x: -x[1])
                 ]
 
+                # Convert tuple keys to serializable format for JSON
+                common_100_serializable = [{'layer': n[0], 'neuron': n[1]} for n in sorted(common_neurons_100)]
+                common_80_serializable = [{'layer': n[0], 'neuron': n[1]} for n in sorted(common_neurons_80)]
+                common_50_serializable = [{'layer': n[0], 'neuron': n[1]} for n in sorted(common_neurons_50)]
+
                 base_result.update({
-                    'common_neurons_100': sorted(common_neurons_100),
-                    'common_neurons_80': sorted(common_neurons_80),
-                    'common_neurons_50': sorted(common_neurons_50),
+                    'common_neurons_100': common_100_serializable,
+                    'common_neurons_80': common_80_serializable,
+                    'common_neurons_50': common_50_serializable,
                     'total_unique_neurons': len(target_neuron_counts),
                     'neuron_frequencies': neuron_frequencies,
-                    'contrastive_scores': contrastive_scores,  # Full dict for filtering
+                    'contrastive_scores': {f"L{k[0]}_N{k[1]}": v for k, v in contrastive_scores.items()},
                     'contrastive_top50': sorted(
-                        [{'neuron': n, 'score': s,
+                        [{'layer': n[0], 'neuron': n[1], 'score': s,
                           'target_freq': target_freq.get(n, 0) * 100,
                           'baseline_freq': (baseline_neuron_counts[n] / total_baseline_steps * 100) if total_baseline_steps > 0 else 0}
                          for n, s in contrastive_scores.items()],

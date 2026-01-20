@@ -1320,14 +1320,20 @@ class ModelAnalyzer:
                 print(f"  {'='*70}")
 
                 if successful > 0:
-                    # Common neurons at different thresholds
+                    # Common neurons at different thresholds (now with layer info)
                     n100 = data.get('common_neurons_100', [])
                     n80 = data.get('common_neurons_80', [])
                     n50 = data.get('common_neurons_50', [])
 
-                    print(f"\n  100% common neurons ({len(n100)}): {n100[:20]}{'...' if len(n100) > 20 else ''}")
-                    print(f"   80%+ common neurons ({len(n80)}): {n80[:20]}{'...' if len(n80) > 20 else ''}")
-                    print(f"   50%+ common neurons ({len(n50)}): {n50[:20]}{'...' if len(n50) > 20 else ''}")
+                    # Format neurons as L{layer}_N{neuron}
+                    def fmt_neurons(neurons, limit=10):
+                        if isinstance(neurons[0], dict) if neurons else False:
+                            return [f"L{n['layer']}_N{n['neuron']}" for n in neurons[:limit]]
+                        return neurons[:limit]
+
+                    print(f"\n  100% common neurons ({len(n100)}): {fmt_neurons(n100)}{'...' if len(n100) > 10 else ''}")
+                    print(f"   80%+ common neurons ({len(n80)}): {fmt_neurons(n80)}{'...' if len(n80) > 10 else ''}")
+                    print(f"   50%+ common neurons ({len(n50)}): {fmt_neurons(n50)}{'...' if len(n50) > 10 else ''}")
 
                     # Top neurons by frequency (bar chart style)
                     neuron_freqs = data.get('neuron_frequencies', [])[:15]
@@ -1335,14 +1341,16 @@ class ModelAnalyzer:
                         print(f"\n  Top 15 neurons by frequency:")
                         for nf in neuron_freqs:
                             bar = '█' * int(nf['percentage'] / 5)
-                            print(f"    Neuron {nf['neuron']:4d}: {nf['count']:3d}/{successful} ({nf['percentage']:5.1f}%) {bar}")
+                            layer = nf.get('layer', '?')
+                            neuron = nf.get('neuron', nf.get('neuron', '?'))
+                            print(f"    L{layer}_N{neuron:3d}: {nf['count']:3d}/{successful} ({nf['percentage']:5.1f}%) {bar}")
 
                     # Sample generations
-                    samples = data.get('sample_successful_generations', [])[:3]
+                    samples = data.get('sample_generations', data.get('sample_successful_generations', []))[:3]
                     if samples:
                         print(f"\n  Sample generations with '{target}':")
                         for i, sample in enumerate(samples):
-                            text = sample.get('text', '')[:80]
+                            text = sample[:80] if isinstance(sample, str) else sample.get('text', '')[:80]
                             print(f"    Run {i}: {text}...")
 
                     # Top contrastive neurons
@@ -1350,7 +1358,9 @@ class ModelAnalyzer:
                     if contrastive:
                         print(f"\n  Top target-specific neurons (contrastive score):")
                         for c in contrastive:
-                            print(f"    Neuron {c['neuron']:4d}: target={c['target_freq']:5.1f}% baseline={c['baseline_freq']:5.1f}% score={c['score']:.3f}")
+                            layer = c.get('layer', '?')
+                            neuron = c.get('neuron', '?')
+                            print(f"    L{layer}_N{neuron:3d}: target={c['target_freq']:5.1f}% baseline={c['baseline_freq']:5.1f}% score={c['score']:.3f}")
                 else:
                     first_gen = data.get('first_generation', '')[:80]
                     print(f"\n  Note: Target '{target}' not found in {total} generations")
@@ -2221,7 +2231,7 @@ class ModelAnalyzer:
                 ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
                 ('health', self.analyze_health, {}),
                 ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'min_target_count': 100, 'max_runs': 300, 'pool_type': self.pool_type}),
+                ('factual', self.analyze_factual, {'min_target_count': self.min_targets, 'max_runs': self.max_runs, 'pool_type': self.pool_type}),
             ]
 
         if only:
@@ -2238,7 +2248,7 @@ class ModelAnalyzer:
                 ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
                 ('health', self.analyze_health, {}),
                 ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'min_target_count': 100, 'max_runs': 300, 'pool_type': self.pool_type}),
+                ('factual', self.analyze_factual, {'min_target_count': self.min_targets, 'max_runs': self.max_runs, 'pool_type': self.pool_type}),
             ]
 
             # Find missing analyses
