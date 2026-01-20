@@ -1706,6 +1706,11 @@ class ModelAnalyzer:
         print("  Generating paper tables...")
         self._generate_tables(tables_dir)
 
+        # Generate comparison samples if baseline available
+        if self.compare_checkpoint:
+            print("  Generating comparison samples...")
+            self._generate_comparison_samples(paper_dir)
+
         # Summary
         self._generate_paper_summary(paper_dir)
 
@@ -1842,6 +1847,126 @@ class ModelAnalyzer:
                 f.write("\\bottomrule\n")
                 f.write("\\end{tabular}\n")
                 f.write("\\end{table}\n")
+
+    def _generate_comparison_samples(self, paper_dir: Path):
+        """Generate text samples comparing DAWN vs Baseline for paper."""
+        import torch.nn.functional as F
+
+        # Paper-quality prompts
+        PROMPTS = {
+            'Factual Knowledge': [
+                "The capital of France is",
+                "The largest planet in our solar system is",
+                "Water boils at",
+                "Albert Einstein was born in",
+            ],
+            'Common Sense': [
+                "If you drop a glass on the floor, it will",
+                "Fire is hot, but ice is",
+                "Birds fly in the sky, fish swim in",
+                "At night, the sun is",
+            ],
+            'Narrative': [
+                "Once upon a time, in a small village,",
+                "The detective examined the evidence and",
+                "She opened the door and saw",
+                "After years of hard work, he finally",
+            ],
+            'Technical': [
+                "In machine learning, gradient descent is",
+                "The function of the mitochondria is",
+                "A neural network consists of",
+            ],
+        }
+
+        def generate_text(model, prompt, max_new_tokens=50, temperature=0.8, top_k=50):
+            """Generate text with top-k sampling."""
+            input_ids = self.tokenizer.encode(prompt, add_special_tokens=False, return_tensors='pt').to(self.device)
+            generated = input_ids.clone()
+            eos_token_id = self.tokenizer.sep_token_id
+
+            with torch.no_grad():
+                for _ in range(max_new_tokens):
+                    output = model(generated, attention_mask=None)
+                    logits = output[0] if isinstance(output, tuple) else output
+                    next_token_logits = logits[:, -1, :] / temperature
+
+                    if top_k > 0:
+                        indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                        next_token_logits[indices_to_remove] = float('-inf')
+
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    generated = torch.cat([generated, next_token], dim=1)
+
+                    if next_token.item() == eos_token_id:
+                        break
+
+            return self.tokenizer.decode(generated[0], skip_special_tokens=True)
+
+        # Load baseline model
+        print("    Loading baseline model...")
+        try:
+            from scripts.analysis.utils import load_model
+            baseline_model, _, baseline_config = load_model(self.compare_checkpoint, self.device)
+            baseline_model.eval()
+
+            # Get baseline name
+            baseline_path = Path(self.compare_checkpoint)
+            baseline_name = baseline_path.name if baseline_path.is_dir() else baseline_path.parent.name
+        except Exception as e:
+            print(f"    Error loading baseline: {e}")
+            return
+
+        # Generate samples
+        lines = []
+        lines.append("=" * 100)
+        lines.append("GENERATION COMPARISON: DAWN vs Baseline")
+        lines.append("=" * 100)
+        lines.append(f"DAWN Model:     {self.name} (v{self.version})")
+        lines.append(f"Baseline Model: {baseline_name}")
+        lines.append(f"Max tokens: {self.gen_tokens}")
+        lines.append("=" * 100)
+
+        # Print header to console
+        print("\n" + "\n".join(lines[-5:]))
+
+        for category, prompts in PROMPTS.items():
+            cat_header = f"\n{'='*100}\n[{category.upper()}]\n{'='*100}"
+            lines.append(cat_header)
+            print(cat_header)
+
+            for prompt in prompts:
+                prompt_line = f"\n{'─'*100}\nPrompt: \"{prompt}\"\n{'─'*100}"
+                lines.append(prompt_line)
+                print(prompt_line)
+
+                # Generate from both models
+                dawn_output = generate_text(self.model, prompt, max_new_tokens=self.gen_tokens)
+                baseline_output = generate_text(baseline_model, prompt, max_new_tokens=self.gen_tokens)
+
+                # Extract generated part (remove prompt)
+                dawn_gen = dawn_output[len(prompt):].strip() if dawn_output.startswith(prompt) else dawn_output
+                baseline_gen = baseline_output[len(prompt):].strip() if baseline_output.startswith(prompt) else baseline_output
+
+                dawn_line = f"  DAWN:     {dawn_gen}"
+                baseline_line = f"  Baseline: {baseline_gen}"
+
+                lines.append(dawn_line)
+                lines.append(baseline_line)
+                print(dawn_line)
+                print(baseline_line)
+
+        # Save to file
+        output_path = paper_dir / 'generation_comparison.txt'
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+
+        print(f"\n    Saved to: {output_path}")
+
+        # Cleanup
+        del baseline_model
+        torch.cuda.empty_cache()
 
     def _generate_paper_summary(self, paper_dir: Path):
         """Generate paper summary markdown."""
