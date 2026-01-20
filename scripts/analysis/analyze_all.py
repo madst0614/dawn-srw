@@ -1752,6 +1752,7 @@ class ModelAnalyzer:
                 self.output_dir.parent / comp_path.stem / 'analysis' if comp_path.is_file() else None,
                 self.output_dir.parent / comp_path.name if comp_path.is_dir() else None,
             ]
+            found_results = False
             for comp_dir in comp_dirs:
                 if comp_dir and comp_dir.exists():
                     comp_params = comp_dir / 'model_info' / 'parameters.json'
@@ -1760,6 +1761,7 @@ class ModelAnalyzer:
                     if comp_params.exists():
                         with open(comp_params) as f:
                             vanilla_info = json.load(f)
+                        found_results = True
                     if comp_val_file.exists():
                         with open(comp_val_file) as f:
                             vanilla_val = json.load(f)
@@ -1767,7 +1769,16 @@ class ModelAnalyzer:
                         with open(comp_speed_file) as f:
                             vanilla_speed = json.load(f)
                     if vanilla_info or vanilla_val:
+                        found_results = True
                         break
+
+            # If no pre-existing results, run quick analysis on vanilla model
+            if not found_results:
+                print("    Running quick analysis on comparison model...")
+                try:
+                    vanilla_info, vanilla_val, vanilla_speed = self._analyze_comparison_model()
+                except Exception as e:
+                    print(f"    Warning: Could not analyze comparison model: {e}")
 
         has_comparison = bool(vanilla_info or vanilla_val)
 
@@ -1967,6 +1978,59 @@ class ModelAnalyzer:
         # Cleanup
         del baseline_model
         torch.cuda.empty_cache()
+
+    def _analyze_comparison_model(self):
+        """Run quick analysis on comparison model for table generation."""
+        from scripts.analysis.utils import load_model
+        from scripts.evaluation.evaluate import evaluate_model, load_val_data, estimate_flops
+
+        print(f"    Loading: {self.compare_checkpoint}")
+        comp_model, _, comp_config = load_model(self.compare_checkpoint, self.device)
+        comp_model.eval()
+
+        # Model info
+        total_params = sum(p.numel() for p in comp_model.parameters())
+        flops = estimate_flops(comp_model, seq_len=512)
+        vanilla_info = {
+            'total': total_params,
+            'total_M': total_params / 1e6,
+            'flops': flops,
+            'flops_G': flops / 1e9,
+        }
+        print(f"    Parameters: {vanilla_info['total_M']:.2f}M, FLOPs: {vanilla_info['flops_G']:.2f}G")
+
+        # Performance (quick eval)
+        print(f"    Running validation...")
+        val_tokens = load_val_data(self.val_data_path, max_tokens=50 * 32 * 512)
+        val_results = evaluate_model(comp_model, val_tokens, batch_size=32, seq_len=512, device=self.device)
+        vanilla_val = val_results
+        print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
+
+        # Speed benchmark
+        import time
+        comp_model.eval()
+        dummy = torch.randint(0, 1000, (1, 512)).to(self.device)
+        # Warmup
+        for _ in range(5):
+            with torch.no_grad():
+                comp_model(dummy)
+        # Benchmark
+        torch.cuda.synchronize() if self.device == 'cuda' else None
+        start = time.time()
+        for _ in range(20):
+            with torch.no_grad():
+                comp_model(dummy)
+        torch.cuda.synchronize() if self.device == 'cuda' else None
+        elapsed = time.time() - start
+        tokens_per_sec = (20 * 512) / elapsed
+        vanilla_speed = {'tokens_per_sec': tokens_per_sec}
+        print(f"    Speed: {tokens_per_sec/1000:.1f}K tok/s")
+
+        # Cleanup
+        del comp_model
+        torch.cuda.empty_cache()
+
+        return vanilla_info, vanilla_val, vanilla_speed
 
     def _generate_paper_summary(self, paper_dir: Path):
         """Generate paper summary markdown."""
