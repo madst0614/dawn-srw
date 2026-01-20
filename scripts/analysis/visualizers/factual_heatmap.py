@@ -63,45 +63,27 @@ def plot_factual_heatmap(
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
     # Collect neuron frequencies and contrastive scores for each target
-    # Neurons are now identified as (layer, neuron_idx) tuples internally,
-    # stored as "L{layer}_N{neuron}" strings for JSON compatibility
     all_neurons = defaultdict(lambda: defaultdict(float))
     all_contrastive = defaultdict(lambda: defaultdict(float))  # contrastive scores
     common_neurons_per_target = {}
 
-    def neuron_to_key(n):
-        """Convert neuron format to consistent key."""
-        if isinstance(n, dict):
-            return f"L{n['layer']}_N{n['neuron']}"
-        elif isinstance(n, (list, tuple)):
-            return f"L{n[0]}_N{n[1]}"
-        elif isinstance(n, str) and n.startswith('L'):
-            return n  # Already in correct format
-        else:
-            return f"L?_N{n}"  # Legacy format fallback
-
     for target, data in per_target.items():
         if 'error' in data:
             continue
-        # Get common neurons (80%+ threshold) - now with layer info
-        common_80 = data.get('common_neurons_80', [])
-        common_neurons_per_target[target] = set(neuron_to_key(n) for n in common_80)
+        # Get common neurons (80%+ threshold)
+        common_neurons_per_target[target] = set(data.get('common_neurons_80', []))
         # Get contrastive scores (target_freq - baseline_freq)
-        # Now keyed as "L{layer}_N{neuron}" strings
         contrastive_scores = data.get('contrastive_scores', {})
-        for neuron_key, score in contrastive_scores.items():
-            all_contrastive[target][neuron_key] = score
-        # Get all frequencies - now with layer info
+        for neuron, score in contrastive_scores.items():
+            all_contrastive[target][neuron] = score
+        # Get all frequencies
         for nf in data.get('neuron_frequencies', []):
             if isinstance(nf, dict):
-                if 'layer' in nf:
-                    neuron_key = f"L{nf['layer']}_N{nf['neuron']}"
-                else:
-                    neuron_key = f"L?_N{nf['neuron']}"
+                neuron = nf['neuron']
                 freq = nf['percentage'] / 100.0
             else:
-                neuron_key, freq = neuron_to_key(nf), 0.0
-            all_neurons[target][neuron_key] = freq
+                neuron, freq = nf
+            all_neurons[target][neuron] = freq
 
     if not all_neurons:
         return None
@@ -250,7 +232,7 @@ def plot_factual_heatmap(
 
     sns.heatmap(
         matrix,
-        xticklabels=sorted_neurons,  # Already in "L{layer}_N{neuron}" format
+        xticklabels=[f'N{n}' for n in sorted_neurons],
         yticklabels=display_targets,
         cmap='YlOrRd',
         vmin=0, vmax=1,
