@@ -561,6 +561,14 @@ class BehavioralAnalyzer(BaseAnalyzer):
         self.model.eval()
         self.extractor.enable_weight_storage()
 
+        # Debug: verify store_pref_tensors is enabled
+        if hasattr(self.model, 'router'):
+            store_flag = getattr(self.model.router, 'store_pref_tensors', 'NOT_FOUND')
+            print(f"    [Debug] model.router.store_pref_tensors = {store_flag}")
+        else:
+            print(f"    [Debug] model has no 'router' attribute!")
+            print(f"    [Debug] model attributes: {[a for a in dir(self.model) if not a.startswith('_')][:20]}")
+
         for prompt_idx, (prompt, target) in enumerate(zip(prompts, targets)):
             target_neuron_counts = Counter()
             baseline_neuron_counts = Counter()
