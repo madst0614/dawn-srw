@@ -204,10 +204,13 @@ def plot_factual_heatmap(
     # Plot
     fig, ax = plt.subplots(figsize=(max(12, len(sorted_neurons) * 0.6), max(4, len(ordered_targets) * 0.8)))
 
+    # Capitalize target labels for display
+    display_targets = [t.capitalize() for t in ordered_targets]
+
     sns.heatmap(
         matrix,
         xticklabels=[f'N{n}' for n in sorted_neurons],
-        yticklabels=ordered_targets,
+        yticklabels=display_targets,
         cmap='YlOrRd',
         vmin=0, vmax=1,
         annot=True, fmt='.2f',
@@ -238,9 +241,9 @@ def plot_factual_heatmap(
                    transform=ax.transAxes)
         prev_boundary = b
 
-    # Title - above category labels
+    # Title - above category labels (closer)
     ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets',
-                fontsize=11, fontweight='bold', pad=20, y=1.08)
+                fontsize=11, fontweight='bold', pad=10, y=1.04)
 
     ax.set_xlabel('Neuron Index (grouped by semantic category)')
     ax.set_ylabel('Target Token')
