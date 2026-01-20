@@ -2188,14 +2188,23 @@ class ModelAnalyzer:
         with open(self.output_dir / 'report.md', 'w') as f:
             f.write('\n'.join(lines))
 
-    def run_all(self, paper_only: bool = False, only: List[str] = None):
-        """Run all analyses."""
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def _get_paper_analyses(self) -> List[tuple]:
+        """Paper generation에 필요한 분석 목록 (Single Source of Truth)"""
+        return [
+            ('model_info', self.analyze_model_info, {}),
+            ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
+            ('health', self.analyze_health, {}),
+            ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
+            ('factual', self.analyze_factual, {
+                'min_target_count': self.min_targets,
+                'max_runs': self.max_runs,
+                'pool_type': self.pool_type
+            }),
+        ]
 
-        self.load_model()
-
-        # Define all analyses using instance parameters
-        analyses = [
+    def _get_full_analyses(self) -> List[tuple]:
+        """전체 분석 목록"""
+        return [
             ('model_info', self.analyze_model_info, {}),
             ('performance', self.analyze_performance, {'n_batches': self.val_batches}),
             ('health', self.analyze_health, {}),
@@ -2207,23 +2216,30 @@ class ModelAnalyzer:
             ('token_combination', self.analyze_token_combination, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('neuron_features', self.analyze_neuron_features, {'max_sentences': self.max_sentences, 'target_layer': self.target_layer}),
             ('layerwise_semantic', self.analyze_layerwise_semantic, {'max_sentences': self.max_sentences // 4}),
-            ('factual', self.analyze_factual, {'min_target_count': self.min_targets, 'max_runs': self.max_runs, 'pool_type': self.pool_type}),
+            ('factual', self.analyze_factual, {
+                'min_target_count': self.min_targets,
+                'max_runs': self.max_runs,
+                'pool_type': self.pool_type
+            }),
             ('behavioral', self.analyze_behavioral, {'n_batches': self.n_batches // 2}),
             ('coselection', self.analyze_coselection, {'n_batches': self.n_batches // 2}),
             ('weight', self.analyze_weight, {}),
             ('v18', self.analyze_v18, {'n_batches': self.n_batches // 2}),
         ]
 
-        if paper_only:
-            # Reduced params for faster paper-only mode
-            analyses = [
-                ('model_info', self.analyze_model_info, {}),
-                ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
-                ('health', self.analyze_health, {}),
-                ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'min_target_count': self.min_targets, 'max_runs': self.max_runs, 'pool_type': self.pool_type}),
-            ]
+    def run_all(self, paper_only: bool = False, only: List[str] = None):
+        """Run all analyses."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        self.load_model()
+
+        # Get analysis list based on mode
+        if paper_only:
+            analyses = self._get_paper_analyses()
+        else:
+            analyses = self._get_full_analyses()
+
+        # Filter by --only option
         if only:
             analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
@@ -2232,18 +2248,9 @@ class ModelAnalyzer:
             print("\n[Checking existing analysis results...]")
             self._load_existing_results()
 
-            # Define required analyses for paper generation
-            required_for_paper = [
-                ('model_info', self.analyze_model_info, {}),
-                ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
-                ('health', self.analyze_health, {}),
-                ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
-                ('factual', self.analyze_factual, {'min_target_count': self.min_targets, 'max_runs': self.max_runs, 'pool_type': self.pool_type}),
-            ]
-
-            # Find missing analyses
+            # Find missing analyses from paper requirements
             missing = []
-            for name, func, kwargs in required_for_paper:
+            for name, func, kwargs in self._get_paper_analyses():
                 if name not in self.results or not self.results[name]:
                     missing.append((name, func, kwargs))
 
