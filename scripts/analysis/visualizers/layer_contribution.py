@@ -1,13 +1,10 @@
 """
-Layer Contribution & Routing Stats Visualizer
-==============================================
+Layer Contribution Visualizer
+=============================
 
-Paper-quality visualization for DAWN routing statistics.
-Matches the style from figures/fig4_routing_stats.py.
+Paper-quality visualization for DAWN layer-wise circuit contribution.
 
-Creates a 2-panel figure:
-(a) Neuron Utilization - horizontal bar chart showing pool usage
-(b) Layer-wise Circuit Contribution - line plot with fill
+Creates a single-panel figure showing attention vs knowledge contribution per layer.
 """
 
 import os
@@ -23,7 +20,7 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-# Style settings (matching fig4_routing_stats.py)
+# Style settings
 if HAS_MATPLOTLIB:
     plt.rcParams['font.family'] = 'serif'
     plt.rcParams['font.size'] = 9
@@ -31,97 +28,10 @@ if HAS_MATPLOTLIB:
     plt.rcParams['axes.spines.top'] = False
     plt.rcParams['axes.spines.right'] = False
 
-# Colors (matching fig4_routing_stats.py)
+# Colors
 COLOR_ATTENTION = '#4A90D9'
 COLOR_KNOWLEDGE = '#50C878'
-COLOR_BLACK = '#2C3E50'
 COLOR_GRAY = '#7F8C8D'
-
-
-def extract_utilization_from_routing(routing_data: Dict, router=None) -> Dict:
-    """
-    Extract neuron utilization from routing analysis data or router EMA.
-
-    Priority:
-    1. Router's usage_ema_* attributes (most accurate)
-    2. Pre-computed 'utilization' in routing_data
-    3. qk_usage counts (fallback)
-
-    Args:
-        routing_data: Results from RoutingAnalyzer
-        router: NeuronRouter instance (optional, for EMA access)
-
-    Returns:
-        Dict with pool names and utilization percentages
-    """
-    utilization = {}
-
-    # Method 1: Get EMA from router directly (most accurate, matches fig4)
-    if router is not None:
-        # Try multiple paths to find NeuronRouterCore with EMA buffers
-        nr_candidates = [router]
-        if hasattr(router, 'neuron_router'):
-            nr_candidates.append(router.neuron_router)
-        if hasattr(router, 'global_routers'):
-            nr_candidates.append(router.global_routers)
-            if hasattr(router.global_routers, 'neuron_router'):
-                nr_candidates.append(router.global_routers.neuron_router)
-
-        ema_attrs = {
-            'Feature_Q': 'usage_ema_feature_q',
-            'Feature_K': 'usage_ema_feature_k',
-            'Feature_V': 'usage_ema_feature_v',
-            'Restore_Q': 'usage_ema_restore_q',
-            'Restore_K': 'usage_ema_restore_k',
-            'Restore_V': 'usage_ema_restore_v',
-            'Feature_Know': 'usage_ema_feature_know',
-            'Restore_Know': 'usage_ema_restore_know',
-        }
-
-        for nr in nr_candidates:
-            if nr is None:
-                continue
-            for display, attr in ema_attrs.items():
-                if display not in utilization and hasattr(nr, attr):
-                    ema = getattr(nr, attr)
-                    if ema is not None:
-                        # Match fig4: threshold > 0.01
-                        active_ratio = (ema > 0.01).float().mean().item() * 100
-                        utilization[display] = active_ratio
-
-    # Method 2: Pre-computed utilization dict
-    if not utilization:
-        utilization = routing_data.get('utilization', {})
-
-    # Method 3: Calculate from qk_usage counts (from actual forward passes)
-    if not utilization:
-        qk_usage = routing_data.get('qk_usage', {})
-        for pool_name, pool_data in qk_usage.items():
-            if pool_name == 'n_batches' or not isinstance(pool_data, dict):
-                continue
-
-            q_counts = pool_data.get('q_counts', [])
-            k_counts = pool_data.get('k_counts', [])
-            n_neurons = pool_data.get('n_neurons', len(q_counts) if q_counts else 0)
-
-            if n_neurons > 0 and q_counts:
-                q_counts = np.array(q_counts)
-                k_counts = np.array(k_counts)
-
-                # Utilization = neurons selected at least once / total neurons
-                # Use count > 0 to match "ever selected during inference"
-                q_active = (q_counts > 0).sum() / n_neurons * 100
-                k_active = (k_counts > 0).sum() / n_neurons * 100
-
-                # Map pool names: 'feature_qk' -> Feature_Q/K, 'restore_qk' -> Restore_Q/K
-                if 'feature' in pool_name.lower():
-                    utilization['Feature_Q'] = q_active
-                    utilization['Feature_K'] = k_active
-                elif 'restore' in pool_name.lower():
-                    utilization['Restore_Q'] = q_active
-                    utilization['Restore_K'] = k_active
-
-    return utilization
 
 
 def extract_layer_stats_from_contribution(contribution_data: Dict) -> list:
@@ -169,20 +79,16 @@ def plot_routing_stats(
     dpi: int = 300
 ) -> Optional[str]:
     """
-    Generate paper-quality routing statistics figure with 2 panels.
+    Generate paper-quality layer-wise circuit contribution figure.
 
-    Creates:
-    (a) Neuron Utilization - horizontal bar chart
-    (b) Layer-wise Circuit Contribution - line plot
+    Shows attention vs knowledge contribution per layer as a single panel.
 
     Args:
         routing_data: Dict with routing analysis results containing:
-            - 'utilization': pre-computed utilization dict
             - 'layer_stats': pre-computed layer stats list
             - 'layer_contribution': for layer-wise data extraction
-            - 'qk_usage': fallback for utilization
         output_path: Path for output PNG
-        router: NeuronRouter instance (optional, for EMA access)
+        router: NeuronRouter instance (unused, kept for API compatibility)
         dpi: Output resolution
 
     Returns:
@@ -192,11 +98,6 @@ def plot_routing_stats(
         print("matplotlib not available")
         return None
 
-    # Extract utilization (try router EMA first, then routing_data)
-    utilization = routing_data.get('utilization', {})
-    if not utilization:
-        utilization = extract_utilization_from_routing(routing_data, router)
-
     # Extract layer stats
     layer_stats = routing_data.get('layer_stats', [])
     if not layer_stats:
@@ -204,124 +105,66 @@ def plot_routing_stats(
         if contribution_data:
             layer_stats = extract_layer_stats_from_contribution(contribution_data)
 
-    # Create figure with 2 panels - adjust height for number of pools
-    n_pools = len(utilization) if utilization else 4
-    fig_height = max(3.5, n_pools * 0.5)  # At least 0.5 inch per pool
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, fig_height), dpi=dpi)
+    if not layer_stats:
+        print("No layer contribution data available")
+        return None
 
-    # === (a) Neuron Utilization ===
-    if utilization:
-        # Order pools for display
-        pool_order = ['Feature_Q', 'Feature_K', 'Feature_V',
-                     'Restore_Q', 'Restore_K', 'Restore_V',
-                     'Feature_Know', 'Restore_Know']
-        pools = [p for p in pool_order if p in utilization][::-1]  # Reverse for horizontal bar
-        values = [utilization[p] for p in pools]
+    # Create single-panel figure
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=dpi)
 
-        # Colors based on type
-        colors = []
-        for p in pools:
-            if 'Know' in p:
-                colors.append(COLOR_KNOWLEDGE)
-            elif 'Q' in p:
-                colors.append('#C0392B')  # Darker red for Q
-            elif 'K' in p:
-                colors.append('#2471A3')  # Darker blue for K
-            else:
-                colors.append('#9B59B6')  # Purple for V
+    n_layers = len(layer_stats)
+    layers = list(range(1, n_layers + 1))
 
-        y_pos = np.arange(len(pools))
-        bars = ax1.barh(y_pos, values, height=0.7, color=colors, alpha=0.85,
-                       edgecolor='white', linewidth=0.5)
+    # Plot line with markers
+    ax.plot(layers, layer_stats, 'o-', color=COLOR_ATTENTION, linewidth=2,
+            markersize=6, markerfacecolor='white', markeredgewidth=1.5)
 
-        # Add value labels - inside bar if value > 70, outside otherwise
-        for i, (bar, val) in enumerate(zip(bars, values)):
-            if val > 70:
-                # Label inside bar (white text)
-                ax1.text(val - 3, i, f'{val:.0f}%', va='center', ha='right',
-                        fontsize=8, color='white', fontweight='bold')
-            else:
-                # Label outside bar
-                ax1.text(val + 1, i, f'{val:.0f}%', va='center', fontsize=8, color=COLOR_BLACK)
+    # Fill areas above/below 50%
+    ax.fill_between(layers, layer_stats, 50,
+                    where=[a >= 50 for a in layer_stats],
+                    color=COLOR_ATTENTION, alpha=0.3)
+    ax.fill_between(layers, layer_stats, 50,
+                    where=[a < 50 for a in layer_stats],
+                    color=COLOR_KNOWLEDGE, alpha=0.3)
 
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels(pools, fontsize=8)
-        ax1.set_xlim(0, 110)  # Extra space for labels
-        ax1.set_xlabel('Active Neurons (%)', fontsize=9)
-        ax1.set_title('(a) Neuron Utilization', fontsize=10, fontweight='bold', pad=10)
-        ax1.xaxis.grid(True, linestyle='--', alpha=0.3)
-        ax1.set_axisbelow(True)
-        ax1.axvline(x=50, color=COLOR_GRAY, linestyle=':', linewidth=1, alpha=0.7)
+    # 50% baseline
+    ax.axhline(y=50, color=COLOR_GRAY, linestyle='--', linewidth=1.5)
 
-        # Legend
-        legend_elements = [
-            mpatches.Patch(color='#C0392B', label='Q routing', alpha=0.85),
-            mpatches.Patch(color='#2471A3', label='K routing', alpha=0.85),
-            mpatches.Patch(color='#9B59B6', label='V routing', alpha=0.85),
-            mpatches.Patch(color=COLOR_KNOWLEDGE, label='Knowledge', alpha=0.85),
-        ]
-        ax1.legend(handles=legend_elements, loc='lower right', fontsize=7, framealpha=0.9)
-    else:
-        ax1.text(0.5, 0.5, 'No utilization data', ha='center', va='center', transform=ax1.transAxes)
+    # Styling
+    ax.set_xlim(0.5, n_layers + 0.5)
+    ax.set_ylim(35, 75)
+    ax.set_xticks(layers)
+    ax.set_xlabel('Layer', fontsize=10)
+    ax.set_ylabel('Attention Contribution (%)', fontsize=10)
+    ax.set_title('Layer-wise Circuit Contribution', fontsize=11, fontweight='bold', pad=10)
+    ax.yaxis.grid(True, linestyle='--', alpha=0.3)
+    ax.set_axisbelow(True)
 
-    # === (b) Layer-wise Circuit Contribution ===
-    if layer_stats:
-        n_layers = len(layer_stats)
-        layers = list(range(1, n_layers + 1))
-
-        ax2.plot(layers, layer_stats, 'o-', color=COLOR_ATTENTION, linewidth=2,
-                markersize=6, markerfacecolor='white', markeredgewidth=1.5)
-
-        # Fill areas
-        ax2.fill_between(layers, layer_stats, 50,
-                        where=[a >= 50 for a in layer_stats],
-                        color=COLOR_ATTENTION, alpha=0.3)
-        ax2.fill_between(layers, layer_stats, 50,
-                        where=[a < 50 for a in layer_stats],
-                        color=COLOR_KNOWLEDGE, alpha=0.3)
-
-        ax2.axhline(y=50, color=COLOR_GRAY, linestyle='--', linewidth=1.5)
-
-        ax2.set_xlim(0.5, n_layers + 0.5)
-        ax2.set_ylim(35, 75)
-        ax2.set_xticks(layers)
-        ax2.set_xlabel('Layer', fontsize=9)
-        ax2.set_ylabel('Attention Contribution (%)', fontsize=9)
-        ax2.set_title('(b) Layer-wise Circuit Contribution', fontsize=10, fontweight='bold', pad=10)
-        ax2.yaxis.grid(True, linestyle='--', alpha=0.3)
-        ax2.set_axisbelow(True)
-
-        # Legend
-        legend_elements2 = [
-            mpatches.Patch(color=COLOR_ATTENTION, alpha=0.3, label='Attention > 50%'),
-            mpatches.Patch(color=COLOR_KNOWLEDGE, alpha=0.3, label='Knowledge > 50%'),
-            plt.Line2D([0], [0], color=COLOR_GRAY, linestyle='--', label='50% baseline'),
-        ]
-        ax2.legend(handles=legend_elements2, loc='upper right', fontsize=7, framealpha=0.9)
-    else:
-        ax2.text(0.5, 0.5, 'No layer data', ha='center', va='center', transform=ax2.transAxes)
+    # Legend
+    legend_elements = [
+        mpatches.Patch(color=COLOR_ATTENTION, alpha=0.3, label='Attention > 50%'),
+        mpatches.Patch(color=COLOR_KNOWLEDGE, alpha=0.3, label='Knowledge > 50%'),
+        plt.Line2D([0], [0], color=COLOR_GRAY, linestyle='--', label='50% baseline'),
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=8, framealpha=0.9)
 
     plt.tight_layout()
 
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
 
-    # Save PNG only
+    # Save PNG
     plt.savefig(output_path, dpi=dpi, facecolor='white', edgecolor='none', bbox_inches='tight')
     plt.close()
 
     return output_path
 
 
-# Keep backward compatible alias
+# Backward compatible alias
 def plot_layer_contribution(
     contribution_data: Dict,
     output_path: str,
     dpi: int = 300
 ) -> Optional[str]:
-    """
-    Backward compatible wrapper for plot_routing_stats.
-
-    Now generates 2-panel figure if routing data is available.
-    """
-    return plot_routing_stats(contribution_data, output_path, dpi)
+    """Backward compatible wrapper for plot_routing_stats."""
+    return plot_routing_stats(contribution_data, output_path, dpi=dpi)
