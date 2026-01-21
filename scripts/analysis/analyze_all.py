@@ -2081,10 +2081,25 @@ class ModelAnalyzer:
                 'max_seq_len': model_config.get('max_seq_len', model_config.get('max_position_embeddings', 0)),
             }
 
-            # Count parameters from state dict
-            state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', {}))
+            # Count parameters from state dict (exclude EMA/optimizer buffers)
+            state_dict = checkpoint.get('model_state_dict', {})
+            if not state_dict:
+                # Fallback: try 'state_dict' but filter out optimizer/EMA keys
+                raw_state = checkpoint.get('state_dict', {})
+                state_dict = {
+                    k: v for k, v in raw_state.items()
+                    if not k.startswith('optimizer') and not k.startswith('ema_') and
+                       not k.startswith('_') and hasattr(v, 'numel')
+                }
             if state_dict:
-                total_params = sum(p.numel() for p in state_dict.values() if hasattr(p, 'numel'))
+                # Only count actual parameters (weight, bias, embeddings)
+                param_keys = [k for k in state_dict.keys()
+                             if any(x in k for x in ['.weight', '.bias', 'embedding', '_emb'])]
+                if param_keys:
+                    total_params = sum(state_dict[k].numel() for k in param_keys if hasattr(state_dict[k], 'numel'))
+                else:
+                    # Fallback: count all tensors
+                    total_params = sum(p.numel() for p in state_dict.values() if hasattr(p, 'numel'))
                 config_data['model']['total_params'] = total_params
                 config_data['model']['total_params_M'] = round(total_params / 1e6, 2)
 
