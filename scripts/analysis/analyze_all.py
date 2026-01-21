@@ -2044,7 +2044,7 @@ class ModelAnalyzer:
         return vanilla_info, vanilla_val, vanilla_speed
 
     def _extract_checkpoint_config(self, checkpoint_path: str) -> Dict:
-        """Extract training config from a checkpoint file."""
+        """Extract training config from a checkpoint file or directory."""
         config_data = {
             'model': {},
             'training': {},
@@ -2052,6 +2052,22 @@ class ModelAnalyzer:
         }
 
         try:
+            # Handle directory paths (find actual checkpoint file)
+            path = Path(checkpoint_path)
+            if path.is_dir():
+                pt_files = list(path.glob('*.pt'))
+                found = False
+                for f in pt_files:
+                    if 'best' in f.name.lower() or 'final' in f.name.lower():
+                        checkpoint_path = str(f)
+                        found = True
+                        break
+                if not found and pt_files:
+                    # Use most recent .pt file
+                    checkpoint_path = str(sorted(pt_files, key=lambda x: x.stat().st_mtime)[-1])
+                elif not found:
+                    raise FileNotFoundError(f"No .pt files found in {path}")
+
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
             # Model config
