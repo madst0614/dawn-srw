@@ -1715,6 +1715,11 @@ class ModelAnalyzer:
         print("  Generating paper_results.json...")
         self._generate_paper_results_json(paper_dir)
 
+        # Generate training config comparison
+        if self.compare_checkpoint:
+            print("  Generating training_comparison...")
+            self._generate_training_comparison(paper_dir)
+
         # Summary
         self._generate_paper_summary(paper_dir)
 
@@ -2036,6 +2041,272 @@ class ModelAnalyzer:
 
         return vanilla_info, vanilla_val, vanilla_speed
 
+    def _extract_checkpoint_config(self, checkpoint_path: str) -> Dict:
+        """Extract training config from a checkpoint file."""
+        config_data = {
+            'model': {},
+            'training': {},
+            'optimizer': {},
+        }
+
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+            # Model config
+            model_config = checkpoint.get('model_config', checkpoint.get('config', {}))
+            config_data['model'] = {
+                'd_model': model_config.get('d_model', model_config.get('hidden_size', 0)),
+                'n_layers': model_config.get('n_layers', model_config.get('num_hidden_layers', 0)),
+                'n_heads': model_config.get('n_heads', model_config.get('num_attention_heads', 0)),
+                'vocab_size': model_config.get('vocab_size', 0),
+                'd_ff': model_config.get('d_ff', model_config.get('intermediate_size', 0)),
+                'max_seq_len': model_config.get('max_seq_len', model_config.get('max_position_embeddings', 0)),
+            }
+
+            # Count parameters from state dict
+            state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', {}))
+            if state_dict:
+                total_params = sum(p.numel() for p in state_dict.values() if hasattr(p, 'numel'))
+                config_data['model']['total_params'] = total_params
+                config_data['model']['total_params_M'] = round(total_params / 1e6, 2)
+
+            # Training config
+            training_config = checkpoint.get('training_config', checkpoint.get('train_config', {}))
+            if not training_config:
+                # Try to extract from top-level keys
+                training_config = {
+                    'batch_size': checkpoint.get('batch_size'),
+                    'learning_rate': checkpoint.get('learning_rate', checkpoint.get('lr')),
+                    'total_steps': checkpoint.get('total_steps', checkpoint.get('max_steps')),
+                    'warmup_steps': checkpoint.get('warmup_steps'),
+                    'dataset': checkpoint.get('dataset', checkpoint.get('data_path')),
+                }
+
+            config_data['training'] = {
+                'dataset': training_config.get('dataset', training_config.get('data_path', 'unknown')),
+                'batch_size': training_config.get('batch_size', training_config.get('train_batch_size', 0)),
+                'learning_rate': training_config.get('learning_rate', training_config.get('lr', 0)),
+                'total_steps': training_config.get('total_steps', training_config.get('max_steps', 0)),
+                'warmup_steps': training_config.get('warmup_steps', 0),
+                'epochs': training_config.get('epochs', training_config.get('num_epochs', 0)),
+            }
+
+            # Current step/epoch from checkpoint
+            config_data['training']['current_step'] = checkpoint.get('step', checkpoint.get('global_step', 0))
+            config_data['training']['current_epoch'] = checkpoint.get('epoch', 0)
+
+            # Optimizer config
+            optimizer_config = checkpoint.get('optimizer_config', {})
+            if not optimizer_config and 'optimizer_state_dict' in checkpoint:
+                # Try to infer from optimizer state
+                opt_state = checkpoint['optimizer_state_dict']
+                if 'param_groups' in opt_state and opt_state['param_groups']:
+                    pg = opt_state['param_groups'][0]
+                    optimizer_config = {
+                        'lr': pg.get('lr'),
+                        'weight_decay': pg.get('weight_decay'),
+                        'betas': pg.get('betas'),
+                    }
+
+            config_data['optimizer'] = {
+                'optimizer': training_config.get('optimizer', 'AdamW'),
+                'weight_decay': optimizer_config.get('weight_decay', training_config.get('weight_decay', 0)),
+                'grad_clip': training_config.get('grad_clip', training_config.get('max_grad_norm', 0)),
+                'scheduler': training_config.get('scheduler', training_config.get('lr_scheduler', 'unknown')),
+                'betas': optimizer_config.get('betas', [0.9, 0.999]),
+            }
+
+            # DAWN-specific config
+            if 'n_feature_qk' in model_config or 'n_neurons' in model_config:
+                config_data['dawn_specific'] = {
+                    'n_feature_qk': model_config.get('n_feature_qk', 0),
+                    'n_restore_qk': model_config.get('n_restore_qk', 0),
+                    'n_feature_v': model_config.get('n_feature_v', 0),
+                    'n_restore_v': model_config.get('n_restore_v', 0),
+                    'n_knowledge': model_config.get('n_knowledge', 0),
+                    'top_k': model_config.get('top_k', 0),
+                }
+
+            del checkpoint  # Free memory
+
+        except Exception as e:
+            config_data['error'] = str(e)
+
+        return config_data
+
+    def _extract_training_configs(self) -> Dict:
+        """Extract and compare training configs from DAWN and Vanilla checkpoints."""
+        result = {
+            'dawn': {},
+            'vanilla': {},
+            'comparison': {},
+        }
+
+        # Extract DAWN config
+        if self.checkpoint_path:
+            print(f"    Extracting config from DAWN: {self.checkpoint_path}")
+            result['dawn'] = self._extract_checkpoint_config(str(self.checkpoint_path))
+
+        # Extract Vanilla config
+        if self.compare_checkpoint:
+            print(f"    Extracting config from Vanilla: {self.compare_checkpoint}")
+            result['vanilla'] = self._extract_checkpoint_config(str(self.compare_checkpoint))
+
+        # Build comparison table
+        if result['dawn'] and result['vanilla']:
+            dawn_m = result['dawn'].get('model', {})
+            dawn_t = result['dawn'].get('training', {})
+            dawn_o = result['dawn'].get('optimizer', {})
+            van_m = result['vanilla'].get('model', {})
+            van_t = result['vanilla'].get('training', {})
+            van_o = result['vanilla'].get('optimizer', {})
+
+            result['comparison'] = {
+                # Model
+                'd_model': {'dawn': dawn_m.get('d_model'), 'vanilla': van_m.get('d_model')},
+                'n_layers': {'dawn': dawn_m.get('n_layers'), 'vanilla': van_m.get('n_layers')},
+                'n_heads': {'dawn': dawn_m.get('n_heads'), 'vanilla': van_m.get('n_heads')},
+                'params_M': {'dawn': dawn_m.get('total_params_M'), 'vanilla': van_m.get('total_params_M')},
+                # Training
+                'dataset': {'dawn': dawn_t.get('dataset'), 'vanilla': van_t.get('dataset')},
+                'batch_size': {'dawn': dawn_t.get('batch_size'), 'vanilla': van_t.get('batch_size')},
+                'learning_rate': {'dawn': dawn_t.get('learning_rate'), 'vanilla': van_t.get('learning_rate')},
+                'total_steps': {'dawn': dawn_t.get('total_steps'), 'vanilla': van_t.get('total_steps')},
+                'warmup_steps': {'dawn': dawn_t.get('warmup_steps'), 'vanilla': van_t.get('warmup_steps')},
+                # Optimizer
+                'optimizer': {'dawn': dawn_o.get('optimizer'), 'vanilla': van_o.get('optimizer')},
+                'weight_decay': {'dawn': dawn_o.get('weight_decay'), 'vanilla': van_o.get('weight_decay')},
+                'grad_clip': {'dawn': dawn_o.get('grad_clip'), 'vanilla': van_o.get('grad_clip')},
+            }
+
+            # Check if configs match
+            matches = []
+            mismatches = []
+            for key, vals in result['comparison'].items():
+                if vals['dawn'] == vals['vanilla']:
+                    matches.append(key)
+                elif vals['dawn'] is not None and vals['vanilla'] is not None:
+                    mismatches.append(key)
+
+            result['validation'] = {
+                'matching_configs': matches,
+                'mismatching_configs': mismatches,
+                'is_comparable': len(mismatches) == 0 or all(
+                    k in ['params_M', 'd_model', 'n_layers']  # These can differ
+                    for k in mismatches
+                ),
+            }
+
+        return result
+
+    def _generate_training_comparison(self, paper_dir: Path):
+        """Generate training_comparison.json and training_comparison.md."""
+        config_data = self._extract_training_configs()
+
+        # Save JSON
+        json_path = paper_dir / 'training_comparison.json'
+        with open(json_path, 'w') as f:
+            json.dump(config_data, f, indent=2, default=str)
+        print(f"    Saved: {json_path}")
+
+        # Generate Markdown table
+        md_lines = [
+            "# Training Configuration Comparison",
+            "",
+            "## Model Architecture",
+            "",
+            "| Config | DAWN | Vanilla |",
+            "|--------|------|---------|",
+        ]
+
+        comparison = config_data.get('comparison', {})
+
+        # Model section
+        for key in ['d_model', 'n_layers', 'n_heads', 'params_M']:
+            vals = comparison.get(key, {})
+            dawn_val = vals.get('dawn', '-')
+            van_val = vals.get('vanilla', '-')
+            if key == 'params_M' and dawn_val and van_val:
+                md_lines.append(f"| {key} | {dawn_val}M | {van_val}M |")
+            else:
+                md_lines.append(f"| {key} | {dawn_val} | {van_val} |")
+
+        md_lines.extend([
+            "",
+            "## Training Settings",
+            "",
+            "| Config | DAWN | Vanilla |",
+            "|--------|------|---------|",
+        ])
+
+        # Training section
+        for key in ['dataset', 'batch_size', 'learning_rate', 'total_steps', 'warmup_steps']:
+            vals = comparison.get(key, {})
+            dawn_val = vals.get('dawn', '-')
+            van_val = vals.get('vanilla', '-')
+            # Format learning rate
+            if key == 'learning_rate' and dawn_val and isinstance(dawn_val, float):
+                dawn_val = f"{dawn_val:.0e}"
+            if key == 'learning_rate' and van_val and isinstance(van_val, float):
+                van_val = f"{van_val:.0e}"
+            # Format steps with K
+            if key in ['total_steps', 'warmup_steps'] and dawn_val and isinstance(dawn_val, (int, float)) and dawn_val >= 1000:
+                dawn_val = f"{dawn_val/1000:.0f}K"
+            if key in ['total_steps', 'warmup_steps'] and van_val and isinstance(van_val, (int, float)) and van_val >= 1000:
+                van_val = f"{van_val/1000:.0f}K"
+            md_lines.append(f"| {key} | {dawn_val} | {van_val} |")
+
+        md_lines.extend([
+            "",
+            "## Optimizer Settings",
+            "",
+            "| Config | DAWN | Vanilla |",
+            "|--------|------|---------|",
+        ])
+
+        # Optimizer section
+        for key in ['optimizer', 'weight_decay', 'grad_clip']:
+            vals = comparison.get(key, {})
+            dawn_val = vals.get('dawn', '-')
+            van_val = vals.get('vanilla', '-')
+            md_lines.append(f"| {key} | {dawn_val} | {van_val} |")
+
+        # Validation summary
+        validation = config_data.get('validation', {})
+        if validation:
+            md_lines.extend([
+                "",
+                "## Validation",
+                "",
+                f"- **Comparable**: {'✅ Yes' if validation.get('is_comparable') else '⚠️ No'}",
+                f"- **Matching configs**: {', '.join(validation.get('matching_configs', []))}",
+            ])
+            if validation.get('mismatching_configs'):
+                md_lines.append(f"- **Mismatching configs**: {', '.join(validation['mismatching_configs'])}")
+
+        # DAWN-specific
+        dawn_specific = config_data.get('dawn', {}).get('dawn_specific', {})
+        if dawn_specific:
+            md_lines.extend([
+                "",
+                "## DAWN-Specific Config",
+                "",
+                "| Pool | Size |",
+                "|------|------|",
+            ])
+            for key, val in dawn_specific.items():
+                if val:
+                    md_lines.append(f"| {key} | {val} |")
+
+        md_lines.append("")
+        md_lines.append(f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+
+        # Save Markdown
+        md_path = paper_dir / 'training_comparison.md'
+        with open(md_path, 'w') as f:
+            f.write('\n'.join(md_lines))
+        print(f"    Saved: {md_path}")
+
     def _generate_paper_results_json(self, paper_dir: Path):
         """Generate paper_results.json with all numeric data for paper figures."""
         from scripts.analysis.utils import convert_to_serializable
@@ -2139,14 +2410,9 @@ class ModelAnalyzer:
                 }
             }
 
-        # Fig 6: Training Dynamics (steps, val_loss loaded from logs)
-        paper_results['fig6_training_dynamics'] = {
-            'note': 'Loaded from training_log.txt during figure generation',
-            'expected_format': {
-                'dawn': {'steps': [], 'val_loss': []},
-                'vanilla': {'steps': [], 'val_loss': []},
-            }
-        }
+        # Fig 6: Training Dynamics - Extract config from checkpoints
+        fig6_config = self._extract_training_configs()
+        paper_results['fig6_training_dynamics'] = fig6_config
 
         # Fig 7: Layer Contribution
         layer_contrib = routing.get('layer_contribution', {})
