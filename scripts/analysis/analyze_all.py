@@ -2459,7 +2459,7 @@ class ModelAnalyzer:
                     'n_neurons': data.get('n_neurons', 0),
                 }
 
-        # Fig 4: POS Specialization (if available)
+        # Fig 4: POS Specialization (summary only for paper)
         neuron_features = self.results.get('neuron_features', {})
         if neuron_features:
             specialized = neuron_features.get('specialized_neurons', {})
@@ -2468,28 +2468,31 @@ class ModelAnalyzer:
 
             # Get POS-specialized neurons (specialized['pos'] is a list)
             pos_neurons = specialized.get('pos', [])
+            total_neurons = summary.get('n_neurons', neuron_features.get('n_neurons_profiled', 0))
+            n_specialized_total = n_specialized.get('pos', 0) if isinstance(n_specialized, dict) else len(pos_neurons)
 
             # Count neurons per actual POS tag
-            pos_neuron_counts = {}
-            top_specialized_list = []
+            per_pos = {}
+            top_list = []
             for neuron_info in pos_neurons:
                 if isinstance(neuron_info, dict):
                     pos_tag = neuron_info.get('specialized_for', 'unknown')
-                    pos_neuron_counts[pos_tag] = pos_neuron_counts.get(pos_tag, 0) + 1
-                    top_specialized_list.append({
+                    per_pos[pos_tag] = per_pos.get(pos_tag, 0) + 1
+                    top_list.append({
                         'neuron_id': neuron_info.get('neuron', 0),
                         'pos': pos_tag,
-                        'concentration': round(neuron_info.get('pct', 0), 2),
+                        'concentration': round(neuron_info.get('pct', 0), 1),
                     })
 
-            # Sort by concentration
-            top_specialized_list.sort(key=lambda x: x['concentration'], reverse=True)
+            # Sort by concentration and keep top 10
+            top_list.sort(key=lambda x: x['concentration'], reverse=True)
 
             paper_results['fig4_pos_specialization'] = {
-                'pos_neuron_counts': pos_neuron_counts,
-                'top_specialized': top_specialized_list[:20],
-                'total_neurons': summary.get('n_neurons', neuron_features.get('n_neurons_profiled', 0)),
-                'n_specialized_total': n_specialized.get('pos', 0) if isinstance(n_specialized, dict) else len(pos_neurons),
+                'total_neurons_analyzed': total_neurons,
+                'specialized_neurons': n_specialized_total,
+                'specialized_ratio': round(n_specialized_total / total_neurons, 3) if total_neurons > 0 else 0,
+                'per_pos': per_pos,
+                'top_10': top_list[:10],
             }
 
         # Fig 5: Factual Heatmap (summary only, no neuron lists)
@@ -2543,19 +2546,39 @@ class ModelAnalyzer:
             } if fig6_config.get('vanilla') else None,
         }
 
-        # Fig 7: Layer Contribution
+        # Fig 7: Layer Contribution (with computed summary)
         layer_contrib = routing.get('layer_contribution', {})
         if layer_contrib:
             per_layer = layer_contrib.get('per_layer', {})
+
+            # Build per_layer dict with rounded values
+            per_layer_data = {}
+            attention_ratios = []
+            knowledge_ratios = []
+
+            for layer, data in per_layer.items():
+                att_ratio = data.get('attention_ratio', 50)
+                know_ratio = data.get('knowledge_ratio', 50)
+                per_layer_data[layer] = {
+                    'attention_ratio': round(att_ratio, 1),
+                    'knowledge_ratio': round(know_ratio, 1),
+                }
+                attention_ratios.append(att_ratio)
+                knowledge_ratios.append(know_ratio)
+
+            # Compute summary statistics
+            import numpy as np
+            att_arr = np.array(attention_ratios) if attention_ratios else np.array([50])
+            know_arr = np.array(knowledge_ratios) if knowledge_ratios else np.array([50])
+
             paper_results['fig7_layer_contribution'] = {
-                'per_layer': {
-                    layer: {
-                        'attention_ratio': round(data.get('attention_ratio', 50), 2),
-                        'knowledge_ratio': round(data.get('knowledge_ratio', 50), 2),
-                    }
-                    for layer, data in per_layer.items()
+                'per_layer': per_layer_data,
+                'summary': {
+                    'attention_mean': round(float(att_arr.mean()), 1),
+                    'attention_std': round(float(att_arr.std()), 1),
+                    'knowledge_mean': round(float(know_arr.mean()), 1),
+                    'knowledge_std': round(float(know_arr.std()), 1),
                 },
-                'summary': layer_contrib.get('summary', {}),
             }
 
         # === Appendix Data (Important) ===
