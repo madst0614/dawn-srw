@@ -551,12 +551,29 @@ class RoutingAnalyzer(BaseAnalyzer):
                 else:
                     corr = 0.0
 
-                # Specialization analysis
-                threshold = (q_np.sum() + k_np.sum()) / (2 * len(q_np)) * 0.1
-                q_only = int(((q_np > threshold) & (k_np < threshold)).sum())
-                k_only = int(((k_np > threshold) & (q_np < threshold)).sum())
-                shared = int(((q_np > threshold) & (k_np > threshold)).sum())
-                inactive = int(((q_np < threshold) & (k_np < threshold)).sum())
+                # Ratio-based specialization analysis (for paper Fig 3)
+                # q_ratio = q_count / (q_count + k_count) per neuron
+                total_usage = q_np + k_np
+                q_ratio = np.zeros_like(q_np, dtype=float)
+                valid_mask = total_usage > 0
+                q_ratio[valid_mask] = q_np[valid_mask] / total_usage[valid_mask]
+
+                # Inactive: bottom 10% by total usage (neurons rarely selected)
+                usage_threshold = np.percentile(total_usage, 10) if len(total_usage) > 0 else 0
+                inactive_mask = total_usage <= usage_threshold
+
+                # Among active neurons, classify by ratio
+                # Q-specialized: q_ratio > 0.7 (mostly selected by Q)
+                # K-specialized: q_ratio < 0.3 (mostly selected by K)
+                # Shared: 0.3 <= q_ratio <= 0.7 (selected by both)
+                active_mask = ~inactive_mask
+                q_specialized = int(((q_ratio > 0.7) & active_mask).sum())
+                k_specialized = int(((q_ratio < 0.3) & active_mask).sum())
+                shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7) & active_mask).sum())
+                inactive = int(inactive_mask.sum())
+
+                # Q-ratio data for histogram (bimodal distribution)
+                q_ratio_active = q_ratio[active_mask].tolist()
 
                 results[pool_name] = {
                     'display': pool_info['display'],
@@ -567,13 +584,22 @@ class RoutingAnalyzer(BaseAnalyzer):
                     'correlation': corr,
                     'avg_overlap': float(np.mean(all_overlaps)) if all_overlaps else 0,
                     'std_overlap': float(np.std(all_overlaps)) if all_overlaps else 0,
-                    'q_specialized': q_only,
-                    'k_specialized': k_only,
+                    'q_specialized': q_specialized,
+                    'k_specialized': k_specialized,
                     'shared': shared,
                     'inactive': inactive,
                     'q_total': int(q_np.sum()),
                     'k_total': int(k_np.sum()),
                     'per_layer': per_layer_results,
+                    # Paper Fig 3 specific data
+                    'q_ratio': q_ratio.tolist(),  # Per-neuron Q ratio for scatter/histogram
+                    'q_ratio_active': q_ratio_active,  # Only active neurons for histogram
+                    'usage_threshold': float(usage_threshold),
+                    'specialization_thresholds': {
+                        'q_specialized': 0.7,
+                        'k_specialized': 0.3,
+                        'inactive_percentile': 10
+                    }
                 }
 
             results['n_batches'] = n_batches

@@ -1711,6 +1711,10 @@ class ModelAnalyzer:
             print("  Generating comparison samples...")
             self._generate_comparison_samples(paper_dir)
 
+        # Generate paper_results.json with all numeric data
+        print("  Generating paper_results.json...")
+        self._generate_paper_results_json(paper_dir)
+
         # Summary
         self._generate_paper_summary(paper_dir)
 
@@ -2031,6 +2035,139 @@ class ModelAnalyzer:
         torch.cuda.empty_cache()
 
         return vanilla_info, vanilla_val, vanilla_speed
+
+    def _generate_paper_results_json(self, paper_dir: Path):
+        """Generate paper_results.json with all numeric data for paper figures."""
+        from scripts.analysis.utils import convert_to_serializable
+
+        paper_results = {}
+
+        # Table 1: Model Statistics
+        model_info = self.results.get('model_info', {})
+        perf = self.results.get('performance', {})
+        val = perf.get('validation', {})
+        speed = perf.get('speed', {})
+
+        paper_results['table1_model_stats'] = {
+            'parameters_M': round(model_info.get('total_M', 0), 2),
+            'flops_G': round(model_info.get('flops_G', 0), 2),
+            'perplexity': round(val.get('perplexity', 0), 2),
+            'accuracy': round(val.get('accuracy', 0), 2),
+            'tokens_per_sec': round(speed.get('tokens_per_sec', 0), 0),
+        }
+
+        # Table 2: Neuron Utilization
+        health = self.results.get('health', {})
+        ema = health.get('ema_distribution', {})
+        paper_results['table2_neuron_util'] = {}
+        for name, data in ema.items():
+            if isinstance(data, dict) and 'total' in data:
+                paper_results['table2_neuron_util'][data.get('display', name)] = {
+                    'total': data['total'],
+                    'active': data['active'],
+                    'dead': data['dead'],
+                    'active_ratio': round(data['active_ratio'], 3),
+                    'gini': round(data.get('gini', 0), 3),
+                }
+
+        # Fig 3: Q/K Specialization
+        routing = self.results.get('routing', {})
+        qk_usage = routing.get('qk_usage', {})
+        paper_results['fig3_qk_specialization'] = {}
+        for pool_name, data in qk_usage.items():
+            if isinstance(data, dict) and 'q_counts' in data:
+                paper_results['fig3_qk_specialization'][pool_name] = {
+                    'correlation': round(data.get('correlation', 0), 3),
+                    'q_specialized': data.get('q_specialized', 0),
+                    'k_specialized': data.get('k_specialized', 0),
+                    'shared': data.get('shared', 0),
+                    'inactive': data.get('inactive', 0),
+                    'n_neurons': data.get('n_neurons', 0),
+                    # Raw data for plotting
+                    'q_counts': data.get('q_counts', []),
+                    'k_counts': data.get('k_counts', []),
+                    'q_ratio': data.get('q_ratio', []),
+                    'q_ratio_active': data.get('q_ratio_active', []),
+                }
+
+        # Fig 4: POS Specialization (if available)
+        neuron_features = self.results.get('neuron_features', {})
+        if neuron_features:
+            specialized = neuron_features.get('specialized_neurons', {})
+            summary = neuron_features.get('summary', {})
+            n_specialized = summary.get('n_specialized', {})
+
+            # Count neurons per POS
+            pos_neuron_counts = {}
+            top_specialized_list = []
+            for pos, neurons in specialized.items():
+                pos_neuron_counts[pos] = len(neurons) if isinstance(neurons, list) else 0
+                # Collect top neurons with their concentration
+                if isinstance(neurons, list):
+                    for neuron_info in neurons[:5]:  # Top 5 per POS
+                        if isinstance(neuron_info, dict):
+                            top_specialized_list.append({
+                                'neuron_id': neuron_info.get('neuron_idx', 0),
+                                'pos': pos,
+                                'concentration': round(neuron_info.get('concentration', 0), 2),
+                            })
+
+            # Sort by concentration
+            top_specialized_list.sort(key=lambda x: x['concentration'], reverse=True)
+
+            paper_results['fig4_pos_specialization'] = {
+                'pos_neuron_counts': pos_neuron_counts,
+                'top_specialized': top_specialized_list[:20],
+                'total_neurons': summary.get('n_neurons', neuron_features.get('n_neurons_profiled', 0)),
+                'n_specialized_total': sum(n_specialized.values()) if isinstance(n_specialized, dict) else 0,
+            }
+
+        # Fig 5: Factual Heatmap
+        factual = self.results.get('factual', {})
+        if factual:
+            paper_results['fig5_factual'] = {
+                'common_neurons_100': factual.get('common_neurons_100', []),
+                'common_neurons_80': factual.get('common_neurons_80', []),
+                'contrastive_top50': factual.get('contrastive_top50', []),
+                'per_target': {
+                    k: {
+                        'success_rate': round(v.get('success_rate', 0), 3),
+                        'n_runs': v.get('n_runs', 0),
+                        'active_neurons': v.get('active_neurons', [])[:50],
+                    }
+                    for k, v in factual.get('per_target', {}).items()
+                }
+            }
+
+        # Fig 6: Training Dynamics (steps, val_loss loaded from logs)
+        paper_results['fig6_training_dynamics'] = {
+            'note': 'Loaded from training_log.txt during figure generation',
+            'expected_format': {
+                'dawn': {'steps': [], 'val_loss': []},
+                'vanilla': {'steps': [], 'val_loss': []},
+            }
+        }
+
+        # Fig 7: Layer Contribution
+        layer_contrib = routing.get('layer_contribution', {})
+        if layer_contrib:
+            per_layer = layer_contrib.get('per_layer', {})
+            paper_results['fig7_layer_contribution'] = {
+                'per_layer': {
+                    layer: {
+                        'attention_ratio': round(data.get('attention_ratio', 50), 2),
+                        'knowledge_ratio': round(data.get('knowledge_ratio', 50), 2),
+                    }
+                    for layer, data in per_layer.items()
+                },
+                'summary': layer_contrib.get('summary', {}),
+            }
+
+        # Save JSON
+        results_path = paper_dir / 'paper_results.json'
+        with open(results_path, 'w') as f:
+            json.dump(convert_to_serializable(paper_results), f, indent=2)
+        print(f"    Saved: {results_path}")
 
     def _generate_paper_summary(self, paper_dir: Path):
         """Generate paper summary markdown."""

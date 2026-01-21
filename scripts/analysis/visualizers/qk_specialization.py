@@ -138,19 +138,30 @@ def plot_qk_specialization(
         ax.yaxis.grid(True, linestyle='--', alpha=0.3)
         ax.set_axisbelow(True)
 
-        # 3. Histogram: Q/(Q+K) ratio distribution
+        # 3. Histogram: Q/(Q+K) ratio distribution with specialization thresholds
         ax = axes[row, 2]
-        total = q_counts + k_counts + 1e-8
-        q_ratio = q_counts / total
-        active_mask = (q_counts + k_counts) > 0
-        if active_mask.sum() > 0:
-            ax.hist(q_ratio[active_mask], bins=20, alpha=0.75, color=COLOR_PURPLE,
+        # Use precomputed q_ratio if available (more accurate with inactive handling)
+        if 'q_ratio_active' in data and len(data['q_ratio_active']) > 0:
+            q_ratio_active = np.array(data['q_ratio_active'])
+        else:
+            total = q_counts + k_counts + 1e-8
+            q_ratio = q_counts / total
+            active_mask = (q_counts + k_counts) > 0
+            q_ratio_active = q_ratio[active_mask] if active_mask.sum() > 0 else np.array([])
+
+        if len(q_ratio_active) > 0:
+            ax.hist(q_ratio_active, bins=20, alpha=0.75, color=COLOR_PURPLE,
                    edgecolor='white', linewidth=0.5)
-        ax.axvline(x=0.5, color=COLOR_Q, linestyle='--', linewidth=1.5, label='Q=K')
+        # Threshold lines for specialization
+        thresholds = data.get('specialization_thresholds', {'q_specialized': 0.7, 'k_specialized': 0.3})
+        ax.axvline(x=thresholds.get('k_specialized', 0.3), color=COLOR_K, linestyle='--',
+                  linewidth=1.5, label=f'K-spec (<{thresholds.get("k_specialized", 0.3)})')
+        ax.axvline(x=thresholds.get('q_specialized', 0.7), color=COLOR_Q, linestyle='--',
+                  linewidth=1.5, label=f'Q-spec (>{thresholds.get("q_specialized", 0.7)})')
         ax.set_xlabel('Q Ratio (Q / (Q+K))')
         ax.set_ylabel('Neuron Count')
         ax.set_title(f'{display_name}: Q/K Balance Distribution', fontweight='bold')
-        ax.legend(loc='upper right', fontsize=7, framealpha=0.9)
+        ax.legend(loc='upper center', fontsize=7, framealpha=0.9)
         ax.yaxis.grid(True, linestyle='--', alpha=0.3)
         ax.set_axisbelow(True)
 
