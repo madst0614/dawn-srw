@@ -2415,12 +2415,12 @@ class ModelAnalyzer:
                     'gini': round(data.get('gini', 0), 3),
                 }
 
-        # Fig 3: Q/K Specialization
+        # Fig 3: Q/K Specialization (summary only, no raw arrays)
         routing = self.results.get('routing', {})
         qk_usage = routing.get('qk_usage', {})
         paper_results['fig3_qk_specialization'] = {}
         for pool_name, data in qk_usage.items():
-            if isinstance(data, dict) and 'q_counts' in data:
+            if isinstance(data, dict) and 'q_specialized' in data:
                 paper_results['fig3_qk_specialization'][pool_name] = {
                     'correlation': round(data.get('correlation', 0), 3),
                     'q_specialized': data.get('q_specialized', 0),
@@ -2428,11 +2428,6 @@ class ModelAnalyzer:
                     'shared': data.get('shared', 0),
                     'inactive': data.get('inactive', 0),
                     'n_neurons': data.get('n_neurons', 0),
-                    # Raw data for plotting
-                    'q_counts': data.get('q_counts', []),
-                    'k_counts': data.get('k_counts', []),
-                    'q_ratio': data.get('q_ratio', []),
-                    'q_ratio_active': data.get('q_ratio_active', []),
                 }
 
         # Fig 4: POS Specialization (if available)
@@ -2468,43 +2463,56 @@ class ModelAnalyzer:
                 'n_specialized_total': n_specialized.get('pos', 0) if isinstance(n_specialized, dict) else len(pos_neurons),
             }
 
-        # Fig 5: Factual Heatmap
+        # Fig 5: Factual Heatmap (summary only, no neuron lists)
         factual = self.results.get('factual', {})
         if factual:
-            # Extract per-target data with correct keys from analyze_factual_neurons
-            per_target_data = {}
+            # Extract per-target summary (counts only, no lists)
+            per_target_summary = {}
+            all_common_100 = set()
+            all_common_80 = set()
+
             for target, data in factual.get('per_target', {}).items():
                 if isinstance(data, dict):
-                    per_target_data[target] = {
+                    common_100 = data.get('common_neurons_100', [])
+                    common_80 = data.get('common_neurons_80', [])
+                    all_common_100.update(common_100)
+                    all_common_80.update(common_80)
+
+                    per_target_summary[target] = {
                         'match_rate': round(data.get('match_rate', 0), 3),
                         'successful_runs': data.get('successful_runs', 0),
                         'total_runs': data.get('total_runs', 0),
-                        'common_neurons_100': data.get('common_neurons_100', []),
-                        'common_neurons_80': data.get('common_neurons_80', []),
-                        'common_neurons_50': data.get('common_neurons_50', []),
-                        'contrastive_top50': data.get('contrastive_top50', [])[:20],
-                        'total_unique_neurons': data.get('total_unique_neurons', 0),
+                        'n_common_100': len(common_100),
+                        'n_common_80': len(common_80),
+                        'n_unique_neurons': data.get('total_unique_neurons', 0),
                     }
 
-            # Aggregate common neurons across all targets
-            all_common_100 = set()
-            all_common_80 = set()
-            for data in per_target_data.values():
-                all_common_100.update(data.get('common_neurons_100', []))
-                all_common_80.update(data.get('common_neurons_80', []))
-
             paper_results['fig5_factual'] = {
-                'prompts': factual.get('prompts', []),
-                'targets': factual.get('targets', []),
                 'pool_type': factual.get('pool_type', 'fv'),
-                'all_common_neurons_100': sorted(all_common_100),
-                'all_common_neurons_80': sorted(all_common_80),
-                'per_target': per_target_data,
+                'n_all_common_100': len(all_common_100),
+                'n_all_common_80': len(all_common_80),
+                'per_target': per_target_summary,
             }
 
-        # Fig 6: Training Dynamics - Extract config from checkpoints
+        # Fig 6: Training Dynamics - Extract config from checkpoints (summary only)
         fig6_config = self._extract_training_configs()
-        paper_results['fig6_training_dynamics'] = fig6_config
+        # Keep only essential summary, remove detailed comparison
+        paper_results['fig6_training_dynamics'] = {
+            'dawn': {
+                'params_M': fig6_config.get('dawn', {}).get('model', {}).get('total_params_M'),
+                'd_model': fig6_config.get('dawn', {}).get('model', {}).get('d_model'),
+                'n_layers': fig6_config.get('dawn', {}).get('model', {}).get('n_layers'),
+                'batch_size': fig6_config.get('dawn', {}).get('training', {}).get('batch_size'),
+                'learning_rate': fig6_config.get('dawn', {}).get('training', {}).get('learning_rate'),
+            },
+            'vanilla': {
+                'params_M': fig6_config.get('vanilla', {}).get('model', {}).get('total_params_M'),
+                'd_model': fig6_config.get('vanilla', {}).get('model', {}).get('d_model'),
+                'n_layers': fig6_config.get('vanilla', {}).get('model', {}).get('n_layers'),
+                'batch_size': fig6_config.get('vanilla', {}).get('training', {}).get('batch_size'),
+                'learning_rate': fig6_config.get('vanilla', {}).get('training', {}).get('learning_rate'),
+            } if fig6_config.get('vanilla') else None,
+        }
 
         # Fig 7: Layer Contribution
         layer_contrib = routing.get('layer_contribution', {})
