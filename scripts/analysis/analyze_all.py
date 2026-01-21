@@ -2506,112 +2506,37 @@ class ModelAnalyzer:
                 'summary': layer_contrib.get('summary', {}),
             }
 
-        # === Additional Paper Data ===
+        # === Appendix Data (Important) ===
 
-        # Diversity Metrics (from health analysis)
+        # Diversity Metrics - Dead neuron 문제 없음 증명
         diversity = health.get('diversity', {})
         if diversity:
-            paper_results['diversity_metrics'] = {}
+            paper_results['appendix_diversity'] = {}
             for name, data in diversity.items():
                 if isinstance(data, dict) and 'normalized_entropy' in data:
-                    paper_results['diversity_metrics'][data.get('display', name)] = {
-                        'entropy': round(data.get('entropy', 0), 3),
+                    paper_results['appendix_diversity'][data.get('display', name)] = {
                         'normalized_entropy': round(data.get('normalized_entropy', 0), 3),
                         'effective_count': round(data.get('effective_count', 0), 1),
                         'coverage': round(data.get('coverage', 0), 3),
-                        'gini': round(data.get('gini', 0), 3),
                     }
             overall = diversity.get('overall', {})
             if overall:
-                paper_results['diversity_metrics']['overall'] = {
+                paper_results['appendix_diversity']['overall'] = {
                     'diversity_score': round(overall.get('diversity_score', 0), 3),
                     'health': overall.get('health', 'unknown'),
                 }
 
-        # Routing Entropy
-        entropy = routing.get('entropy', {})
-        if entropy:
-            paper_results['routing_entropy'] = {}
-            for pool, data in entropy.items():
-                if isinstance(data, dict) and 'mean_entropy' in data:
-                    paper_results['routing_entropy'][data.get('display', pool)] = {
-                        'mean': round(data.get('mean_entropy', 0), 3),
-                        'std': round(data.get('std_entropy', 0), 3),
-                        'min': round(data.get('min_entropy', 0), 3),
-                        'max': round(data.get('max_entropy', 0), 3),
-                    }
-
-        # Selection Diversity (union coverage)
-        selection_div = routing.get('selection_diversity', {})
-        if selection_div:
-            paper_results['selection_diversity'] = {}
-            for key, data in selection_div.items():
-                if isinstance(data, dict) and 'union_count' in data:
-                    paper_results['selection_diversity'][data.get('display', key)] = {
-                        'union_count': data.get('union_count', 0),
-                        'n_total': data.get('n_total', 0),
-                        'union_coverage': round(data.get('union_coverage', 0), 3),
-                        'diversity_ratio': round(data.get('diversity_ratio', 0), 3),
-                    }
-
-        # Semantic Path Similarity
-        semantic = self.results.get('semantic', {})
-        path_sim = semantic.get('path_similarity', {})
-        if path_sim:
-            similar = path_sim.get('similar_pairs', {})
-            different = path_sim.get('different_pairs', {})
-            paper_results['semantic_path_similarity'] = {
-                'similar_pairs': {
-                    'cosine_mean': round(similar.get('cosine_mean', 0), 3),
-                    'cosine_std': round(similar.get('cosine_std', 0), 3),
-                },
-                'different_pairs': {
-                    'cosine_mean': round(different.get('cosine_mean', 0), 3),
-                    'cosine_std': round(different.get('cosine_std', 0), 3),
-                },
-                'separation': round(path_sim.get('separation', 0), 3),
-            }
-
-        # Layerwise Semantic (semantic correlation trend across layers)
-        layerwise = self.results.get('layerwise_semantic', {})
-        if layerwise:
-            per_layer_sem = layerwise.get('per_layer', {})
-            paper_results['layerwise_semantic'] = {
-                'per_layer': {
-                    layer: {
-                        'semantic_correlation': round(data.get('semantic_correlation', 0), 3),
-                        'pos_silhouette': round(data.get('pos_silhouette', 0), 3),
-                    }
-                    for layer, data in per_layer_sem.items()
-                    if isinstance(data, dict)
-                },
-                'crossover_layer': layerwise.get('crossover_layer'),
-                'trend': layerwise.get('trend', {}),
-            }
-
-        # Behavioral Probing Accuracy
+        # Probing Accuracy - Interpretability 강화
         behavioral = self.results.get('behavioral', {})
         probing = behavioral.get('probing', {})
         if probing:
-            paper_results['probing_accuracy'] = {}
+            paper_results['appendix_probing'] = {}
             for pool, data in probing.items():
                 if isinstance(data, dict) and 'accuracy' in data:
-                    paper_results['probing_accuracy'][pool] = {
+                    paper_results['appendix_probing'][pool] = {
                         'accuracy': round(data.get('accuracy', 0), 3),
                         'f1_macro': round(data.get('f1_macro', 0), 3),
                     }
-
-        # Co-selection Analysis
-        coselection = self.results.get('coselection', {})
-        if coselection:
-            paper_results['coselection'] = {
-                'n_batches': coselection.get('n_batches', 0),
-                'pool_type': coselection.get('pool_type', ''),
-            }
-            cooccur = coselection.get('cooccurrence', {})
-            if cooccur:
-                paper_results['coselection']['top_pairs'] = cooccur.get('top_pairs', [])[:20]
-                paper_results['coselection']['avg_cooccurrence'] = round(cooccur.get('avg_cooccurrence', 0), 3)
 
         # Save JSON
         results_path = paper_dir / 'paper_results.json'
