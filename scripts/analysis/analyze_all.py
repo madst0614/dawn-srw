@@ -587,6 +587,7 @@ class ModelAnalyzer:
         selection_div = results.get('selection_diversity', {})
         qk_overlap = results.get('qk_overlap', {})
         qk_entropy = results.get('qk_entropy', {})
+        qk_usage = results.get('qk_usage', {})
 
         if entropy:
             print(f"\n  ┌─ Routing Entropy ─────────────────────────────────────────────────────")
@@ -654,6 +655,18 @@ class ModelAnalyzer:
                         print(f"  │ {pool}: N/A (v18.5 context-based routing)")
                     else:
                         print(f"  │ {pool}: Q={q_ent:.1f}%, K={k_ent:.1f}%, diff={data.get('entropy_diff', 0):.1f}%")
+            print(f"  └─────────────────────────────────────────────────────────────────────────")
+
+        # Q/K Specialization (forward-based, Fig 3)
+        if qk_usage:
+            print(f"\n  ┌─ Q/K Specialization (Forward-based) ─────────────────────────────────────")
+            print(f"  │ {'Pool':<8} {'Total':>8} {'Q-spec':>8} {'K-spec':>8} {'Shared':>8} {'Inactive':>8} {'Corr':>8}")
+            print(f"  │ {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+            for pool, data in qk_usage.items():
+                if isinstance(data, dict) and 'q_specialized' in data:
+                    print(f"  │ {pool:<8} {data.get('n_neurons', 0):>8d} {data['q_specialized']:>8d} "
+                          f"{data['k_specialized']:>8d} {data['shared']:>8d} {data['inactive']:>8d} "
+                          f"{data.get('correlation', 0):>8.3f}")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
 
         # Q/K Union Coverage (true dead neurons)
