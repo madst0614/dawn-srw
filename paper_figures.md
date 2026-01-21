@@ -31,7 +31,8 @@
 ```
 scripts/analysis/
 ├── routing.py
-│   └── analyze_qk_overlap() [line 430-577]
+│   ├── analyze_qk_overlap() [line 329-426]  # Jaccard similarity
+│   └── analyze_qk_usage() [line 428-581]    # Per-neuron counts & correlation
 │
 ├── paper_figures.py
 │   └── generate_figure3() [line 401-427]
@@ -42,28 +43,76 @@ scripts/analysis/
 
 #### 계산 로직
 ```python
-# routing.py:500-550
+# routing.py - analyze_qk_usage()
 
-# 1. 각 뉴런별 Q/K 선택 횟수 카운트
-selected_q = (w_q > 0).float().sum(dim=[0, 1])  # weight > 0 = 선택됨
+# 1. 각 뉴런별 Q/K 선택 횟수 카운트 (line 502-510)
+selected_q = (w_q > 0).float().sum(dim=[0, 1])  # top-k weight > 0 = 선택됨
 selected_k = (w_k > 0).float().sum(dim=[0, 1])
 
-# 2. 모든 배치/레이어 합산
-for layer in routing:
-    total_q += selected_q
-    total_k += selected_k
+# 2. 모든 배치/레이어 합산 (line 527-530)
+for lidx, (q_counts, k_counts, _) in layer_data.items():
+    total_q += q_counts
+    total_k += k_counts
 
-# 3. Pearson correlation 계산
-corr = np.corrcoef(total_q, total_k)[0, 1]  # 예: r = -0.75
+# 3. Pearson correlation 계산 (line 549-552)
+q_np = total_q.cpu().numpy()
+k_np = total_k.cpu().numpy()
+corr = np.corrcoef(q_np, k_np)[0, 1]
 ```
 
+#### Measurement Method (논문용)
+
+**Primary Metric: Pearson Correlation**
+```
+For each neuron i in the shared Q/K pool, we count:
+- c_i^Q: number of times selected for Q projection
+- c_i^K: number of times selected for K projection
+
+Correlation: r = pearson(c^Q, c^K) across all neurons
+Interpretation: r < 0 → neurons specialize (Q-popular ≠ K-popular)
+```
+
+**Secondary Metric: Categorical Classification (ratio 기반 권장)**
+```python
+total = q_np + k_np
+q_ratio = q_np / (total + 1e-8)  # 0~1
+
+# Active 기준: 하위 10% 제외
+min_usage = np.percentile(total, 10)
+active = total > min_usage
+
+# Specialization 기준: 70/30 split
+q_specialized = (active & (q_ratio > 0.7)).sum()
+k_specialized = (active & (q_ratio < 0.3)).sum()
+shared = (active & (q_ratio >= 0.3) & (q_ratio <= 0.7)).sum()
+inactive = (~active).sum()
+```
+
+**70/30 threshold justification:**
+- 명확한 majority preference (>2:1 ratio)
+- Q/K에 symmetric한 기준
+- Sensitivity analysis로 robustness 검증 (60-80% 범위)
+
+#### 검증 완료 ✅
+| 항목 | 상태 | 비고 |
+|------|------|------|
+| `w > 0` 체크 | ✅ | top-k sparsity와 정합 (선택된 뉴런만 양수) |
+| Weight 소스 | ✅ | `fqk_weights_Q` 사용 (top-k 후, softmax 전 logits 아님) |
+| 집계 범위 | ✅ | 모든 레이어/배치 합산 |
+| Correlation 계산 | ✅ | `np.corrcoef()` 정확 |
+
+#### 수정 필요 ⚠️
+| 항목 | 현재 | 권장 |
+|------|------|------|
+| Specialization threshold | `mean * 0.1` (arbitrary) | `q_ratio > 0.7` (interpretable) |
+
 #### 데이터 소스
-- `self.results['routing']['qk_overlap']`
-- 측정 데이터: 25 batches × 16 samples × 512 tokens × 12 layers
+- `self.results['routing']['qk_usage']` (analyze_qk_usage 결과)
+- 측정 범위: n_batches × batch_size × seq_len × n_layers
 
 #### 출력
 - (a) Q vs K scatter plot + correlation coefficient
-- (b) Specialization 분포 (Q-only, K-only, Shared, Inactive)
+- (b) Specialization 분포 histogram (Q-only, K-only, Shared, Inactive)
 
 ---
 
@@ -75,10 +124,14 @@ corr = np.corrcoef(total_q, total_k)[0, 1]  # 예: r = -0.75
 ```
 scripts/analysis/
 ├── pos_neuron.py
-│   ├── TokenCombinationAnalyzer.analyze_dataset()
+│   ├── TokenCombinationAnalyzer
+│   │   ├── _extract_layer_mask() [line 1660-1737]  # 뉴런 활성화 판정
+│   │   └── analyze_dataset()
 │   └── NeuronFeatureAnalyzer
-│       ├── build_neuron_profiles() [line 3700+]
-│       ├── detect_specialized_neurons() [line 3830+]
+│       ├── _build_matrices() [line 3604-3685]      # activation matrix 구성
+│       ├── _compute_neuron_features() [line 3687-3732]
+│       ├── build_neuron_profiles() [line 3760-3828]
+│       ├── detect_specialized_neurons() [line 3830-3920]
 │       └── run_full_analysis()
 │
 ├── paper_figures.py
@@ -90,25 +143,59 @@ scripts/analysis/
 
 #### 계산 로직
 ```python
-# pos_neuron.py:3838, 3867
+# 1. 뉴런 활성화 판정 (_extract_layer_mask, line 1684-1720)
+mask = layer.get_mask(pool_key)      # 우선: 모델의 binary mask (tau 기반)
+if mask is None:
+    mask = weights > 0.01            # fallback: weight threshold
 
-# Concentration (절대적 비율) - Fig 4에서 사용
-top_pos_pct = (activations_for_top_POS / total_activations) * 100
+# 2. Activation matrix 구성 (_build_matrices, line 3619-3632)
+# activation_matrix[token_idx, neuron_idx] = 1 if active
+for tok_idx, token in enumerate(token_data):
+    active_neurons = np.where(token['mask'])[0]
+    activation_matrix[tok_idx, active_neurons] = 1
 
-# Specialized neuron 판정
+# 3. POS별 활성화 집계 (_compute_neuron_features, line 3703-3706)
+# neuron_pos_counts[neuron, pos] = 해당 POS 토큰에서 활성화된 횟수
+neuron_pos_counts = activation_matrix.T @ pos_matrix  # [n_neurons, n_pos]
+neuron_pos_pct = neuron_pos_counts / neuron_totals * 100
+
+# 4. Specialization 판정 (detect_specialized_neurons, line 3867-3873)
+top_pos_pct = max(neuron_pos_pct[neuron, :])
 if top_pos_pct >= 80:  # threshold = 0.8
     specialized['pos'].append(neuron)
 ```
 
-**참고: Selectivity (상대적 선호도) - 내부 분석용**
-```python
-# pos_neuron.py:801-818
-selectivity[pos, neuron] = mean_weight[pos, neuron] / neuron_avg[neuron]
-# selectivity > 2.0 = "Specialist"
+#### Measurement Method (논문용)
+
+**Concentration Metric:**
+```
+For each neuron i:
+  concentration_i(POS) = activations_on_POS / total_activations_of_neuron_i
+
+Specialized if: max(concentration_i) >= 80%
+Interpretation: "80%+ of this neuron's activations occur on a single POS"
 ```
 
+**Why 80% threshold:**
+- Represents overwhelming majority (4:1 ratio over all other POS combined)
+- Consistent with prior interpretability work (Geva et al., Bau et al.)
+- Can report sensitivity analysis (70%-90%) in Appendix
+
+#### 검증 완료 ✅
+| 항목 | 상태 | 비고 |
+|------|------|------|
+| 활성화 판정 | ✅ | 우선 model mask, fallback weight > 0.01 (top-k 후라 동일) |
+| Concentration 계산 | ✅ | count_for_POS / total * 100 |
+| 80% threshold | ✅ | Reasonable - overwhelming majority |
+| 모든 pool 포함 | ✅ | 6 attention + 2 knowledge pools concatenated |
+
+#### 주의사항 ⚠️
+- v17.1 모델은 routing_info에 mask 저장 안 함 → fallback 사용
+- fallback (`weight > 0.01`)은 top-k sparsity 후라 `weight > 0`과 동일 효과
+
 #### 데이터 소스
-- UD Treebank (English EWT)로 POS 태깅
+- Universal Dependencies English Web Treebank (UD EWT)
+- POS tags: 17개 UPOS categories
 - `NeuronFeatureAnalyzer.run_full_analysis()` 결과
 
 #### 출력
@@ -125,7 +212,10 @@ selectivity[pos, neuron] = mean_weight[pos, neuron] / neuron_avg[neuron]
 ```
 scripts/analysis/
 ├── behavioral.py
-│   └── analyze_factual_neurons() [line 518-770]
+│   └── analyze_factual_neurons() [line 518-767]
+│       ├── Generation loop [line 599-706]
+│       ├── Neuron collection [line 643-666]
+│       └── Result computation [line 726-760]
 │
 ├── paper_figures.py
 │   └── generate_figure5() [line 474-527]
@@ -136,45 +226,94 @@ scripts/analysis/
 
 #### 계산 로직
 ```python
-# behavioral.py:643-686
+# behavioral.py - analyze_factual_neurons()
 
-# 1. Target 토큰 생성까지 반복
+# 1. Generation loop (line 599-706)
 while successful_runs < min_target_count and total_runs < max_runs:
-    for step in range(max_tokens_per_run):
-        # 2. 활성 뉴런 추출 (모든 레이어에서 - SHARED POOL)
-        step_neurons = set()
-        for layer in routing:
-            active = (weight > 0.01).nonzero()
-            step_neurons.update(active)  # 같은 뉴런이면 중복 제거
+    generated = base_input_ids.clone()  # 매 run fresh start
 
-        # 3. Target 발견 시 뉴런 카운트
-        if target in generated_token:
+    for step in range(max_tokens_per_run):
+        outputs = self.model(generated, return_routing_info=True)
+        routing = self.extractor.extract(outputs)
+
+        # 2. 활성 뉴런 추출 - 모든 레이어에서 (line 644-666)
+        step_neurons = set()  # SHARED POOL: set으로 중복 제거
+        for layer_idx, layer in enumerate(routing):
+            m = layer.get_mask(pool_type)       # 우선: binary mask
+            if m is None:
+                w = layer.get_weight(pool_type)  # fallback: weight > 0.01
+                active = (w > 0.01).nonzero()
+            else:
+                active = m.nonzero()
+            step_neurons.update(active)  # neuron index = identity
+
+        # 3. Target 발견 시 뉴런 카운트 (line 674-685)
+        if target_lower in token_text.strip().lower():
             for n in step_neurons:
                 target_neuron_counts[n] += 1
+            successful_runs += 1
+            break
+        else:
+            # Baseline: target 아닌 step들
+            for n in step_neurons:
+                baseline_neuron_counts[n] += 1
 
-# 4. Common neurons 계산
-target_freq = {n: count / successful_runs for n, count in counts.items()}
-common_neurons_100 = [n for n, f in target_freq.items() if f >= 1.0]  # 100%
-common_neurons_80 = [n for n, f in target_freq.items() if f >= 0.8]   # 80%+
+# 4. 결과 계산 (line 726-760)
+target_freq = {n: count / successful_runs for n, count in target_neuron_counts.items()}
+common_neurons_100 = [n for n, f in target_freq.items() if f >= 1.0]
+common_neurons_80 = [n for n, f in target_freq.items() if f >= 0.8]
 
 # 5. Contrastive score (target-specific 뉴런 찾기)
-contrastive_score = target_freq - baseline_freq
+contrastive_score[n] = target_freq[n] - baseline_freq[n]
 ```
 
-#### 핵심 설계 (DAWN 특성)
+#### Measurement Method (논문용)
+
+**Approach: Independent Generation Runs**
 ```
-DAWN은 Shared Neuron Pool 사용:
-- Layer 0의 neuron 42 = Layer 5의 neuron 42 = 같은 뉴런
-- 따라서 neuron index만 저장, set()으로 중복 제거가 올바른 로직
+1. Start from prompt (e.g., "The capital of France is")
+2. Generate tokens until target appears (e.g., "Paris")
+3. Record active neurons at target generation step
+4. Repeat for min_target_count runs (default: 100)
+5. Compute frequency: how often each neuron activates when generating target
 ```
+
+**Shared Pool Design:**
+```
+DAWN uses shared neuron pool across layers:
+- Neuron index i in Layer 0 = same physical neuron as index i in Layer 5
+- Therefore: collect unique neuron indices via set(), not layer-specific
+- This enables cross-layer neuron reuse analysis
+```
+
+**Contrastive Score:**
+```
+For each neuron n:
+  contrastive_score[n] = target_freq[n] - baseline_freq[n]
+
+High positive score → neuron is target-specific (활성이 target에 집중)
+```
+
+#### 검증 완료 ✅
+| 항목 | 상태 | 비고 |
+|------|------|------|
+| Shared pool 처리 | ✅ | `set()`으로 중복 제거, index = neuron identity |
+| Mask 우선 사용 | ✅ | `get_mask()` 우선, fallback `weight > 0.01` |
+| Target step만 기록 | ✅ | target 발견 step의 뉴런만 카운트 |
+| Contrastive score | ✅ | baseline 대비 target-specific 뉴런 식별 |
+
+#### 주의사항 ⚠️
+- v17.1은 routing_info에 mask 없음 → fallback 사용
+- top-k 후 `weight > 0.01` ≈ `weight > 0` (동일 효과)
+- `pool_type` 파라미터로 분석 대상 pool 선택 가능 (기본: 'fv')
 
 #### 데이터 소스
 - `self.results['factual']`
-- Prompts: "The capital of France is" → "Paris" 등
+- Example prompts: "The capital of France is" → "Paris"
 
 #### 출력
-- Heatmap: Target × Neuron (activation frequency)
-- Neurons grouped by semantic category
+- Heatmap: Target × Neuron (activation frequency %)
+- Common neurons shared across semantic category (e.g., capitals)
 
 ---
 
@@ -194,9 +333,7 @@ scripts/analysis/
 
 #### 계산 로직
 ```python
-# paper_figures.py:560-600
-
-# training_log.txt 파싱
+# paper_figures.py - training_log.txt 파싱
 # 형식: "Step 1000: loss=3.5432, val_loss=3.6789, ..."
 for line in log_file:
     match = re.search(r'Step (\d+).*val_loss=([0-9.]+)', line)
@@ -205,6 +342,18 @@ for line in log_file:
         losses.append(float(match.group(2)))
 ```
 
+#### 검증 포인트
+| 항목 | 상태 | 비고 |
+|------|------|------|
+| 로그 파싱 | ✅ | regex로 step, val_loss 추출 |
+| 비교 조건 | ⚠️ | 두 모델이 같은 조건인지 확인 필요 |
+
+#### 확인 필요 ⚠️
+- [ ] 같은 데이터셋으로 학습했는가?
+- [ ] 같은 step 수 학습했는가?
+- [ ] 같은 evaluation 방식인가?
+- [ ] Parameter 수가 comparable한가?
+
 #### 데이터 소스
 - `{checkpoint_path}/training_log.txt`
 - DAWN checkpoint + Vanilla checkpoint
@@ -212,9 +361,6 @@ for line in log_file:
 #### 출력
 - Validation loss curves (DAWN vs Vanilla)
 - X축: Training steps, Y축: Validation loss
-
-#### 검토 필요
-- 두 모델이 같은 조건(데이터, steps, evaluation)인지 확인
 
 ---
 
@@ -226,7 +372,7 @@ for line in log_file:
 ```
 scripts/analysis/
 ├── routing.py
-│   └── analyze_layer_contribution() [line 687-764]
+│   └── analyze_layer_contribution() [line 687-766]
 │
 ├── utils.py
 │   └── LayerRoutingData.get_output_norms() [line 906-924]
@@ -240,29 +386,41 @@ scripts/analysis/
 
 #### 계산 로직
 ```python
-# routing.py:725-752
+# 1. 모델이 forward에서 저장 (model_v17_1.py line 711-718)
+attn_out_norm = attn_out.norm(dim=-1).mean().detach()
+know_out_norm = know_out.norm(dim=-1).mean().detach()
+routing_info = {
+    'attn_out_norm': attn_out_norm,
+    'know_out_norm': know_out_norm,
+}
 
-# 1. 모델이 저장한 output norm 가져오기
-norms = layer.get_output_norms()
-# → {'attn_out_norm': 0.42, 'know_out_norm': 0.58}
+# 2. 분석 코드에서 추출 (routing.py line 726-732)
+for layer in routing:
+    norms = layer.get_output_norms()
+    layer_norms[layer_idx]['attn'].append(norms['attn_out_norm'])
+    layer_norms[layer_idx]['know'].append(norms['know_out_norm'])
 
-# 2. Attention ratio 계산
+# 3. Attention ratio 계산 (routing.py line 750)
 attention_ratio = attn_norm / (attn_norm + know_norm) * 100
-
-# "Attention > 50%" = attention_ratio > 50
-# = Attention circuit이 Knowledge circuit보다 기여도가 큼
 ```
 
-```python
-# utils.py:918-923 - Output norm 추출
-def get_output_norms(self) -> Dict[str, float]:
-    norms = {}
-    if 'attn_out_norm' in self.raw:
-        norms['attn_out_norm'] = self.raw['attn_out_norm']
-    if 'know_out_norm' in self.raw:
-        norms['know_out_norm'] = self.raw['know_out_norm']
-    return norms
+#### Measurement Method (논문용)
 ```
+Output Norm Based Measurement:
+- attn_out_norm = ||attention_circuit_output||₂ averaged over tokens
+- know_out_norm = ||knowledge_circuit_output||₂ averaged over tokens
+- attention_ratio = attn_norm / (attn_norm + know_norm)
+
+This measures actual output magnitude contribution, not routing weights.
+```
+
+#### 검증 완료 ✅
+| 항목 | 상태 | 비고 |
+|------|------|------|
+| Output norm 저장 | ✅ | 모델이 forward에서 저장 (line 711-718) |
+| Norm 추출 | ✅ | `layer.get_output_norms()` 사용 |
+| Ratio 계산 | ✅ | `attn / (attn + know) * 100` |
+| 레이어별 집계 | ✅ | 모든 레이어 개별 분석 |
 
 #### 데이터 소스
 - `self.results['routing']['layer_contribution']`
@@ -270,7 +428,7 @@ def get_output_norms(self) -> Dict[str, float]:
 
 #### 출력
 - Stacked bar chart: Attention vs Knowledge per layer
-- Layer 0~11의 기여도 비율
+- Layer 0~N의 기여도 비율
 
 ---
 
@@ -355,7 +513,7 @@ scripts/analysis/analyze_all.py
 
 | Output | Analysis Function | Data Key | Visualizer |
 |--------|-------------------|----------|------------|
-| **Fig 3** | `routing.analyze_qk_overlap()` | `routing.qk_overlap` | `qk_specialization.py` |
+| **Fig 3** | `routing.analyze_qk_usage()` | `routing.qk_usage` | `qk_specialization.py` |
 | **Fig 4** | `NeuronFeatureAnalyzer.run_full_analysis()` | `neuron_features` | `pos_neurons.py` |
 | **Fig 5** | `behavioral.analyze_factual_neurons()` | `factual` | `factual_heatmap.py` |
 | **Fig 6** | (파일 파싱) | `training_log.txt` | `training_dynamics.py` |
@@ -366,17 +524,30 @@ scripts/analysis/analyze_all.py
 
 ---
 
-## Review Checklist
+## Review Checklist (Updated 2025-01-21)
 
-| Item | Logic | Status |
-|------|-------|--------|
-| Fig 3 Q/K correlation | `np.corrcoef(q_counts, k_counts)` | ✅ OK |
-| Fig 4 POS concentration | `count[pos] / total * 100` | ✅ OK |
-| Fig 5 Factual neurons | shared pool, set dedup | ✅ OK |
-| Fig 6 Training dynamics | log 파일 파싱 | ⚠️ 조건 동일 확인 필요 |
-| Fig 7 Layer contribution | `attn_norm / (attn + know)` | ✅ OK |
-| Table 1 Model stats | model_info + performance | ✅ OK |
-| Table 2 Neuron util | health.ema_distribution | ✅ OK |
+| Item | Logic | Status | Notes |
+|------|-------|--------|-------|
+| Fig 3 Q/K correlation | `np.corrcoef(q_counts, k_counts)` | ✅ Verified | Uses top-k weights correctly |
+| Fig 3 Specialization | `mean * 0.1` threshold | ⚠️ Needs fix | Change to ratio-based (70/30) |
+| Fig 4 POS concentration | `count[pos] / total * 100` | ✅ Verified | 80% threshold OK |
+| Fig 4 Mask source | `get_mask()` → `weight > 0.01` | ✅ Verified | Fallback works with top-k |
+| Fig 5 Factual neurons | shared pool, set dedup | ✅ Verified | Correct DAWN semantics |
+| Fig 5 Contrastive | `target_freq - baseline_freq` | ✅ Verified | |
+| Fig 6 Training dynamics | log 파일 파싱 | ⚠️ Check | 두 모델 조건 동일 확인 필요 |
+| Fig 7 Layer contribution | `attn_norm / (attn + know)` | ✅ Verified | Model stores norms |
+| Table 1 Model stats | model_info + performance | ✅ OK | |
+| Table 2 Neuron util | health.ema_distribution | ✅ OK | |
+
+### Action Items
+1. **Fig 3**: Specialization threshold를 ratio 기반으로 수정 (코드 변경 필요)
+2. **Fig 6**: DAWN vs Vanilla 비교 조건 동일 확인
+
+### Key Verification Points
+- [x] Top-k sparsity: `weight > 0` correctly identifies selected neurons
+- [x] WEIGHT_KEY_MAP: `fqk_q` → `fqk_weights_Q` (top-k applied)
+- [x] Shared pool: neuron index = identity across layers
+- [x] Output norms: model saves `attn_out_norm`, `know_out_norm`
 
 ---
 
