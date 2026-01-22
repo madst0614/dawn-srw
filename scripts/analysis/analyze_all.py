@@ -2851,15 +2851,26 @@ class ModelAnalyzer:
             factual_summary = factual.get('summary', {})
 
             per_target_summary = {}
-            for target, pool_data in per_target.items():
-                if isinstance(pool_data, dict):
-                    target_summary = {}
-                    for pool, data in pool_data.items():
+            for target, target_data in per_target.items():
+                if isinstance(target_data, dict):
+                    # match_rate is at top level, per_pool contains the pool data
+                    match_rate = target_data.get('match_rate', 0)
+                    target_per_pool = target_data.get('per_pool', {})
+
+                    target_summary = {
+                        'match_rate': round(match_rate, 3),
+                        'successful_runs': target_data.get('successful_runs', 0),
+                        'total_runs': target_data.get('total_runs', 0),
+                    }
+
+                    # Add per-pool common neurons
+                    for pool, data in target_per_pool.items():
                         if isinstance(data, dict):
                             target_summary[pool] = {
                                 'common_100': data.get('common_100', []),
                                 'common_80': data.get('common_80', []),
-                                'match_rate': round(data.get('match_rate', 0), 3),
+                                'n_common_100': len(data.get('common_100', [])),
+                                'n_common_80': len(data.get('common_80', [])),
                             }
                     per_target_summary[target] = target_summary
 
