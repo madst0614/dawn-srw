@@ -2087,15 +2087,6 @@ class ModelAnalyzer:
             model_config = json_config.get('model', {})
             if not model_config:
                 model_config = checkpoint.get('config', checkpoint.get('model_config', {}))
-            config_data['model'] = {
-                'd_model': model_config.get('d_model', model_config.get('hidden_size', 0)),
-                'n_layers': model_config.get('n_layers', model_config.get('num_hidden_layers', 0)),
-                'n_heads': model_config.get('n_heads', model_config.get('num_attention_heads', 0)),
-                'vocab_size': model_config.get('vocab_size', 0),
-                'd_ff': model_config.get('d_ff', model_config.get('intermediate_size', 0)),
-                'max_seq_len': model_config.get('max_seq_len', model_config.get('max_position_embeddings', 0)),
-            }
-
             # Count parameters from state dict (exclude EMA/optimizer buffers)
             state_dict = checkpoint.get('model_state_dict', {})
             if not state_dict:
@@ -2106,6 +2097,27 @@ class ModelAnalyzer:
                     if not k.startswith('optimizer') and not k.startswith('ema_') and
                        not k.startswith('_') and hasattr(v, 'numel')
                 }
+
+            # Try to infer vocab_size from embedding layer
+            vocab_size = model_config.get('vocab_size', 0)
+            if vocab_size == 0 and state_dict:
+                # Try to find embedding layer and extract vocab_size from its shape
+                for key in state_dict.keys():
+                    if 'embed' in key.lower() and 'weight' in key:
+                        tensor = state_dict[key]
+                        if hasattr(tensor, 'shape') and len(tensor.shape) == 2:
+                            vocab_size = tensor.shape[0]
+                            break
+
+            config_data['model'] = {
+                'd_model': model_config.get('d_model', model_config.get('hidden_size', 0)),
+                'n_layers': model_config.get('n_layers', model_config.get('num_hidden_layers', 0)),
+                'n_heads': model_config.get('n_heads', model_config.get('num_attention_heads', 0)),
+                'vocab_size': vocab_size,
+                'd_ff': model_config.get('d_ff', model_config.get('intermediate_size', 0)),
+                'max_seq_len': model_config.get('max_seq_len', model_config.get('max_position_embeddings', 0)),
+            }
+
             if state_dict:
                 # Only count actual parameters (weight, bias, embeddings)
                 param_keys = [k for k in state_dict.keys()
@@ -2132,12 +2144,39 @@ class ModelAnalyzer:
                     'dataset': checkpoint.get('dataset', checkpoint.get('data_path')),
                 }
 
+            # Extract dataset info from data section (YAML config) or training section
+            data_config = json_config.get('data', {})
+            dataset_name = 'unknown'
+            if data_config.get('train_files'):
+                # Extract dataset name from first train file path (e.g., "train/c4/c4_raw_000.pt" -> "c4")
+                first_file = data_config['train_files'][0] if data_config['train_files'] else ''
+                if 'c4' in first_file.lower():
+                    dataset_name = 'C4'
+                elif 'wikitext' in first_file.lower():
+                    dataset_name = 'WikiText'
+                else:
+                    dataset_name = first_file.split('/')[-1].split('_')[0] if first_file else 'unknown'
+            elif data_config.get('base_dir'):
+                dataset_name = data_config['base_dir'].split('/')[-1]
+            else:
+                dataset_name = training_config.get('dataset', training_config.get('data_path', 'unknown'))
+
+            # Extract training tokens / steps
+            max_train_tokens = data_config.get('max_train_tokens', 0)
+            total_steps = training_config.get('total_steps', training_config.get('max_steps', 0))
+
+            # Warmup: prefer warmup_ratio (convert to ratio), fallback to warmup_steps
+            warmup_ratio = training_config.get('warmup_ratio', 0)
+            warmup_steps = training_config.get('warmup_steps', 0)
+
             config_data['training'] = {
-                'dataset': training_config.get('dataset', training_config.get('data_path', 'unknown')),
+                'dataset': dataset_name,
                 'batch_size': training_config.get('batch_size', training_config.get('train_batch_size', 0)),
                 'learning_rate': training_config.get('learning_rate', training_config.get('lr', 0)),
-                'total_steps': training_config.get('total_steps', training_config.get('max_steps', 0)),
-                'warmup_steps': training_config.get('warmup_steps', 0),
+                'total_steps': total_steps,
+                'max_train_tokens': max_train_tokens,
+                'warmup_steps': warmup_steps,
+                'warmup_ratio': warmup_ratio,
                 'epochs': training_config.get('epochs', training_config.get('num_epochs', 0)),
             }
 
@@ -2530,24 +2569,35 @@ class ModelAnalyzer:
                 'per_target': per_target_summary,
             }
 
-        # Fig 6: Training Dynamics - Extract config from checkpoints (summary only)
+        # Fig 6: Training Dynamics - Use same sources as Table 1 for consistency
+        # DAWN: use model_info (from loaded model), Vanilla: use vanilla_info (from comparison)
         fig6_config = self._extract_training_configs()
-        # Keep only essential summary, remove detailed comparison
+        dawn_training = fig6_config.get('dawn', {}).get('training', {})
+        vanilla_training = fig6_config.get('vanilla', {}).get('training', {})
+
         paper_results['fig6_training_dynamics'] = {
             'dawn': {
-                'params_M': fig6_config.get('dawn', {}).get('model', {}).get('total_params_M'),
-                'd_model': fig6_config.get('dawn', {}).get('model', {}).get('d_model'),
-                'n_layers': fig6_config.get('dawn', {}).get('model', {}).get('n_layers'),
-                'batch_size': fig6_config.get('dawn', {}).get('training', {}).get('batch_size'),
-                'learning_rate': fig6_config.get('dawn', {}).get('training', {}).get('learning_rate'),
+                # Use model_info for params (same as Table 1)
+                'params_M': round(model_info.get('total_M', 0), 2),
+                'd_model': model_info.get('d_model', fig6_config.get('dawn', {}).get('model', {}).get('d_model')),
+                'n_layers': model_info.get('n_layers', fig6_config.get('dawn', {}).get('model', {}).get('n_layers')),
+                # Training config from checkpoint
+                'batch_size': dawn_training.get('batch_size'),
+                'learning_rate': dawn_training.get('learning_rate'),
+                'total_steps': dawn_training.get('total_steps'),
+                'warmup_steps': dawn_training.get('warmup_steps'),
             },
             'vanilla': {
-                'params_M': fig6_config.get('vanilla', {}).get('model', {}).get('total_params_M'),
-                'd_model': fig6_config.get('vanilla', {}).get('model', {}).get('d_model'),
-                'n_layers': fig6_config.get('vanilla', {}).get('model', {}).get('n_layers'),
-                'batch_size': fig6_config.get('vanilla', {}).get('training', {}).get('batch_size'),
-                'learning_rate': fig6_config.get('vanilla', {}).get('training', {}).get('learning_rate'),
-            } if fig6_config.get('vanilla') else None,
+                # Use vanilla_info for params (same as Table 1)
+                'params_M': round(vanilla_info.get('total_M', 0), 2) if vanilla_info else fig6_config.get('vanilla', {}).get('model', {}).get('total_params_M'),
+                'd_model': vanilla_info.get('d_model') if vanilla_info else fig6_config.get('vanilla', {}).get('model', {}).get('d_model'),
+                'n_layers': vanilla_info.get('n_layers') if vanilla_info else fig6_config.get('vanilla', {}).get('model', {}).get('n_layers'),
+                # Training config from checkpoint
+                'batch_size': vanilla_training.get('batch_size'),
+                'learning_rate': vanilla_training.get('learning_rate'),
+                'total_steps': vanilla_training.get('total_steps'),
+                'warmup_steps': vanilla_training.get('warmup_steps'),
+            } if fig6_config.get('vanilla') or vanilla_info else None,
         }
 
         # Fig 7: Layer Contribution (with computed summary)
