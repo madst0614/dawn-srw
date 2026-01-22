@@ -63,8 +63,9 @@ class BaseAnalyzer(ABC):
 
     @property
     def is_v18(self) -> bool:
-        """Check if model is v18.x (has separate Q/K EMA)."""
-        return hasattr(self.router, 'usage_ema_feature_q')
+        """Check if model is v18.x (has max_paths for multi-path routing)."""
+        gr = self.global_routers
+        return gr is not None and hasattr(gr, 'max_paths')
 
     @property
     def global_routers(self):
@@ -88,8 +89,8 @@ class BaseAnalyzer(ABC):
         """Get embedding pool configuration (6 unique pools for v18)."""
         if self.is_v18:
             return EMBEDDING_POOLS_V18
-        # For non-v18, use NEURON_TYPES format
-        return {k: (v[0], v[2], v[3]) for k, v in NEURON_TYPES.items()}
+        # For non-v18, use NEURON_TYPES format (display, n_attr, color)
+        return {k: v for k, v in NEURON_TYPES.items()}
 
     def enable_pref_tensors(self):
         """Enable store_pref_tensors for detailed routing analysis."""
@@ -150,13 +151,5 @@ class BaseAnalyzer(ABC):
         neuron_types = self.get_neuron_types()
         if neuron_type not in neuron_types:
             return 0
-        _, _, n_attr, _ = neuron_types[neuron_type]
+        _, n_attr, _ = neuron_types[neuron_type]
         return getattr(self.router, n_attr, 0)
-
-    def get_ema(self, neuron_type: str) -> Optional[torch.Tensor]:
-        """Get EMA tensor for a given neuron type."""
-        neuron_types = self.get_neuron_types()
-        if neuron_type not in neuron_types:
-            return None
-        _, ema_attr, _, _ = neuron_types[neuron_type]
-        return getattr(self.router, ema_attr, None)

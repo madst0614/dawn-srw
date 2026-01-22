@@ -517,32 +517,30 @@ class ModelAnalyzer:
         output_dir = self.output_dir / 'health'
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        print("  Analyzing neuron health...")
+        print("  Analyzing neuron health (forward-based)...")
         analyzer = NeuronHealthAnalyzer(self.model, device=self.device)
-        results = analyzer.run_all(str(output_dir))
+        results = analyzer.run_all(self.dataloader, str(output_dir), n_batches=self.n_batches)
 
         # Print detailed summary
-        ema = results.get('ema_distribution', {})
+        activation = results.get('activation_distribution', {})
         diversity = results.get('diversity', {})
 
-        if ema:
-            print(f"\n  ┌─ Neuron Health Summary ───────────────────────────────────────────────")
-            print(f"  │ {'Pool':<12} {'Active':>8} {'Dead':>8} {'Total':>8} {'Ratio':>8} {'Gini':>8} {'EMA Mean':>10} {'EMA Std':>10}")
-            print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*10} {'─'*10}")
+        if activation:
+            print(f"\n  ┌─ Neuron Health Summary (Forward-based) ──────────────────────────────")
+            print(f"  │ {'Pool':<12} {'Active':>8} {'Dead':>8} {'Total':>8} {'Ratio':>8} {'Gini':>8}")
+            print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
 
             total_active = 0
             total_neurons = 0
-            for name, data in ema.items():
+            for name, data in activation.items():
                 if isinstance(data, dict) and 'total' in data:
                     total_active += data.get('active', 0)
                     total_neurons += data.get('total', 0)
-                    stats = data.get('stats', {})
-                    print(f"  │ {data.get('display', name):<12} {data['active']:>8d} {data['dead']:>8d} "
-                          f"{data['total']:>8d} {data['active_ratio']*100:>7.1f}% {data.get('gini', 0):>8.3f} "
-                          f"{stats.get('mean', 0):>10.4f} {stats.get('std', 0):>10.4f}")
+                    print(f"  │ {name:<12} {data['active']:>8d} {data['dead']:>8d} "
+                          f"{data['total']:>8d} {data['active_ratio']*100:>7.1f}% {data.get('gini', 0):>8.3f}")
 
             if total_neurons > 0:
-                print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*10} {'─'*10}")
+                print(f"  │ {'─'*12} {'─'*8} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
                 print(f"  │ {'TOTAL':<12} {total_active:>8d} {total_neurons - total_active:>8d} "
                       f"{total_neurons:>8d} {total_active/total_neurons*100:>7.1f}%")
             print(f"  └─────────────────────────────────────────────────────────────────────────")
@@ -1838,13 +1836,13 @@ class ModelAnalyzer:
         # Neuron utilization table
         if 'health' in self.results:
             health = self.results['health']
-            ema = health.get('ema_distribution', {})
+            activation = health.get('activation_distribution', {})
 
             with open(tables_dir / 'neuron_utilization.csv', 'w') as f:
                 f.write("pool,total,active,dead,active_ratio,gini\n")
-                for name, data in ema.items():
+                for name, data in activation.items():
                     if isinstance(data, dict) and 'total' in data:
-                        f.write(f"{data.get('display', name)},{data['total']},{data['active']},"
+                        f.write(f"{name},{data['total']},{data['active']},"
                                f"{data['dead']},{data['active_ratio']:.3f},{data.get('gini', 0):.3f}\n")
 
             with open(tables_dir / 'neuron_utilization.tex', 'w') as f:
@@ -1855,9 +1853,9 @@ class ModelAnalyzer:
                 f.write("\\toprule\n")
                 f.write("Pool & Total & Active & Dead & Gini \\\\\n")
                 f.write("\\midrule\n")
-                for name, data in ema.items():
+                for name, data in activation.items():
                     if isinstance(data, dict) and 'total' in data:
-                        f.write(f"{data.get('display', name)} & {data['total']} & {data['active']} & "
+                        f.write(f"{name} & {data['total']} & {data['active']} & "
                                f"{data['dead']} & {data.get('gini', 0):.3f} \\\\\n")
                 f.write("\\bottomrule\n")
                 f.write("\\end{tabular}\n")
@@ -2966,9 +2964,9 @@ class ModelAnalyzer:
         ]
 
         if health:
-            ema = health.get('ema_distribution', {})
-            total_active = sum(d.get('active', 0) for d in ema.values() if isinstance(d, dict))
-            total_neurons = sum(d.get('total', 0) for d in ema.values() if isinstance(d, dict))
+            activation = health.get('activation_distribution', {})
+            total_active = sum(d.get('active', 0) for d in activation.values() if isinstance(d, dict))
+            total_neurons = sum(d.get('total', 0) for d in activation.values() if isinstance(d, dict))
 
             if total_neurons > 0:
                 lines.extend([
@@ -3031,17 +3029,17 @@ class ModelAnalyzer:
         ]
 
         if health:
-            ema = health.get('ema_distribution', {})
+            activation = health.get('activation_distribution', {})
             lines.extend([
                 "## Neuron Health",
                 "",
                 "| Pool | Total | Active | Dead | Active % | Gini |",
                 "|------|-------|--------|------|----------|------|",
             ])
-            for name, data in ema.items():
+            for name, data in activation.items():
                 if isinstance(data, dict) and 'total' in data:
                     lines.append(
-                        f"| {data.get('display', name)} | {data['total']} | {data['active']} | "
+                        f"| {name} | {data['total']} | {data['active']} | "
                         f"{data['dead']} | {data['active_ratio']*100:.1f}% | {data.get('gini', 0):.3f} |"
                     )
             lines.append("")
@@ -3296,9 +3294,9 @@ class ModelAnalyzer:
         # Health summary (DAWN only)
         health = self.results.get('health', {})
         if health:
-            ema = health.get('ema_distribution', {})
-            total_active = sum(d.get('active', 0) for d in ema.values() if isinstance(d, dict))
-            total_neurons = sum(d.get('total', 0) for d in ema.values() if isinstance(d, dict))
+            activation = health.get('activation_distribution', {})
+            total_active = sum(d.get('active', 0) for d in activation.values() if isinstance(d, dict))
+            total_neurons = sum(d.get('total', 0) for d in activation.values() if isinstance(d, dict))
             if total_neurons > 0:
                 print(f"\nNeuron Health:")
                 print(f"  Active: {total_active}/{total_neurons} ({total_active/total_neurons*100:.1f}%)")
@@ -3550,18 +3548,18 @@ class MultiModelAnalyzer:
 
             if analyzer.model_type == 'dawn':
                 health = analyzer.results.get('health', {})
-                ema = health.get('ema_distribution', {})
+                activation = health.get('activation_distribution', {})
 
-                if ema:
+                if activation:
                     lines.append("#### Neuron Health")
                     lines.append("")
                     lines.append("| Pool | Total | Active | Dead | Gini |")
                     lines.append("|------|-------|--------|------|------|")
 
-                    for pool_name, data in ema.items():
+                    for pool_name, data in activation.items():
                         if isinstance(data, dict) and 'total' in data:
                             lines.append(
-                                f"| {data.get('display', pool_name)} | {data['total']} | "
+                                f"| {pool_name} | {data['total']} | "
                                 f"{data['active']} | {data['dead']} | {data.get('gini', 0):.3f} |"
                             )
                     lines.append("")

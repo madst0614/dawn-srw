@@ -66,20 +66,11 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
         neuron_types = self.get_neuron_types()
 
-        # Get EMA usage
-        type_info = neuron_types.get(neuron_type)
-        if type_info:
-            ema_attr = type_info[1]
-            if hasattr(self.router, ema_attr):
-                ema = getattr(self.router, ema_attr)
-                if neuron_id < len(ema):
-                    results['usage_ema'] = float(ema[neuron_id])
-
         # Get embedding properties
         emb = self.router.neuron_emb.detach().cpu().numpy()
 
         offset = 0
-        for name, (_, _, n_attr, _) in neuron_types.items():
+        for name, (_, n_attr, _) in neuron_types.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
                 if name == neuron_type:

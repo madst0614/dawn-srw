@@ -171,19 +171,17 @@ class PaperFigureGenerator:
             health_results: Results from NeuronHealthAnalyzer
             output_dir: Directory for output
         """
-        ema_dist = health_results.get('ema_distribution', {})
+        activation = health_results.get('activation_distribution', {})
 
         # Create CSV
         csv_path = os.path.join(output_dir, 'table1_neuron_utilization.csv')
         with open(csv_path, 'w') as f:
-            f.write("Pool,Total,Active,Dead,Active%,Gini,Mean EMA,Std EMA\n")
-            for name, data in ema_dist.items():
-                if isinstance(data, dict) and 'display' in data:
-                    stats = data.get('stats', {})
-                    f.write(f"{data['display']},{data['total']},{data['active']},"
+            f.write("Pool,Total,Active,Dead,Active%,Gini\n")
+            for name, data in activation.items():
+                if isinstance(data, dict) and 'total' in data:
+                    f.write(f"{name},{data['total']},{data['active']},"
                            f"{data['dead']},{data['active_ratio']*100:.1f}%,"
-                           f"{data['gini']:.3f},{stats.get('mean', 0):.4f},"
-                           f"{stats.get('std', 0):.4f}\n")
+                           f"{data['gini']:.3f}\n")
 
         print(f"  Table 1 saved: {csv_path}")
 
@@ -193,17 +191,15 @@ class PaperFigureGenerator:
             f.write("\\begin{table}[h]\n")
             f.write("\\centering\n")
             f.write("\\caption{Neuron Utilization Statistics}\n")
-            f.write("\\begin{tabular}{lrrrrrrr}\n")
+            f.write("\\begin{tabular}{lrrrrr}\n")
             f.write("\\toprule\n")
-            f.write("Pool & Total & Active & Dead & Active\\% & Gini & Mean EMA & Std EMA \\\\\n")
+            f.write("Pool & Total & Active & Dead & Active\\% & Gini \\\\\n")
             f.write("\\midrule\n")
-            for name, data in ema_dist.items():
-                if isinstance(data, dict) and 'display' in data:
-                    stats = data.get('stats', {})
-                    f.write(f"{data['display']} & {data['total']} & {data['active']} & "
+            for name, data in activation.items():
+                if isinstance(data, dict) and 'total' in data:
+                    f.write(f"{name} & {data['total']} & {data['active']} & "
                            f"{data['dead']} & {data['active_ratio']*100:.1f}\\% & "
-                           f"{data['gini']:.3f} & {stats.get('mean', 0):.4f} & "
-                           f"{stats.get('std', 0):.4f} \\\\\n")
+                           f"{data['gini']:.3f} \\\\\n")
             f.write("\\bottomrule\n")
             f.write("\\end{tabular}\n")
             f.write("\\label{tab:neuron-utilization}\n")
@@ -226,12 +222,12 @@ class PaperFigureGenerator:
 
         # 1. Active Neuron Ratios
         ax = axes[0, 0]
-        ema_dist = results.get('health', {}).get('ema_distribution', {})
+        activation = results.get('health', {}).get('activation_distribution', {})
         names = []
         ratios = []
-        for name, data in ema_dist.items():
-            if isinstance(data, dict) and 'display' in data:
-                names.append(data['display'])
+        for name, data in activation.items():
+            if isinstance(data, dict) and 'total' in data:
+                names.append(name)
                 ratios.append(data['active_ratio'] * 100)
         if names:
             ax.bar(names, ratios, color='steelblue', alpha=0.7)
@@ -247,7 +243,7 @@ class PaperFigureGenerator:
         div_scores = []
         for name, data in diversity.items():
             if isinstance(data, dict) and 'normalized_entropy' in data:
-                div_names.append(data['display'])
+                div_names.append(name)
                 div_scores.append(data['normalized_entropy'] * 100)
         if div_names:
             ax.bar(div_names, div_scores, color='green', alpha=0.7)

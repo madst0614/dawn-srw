@@ -168,28 +168,17 @@ class EmbeddingAnalyzer(BaseAnalyzer):
         # Use embedding pools (6 unique pools) for correct boundaries
         pools = self.get_embedding_pools()
 
-        # Map pool names to EMA attributes (for v18, QK pools use combined Q+K)
-        ema_mapping = {
-            'feature_qk': ('usage_ema_feature_q', 'usage_ema_feature_k'),
-            'feature_v': 'usage_ema_feature_v',
-            'restore_qk': ('usage_ema_restore_q', 'usage_ema_restore_k'),
-            'restore_v': 'usage_ema_restore_v',
-            'feature_know': 'usage_ema_feature_know',
-            'restore_know': 'usage_ema_restore_know',
-        }
-
         # Build boundaries for each pool
         boundaries = {}
         offset = 0
         for name, (display, n_attr, _) in pools.items():
             if hasattr(self.router, n_attr):
                 n = getattr(self.router, n_attr)
-                ema_info = ema_mapping.get(name)
-                boundaries[name] = (offset, offset + n, ema_info, display)
+                boundaries[name] = (offset, offset + n, display)
                 offset += n
 
         # Cluster each pool
-        for name, (start, end, ema_info, display) in boundaries.items():
+        for name, (start, end, display) in boundaries.items():
             pool_emb = emb[start:end]
             n_neurons = pool_emb.shape[0]
 
@@ -200,44 +189,19 @@ class EmbeddingAnalyzer(BaseAnalyzer):
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             labels = kmeans.fit_predict(pool_emb)
 
-            # Get EMA (for QK pools, use max of Q and K)
-            ema = None
-            if ema_info is not None:
-                if isinstance(ema_info, tuple):
-                    ema_q = getattr(self.router, ema_info[0], None)
-                    ema_k = getattr(self.router, ema_info[1], None)
-                    if ema_q is not None and ema_k is not None:
-                        ema = torch.maximum(ema_q, ema_k).cpu().numpy()
-                else:
-                    ema_attr = getattr(self.router, ema_info, None)
-                    if ema_attr is not None:
-                        ema = ema_attr.cpu().numpy()
-
             cluster_stats = []
             for c in range(n_clusters):
                 cluster_mask = labels == c
                 cluster_size = cluster_mask.sum()
-
-                if ema is not None:
-                    cluster_ema = ema[cluster_mask]
-                    cluster_stats.append({
-                        'cluster_id': c,
-                        'size': int(cluster_size),
-                        'avg_usage': float(cluster_ema.mean()),
-                        'max_usage': float(cluster_ema.max()),
-                        'min_usage': float(cluster_ema.min()),
-                        'active_count': int((cluster_ema > 0.01).sum()),
-                    })
-                else:
-                    cluster_stats.append({
-                        'cluster_id': c,
-                        'size': int(cluster_size),
-                    })
+                cluster_stats.append({
+                    'cluster_id': c,
+                    'size': int(cluster_size),
+                })
 
             results[name] = {
                 'display': display,
                 'n_clusters': n_clusters,
-                'clusters': sorted(cluster_stats, key=lambda x: -x.get('avg_usage', 0)),
+                'clusters': sorted(cluster_stats, key=lambda x: -x['size']),
                 'labels': labels.tolist(),
             }
 
