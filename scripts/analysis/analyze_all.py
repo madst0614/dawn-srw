@@ -2686,8 +2686,14 @@ class ModelAnalyzer:
         }
 
         # Table 2: Neuron Utilization (forward-pass based)
+        # Try neuron_features.utilization first, then fallback to health.activation_distribution
         neuron_features = self.results.get('neuron_features', {})
         utilization = neuron_features.get('utilization', {})
+
+        # Fallback to health analysis if utilization not in neuron_features
+        if not utilization:
+            health = self.results.get('health', {})
+            utilization = health.get('activation_distribution', {})
 
         table2_data = {'method': 'forward_pass', 'pools': {}}
         if utilization:
@@ -2886,6 +2892,37 @@ class ModelAnalyzer:
                         'f1_macro': round(data.get('f1_macro', 0), 3),
                     }
             paper_data['appendix']['probing'] = probing_data
+
+        # Generation Samples
+        gen = self.results.get('performance', {}).get('generation', {})
+        if gen and gen.get('samples'):
+            paper_data['appendix']['generation'] = {
+                'samples': gen.get('samples', [])[:10],  # Top 10 samples
+                'prompts_used': gen.get('prompts_used', []),
+            }
+
+        # Semantic Analysis
+        semantic = self.results.get('semantic', {})
+        if semantic:
+            paper_data['appendix']['semantic'] = {
+                'path_similarity': semantic.get('path_similarity', {}),
+                'context_routing': semantic.get('context_routing', {}),
+            }
+
+        # Coselection Analysis
+        coselection = self.results.get('coselection', {})
+        if coselection:
+            paper_data['appendix']['coselection'] = {
+                'pools': coselection.get('pools', {}),
+                'correlation': coselection.get('correlation', {}),
+            }
+
+        # Behavioral Analysis (token trajectory, entropy)
+        if behavioral:
+            if 'trajectory' in behavioral:
+                paper_data['appendix']['behavioral'] = {
+                    'trajectory': behavioral.get('trajectory', {}),
+                }
 
         # === SAVE UNIFIED JSON ===
         # Save as paper_data.json (new unified format)
