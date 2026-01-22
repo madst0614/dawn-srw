@@ -312,6 +312,15 @@ selectivity_matrix: np.ndarray  # [n_neurons, n_pos]
 
 **목적**: 관련된 사실(예: 수도 이름들)이 유사한 뉴런 패턴을 공유함을 보여줌
 
+#### 논문 Caption
+```
+Figure 5: Factual knowledge neuron activation in F-Know pool.
+Left section shows neurons consistently activated across all factual queries (shared).
+Middle section shows capital-city-specific neurons.
+Right section shows neurons specific to color queries.
+Dashed line separates geographic (Paris, London, Tokyo) from non-geographic (Blue) targets.
+```
+
 #### 관련 파일
 ```
 scripts/analysis/
