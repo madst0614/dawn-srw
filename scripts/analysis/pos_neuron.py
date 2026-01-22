@@ -1566,12 +1566,12 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         self.total_neurons = sum(self.pool_sizes.values())
 
         # Precompute pool order for fast concatenation
+        # NOTE: Use physical neuron pools, not Q/K separately
+        # Q/K share the same neurons, so fqk (not fqk_q + fqk_k)
         self.pool_order = [
-            ('fqk_q', self.pool_sizes.get('fqk', 0)),
-            ('fqk_k', self.pool_sizes.get('fqk', 0)),
+            ('fqk', self.pool_sizes.get('fqk', 0)),
             ('fv', self.pool_sizes.get('fv', 0)),
-            ('rqk_q', self.pool_sizes.get('rqk', 0)),
-            ('rqk_k', self.pool_sizes.get('rqk', 0)),
+            ('rqk', self.pool_sizes.get('rqk', 0)),
             ('rv', self.pool_sizes.get('rv', 0)),
             ('fknow', self.pool_sizes.get('fknow', 0)),
             ('rknow', self.pool_sizes.get('rknow', 0)),
@@ -1680,44 +1680,91 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
             print(f"  [Debug] knowledge keys: {[k for k in know_keys if 'mask' in k.lower()]}")
 
         for pool_key, expected_size in self.pool_order:
-            # Try to get actual binary mask first (scores > tau)
-            mask = layer.get_mask(pool_key)
+            # For Q/K shared pools, combine Q and K masks with OR
+            # A neuron is active if selected for Q OR K
+            if pool_key in ('fqk', 'rqk'):
+                mask_q = layer.get_mask(f'{pool_key}_q')
+                mask_k = layer.get_mask(f'{pool_key}_k')
 
-            if mask is not None:
-                used_actual += 1
-                # Use actual model mask (cleaner signal)
-                if mask.dim() == 3:
-                    m = mask[0, :seq_len].cpu().numpy().astype(np.bool_)
+                if mask_q is not None or mask_k is not None:
+                    used_actual += 1
+                    m = np.zeros((seq_len, expected_size), dtype=np.bool_)
+
+                    for sub_mask in [mask_q, mask_k]:
+                        if sub_mask is not None:
+                            if sub_mask.dim() == 3:
+                                sub_m = sub_mask[0, :seq_len].cpu().numpy().astype(np.bool_)
+                            else:
+                                sub_m = np.broadcast_to(
+                                    sub_mask[0].cpu().numpy().astype(np.bool_),
+                                    (seq_len, sub_mask.shape[-1])
+                                )
+                            if sub_m.shape[0] < seq_len:
+                                sub_m = np.pad(sub_m, ((0, seq_len - sub_m.shape[0]), (0, 0)))
+                            m = m | sub_m  # OR combine
+
+                    masks.append(m)
                 else:
-                    m = np.broadcast_to(
-                        mask[0].cpu().numpy().astype(np.bool_),
-                        (seq_len, mask.shape[-1])
-                    )
+                    # Fallback: use weights > threshold
+                    used_fallback += 1
+                    failed_pools.append(pool_key)
+                    weights_q = layer.get_weight(f'{pool_key}_q')
+                    weights_k = layer.get_weight(f'{pool_key}_k')
 
-                if m.shape[0] < seq_len:
-                    m = np.pad(m, ((0, seq_len - m.shape[0]), (0, 0)))
+                    m = np.zeros((seq_len, expected_size), dtype=np.bool_)
+                    for weights in [weights_q, weights_k]:
+                        if weights is not None:
+                            if weights.dim() == 3:
+                                w = weights[0, :seq_len].cpu().numpy()
+                            else:
+                                w = np.broadcast_to(
+                                    weights[0].cpu().numpy(),
+                                    (seq_len, weights.shape[-1])
+                                )
+                            if w.shape[0] < seq_len:
+                                w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+                            m = m | (w > self.activation_threshold)  # OR combine
 
-                masks.append(m)
+                    masks.append(m)
             else:
-                used_fallback += 1
-                failed_pools.append(pool_key)
-                # Fallback: use weights > threshold
-                weights = layer.get_weight(pool_key)
-                if weights is None:
-                    masks.append(np.zeros((seq_len, expected_size), dtype=np.bool_))
-                else:
-                    if weights.dim() == 3:
-                        w = weights[0, :seq_len].cpu().numpy()
+                # Regular pools: fv, rv, fknow, rknow
+                mask = layer.get_mask(pool_key)
+
+                if mask is not None:
+                    used_actual += 1
+                    # Use actual model mask (cleaner signal)
+                    if mask.dim() == 3:
+                        m = mask[0, :seq_len].cpu().numpy().astype(np.bool_)
                     else:
-                        w = np.broadcast_to(
-                            weights[0].cpu().numpy(),
-                            (seq_len, weights.shape[-1])
+                        m = np.broadcast_to(
+                            mask[0].cpu().numpy().astype(np.bool_),
+                            (seq_len, mask.shape[-1])
                         )
 
-                    if w.shape[0] < seq_len:
-                        w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+                    if m.shape[0] < seq_len:
+                        m = np.pad(m, ((0, seq_len - m.shape[0]), (0, 0)))
 
-                    masks.append(w > self.activation_threshold)
+                    masks.append(m)
+                else:
+                    used_fallback += 1
+                    failed_pools.append(pool_key)
+                    # Fallback: use weights > threshold
+                    weights = layer.get_weight(pool_key)
+                    if weights is None:
+                        masks.append(np.zeros((seq_len, expected_size), dtype=np.bool_))
+                    else:
+                        if weights.dim() == 3:
+                            w = weights[0, :seq_len].cpu().numpy()
+                        else:
+                            w = np.broadcast_to(
+                                weights[0].cpu().numpy(),
+                                (seq_len, weights.shape[-1])
+                            )
+
+                        if w.shape[0] < seq_len:
+                            w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+
+                        masks.append(w > self.activation_threshold)
 
         # Log mask mode once
         if not self._logged_mask_mode:
@@ -1741,27 +1788,50 @@ class TokenCombinationAnalyzer(BaseAnalyzer):
         Extract concatenated continuous weights from a single layer.
 
         Returns continuous routing weights for cosine similarity analysis.
+        For Q/K shared pools, takes max(Q, K) weights.
         """
         weights_list = []
 
         for pool_key, expected_size in self.pool_order:
-            weights = layer.get_weight(pool_key)
+            # For Q/K shared pools, take max of Q and K weights
+            if pool_key in ('fqk', 'rqk'):
+                weights_q = layer.get_weight(f'{pool_key}_q')
+                weights_k = layer.get_weight(f'{pool_key}_k')
 
-            if weights is None:
-                weights_list.append(np.zeros((seq_len, expected_size), dtype=np.float32))
-            else:
-                if weights.dim() == 3:
-                    w = weights[0, :seq_len].cpu().numpy().astype(np.float32)
-                else:
-                    w = np.broadcast_to(
-                        weights[0].cpu().numpy().astype(np.float32),
-                        (seq_len, weights.shape[-1])
-                    )
-
-                if w.shape[0] < seq_len:
-                    w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+                w = np.zeros((seq_len, expected_size), dtype=np.float32)
+                for weights in [weights_q, weights_k]:
+                    if weights is not None:
+                        if weights.dim() == 3:
+                            sub_w = weights[0, :seq_len].cpu().numpy().astype(np.float32)
+                        else:
+                            sub_w = np.broadcast_to(
+                                weights[0].cpu().numpy().astype(np.float32),
+                                (seq_len, weights.shape[-1])
+                            )
+                        if sub_w.shape[0] < seq_len:
+                            sub_w = np.pad(sub_w, ((0, seq_len - sub_w.shape[0]), (0, 0)))
+                        w = np.maximum(w, sub_w)  # Take max
 
                 weights_list.append(w)
+            else:
+                # Regular pools
+                weights = layer.get_weight(pool_key)
+
+                if weights is None:
+                    weights_list.append(np.zeros((seq_len, expected_size), dtype=np.float32))
+                else:
+                    if weights.dim() == 3:
+                        w = weights[0, :seq_len].cpu().numpy().astype(np.float32)
+                    else:
+                        w = np.broadcast_to(
+                            weights[0].cpu().numpy().astype(np.float32),
+                            (seq_len, weights.shape[-1])
+                        )
+
+                    if w.shape[0] < seq_len:
+                        w = np.pad(w, ((0, seq_len - w.shape[0]), (0, 0)))
+
+                    weights_list.append(w)
 
         return np.concatenate(weights_list, axis=-1) if weights_list else np.zeros((seq_len, 0), dtype=np.float32)
 
