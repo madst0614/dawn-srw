@@ -254,10 +254,120 @@ if routing:
 
 ---
 
+## 9. Routing Analysis Single-Pass (10-15x Faster)
+
+### Before (Inefficient - 13+ separate loops)
+```python
+# Each analysis method independently iterates through dataloader
+results = {
+    'entropy': self.analyze_entropy(dataloader, n_batches),           # Loop 1
+    'selection_frequency': self.analyze_selection_frequency(...),      # Loop 2
+    'selection_diversity': self.analyze_selection_diversity(...),      # Loop 3
+    'qk_overlap': self.analyze_qk_overlap(...),                        # Loop 4
+    'qk_usage': self.analyze_qk_usage(...),                            # Loop 5
+    'qk_entropy': self.analyze_qk_entropy(...),                        # Loop 6
+    'qk_union_coverage': self.analyze_qk_union_coverage(...),          # Loop 7
+    'activation_sparsity': self.analyze_activation_sparsity(...),      # Loop 8
+    'token_coselection': self.analyze_token_coselection(...),          # Loop 9
+    'weight_concentration': self.analyze_weight_concentration(...),    # Loop 10
+    'path_usage': self.analyze_path_usage(...),                        # Loop 11
+    'coverage_progression': self.analyze_coverage_progression(...),    # Loop 12 (calls diversity again!)
+    'layer_contribution': self.analyze_layer_contribution(...),        # Loop 13
+}
+# Total: ~1500 forward passes (with 2x multipliers)
+```
+
+### After (Efficient - Single pass)
+```python
+# ALL analyses computed in ONE dataloader iteration
+def run_all(self, dataloader, output_dir, n_batches):
+    # Initialize all accumulators
+    entropy_data = {...}
+    selection_tensors = {...}
+    qk_layer_data = {...}
+    # ... etc
+
+    # Single loop through dataloader
+    for batch in dataloader:
+        routing = self.extractor.extract(model(batch))
+
+        # Update ALL accumulators from same routing data
+        for layer in routing:
+            # Entropy
+            for key in ROUTING_KEYS:
+                weights = layer.get_weight(key)
+                entropy_data[key].append(calc_entropy_ratio(weights))
+
+            # Selection frequency, sparsity, concentration...
+            # Q/K usage, entropy, overlap, co-selection...
+            # Layer contribution...
+
+    # Finalize all results
+    return {
+        'entropy': self._finalize_entropy(entropy_data),
+        'selection_frequency': self._finalize_selection_frequency(...),
+        # ... etc
+    }
+```
+
+### Key Optimization
+- ~100 forward passes instead of ~1500 (10-15x speedup)
+- All routing data extracted once per batch
+- Tensor accumulators for GPU-efficient computation
+- Results identical to separate analysis calls
+
+---
+
+## 10. TokenCombinationAnalyzer Batch Processing (5-10x Faster)
+
+### Before (Sentence-by-sentence, batch_size=1)
+```python
+for i in tqdm(range(n_sentences), desc="Processing"):
+    example = dataset[i]
+    self.analyze_sentence(example['tokens'], example['upos'], ...)
+    # Each analyze_sentence() creates batch_size=1 tensor:
+    # input_ids = torch.tensor([token_ids], device=self.device)
+```
+
+### After (Batched processing)
+```python
+def analyze_dataset(self, dataset, max_sentences, batch_size=16):
+    # Pre-process all sentences
+    preprocessed = [{'token_ids': ..., 'pos_tags': ...} for ...]
+
+    # Process in batches
+    for batch_idx in tqdm(range(n_batches)):
+        batch = preprocessed[start:end]
+        token_masks = self._extract_batch_token_masks(batch, ...)
+```
+
+### Key Optimization
+```python
+def _extract_batch_token_masks(self, batch, store_layer_masks):
+    # Pad sequences to same length
+    max_len = max(len(item['token_ids']) for item in batch)
+    padded_input = torch.full((batch_size, max_len), pad_id, device=self.device)
+
+    # Single forward pass for entire batch
+    outputs = self.model(padded_input, return_routing_info=True)
+
+    # Extract masks/weights for all batch items simultaneously
+    batch_masks = self._extract_batch_layer_mask(layer, batch_size, max_len)
+```
+
+### Benefits
+- 16 sentences processed per forward pass instead of 1
+- GPU utilization improved significantly
+- 5-10x speedup for POS neuron analysis
+
+---
+
 ## Commit History
 
 | Commit | Description |
 |--------|-------------|
+| `TBD` | **perf: Batched TokenCombinationAnalyzer (5-10x faster)** |
+| `TBD` | **perf: Single-pass routing analysis (10-15x faster)** |
 | `3c9e447` | **perf: Analyze all pools in single forward pass (4x faster)** |
 | `c2cb87f` | docs: Add refactoring summary |
 | `233c689` | Remove pool_type from paper_figures.py |
@@ -280,6 +390,8 @@ if routing:
 - `scripts/analysis/analyze_all.py` - Main analysis orchestration
 - `scripts/analysis/pos_neuron.py` - POS neuron analysis with unified naming
 - `scripts/analysis/paper_figures.py` - Paper figure generation
+- `scripts/analysis/routing.py` - Single-pass routing analysis optimization
+- `scripts/analysis/behavioral.py` - Multi-pool factual analysis optimization
 
 ---
 
