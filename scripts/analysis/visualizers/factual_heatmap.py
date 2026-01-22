@@ -70,20 +70,42 @@ def plot_factual_heatmap(
     for target, data in per_target.items():
         if 'error' in data:
             continue
-        # Get common neurons (80%+ threshold)
-        common_neurons_per_target[target] = set(data.get('common_neurons_80', []))
-        # Get contrastive scores (target_freq - baseline_freq)
-        contrastive_scores = data.get('contrastive_scores', {})
-        for neuron, score in contrastive_scores.items():
-            all_contrastive[target][neuron] = score
-        # Get all frequencies
-        for nf in data.get('neuron_frequencies', []):
-            if isinstance(nf, dict):
-                neuron = nf['neuron']
-                freq = nf['percentage'] / 100.0
-            else:
-                neuron, freq = nf
-            all_neurons[target][neuron] = freq
+
+        # Handle both old structure (common_neurons_80 at top level)
+        # and new multi-pool structure (per_pool: {pool: {common_80: [...]}})
+        if 'common_neurons_80' in data:
+            # Old structure
+            common_neurons_per_target[target] = set(data.get('common_neurons_80', []))
+            # Get contrastive scores
+            contrastive_scores = data.get('contrastive_scores', {})
+            for neuron, score in contrastive_scores.items():
+                all_contrastive[target][neuron] = score
+            # Get all frequencies
+            for nf in data.get('neuron_frequencies', []):
+                if isinstance(nf, dict):
+                    neuron = nf['neuron']
+                    freq = nf['percentage'] / 100.0
+                else:
+                    neuron, freq = nf
+                all_neurons[target][neuron] = freq
+        elif 'per_pool' in data:
+            # New multi-pool structure
+            all_common = set()
+            for pool, pool_data in data.get('per_pool', {}).items():
+                if isinstance(pool_data, dict):
+                    # Add common neurons from all pools
+                    common_80 = pool_data.get('common_80', [])
+                    all_common.update(common_80)
+                    # Get top_neurons for frequencies
+                    for nf in pool_data.get('top_neurons', []):
+                        if isinstance(nf, dict):
+                            neuron = nf.get('neuron', '')
+                            freq = nf.get('freq', 0) / 100.0
+                            all_neurons[target][neuron] = max(all_neurons[target][neuron], freq)
+            common_neurons_per_target[target] = all_common
+            # For new structure, use presence in common_80 as a proxy for high frequency
+            for neuron in all_common:
+                all_neurons[target][neuron] = max(all_neurons[target].get(neuron, 0), 0.8)
 
     if not all_neurons:
         return None
