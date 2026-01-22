@@ -1789,14 +1789,18 @@ class ModelAnalyzer:
             import traceback
             traceback.print_exc()
 
-        # Generate tables
+        # Generate tables (always regenerate - fast and based on loaded data)
         print("  Generating paper tables...")
         self._generate_tables(tables_dir)
 
-        # Generate comparison samples if baseline available
+        # Generate comparison samples if baseline available (skip if already exists)
         if self.compare_checkpoint:
-            print("  Generating comparison samples...")
-            self._generate_comparison_samples(paper_dir)
+            comparison_file = paper_dir / 'generation_comparison.txt'
+            if comparison_file.exists():
+                print("  Comparison samples already exist, skipping...")
+            else:
+                print("  Generating comparison samples...")
+                self._generate_comparison_samples(paper_dir)
 
         # Generate unified paper_data.json (includes training comparison)
         print("  Generating paper_data.json...")
