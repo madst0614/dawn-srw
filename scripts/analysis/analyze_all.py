@@ -38,6 +38,20 @@ Usage:
         --output results/ \
         --only health,routing,performance
 
+    # Figure-specific (auto-expands to required analyses)
+    python scripts/analysis/analyze_all.py \
+        --checkpoint dawn.pt \
+        --val_data val.pt \
+        --output results/ \
+        --only fig3,fig4  # fig3 -> routing, fig4 -> neuron_features
+
+    # Table-specific
+    python scripts/analysis/analyze_all.py \
+        --checkpoint dawn.pt \
+        --val_data val.pt \
+        --output results/ \
+        --only table1,table2  # table1 -> model_info,performance, table2 -> health
+
     # Custom batch settings (faster)
     python scripts/analysis/analyze_all.py \
         --checkpoint dawn.pt \
@@ -63,10 +77,12 @@ CLI Arguments:
     Analysis Mode:
         --paper-only      Generate paper outputs only (faster)
         --only            Run only specific analyses (comma-separated)
-                          Options: model_info,performance,health,routing,embedding,
-                                   neuron_embedding,semantic,pos,token_combination,
-                                   neuron_features,layerwise_semantic,factual,behavioral,
-                                   coselection,weight,v18,paper,report
+                          Figures: fig3,fig4,fig5,fig6,fig7 (auto-expand to required analyses)
+                          Tables: table1,table2
+                          Analyses: model_info,performance,health,routing,embedding,
+                                    neuron_embedding,semantic,pos,token_combination,
+                                    neuron_features,layerwise_semantic,factual,behavioral,
+                                    coselection,weight,v18,paper,report
 
     Analysis Parameters:
         --n_batches       Batches for routing/semantic/behavioral/coselection (default: 100)
@@ -2848,6 +2864,38 @@ class ModelAnalyzer:
         with open(self.output_dir / 'report.md', 'w') as f:
             f.write('\n'.join(lines))
 
+    # Figure/Table to Analysis mapping (Single Source of Truth)
+    FIGURE_ANALYSIS_MAP = {
+        # Figures
+        'fig3': ['routing'],              # Q/K Specialization
+        'fig4': ['neuron_features'],      # POS Neurons
+        'fig5': ['factual'],              # Factual Neurons
+        'fig6': [],                       # Training Dynamics (log parsing, no analysis needed)
+        'fig7': ['routing'],              # Layer Contribution
+        # Tables
+        'table1': ['model_info', 'performance'],  # Model Stats
+        'table2': ['health'],             # Neuron Utilization
+        # Shortcuts
+        'all_figs': ['routing', 'neuron_features', 'factual'],
+        'all_tables': ['model_info', 'performance', 'health'],
+    }
+
+    def _expand_figure_names(self, only: List[str]) -> List[str]:
+        """Expand figure/table names to their required analyses."""
+        expanded = set()
+        regular = []
+
+        for item in only:
+            item_lower = item.lower()
+            if item_lower in self.FIGURE_ANALYSIS_MAP:
+                expanded.update(self.FIGURE_ANALYSIS_MAP[item_lower])
+            else:
+                regular.append(item)
+
+        # Combine expanded and regular
+        result = list(expanded) + regular
+        return result if result else only
+
     def _get_paper_analyses(self) -> List[tuple]:
         """Paper generation에 필요한 분석 목록 (Single Source of Truth)"""
         return [
@@ -2855,6 +2903,10 @@ class ModelAnalyzer:
             ('performance', self.analyze_performance, {'n_batches': self.val_batches // 2}),
             ('health', self.analyze_health, {}),
             ('routing', self.analyze_routing, {'n_batches': self.n_batches // 2}),
+            ('neuron_features', self.analyze_neuron_features, {
+                'max_sentences': self.max_sentences,
+                'target_layer': self.target_layer
+            }),
             ('factual', self.analyze_factual, {
                 'min_target_count': self.min_targets,
                 'max_runs': self.max_runs,
@@ -2898,6 +2950,13 @@ class ModelAnalyzer:
             analyses = self._get_paper_analyses()
         else:
             analyses = self._get_full_analyses()
+
+        # Expand figure/table names (e.g., fig3 -> routing)
+        if only:
+            expanded_only = self._expand_figure_names(only)
+            if expanded_only != only:
+                print(f"[Expanded] {only} -> {expanded_only}")
+            only = expanded_only
 
         # Filter by --only option
         if only:
@@ -3409,7 +3468,11 @@ Examples:
 
     # Analysis mode
     parser.add_argument('--paper-only', action='store_true', help='Generate paper outputs only (faster)')
-    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated: model_info,performance,health,routing,embedding,semantic,pos,token_combination,neuron_features,layerwise_semantic,factual,behavioral,coselection,weight,v18,paper,report)')
+    parser.add_argument('--only', type=str, help='Run only specific analyses (comma-separated). '
+                        'Figures: fig3,fig4,fig5,fig6,fig7 | Tables: table1,table2 | '
+                        'Analyses: model_info,performance,health,routing,embedding,semantic,pos,'
+                        'token_combination,neuron_features,layerwise_semantic,factual,behavioral,'
+                        'coselection,weight,v18,paper,report')
 
     # Analysis parameters
     parser.add_argument('--n_batches', type=int, default=100, help='Number of batches for routing/semantic/behavioral/coselection (default: 100)')

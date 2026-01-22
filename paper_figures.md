@@ -505,8 +505,15 @@ This measures actual output magnitude contribution, not routing weights.
 #### 관련 파일
 ```
 scripts/analysis/analyze_all.py
-└── _generate_tables() [line 1717-1833]
-    └── model_stats.csv / model_stats.tex
+├── analyze_model_info() [line 200-265]
+├── analyze_performance() [line 267-380]
+├── _generate_tables() [line 1717-1833]
+│   └── model_stats.csv / model_stats.tex
+└── _generate_paper_results_json() [line 2360-2470]
+    └── paper_results.json['table1_model_stats']
+
+scripts/evaluation/evaluate.py
+└── estimate_flops() [line 50-95]
 ```
 
 #### 데이터 항목
@@ -517,6 +524,79 @@ scripts/analysis/analyze_all.py
 | perplexity | `performance['validation']['perplexity']` |
 | accuracy | `performance['validation']['accuracy']` |
 | tokens_per_sec | `performance['speed']['tokens_per_sec']` |
+
+#### 파라미터 계산 로직 (CRITICAL)
+
+```python
+# analyze_all.py - analyze_model_info() [line 209-223]
+
+# 1. 파라미터 카운트 (실제 로드된 PyTorch 모델에서)
+total_params = sum(p.numel() for p in self.model.parameters())
+trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+# 2. FLOPs 추정 (evaluate.py - estimate_flops)
+from scripts.evaluation.evaluate import estimate_flops
+flops = estimate_flops(self.model, seq_len=512)
+
+# 3. 결과 구조
+params_info = {
+    'total': total_params,           # 전체 파라미터 수
+    'trainable': trainable_params,   # 학습 가능 파라미터 수
+    'total_M': total_params / 1e6,   # 백만 단위
+    'flops': flops,                  # 총 FLOPs
+    'flops_G': flops / 1e9,          # 10억 단위
+}
+```
+
+#### FLOPs 추정 로직
+
+```python
+# evaluate.py - estimate_flops() [line 50-95]
+
+def estimate_flops(model, seq_len=512):
+    d_model = getattr(model, 'd_model', 512)
+    n_layers = getattr(model, 'n_layers', 12)
+    vocab_size = getattr(model, 'vocab_size', 30000)
+
+    if hasattr(model, 'shared_neurons'):
+        # DAWN model
+        rank = getattr(model, 'rank', 64)
+        top_k_qk = getattr(model, 'top_k_feature_qk', 20)
+        top_k_v = getattr(model, 'top_k_feature_v', 6)
+        knowledge_rank = getattr(model, 'knowledge_rank', 128)
+        top_k_know = getattr(model, 'top_k_feature_know', 4)
+
+        # Per layer FLOPs:
+        attn_proj = 2 * (top_k_qk * 2 + top_k_v) * d_model * rank * seq_len
+        attn_scores = 2 * seq_len * seq_len * d_model
+        knowledge = 2 * 2 * top_k_know * d_model * knowledge_rank * seq_len
+        per_layer = attn_proj + attn_scores + knowledge
+    else:
+        # Vanilla transformer
+        # 4 * d_model^2 * seq_len (QKV + O projections)
+        # + 2 * seq_len^2 * d_model (attention)
+        # + 8 * d_model^2 * seq_len (FFN, assuming 4x expansion)
+        per_layer = 4 * d_model * d_model * seq_len + \
+                    2 * seq_len * seq_len * d_model + \
+                    8 * d_model * d_model * seq_len
+```
+
+#### 주의사항 ⚠️
+
+**Table 1 vs Fig 6 일관성**:
+- Table 1: `model_info.get('total_M')` - 실제 로드된 모델에서 계산
+- Fig 6: 동일한 `model_info` 사용 (수정 후)
+- **절대로 checkpoint state_dict에서 별도 카운트하지 않음**
+
+```python
+# paper_results.json 생성 시 (analyze_all.py line 2578-2583)
+paper_results['fig6_training_dynamics'] = {
+    'dawn': {
+        'params_M': round(model_info.get('total_M', 0), 2),  # Table 1과 동일 소스
+        ...
+    }
+}
+```
 
 #### 데이터 소스
 - `self.results['model_info']` ← `analyze_model_info()`
