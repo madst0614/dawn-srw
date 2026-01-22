@@ -662,7 +662,7 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                             w = w[0, -1]
                                         else:
                                             w = w[0]
-                                        active = (w > 0.01).nonzero(as_tuple=True)[0].cpu().tolist()
+                                        active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                                         step_neurons.update(active)
                                         if total_runs == 1 and step < 3 and layer_idx == 0:
                                             print(f"        [Debug L{layer_idx}] weight fallback, shape: {w.shape}, active: {len(active)}", flush=True)
