@@ -205,21 +205,34 @@ selectivity = {
 
 ---
 
-## 8. Fig 5: Multi-Pool Factual Analysis
+## 8. Fig 5: Multi-Pool Factual Analysis (4x Faster)
 
-### Before
+### Before (Inefficient - 4 separate loops)
 ```python
-# Single pool only
-factual_data = analyzer.analyze_factual_neurons(prompts, targets, pool_type='fv')
+# Single pool per call - runs 4 times for 4 pools
+for pool in ['fv', 'rv', 'fknow', 'rknow']:
+    pool_results = analyzer.analyze_factual_neurons(prompts, targets, pool_type=pool)
 ```
 
-### After
+### After (Efficient - Single pass)
 ```python
-# All V/Knowledge pools
-pools_to_analyze = ['fv', 'rv', 'fknow', 'rknow']
-for pool in pools_to_analyze:
-    pool_results = analyzer.analyze_factual_neurons(prompts, targets, pool_type=pool)
-    all_pool_results[pool] = pool_results
+# All pools in ONE generation loop
+factual_data = analyzer.analyze_factual_neurons(
+    prompts, targets,
+    pools=['fv', 'rv', 'fknow', 'rknow']  # Extracts all simultaneously
+)
+```
+
+### Key Optimization
+```python
+# In each forward pass, extract neurons from ALL pools at once
+step_neurons_per_pool = {pool: set() for pool in pools}
+if routing:
+    for layer in routing:
+        for pool in pools:
+            m = layer.get_mask(pool)
+            active = m.nonzero().cpu().tolist()
+            step_neurons_per_pool[pool].update(active)
 ```
 
 ### Output Format
@@ -245,6 +258,8 @@ for pool in pools_to_analyze:
 
 | Commit | Description |
 |--------|-------------|
+| `3c9e447` | **perf: Analyze all pools in single forward pass (4x faster)** |
+| `c2cb87f` | docs: Add refactoring summary |
 | `233c689` | Remove pool_type from paper_figures.py |
 | `157e4c6` | Remove --pool_type parameter from CLI |
 | `000cdde` | Unified paper_data.json and improved config parsing |
