@@ -404,7 +404,7 @@ class ModelAnalyzer:
         if self.compare_checkpoint:
             print(f"\n  ┌─ Generation Samples: Vanilla (max {self.gen_tokens} tokens) ──────────────")
             try:
-                vanilla_model = self._load_comparison_model()
+                vanilla_model, vanilla_name = self._load_comparison_model()
                 if vanilla_model is not None:
                     vanilla_samples = self._generate_samples(
                         max_new_tokens=self.gen_tokens,
@@ -412,9 +412,7 @@ class ModelAnalyzer:
                         model_name="Vanilla"
                     )
                     results['generation']['vanilla'] = vanilla_samples
-                    del vanilla_model
-                    if self.device == 'cuda':
-                        torch.cuda.empty_cache()
+                    # Don't delete here - model is cached for later use
             except Exception as e:
                 print(f"  [Warning] Could not generate with vanilla model: {e}")
 
@@ -613,7 +611,7 @@ class ModelAnalyzer:
 
         print("  Analyzing neuron health (forward-based)...")
         analyzer = NeuronHealthAnalyzer(self.model, device=self.device)
-        results = analyzer.run_all(self.dataloader, str(output_dir), n_batches=self.n_batches)
+        results = analyzer.run_all(self._get_dataloader(), str(output_dir), n_batches=self.n_batches)
 
         # Print detailed summary
         activation = results.get('activation_distribution', {})
