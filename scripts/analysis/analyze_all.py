@@ -1731,8 +1731,13 @@ class ModelAnalyzer:
         self.results['v18'] = results
         return results
 
-    def generate_paper_outputs(self):
-        """Generate paper-ready figures and tables."""
+    def generate_paper_outputs(self, requested_figures: List[str] = None):
+        """Generate paper-ready figures and tables.
+
+        Args:
+            requested_figures: List of specific figures/tables to generate (e.g., ['fig5', 'table2'])
+                              If None, generates all figures and tables.
+        """
         paper_dir = self.output_dir / 'paper'
         figures_dir = paper_dir / 'figures'
         tables_dir = paper_dir / 'tables'
@@ -1744,52 +1749,72 @@ class ModelAnalyzer:
             print("  Skipping paper outputs (not a DAWN model)")
             return
 
-        # Generate figures using PaperFigureGenerator
-        print("  Generating paper figures...")
-        try:
-            from scripts.analysis.paper_figures import PaperFigureGenerator
+        # Determine which figures to generate
+        if requested_figures:
+            # Extract figure numbers from requested_figures (e.g., 'fig5' -> '5')
+            fig_nums = []
+            for item in requested_figures:
+                if item.startswith('fig'):
+                    try:
+                        fig_nums.append(item[3:])  # 'fig5' -> '5'
+                    except:
+                        pass
+            figures_to_generate = ','.join(fig_nums) if fig_nums else '3,4,5,6,7'
+        else:
+            figures_to_generate = '3,4,5,6,7'
 
-            gen = PaperFigureGenerator(
-                self.checkpoint_path,
-                self.val_data_path,  # Pass path, not dataloader
-                device=self.device
-            )
+        # Generate figures using PaperFigureGenerator (skip if only tables requested)
+        if figures_to_generate:
+            print(f"  Generating paper figures ({figures_to_generate})...")
+            try:
+                from scripts.analysis.paper_figures import PaperFigureGenerator
 
-            # Build precomputed results from already-run analyses
-            precomputed = {}
-            if 'routing' in self.results:
-                precomputed['routing'] = self.results['routing']
-            if 'health' in self.results:
-                precomputed['health'] = self.results['health']
-            if 'factual' in self.results:
-                precomputed['factual'] = self.results['factual']
-            if 'neuron_features' in self.results:
-                precomputed['neuron_features'] = self.results['neuron_features']
+                gen = PaperFigureGenerator(
+                    self.checkpoint_path,
+                    self.val_data_path,  # Pass path, not dataloader
+                    device=self.device
+                )
 
-            # Build config from instance parameters
-            config = {
-                'gen_tokens': self.gen_tokens,
-                'max_sentences': self.max_sentences,
-                'target_layer': self.target_layer,
-            }
+                # Build precomputed results from already-run analyses
+                precomputed = {}
+                if 'routing' in self.results:
+                    precomputed['routing'] = self.results['routing']
+                if 'health' in self.results:
+                    precomputed['health'] = self.results['health']
+                if 'factual' in self.results:
+                    precomputed['factual'] = self.results['factual']
+                if 'neuron_features' in self.results:
+                    precomputed['neuron_features'] = self.results['neuron_features']
 
-            # Add checkpoint paths for figure 6 (training dynamics comparison)
-            checkpoint_paths = [self.checkpoint_path]
-            if self.compare_checkpoint:
-                checkpoint_paths.append(self.compare_checkpoint)
-            config['checkpoint_paths'] = checkpoint_paths
+                # Build config from instance parameters
+                config = {
+                    'gen_tokens': self.gen_tokens,
+                    'max_sentences': self.max_sentences,
+                    'target_layer': self.target_layer,
+                }
 
-            # Generate figures 3,4,5,6,7 (6 = training dynamics)
-            gen.generate('3,4,5,6,7', str(figures_dir), n_batches=self.min_targets // 10,
-                        precomputed=precomputed, config=config)
-        except Exception as e:
-            print(f"    Warning: Could not generate paper figures: {e}")
-            import traceback
-            traceback.print_exc()
+                # Add checkpoint paths for figure 6 (training dynamics comparison)
+                checkpoint_paths = [self.checkpoint_path]
+                if self.compare_checkpoint:
+                    checkpoint_paths.append(self.compare_checkpoint)
+                config['checkpoint_paths'] = checkpoint_paths
 
-        # Generate tables (always regenerate - fast and based on loaded data)
-        print("  Generating paper tables...")
-        self._generate_tables(tables_dir)
+                # Generate requested figures (or all if none specified)
+                gen.generate(figures_to_generate, str(figures_dir), n_batches=self.min_targets // 10,
+                            precomputed=precomputed, config=config)
+            except Exception as e:
+                print(f"    Warning: Could not generate paper figures: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Generate tables (skip if only figures were requested)
+        should_generate_tables = (
+            not requested_figures or
+            any(item.startswith('table') for item in requested_figures)
+        )
+        if should_generate_tables:
+            print("  Generating paper tables...")
+            self._generate_tables(tables_dir)
 
         # Generate comparison samples if baseline available (skip if already exists)
         if self.compare_checkpoint:
@@ -3323,10 +3348,11 @@ class ModelAnalyzer:
                 analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
         # Track if figure names were specified (need paper outputs)
-        has_figure_request = any(
-            item.lower().startswith('fig') or item.lower().startswith('table')
-            for item in (only or [])
-        )
+        requested_figures = [
+            item.lower() for item in (only or [])
+            if item.lower().startswith('fig') or item.lower().startswith('table')
+        ]
+        has_figure_request = len(requested_figures) > 0
 
         total_analyses = len(analyses)
         for i, (name, func, kwargs) in enumerate(analyses, 1):
@@ -3342,7 +3368,7 @@ class ModelAnalyzer:
         # Paper outputs: generate if not filtering, 'paper' in filter, or figure/table specified
         if not only or 'paper' in only or has_figure_request:
             print(f"\n[PAPER] Generating paper outputs...")
-            self.generate_paper_outputs()
+            self.generate_paper_outputs(requested_figures=requested_figures if has_figure_request else None)
 
         # Report (only if not filtering or 'report' in filter)
         if not only or 'report' in only:
