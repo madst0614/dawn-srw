@@ -129,8 +129,9 @@ ALL_ROUTING_KEYS = {**ROUTING_KEYS}
 for k, v in KNOWLEDGE_ROUTING_KEYS.items():
     ALL_ROUTING_KEYS[k] = (v[0], None, v[1], v[2])  # (display, None, weight_key, pool_type)
 
-# Q/K pool keys (for overlap analysis)
-QK_POOLS = {
+# Q/K pool shorthand mapping (for overlap analysis)
+# Maps shorthand keys to (pool_type, q_key, k_key)
+QK_POOL_SHORTHAND = {
     'fqk': ('feature_qk', 'fqk_q', 'fqk_k'),
     'rqk': ('restore_qk', 'rqk_q', 'rqk_k'),
 }
@@ -234,7 +235,9 @@ COSELECTION_PAIRS = {
     },
 }
 
-# Q/K routing pools for v17.1
+# Q/K routing pools configuration
+# Keys: 'feature_qk', 'restore_qk'
+# Each pool has: display name, pref/weight keys, n_attr, color
 QK_POOLS = {
     'feature_qk': {
         'display': 'F-QK',
