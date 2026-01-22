@@ -1816,8 +1816,14 @@ class ModelAnalyzer:
             print("  Generating paper tables...")
             self._generate_tables(tables_dir)
 
-        # Generate comparison samples if baseline available (skip if already exists)
-        if self.compare_checkpoint:
+        # Generate comparison samples only if not specific figure request
+        # (comparison samples are not needed for individual figures like fig5)
+        should_generate_comparison = (
+            not requested_figures or
+            'comparison' in requested_figures or
+            any(item.startswith('table') for item in requested_figures)
+        )
+        if self.compare_checkpoint and should_generate_comparison:
             comparison_file = paper_dir / 'generation_comparison.txt'
             if comparison_file.exists():
                 print("  Comparison samples already exist, skipping...")
@@ -1830,7 +1836,8 @@ class ModelAnalyzer:
         self._generate_paper_results_json(paper_dir)
 
         # Generate training comparison markdown (for human readability)
-        if self.compare_checkpoint:
+        # Skip if only specific figures requested
+        if self.compare_checkpoint and should_generate_comparison:
             print("  Generating training_comparison.md...")
             self._generate_training_comparison(paper_dir)
 
