@@ -364,7 +364,6 @@ class PaperFigureGenerator:
                 - 'routing': Results from analyze_routing()
                 - 'health': Results from analyze_health()
             config: Additional configuration (optional)
-                - 'pool_type': Pool type for factual analysis (default: 'fv')
                 - 'gen_tokens': Max tokens for factual analysis (default: 30)
                 - 'prompts': Custom prompts for figure 5
                 - 'targets': Custom targets for figure 5
@@ -482,7 +481,6 @@ class PaperFigureGenerator:
         Config options:
             prompts: List of prompts (default: capital city prompts)
             targets: List of expected targets (default: ["Paris", "Berlin", "Tokyo", "blue"])
-            pool_type: Pool to analyze (default: 'fv')
             gen_tokens: Max tokens to generate (default: 30)
             temperature: Sampling temperature (default: 1.0)
             top_k: Top-k sampling (default: 50)
@@ -504,21 +502,36 @@ class PaperFigureGenerator:
                 "The color of the sky is",
             ])
             targets = config.get('targets', ["Paris", "London", "Tokyo", "blue"])
-            pool_type = config.get('pool_type', 'fv')
             gen_tokens = config.get('gen_tokens', 30)
             temperature = config.get('temperature', 1.0)
             top_k = config.get('top_k', 50)
 
-            # Independent runs until target appears min_target_count times
+            # Analyze all V/Knowledge pools with unified naming
+            pools_to_analyze = ['fv', 'rv', 'fknow', 'rknow']
             min_targets = max(50, n_batches * 5)
-            print(f"  Analyzing factual neurons (pool={pool_type}, min_targets={min_targets})...", flush=True)
-            factual_data = self.behavioral.analyze_factual_neurons(
-                prompts, targets,
-                pool_type=pool_type,
-                min_target_count=min_targets,
-                temperature=temperature,
-                top_k=top_k
-            )
+            print(f"  Analyzing factual neurons (pools={pools_to_analyze}, min_targets={min_targets})...", flush=True)
+
+            # Aggregate results from all pools
+            all_pool_results = {}
+            for pool in pools_to_analyze:
+                print(f"    Analyzing pool: {pool}...")
+                pool_results = self.behavioral.analyze_factual_neurons(
+                    prompts, targets,
+                    pool_type=pool,
+                    min_target_count=min_targets,
+                    temperature=temperature,
+                    top_k=top_k
+                )
+                all_pool_results[pool] = pool_results
+
+            # Combine into unified format
+            factual_data = {
+                'pools_analyzed': pools_to_analyze,
+                'prompts': prompts,
+                'targets': targets,
+                'per_pool': all_pool_results,
+                'per_target': {},  # Will be populated by visualizer
+            }
 
         path = plot_factual_heatmap(factual_data, os.path.join(output_dir, 'fig5_semantic_coherence.png'))
         print(f"  Saved: {path}", flush=True)
@@ -689,7 +702,7 @@ Examples:
 
   # Generate specific figures with custom parameters
   python -m scripts.analysis.paper_figures --checkpoint model.pt --output figures/ \\
-      --figures 3,5,7 --n_batches 20 --pool_type fv --gen_tokens 50
+      --figures 3,5,7 --n_batches 20 --gen_tokens 50
 
   # Figure 5 with custom prompts
   python -m scripts.analysis.paper_figures --checkpoint model.pt --output figures/ \\
@@ -706,10 +719,9 @@ Examples:
     parser.add_argument('--n_batches', type=int, default=50, help='Number of batches for analysis')
     parser.add_argument('--device', default='cuda', help='Device (cuda/cpu)')
 
-    # Figure 5 specific parameters
+    # Figure 5 specific parameters (analyzes all V/Knowledge pools: fv, rv, fknow, rknow)
     parser.add_argument('--prompts', nargs='+', help='Custom prompts for figure 5')
     parser.add_argument('--targets', nargs='+', help='Custom targets for figure 5')
-    parser.add_argument('--pool_type', default='fv', help='Pool type for factual analysis (fv, rv, fqk, etc.)')
     parser.add_argument('--gen_tokens', type=int, default=30, help='Max tokens to generate')
     parser.add_argument('--temperature', type=float, default=1.0, help='Sampling temperature')
     parser.add_argument('--top_k', type=int, default=50, help='Top-k sampling')
@@ -725,7 +737,6 @@ Examples:
 
     # Build config from arguments
     config = {
-        'pool_type': args.pool_type,
         'gen_tokens': args.gen_tokens,
         'temperature': args.temperature,
         'top_k': args.top_k,
@@ -746,7 +757,7 @@ Examples:
     print(f"Output: {args.output}")
     print(f"Figures: {args.figures}")
     print(f"Batches: {args.n_batches}")
-    print(f"Config: pool_type={args.pool_type}, gen_tokens={args.gen_tokens}")
+    print(f"Config: gen_tokens={args.gen_tokens}, pools=all (fv, rv, fknow, rknow)")
     print("=" * 60)
 
     # Initialize generator
