@@ -1478,6 +1478,7 @@ class RoutingAnalyzer(BaseAnalyzer):
         try:
             with self.extractor.analysis_context():
                 processed_batches = 0
+                empty_routing_count = 0
                 for i, batch in enumerate(tqdm(dataloader, total=n_batches, desc='Routing Analysis (single-pass)')):
                     if i >= n_batches:
                         break
@@ -1489,6 +1490,7 @@ class RoutingAnalyzer(BaseAnalyzer):
                             outputs = self.model(input_ids, return_routing_info=True)
                         routing = self.extractor.extract(outputs)
                         if not routing:
+                            empty_routing_count += 1
                             continue
                     except Exception as e:
                         if processed_batches == 0:
@@ -1496,6 +1498,16 @@ class RoutingAnalyzer(BaseAnalyzer):
                         continue
 
                     processed_batches += 1
+
+                    # Debug: log first batch info
+                    if processed_batches == 1:
+                        first_layer = next(iter(routing), None)
+                        if first_layer:
+                            available_keys = []
+                            for key in ROUTING_KEYS.keys():
+                                if first_layer.get_weight(key) is not None:
+                                    available_keys.append(key)
+                            print(f"  [Debug] First batch: {len(routing)} layers, available keys: {available_keys}")
 
                     # Process all layers from this batch
                     for layer in routing:
@@ -1711,6 +1723,12 @@ class RoutingAnalyzer(BaseAnalyzer):
         finally:
             if hasattr(self.router, 'store_path_weights'):
                 self.router.store_path_weights = False
+
+        # Debug summary
+        print(f"  [Summary] Processed: {processed_batches} batches, empty routing: {empty_routing_count}")
+        print(f"  [Summary] Entropy data keys: {[k for k in entropy_data if entropy_data[k]]}")
+        print(f"  [Summary] Selection tensors: {list(selection_tensors.keys())}")
+        print(f"  [Summary] Union tensors: {len(union_tensors)} layer/key combinations")
 
         # ===== Aggregate all results =====
         results = {
