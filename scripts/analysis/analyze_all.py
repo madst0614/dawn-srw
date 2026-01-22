@@ -3322,6 +3322,12 @@ class ModelAnalyzer:
             else:
                 analyses = [(n, f, a) for n, f, a in analyses if n in only]
 
+        # Track if figure names were specified (need paper outputs)
+        has_figure_request = any(
+            item.lower().startswith('fig') or item.lower().startswith('table')
+            for item in (only or [])
+        )
+
         total_analyses = len(analyses)
         for i, (name, func, kwargs) in enumerate(analyses, 1):
             print(f"\n[{i}/{total_analyses}] {name.upper()}")
@@ -3333,8 +3339,8 @@ class ModelAnalyzer:
                 traceback.print_exc()
                 self.results[name] = {'error': str(e)}
 
-        # Paper outputs (only if not filtering or 'paper' in filter)
-        if not only or 'paper' in only:
+        # Paper outputs: generate if not filtering, 'paper' in filter, or figure/table specified
+        if not only or 'paper' in only or has_figure_request:
             print(f"\n[PAPER] Generating paper outputs...")
             self.generate_paper_outputs()
 
