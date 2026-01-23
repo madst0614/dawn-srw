@@ -1945,29 +1945,25 @@ class RoutingAnalyzer(BaseAnalyzer):
             valid_mask = total_usage > 0
             q_ratio[valid_mask] = q_np[valid_mask] / total_usage[valid_mask]
 
-            usage_threshold = np.percentile(total_usage, 10) if len(total_usage) > 0 else 0
-            inactive_mask = total_usage <= usage_threshold
-            active_mask = ~inactive_mask
-
-            q_specialized = int(((q_ratio > 0.7) & active_mask).sum())
-            k_specialized = int(((q_ratio < 0.3) & active_mask).sum())
-            shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7) & active_mask).sum())
-            inactive = int(inactive_mask.sum())
+            # active_mask 제거 - 모든 뉴런을 Q/K/Shared로 분류
+            q_specialized = int((q_ratio > 0.7).sum())
+            k_specialized = int((q_ratio < 0.3).sum())
+            shared = int(((q_ratio >= 0.3) & (q_ratio <= 0.7)).sum())
 
             sensitivity_thresholds = [0.6, 0.65, 0.7, 0.75, 0.8]
             sensitivity_analysis = {}
             for t in sensitivity_thresholds:
-                q_spec = int(((q_ratio > t) & active_mask).sum())
-                k_spec = int(((q_ratio < (1 - t)) & active_mask).sum())
-                shared_t = int(((q_ratio >= (1 - t)) & (q_ratio <= t) & active_mask).sum())
+                q_spec = int((q_ratio > t).sum())
+                k_spec = int((q_ratio < (1 - t)).sum())
+                shared_t = int(((q_ratio >= (1 - t)) & (q_ratio <= t)).sum())
                 sensitivity_analysis[str(t)] = {
                     'q_specialized': q_spec,
                     'k_specialized': k_spec,
                     'shared': shared_t,
-                    'total_active': int(active_mask.sum()),
+                    'total': n_neurons,
                 }
 
-            q_ratio_active = q_ratio[active_mask].tolist()
+            q_ratio_active = q_ratio.tolist()
 
             results[pool_name] = {
                 'display': pool_info['display'],
@@ -1981,17 +1977,14 @@ class RoutingAnalyzer(BaseAnalyzer):
                 'q_specialized': q_specialized,
                 'k_specialized': k_specialized,
                 'shared': shared,
-                'inactive': inactive,
                 'q_total': int(q_np.sum()),
                 'k_total': int(k_np.sum()),
                 'per_layer': per_layer_results,
                 'q_ratio': q_ratio.tolist(),
                 'q_ratio_active': q_ratio_active,
-                'usage_threshold': float(usage_threshold),
                 'specialization_thresholds': {
                     'q_specialized': 0.7,
                     'k_specialized': 0.3,
-                    'inactive_percentile': 10
                 },
                 'sensitivity_analysis': sensitivity_analysis,
             }
