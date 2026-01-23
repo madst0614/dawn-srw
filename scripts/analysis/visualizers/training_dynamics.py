@@ -184,7 +184,7 @@ def plot_training_dynamics(
     data: Dict[str, Tuple[List, List]],
     output_path: str,
     use_log_scale: bool = False,
-    title: Optional[str] = None,
+    title: Optional[str] = 'Fig 6: Convergence Comparison',
     dpi: int = 300
 ) -> Optional[str]:
     """

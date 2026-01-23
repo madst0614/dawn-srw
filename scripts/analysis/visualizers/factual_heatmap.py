@@ -300,7 +300,7 @@ def plot_factual_heatmap(
         prev_boundary = b
 
     # Title - above category labels
-    ax.set_title('Factual Knowledge Neurons: Related outputs share neuron subsets',
+    ax.set_title('Fig 5: Semantic Clustering of Knowledge Neurons',
                 fontsize=11, fontweight='bold', pad=20, y=1.06)
 
     ax.set_xlabel('Neuron Index')
