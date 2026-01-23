@@ -95,6 +95,7 @@ CLI Arguments:
         --n_clusters      Clusters for embedding analysis (default: 5)
         --target_layer    Target layer for POS analysis (default: all layers)
         --gen_tokens      Max tokens to generate per sample (default: 50)
+        --factual_tokens  Max tokens per run for factual analysis (default: 30)
 """
 
 import os
@@ -154,6 +155,7 @@ class ModelAnalyzer:
         max_samples: int = 5000,
         n_clusters: int = 5,
         gen_tokens: int = 50,
+        factual_tokens: int = 30,
         target_layer: int = None,
         compare_checkpoint: str = None,
     ):
@@ -173,6 +175,7 @@ class ModelAnalyzer:
         self.max_samples = max_samples
         self.n_clusters = n_clusters
         self.gen_tokens = gen_tokens
+        self.factual_tokens = factual_tokens
         self.target_layer = target_layer
 
         self.model = None
@@ -1278,6 +1281,7 @@ class ModelAnalyzer:
             prompts, targets,
             pools=pools_to_analyze,
             min_target_count=min_target_count,
+            max_tokens_per_run=self.factual_tokens,
             max_runs=max_runs,
             temperature=1.0,
             top_k=50,
@@ -3386,6 +3390,7 @@ class MultiModelAnalyzer:
         max_samples: int = 5000,
         n_clusters: int = 5,
         gen_tokens: int = 50,
+        factual_tokens: int = 30,
         target_layer: int = None,
     ):
         self.checkpoint_paths = checkpoint_paths
@@ -3403,6 +3408,7 @@ class MultiModelAnalyzer:
         self.max_samples = max_samples
         self.n_clusters = n_clusters
         self.gen_tokens = gen_tokens
+        self.factual_tokens = factual_tokens
         self.target_layer = target_layer
 
         self.analyzers = []
@@ -3438,6 +3444,7 @@ class MultiModelAnalyzer:
                 max_samples=self.max_samples,
                 n_clusters=self.n_clusters,
                 gen_tokens=self.gen_tokens,
+                factual_tokens=self.factual_tokens,
                 target_layer=self.target_layer,
             )
             analyzer.run_all(paper_only=paper_only, only=only)
@@ -3749,6 +3756,7 @@ Examples:
     parser.add_argument('--n_clusters', type=int, default=5, help='Number of clusters for embedding analysis (default: 5)')
     parser.add_argument('--target_layer', type=int, default=None, help='Target layer for POS/routing analysis (default: all layers)')
     parser.add_argument('--gen_tokens', type=int, default=50, help='Max tokens to generate per sample (default: 50)')
+    parser.add_argument('--factual_tokens', type=int, default=30, help='Max tokens per run for factual analysis (default: 30)')
 
     args = parser.parse_args()
 
@@ -3796,6 +3804,7 @@ Examples:
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
             gen_tokens=args.gen_tokens,
+            factual_tokens=args.factual_tokens,
             target_layer=args.target_layer,
             compare_checkpoint=args.compare_checkpoint,
         )
@@ -3813,6 +3822,7 @@ Examples:
             max_samples=args.max_samples,
             n_clusters=args.n_clusters,
             gen_tokens=args.gen_tokens,
+            factual_tokens=args.factual_tokens,
             target_layer=args.target_layer,
         )
         analyzer.run_all(paper_only=args.paper_only, only=only)
