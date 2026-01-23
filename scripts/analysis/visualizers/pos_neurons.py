@@ -279,7 +279,7 @@ def plot_top_neurons_by_pos(
 
             axes[i].barh(range(len(neurons)), freqs, color='steelblue')
             axes[i].set_yticks(range(len(neurons)))
-            axes[i].set_yticklabels([f'N{n}' for n in neuron_ids])
+            axes[i].set_yticklabels([str(n) for n in neuron_ids])
             axes[i].set_title(pos)
             axes[i].set_xlabel('Freq')
             axes[i].invert_yaxis()
@@ -342,7 +342,7 @@ def plot_pos_specificity(
         color=[pos_color_map[p] for p in pos_tags]
     )
     axes[0].set_yticks(range(len(neurons)))
-    axes[0].set_yticklabels([f'N{n} ({p})' for n, p in zip(neurons, pos_tags)])
+    axes[0].set_yticklabels([f'{n} ({p})' for n, p in zip(neurons, pos_tags)])
     axes[0].set_xlabel('Specificity Score')
     axes[0].set_title('Most POS-Specific Neurons')
     axes[0].invert_yaxis()
@@ -426,7 +426,7 @@ def plot_pos_specialization_from_features(
         color=[pos_color_map[p] for p in pos_tags]
     )
     axes[0].set_yticks(range(len(neurons)))
-    axes[0].set_yticklabels([f'N{n} ({p})' for n, p in zip(neurons, pos_tags)])
+    axes[0].set_yticklabels([f'{n} ({p})' for n, p in zip(neurons, pos_tags)])
     axes[0].set_xlabel('POS Concentration (%)')
     axes[0].set_title('Top POS-Specialized Neurons (≥80%)')
     axes[0].invert_yaxis()
@@ -528,7 +528,7 @@ def plot_pos_selectivity_heatmap(
     axes[0].set_xticks(range(len(UPOS_TAGS)))
     axes[0].set_xticklabels(UPOS_TAGS, rotation=45, ha='right', fontsize=9)
     axes[0].set_yticks(range(0, len(selected_indices), max(1, len(selected_indices) // 20)))
-    axes[0].set_yticklabels([f'N{selected_indices[i]}' for i in range(0, len(selected_indices), max(1, len(selected_indices) // 20))], fontsize=8)
+    axes[0].set_yticklabels([str(selected_indices[i]) for i in range(0, len(selected_indices), max(1, len(selected_indices) // 20))], fontsize=8)
     axes[0].set_xlabel('POS Category', fontsize=11)
     axes[0].set_ylabel('Neuron (sorted by selectivity range)', fontsize=11)
     axes[0].set_title(f'Neuron POS Selectivity (Top {len(selected_indices)} neurons)', fontsize=12)
@@ -610,7 +610,7 @@ def plot_pos_selectivity_clustered(
         vmin=-2, vmax=2,
         figsize=figsize,
         xticklabels=UPOS_TAGS,
-        yticklabels=[f'N{i}' for i in selected_indices],
+        yticklabels=[str(i) for i in selected_indices],
         dendrogram_ratio=(0.1, 0.15),
         cbar_pos=(0.02, 0.8, 0.03, 0.15),
     )
