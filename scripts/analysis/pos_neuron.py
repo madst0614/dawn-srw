@@ -4760,7 +4760,7 @@ class NeuronFeatureAnalyzer:
                 # Count POS-specialized neurons in this pool
                 count = sum(
                     1 for n in spec_t.get('pos', [])
-                    if start_idx <= int(n['neuron']) < end_idx
+                    if start_idx <= n['neuron_idx'] < end_idx
                 )
                 pool_spec[f'specialized_{int(t*100)}'] = count
 
