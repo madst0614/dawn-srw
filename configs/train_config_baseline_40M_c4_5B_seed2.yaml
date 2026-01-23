@@ -1,5 +1,7 @@
-# Vanilla Transformer Baseline - 40M Scale, 5B tokens
+# Vanilla Transformer Baseline - 40M Scale, 5B tokens (Seed 2)
 # Matched to DAWN v17.1 parameter count (~39M)
+
+seed: 2
 
 data:
   base_dir: /content/drive/MyDrive/data
@@ -36,9 +38,8 @@ training:
   warmup_ratio: 0.06
 
 use_amp: true
-seed: null  # Set to integer for reproducibility (e.g., 42, 1234, 5678)
-checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline_40M_c4_5B
-log_dir: /content/drive/MyDrive/dawn/logs_baseline_40M_c4_5B
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_baseline_40M_c4_5B_seed2
+log_dir: /content/drive/MyDrive/dawn/logs_baseline_40M_c4_5B_seed2
 
 # Parameter calculation:
 # Embedding: 30522 × 432 = 13.2M
