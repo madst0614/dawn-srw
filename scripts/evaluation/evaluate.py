@@ -82,12 +82,12 @@ def estimate_flops(model, seq_len=512):
 
         # QKV + O projections: 4 * d_model^2 * seq_len
         # Attention scores: 2 * seq_len^2 * d_model
-        # FFN: 2 * d_model * d_ff * seq_len
+        # FFN: 4 * d_model * d_ff * seq_len (up-proj + down-proj, 2 matmuls)
 
         per_layer = (
             4 * d_model * d_model * seq_len +
             2 * seq_len * seq_len * d_model +
-            2 * d_model * d_ff * seq_len
+            4 * d_model * d_ff * seq_len
         )
 
     total_flops = n_layers * per_layer
