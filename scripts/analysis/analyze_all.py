@@ -1879,8 +1879,13 @@ class ModelAnalyzer:
                 self._generate_comparison_samples(paper_dir)
 
         # Generate unified paper_data.json (includes training comparison)
+        # Skip comparison model eval if only figures were requested (not tables)
+        skip_comparison_eval = (
+            requested_figures and
+            all(item.startswith('fig') for item in requested_figures)
+        )
         print("  Generating paper_data.json...")
-        self._generate_paper_results_json(paper_dir)
+        self._generate_paper_results_json(paper_dir, skip_comparison_eval=skip_comparison_eval)
 
         # Generate training comparison markdown (for human readability)
         # Skip if only specific figures requested
@@ -2657,8 +2662,13 @@ class ModelAnalyzer:
             f.write('\n'.join(md_lines))
         print(f"    Saved: {md_path}")
 
-    def _generate_paper_results_json(self, paper_dir: Path):
+    def _generate_paper_results_json(self, paper_dir: Path, skip_comparison_eval: bool = False):
         """Generate unified paper_data.json with all numeric data for paper.
+
+        Args:
+            paper_dir: Path to paper output directory
+            skip_comparison_eval: If True, skip running eval on comparison model
+                (useful when only generating figures, not tables)
 
         Output structure:
         {
@@ -2755,13 +2765,15 @@ class ModelAnalyzer:
                         found_results = True
                         break
 
-            # Fallback: run quick analysis on vanilla model
-            if not found_results:
+            # Fallback: run quick analysis on vanilla model (unless skipped)
+            if not found_results and not skip_comparison_eval:
                 print("    Running quick analysis on comparison model...")
                 try:
                     vanilla_info, vanilla_val, vanilla_speed = self._analyze_comparison_model()
                 except Exception as e:
                     print(f"    Warning: Could not analyze comparison model: {e}")
+            elif not found_results:
+                print("    Skipping comparison model eval (figure-only mode)")
 
             vanilla_config = training_configs.get('vanilla', {})
             paper_data['models']['vanilla'] = {
