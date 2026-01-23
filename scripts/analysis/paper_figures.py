@@ -158,7 +158,7 @@ class PaperFigureGenerator:
         Uses training logs from checkpoint paths in config.
         """
         from .visualizers import (
-            plot_training_from_logs,
+            plot_training_dynamics,
             find_training_log, parse_training_log
         )
 
@@ -219,7 +219,7 @@ class PaperFigureGenerator:
         if not data:
             return {'error': 'No training logs found. Check checkpoint paths.'}
 
-        path = plot_training_from_logs(data, os.path.join(output_dir, 'fig6_training_dynamics.png'))
+        path = plot_training_dynamics(data, os.path.join(output_dir, 'fig6_training_dynamics.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'visualization': path, 'data': {k: len(v[0]) for k, v in data.items()}}
