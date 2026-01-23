@@ -136,10 +136,24 @@ class PaperFigureGenerator:
         matrix_path = config.get('selectivity_matrix_path')
         path = None
 
+        # Auto-find selectivity_matrix.npy if not explicitly provided
+        if not matrix_path or not os.path.exists(matrix_path):
+            analysis_output_dir = config.get('analysis_output_dir', '')
+            possible_paths = [
+                os.path.join(analysis_output_dir, 'neuron_features', 'selectivity_matrix.npy'),
+                os.path.join(output_dir, '..', 'neuron_features', 'selectivity_matrix.npy'),
+                os.path.join(output_dir, 'selectivity_matrix.npy'),
+            ]
+            for p in possible_paths:
+                if os.path.exists(p):
+                    matrix_path = p
+                    break
+
         if matrix_path and os.path.exists(matrix_path):
             print(f"  Loading selectivity matrix from {matrix_path}...", flush=True)
             selectivity_matrix = np.load(matrix_path)
-            active_indices = list(range(selectivity_matrix.shape[0]))  # All rows are active
+            # Get active indices from selectivity data
+            active_indices = selectivity.get('active_neuron_indices', list(range(selectivity_matrix.shape[0])))
             path = plot_pos_selectivity_heatmap(
                 selectivity_matrix,
                 active_indices,
@@ -147,6 +161,7 @@ class PaperFigureGenerator:
             )
         else:
             # Use JSON data for visualization
+            print("  No selectivity_matrix.npy found, using JSON data...", flush=True)
             path = plot_pos_selectivity_from_json(
                 selectivity,
                 os.path.join(output_dir, 'fig4_pos_selectivity.png')
