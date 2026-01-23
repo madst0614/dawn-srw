@@ -597,59 +597,56 @@ params_info = {
 }
 ```
 
-#### FLOPs 추정 로직
+#### FLOPs 추정 로직 (이론적 Sparse FLOPs)
 
 ```python
-# evaluate.py - estimate_flops() [line 50-98]
+# evaluate.py - estimate_flops() [line 50-120]
+# Reports theoretical FLOPs based on active neurons (top-k sparse)
 
-def estimate_flops(model, seq_len=512):
-    d_model = getattr(model, 'd_model', 512)
-    n_layers = getattr(model, 'n_layers', 12)
-    vocab_size = getattr(model, 'vocab_size', 30000)
+# === DAWN Model ===
+# Feature pathway: (seq, d) @ (d, rank) for each selected neuron
+attn_feat = 2 * (top_k_fqk * 2 + top_k_fv) * d_model * rank * seq_len
 
-    if hasattr(model, 'shared_neurons'):
-        # DAWN model
-        rank = getattr(model, 'rank', 64)
-        top_k_qk = getattr(model, 'top_k_feature_qk', 20)
-        top_k_v = getattr(model, 'top_k_feature_v', 6)
-        knowledge_rank = getattr(model, 'knowledge_rank', 128)
-        top_k_know = getattr(model, 'top_k_feature_know', 4)
+# Restore pathway: (seq, rank) @ (rank, d) for each selected neuron
+attn_rest = 2 * (top_k_rqk * 2 + top_k_rv) * rank * d_model * seq_len
 
-        # Per layer FLOPs:
-        attn_proj = 2 * (top_k_qk * 2 + top_k_v) * d_model * rank * seq_len
-        attn_scores = 2 * seq_len * seq_len * d_model
-        knowledge = 2 * 2 * top_k_know * d_model * knowledge_rank * seq_len
-        per_layer = attn_proj + attn_scores + knowledge
-    else:
-        # Vanilla transformer
-        d_ff = getattr(model, 'd_ff', 4 * d_model)
-        per_layer = (
-            4 * d_model * d_model * seq_len +      # QKV + O projections
-            2 * seq_len * seq_len * d_model +      # Attention scores
-            4 * d_model * d_ff * seq_len           # FFN (up + down proj) ✅
-        )
+# Attention scores: Q @ K^T + scores @ V = 4 * seq^2 * d
+attn_scores = 2 * 2 * seq_len * seq_len * d_model
+
+# expand_O: Linear(d_model, d_model)
+expand_o = 2 * d_model * d_model * seq_len
+
+# Knowledge circuit: feature + restore
+knowledge = 2 * (top_k_fknow + top_k_rknow) * d_model * knowledge_rank * seq_len
+
+per_layer = attn_feat + attn_rest + attn_scores + expand_o + knowledge
+
+# === Vanilla Model ===
+qkvo = 2 * 4 * d_model * d_model * seq_len      # 8 * d^2 * seq
+attn_scores = 2 * 2 * seq_len * seq_len * d_model  # 4 * seq^2 * d
+ffn = 2 * 2 * d_model * d_ff * seq_len          # 4 * d * d_ff * seq
+per_layer = qkvo + attn_scores + ffn
 ```
 
-#### FLOPs 검증 ✅
+#### FLOPs 검증 ✅ (2025-01-23 Updated)
 
-| 항목 | DAWN | Vanilla | 상태 |
-|------|------|---------|------|
-| Top-k sparsity 반영 | ✅ top_k_qk, top_k_v, top_k_know 사용 | N/A | ✅ |
-| Attention projections | ✅ `2 * (top_k_qk*2 + top_k_v) * d_model * rank` | ✅ `4 * d_model^2` | ✅ |
-| Attention scores | ✅ `2 * seq^2 * d_model` | ✅ `2 * seq^2 * d_model` | ✅ |
-| FFN/Knowledge | ✅ `4 * top_k_know * d_model * knowledge_rank` | ✅ `4 * d_model * d_ff` | ✅ Fixed |
-| Router overhead | ❌ 미포함 | N/A | 확인 필요 |
+| Component | DAWN (Sparse) | Vanilla (Dense) | 상태 |
+|-----------|---------------|-----------------|------|
+| **Attention Projections** | | | |
+| - Feature pathway | `2 * (top_k_fqk*2 + top_k_fv) * d * rank` | - | ✅ |
+| - Restore pathway | `2 * (top_k_rqk*2 + top_k_rv) * rank * d` | - | ✅ NEW |
+| - QKVO (Vanilla) | - | `8 * d² * seq` | ✅ Fixed |
+| **Attention Scores** | `4 * seq² * d` | `4 * seq² * d` | ✅ Fixed |
+| **expand_O** | `2 * d² * seq` | (included in QKVO) | ✅ NEW |
+| **FFN/Knowledge** | `2 * (fknow + rknow) * d * rank` | `4 * d * d_ff * seq` | ✅ |
+| **LM Head** | `2 * seq * d * vocab` | `2 * seq * d * vocab` | ✅ Fixed |
 
-**Vanilla FFN FLOPs (수정 완료 ✅)**:
-```python
-# 수정된 코드 (evaluate.py line 87-91)
-4 * d_model * d_ff * seq_len  # up-proj + down-proj
+**DAWN top-k 파라미터**:
+- `top_k_fqk`, `top_k_fv`: Feature pathway (Q/K, V)
+- `top_k_rqk`, `top_k_rv`: Restore pathway (Q/K, V)
+- `top_k_fknow`, `top_k_rknow`: Knowledge circuit
 
-# FFN = x @ W1 (d→d_ff) + h @ W2 (d_ff→d) = 2개 matmul
-# = 2*seq*d*d_ff + 2*seq*d_ff*d = 4*d*d_ff*seq
-```
-
-**결론**: ✅ Fair comparison
+**결론**: ✅ 이론적 Sparse FLOPs 기준으로 Fair comparison
 
 #### tokens/sec 측정 검증 ✅
 
@@ -824,29 +821,35 @@ Paper mode 실행 시 `paper/paper_results.json`에 모든 수치 데이터가 �
 | **FLOPs Calculation** | `estimate_flops()` | ✅ Fixed | Vanilla FFN 2x→4x 수정 완료 |
 | **tokens/sec Measurement** | `SpeedBenchmark.benchmark()` | ✅ Verified | Warmup 포함, 동일 조건 |
 
-### FLOPs 계산 검증 (2025-01-23)
+### FLOPs 계산 검증 (2025-01-23 Updated)
 
-**코드 위치**: `scripts/evaluation/evaluate.py` line 50-98
+**코드 위치**: `scripts/evaluation/evaluate.py` line 50-120
 
-| Component | DAWN | Vanilla | Status |
-|-----------|------|---------|--------|
-| Top-k sparsity | ✅ `top_k_qk`, `top_k_v`, `top_k_know` 사용 | N/A (dense) | ✅ Fair |
-| Attention projections | `2 * (top_k_qk*2 + top_k_v) * d_model * rank` | `4 * d_model^2` | ✅ OK |
-| Attention scores | `2 * seq^2 * d_model` | `2 * seq^2 * d_model` | ✅ Same |
-| FFN/Knowledge | `4 * top_k_know * d_model * knowledge_rank` | `4 * d_model * d_ff` | ✅ Fixed |
-| Router overhead | ❌ 미포함 (무시 가능) | N/A | ✅ 무시 가능 |
+**이론적 Sparse FLOPs 계산** (matmul FLOPs = 2 × m × k × n)
 
-**Vanilla FFN (수정 완료 ✅)**:
+| Component | DAWN (Sparse) | Vanilla (Dense) | Status |
+|-----------|---------------|-----------------|--------|
+| **Attention Circuit** | | | |
+| - Feature pathway | `2 * (fqk*2 + fv) * d * rank * seq` | - | ✅ |
+| - Restore pathway | `2 * (rqk*2 + rv) * rank * d * seq` | - | ✅ NEW |
+| - QKVO projections | - | `8 * d² * seq` | ✅ Fixed |
+| - Attention scores | `4 * seq² * d` | `4 * seq² * d` | ✅ Fixed |
+| - expand_O | `2 * d² * seq` | (in QKVO) | ✅ NEW |
+| **Knowledge/FFN** | `2 * (fknow + rknow) * d * rank * seq` | `4 * d * d_ff * seq` | ✅ |
+| **LM Head** | `2 * seq * d * vocab` | `2 * seq * d * vocab` | ✅ Fixed |
+| Router overhead | ❌ 미포함 | N/A | 무시 가능 |
+
+**DAWN top-k 파라미터**:
 ```python
-# 수정된 코드 (evaluate.py line 87-91)
-per_layer = (
-    4 * d_model * d_model * seq_len +      # QKV + O ✅
-    2 * seq_len * seq_len * d_model +      # Attention ✅
-    4 * d_model * d_ff * seq_len           # FFN (up + down proj) ✅
-)
+top_k_fqk = model.top_k_feature_qk    # Feature Q/K
+top_k_fv = model.top_k_feature_v      # Feature V
+top_k_rqk = model.top_k_restore_qk    # Restore Q/K
+top_k_rv = model.top_k_restore_v      # Restore V
+top_k_fknow = model.top_k_feature_know   # Knowledge Feature
+top_k_rknow = model.top_k_restore_know   # Knowledge Restore
 ```
 
-**결론**: ✅ DAWN과 Vanilla FLOPs 계산이 fair하게 비교됨
+**결론**: ✅ 이론적 Sparse FLOPs 기준으로 fair comparison
 
 ### tokens/sec 측정 검증 (2025-01-23)
 
@@ -899,10 +902,11 @@ def benchmark_model(model, seq_len=512, batch_size=1, warmup=10, iterations=100)
    - 변경 후: `combined_mask = all_masks.any(axis=0)` (union)
    - 이유: DAWN shared pool에서 뉴런이 어느 레이어에서든 선택되면 해당 토큰 처리에 관여
 
-4. **FLOPs 계산 수정** (2025-01-23): `scripts/evaluation/evaluate.py` line 90
-   - 변경 전: `2 * d_model * d_ff * seq_len` (up-proj만)
-   - 변경 후: `4 * d_model * d_ff * seq_len` (up + down projection)
-   - 영향: Vanilla FLOPs가 정확하게 계산됨 → fair comparison
+4. **FLOPs 계산 전면 수정** (2025-01-23): `scripts/evaluation/evaluate.py` line 50-120
+   - DAWN: Restore pathway 추가, expand_O 추가, attention scores 수정 (2x → 4x)
+   - Vanilla: QKVO 수정 (4x → 8x), attention scores 수정 (2x → 4x), FFN 유지 (4x)
+   - LM head: 2x factor 추가
+   - 이론적 Sparse FLOPs 기준으로 fair comparison
 
 ### Action Items (남은 작업)
 1. **Fig 6**: DAWN vs Vanilla 비교 조건 동일 확인
