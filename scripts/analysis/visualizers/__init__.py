@@ -15,7 +15,9 @@ from .embedding import plot_similarity_heatmap, plot_clustering, plot_embedding_
 from .pos_neurons import (
     plot_pos_heatmap, plot_pos_clustering,
     plot_top_neurons_by_pos, plot_pos_specificity,
-    plot_pos_specialization_from_features
+    plot_pos_specialization_from_features,
+    plot_pos_selectivity_from_json,
+    plot_pos_selectivity_heatmap
 )
 from .layer_contribution import plot_routing_stats, plot_layer_contribution
 from .factual_heatmap import plot_factual_heatmap, plot_factual_comparison
@@ -34,6 +36,8 @@ __all__ = [
     'plot_top_neurons_by_pos',
     'plot_pos_specificity',
     'plot_pos_specialization_from_features',
+    'plot_pos_selectivity_from_json',
+    'plot_pos_selectivity_heatmap',
     # Neuron Health (Figure 6a)
     'plot_dead_neurons',
     'plot_usage_histogram',

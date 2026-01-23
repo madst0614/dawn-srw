@@ -1837,6 +1837,7 @@ class ModelAnalyzer:
                     'gen_tokens': self.gen_tokens,
                     'max_sentences': self.max_sentences,
                     'target_layer': self.target_layer,
+                    'analysis_output_dir': str(self.output_dir),  # For finding .npy files
                 }
 
                 # Add checkpoint paths for figure 6 (training dynamics comparison)

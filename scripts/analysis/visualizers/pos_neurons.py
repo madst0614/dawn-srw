@@ -627,3 +627,124 @@ def plot_pos_selectivity_clustered(
 
     print(f"  Saved: {output_path}")
     return output_path
+
+
+def plot_pos_selectivity_from_json(
+    selectivity_data: Dict,
+    output_path: str,
+    figsize: Tuple[int, int] = (14, 10),
+    dpi: int = 150
+) -> Optional[str]:
+    """
+    Plot POS selectivity from precomputed JSON data.
+
+    Paper Figure 4: POS Neuron Selectivity
+    - Left: Heatmap of top selective neurons per POS
+    - Right: Mean selectivity bar chart
+
+    Args:
+        selectivity_data: Dict with 'top_selective_per_pos', 'mean_selectivity_by_pos'
+        output_path: Path to save the figure
+        figsize: Figure size
+        dpi: Output resolution
+
+    Returns:
+        Path to saved figure or None
+    """
+    if not HAS_MATPLOTLIB:
+        print("  Warning: matplotlib not available")
+        return None
+
+    top_selective = selectivity_data.get('top_selective_per_pos', {})
+    mean_selectivity = selectivity_data.get('mean_selectivity_by_pos', {})
+
+    if not top_selective:
+        print("  Warning: No selectivity data found")
+        return None
+
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+
+    # Get POS tags that have data
+    pos_tags = [p for p in UPOS_TAGS if p in top_selective and top_selective[p]]
+    if not pos_tags:
+        print("  Warning: No POS tags with selectivity data")
+        return None
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize, width_ratios=[3, 1])
+
+    # Left: Top selective neurons per POS (grouped bar / heatmap style)
+    n_show = 5  # Top N neurons per POS
+    neurons_data = []
+    labels = []
+
+    for pos in pos_tags:
+        neurons = top_selective[pos][:n_show]
+        for n in neurons:
+            neurons_data.append({
+                'pos': pos,
+                'neuron': n.get('neuron', str(n.get('neuron_idx', '?'))),
+                'selectivity': n.get('selectivity', 0)
+            })
+
+    if not neurons_data:
+        print("  Warning: No neuron selectivity data to plot")
+        return None
+
+    # Create heatmap-style visualization
+    # Rows = POS, Cols = rank (1st, 2nd, ... top neuron)
+    n_pos = len(pos_tags)
+    matrix = np.zeros((n_pos, n_show))
+    neuron_labels = [['' for _ in range(n_show)] for _ in range(n_pos)]
+
+    for i, pos in enumerate(pos_tags):
+        neurons = top_selective[pos][:n_show]
+        for j, n in enumerate(neurons):
+            matrix[i, j] = n.get('selectivity', 0)
+            neuron_labels[i][j] = n.get('neuron', str(n.get('neuron_idx', '?')))
+
+    # Plot heatmap
+    im = axes[0].imshow(matrix, aspect='auto', cmap='YlOrRd', vmin=1, vmax=min(10, matrix.max()))
+
+    # Add neuron labels
+    for i in range(n_pos):
+        for j in range(n_show):
+            if matrix[i, j] > 0:
+                text_color = 'white' if matrix[i, j] > 5 else 'black'
+                axes[0].text(j, i, f'{neuron_labels[i][j]}\n{matrix[i, j]:.1f}x',
+                           ha='center', va='center', fontsize=7, color=text_color)
+
+    axes[0].set_xticks(range(n_show))
+    axes[0].set_xticklabels([f'Top {i+1}' for i in range(n_show)])
+    axes[0].set_yticks(range(n_pos))
+    axes[0].set_yticklabels(pos_tags)
+    axes[0].set_xlabel('Rank', fontsize=11)
+    axes[0].set_ylabel('POS Category', fontsize=11)
+    axes[0].set_title('Most Selective Neurons per POS', fontsize=12)
+
+    cbar = fig.colorbar(im, ax=axes[0], shrink=0.8)
+    cbar.set_label('Selectivity (×baseline)', fontsize=10)
+
+    # Right: Mean selectivity bar chart
+    mean_values = [mean_selectivity.get(pos, 1.0) for pos in pos_tags]
+    colors = ['coral' if v > 1.2 else 'steelblue' if v < 0.8 else 'gray' for v in mean_values]
+
+    axes[1].barh(range(n_pos), mean_values, color=colors)
+    axes[1].axvline(x=1.0, color='black', linestyle='--', alpha=0.5, label='baseline')
+    axes[1].set_yticks(range(n_pos))
+    axes[1].set_yticklabels(pos_tags)
+    axes[1].set_xlabel('Mean Selectivity', fontsize=10)
+    axes[1].set_title('Population Mean', fontsize=11)
+    axes[1].set_xlim(0, max(2.0, max(mean_values) * 1.1) if mean_values else 2.0)
+
+    # Add summary
+    n_active = selectivity_data.get('n_active_neurons', 0)
+    if n_active:
+        fig.text(0.5, 0.02, f'Active neurons analyzed: {n_active}', ha='center', fontsize=10)
+
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.08)
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+
+    print(f"  Saved: {output_path}")
+    return output_path
