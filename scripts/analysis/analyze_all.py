@@ -455,6 +455,11 @@ class ModelAnalyzer:
                         f.write("-" * 40 + "\n")
 
         self.results['performance'] = results
+
+        # Also store generation at top level for paper_data access
+        if 'generation' in results:
+            self.results['generation'] = results['generation']
+
         return results
 
     def _benchmark_speed(self, warmup: int = 10, iterations: int = 50) -> Dict:
@@ -1868,79 +1873,76 @@ class ModelAnalyzer:
                 f.write("\\end{table}\n")
 
     def _generate_comparison_samples(self, paper_dir: Path):
-        """Generate text samples comparing DAWN vs Baseline for paper."""
-        # Paper-quality prompts (unified with _generate_samples)
-        PROMPTS = {
-            'Factual Knowledge': [
-                "The capital of France is",
-                "The largest planet in our solar system is",
-                "Water boils at",
-                "Albert Einstein was born in",
-            ],
-            'Common Sense': [
-                "If you drop a glass on the floor, it will",
-                "Fire is hot, but ice is",
-                "Birds fly in the sky, fish swim in",
-                "At night, the sun is",
-            ],
-            'Narrative': [
-                "Once upon a time, in a small village,",
-                "The detective examined the evidence and",
-                "She opened the door and saw",
-                "After years of hard work, he finally",
-            ],
-            'Technical': [
-                "In machine learning, gradient descent is",
-                "The function of the mitochondria is",
-                "A neural network consists of",
-            ],
-        }
+        """Format generation comparison from pre-computed samples (READ-ONLY).
 
-        # Load baseline model using shared method
-        print("    Loading baseline model...")
-        baseline_model, baseline_name = self._load_comparison_model()
-        if baseline_model is None:
-            print("    Skipping comparison samples (no baseline model)")
+        Uses data from self.results['generation'] which was computed during analyze_performance.
+        """
+        gen_data = self.results.get('generation', {})
+        dawn_samples = gen_data.get('dawn', [])
+        vanilla_samples = gen_data.get('vanilla', [])
+
+        if not dawn_samples:
+            print("    Skipping comparison (no generation data - run analyze_performance first)")
             return
 
-        # Generate samples
+        if not vanilla_samples:
+            print("    Skipping comparison (no vanilla generation data)")
+            return
+
+        # Format comparison output
         lines = []
         lines.append("=" * 100)
         lines.append("GENERATION COMPARISON: DAWN vs Baseline")
         lines.append("=" * 100)
         lines.append(f"DAWN Model:     {self.name} (v{self.version})")
-        lines.append(f"Baseline Model: {baseline_name}")
         lines.append(f"Max tokens: {self.gen_tokens}")
         lines.append("=" * 100)
 
-        # Print header to console
-        print("\n" + "\n".join(lines[-5:]))
+        print("\n" + "\n".join(lines[-4:]))
 
-        for category, prompts in PROMPTS.items():
+        # Group by category
+        dawn_by_cat = {}
+        for s in dawn_samples:
+            cat = s.get('category', 'unknown')
+            if cat not in dawn_by_cat:
+                dawn_by_cat[cat] = []
+            dawn_by_cat[cat].append(s)
+
+        vanilla_by_cat = {}
+        for s in vanilla_samples:
+            cat = s.get('category', 'unknown')
+            if cat not in vanilla_by_cat:
+                vanilla_by_cat[cat] = []
+            vanilla_by_cat[cat].append(s)
+
+        for category in dawn_by_cat.keys():
             cat_header = f"\n{'='*100}\n[{category.upper()}]\n{'='*100}"
             lines.append(cat_header)
             print(cat_header)
 
-            for prompt in prompts:
+            dawn_cat = dawn_by_cat.get(category, [])
+            vanilla_cat = vanilla_by_cat.get(category, [])
+
+            # Match by prompt
+            for d_sample in dawn_cat:
+                prompt = d_sample.get('prompt', '')
+                dawn_gen = d_sample.get('generated', '')
+
+                # Find matching vanilla sample
+                v_sample = next((v for v in vanilla_cat if v.get('prompt') == prompt), None)
+                vanilla_gen = v_sample.get('generated', '') if v_sample else '(no data)'
+
                 prompt_line = f"\n{'─'*100}\nPrompt: \"{prompt}\"\n{'─'*100}"
                 lines.append(prompt_line)
                 print(prompt_line)
 
-                # Generate from both models using shared method
-                dawn_output = self._generate_text_simple(self.model, prompt, max_new_tokens=self.gen_tokens)
-                baseline_output = self._generate_text_simple(baseline_model, prompt, max_new_tokens=self.gen_tokens)
-
-                # Extract generated part (remove prompt)
-                dawn_gen = dawn_output[len(prompt):].strip() if dawn_output.startswith(prompt) else dawn_output
-                baseline_gen = baseline_output[len(prompt):].strip() if baseline_output.startswith(prompt) else baseline_output
-
                 dawn_line = f"  DAWN:     {dawn_gen}"
-                baseline_line = f"  Baseline: {baseline_gen}"
+                vanilla_line = f"  Baseline: {vanilla_gen}"
 
                 lines.append(dawn_line)
-                lines.append(baseline_line)
+                lines.append(vanilla_line)
                 print(dawn_line)
-                print(baseline_line)
+                print(vanilla_line)
 
         # Save to file
         output_path = paper_dir / 'generation_comparison.txt'
