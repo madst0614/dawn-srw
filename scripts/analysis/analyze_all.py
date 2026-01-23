@@ -66,10 +66,21 @@ Usage:
         --output results/ \
         --n_batches 200 --max_sentences 5000 --batch_size 32
 
+    # Multi-seed comparison (Table 1 with mean ± std)
+    python scripts/analysis/analyze_all.py \
+        --checkpoint dawn_main.pt \
+        --compare_checkpoint dawn_seed1.pt dawn_seed2.pt vanilla_seed1.pt vanilla_seed2.pt \
+        --val_data val.pt \
+        --output results/
+        # Outputs Table 1: PPL and Accuracy with mean ± std per model type
+
 CLI Arguments:
     Input/Output:
-        --checkpoint      Single checkpoint path
-        --checkpoints     Multiple checkpoint paths
+        --checkpoint      Single checkpoint path (for neuron analysis)
+        --checkpoints     Multiple checkpoint paths (for comparison)
+        --compare_checkpoint  One or more comparison checkpoints for Table 1 (auto-detects DAWN/Vanilla)
+                              Example: --compare_checkpoint dawn1.pt dawn2.pt vanilla1.pt vanilla2.pt
+                              Produces Table 1 with mean ± std per model type
         --val_data        Validation data path (required)
         --output          Output directory (default: analysis_results)
         --device          Device: cuda/cpu (default: cuda, auto-fallback to cpu)
@@ -157,13 +168,23 @@ class ModelAnalyzer:
         gen_tokens: int = 50,
         factual_tokens: int = 30,
         target_layer: int = None,
-        compare_checkpoint: str = None,
+        compare_checkpoint: List[str] = None,
     ):
         self.checkpoint_path = checkpoint_path
         self.val_data_path = val_data_path
         self.output_dir = Path(output_dir)
         self.device = device
-        self.compare_checkpoint = compare_checkpoint
+        # Normalize to list (for backward compatibility with single path)
+        if compare_checkpoint is None:
+            self.compare_checkpoints = []
+        elif isinstance(compare_checkpoint, str):
+            self.compare_checkpoints = [compare_checkpoint]
+        else:
+            self.compare_checkpoints = list(compare_checkpoint)
+        # Legacy alias for single comparison (first vanilla or first checkpoint)
+        self.compare_checkpoint = self.compare_checkpoints[0] if self.compare_checkpoints else None
+        # Multi-seed results cache
+        self._multi_seed_results = None
 
         # Analysis parameters
         self.n_batches = n_batches
@@ -253,6 +274,140 @@ class ModelAnalyzer:
             del self._comparison_model
             self._comparison_model = None
             torch.cuda.empty_cache()
+
+    def _analyze_multi_seed_checkpoints(self) -> Dict:
+        """Analyze multiple comparison checkpoints for Table 1 with mean ± std.
+
+        Returns:
+            Dict with structure:
+            {
+                'dawn': {
+                    'results': [list of individual results],
+                    'ppl_mean': float, 'ppl_std': float,
+                    'acc_mean': float, 'acc_std': float,
+                    'params_M': float, 'flops_G': float,
+                    'n_seeds': int
+                },
+                'vanilla': { ... same structure ... }
+            }
+        """
+        if self._multi_seed_results is not None:
+            return self._multi_seed_results
+
+        from scripts.analysis.utils import load_model
+        from scripts.evaluation.evaluate import evaluate_model, load_val_data, estimate_flops
+        import numpy as np
+
+        # Collect all checkpoints including main checkpoint
+        all_checkpoints = []
+
+        # Main checkpoint is always DAWN (for neuron analysis)
+        if self.checkpoint_path:
+            all_checkpoints.append(('main', self.checkpoint_path))
+
+        # Add comparison checkpoints
+        for cp in self.compare_checkpoints:
+            all_checkpoints.append(('compare', cp))
+
+        if not all_checkpoints:
+            self._multi_seed_results = {}
+            return self._multi_seed_results
+
+        print(f"\n  [Multi-Seed Analysis] Processing {len(all_checkpoints)} checkpoints...")
+
+        # Load validation data once
+        val_tokens = load_val_data(self.val_data_path, max_tokens=self.val_batches * 32 * 512)
+
+        # Group results by model type
+        dawn_results = []
+        vanilla_results = []
+
+        for source, checkpoint_path in all_checkpoints:
+            cp_path = Path(checkpoint_path)
+            cp_name = cp_path.name if cp_path.is_dir() else cp_path.stem
+
+            try:
+                # Load model
+                model, tokenizer, config = load_model(checkpoint_path, self.device)
+                model.eval()
+
+                # Detect model type
+                is_dawn = hasattr(model, 'shared_neurons') or hasattr(model, 'router')
+                model_type = 'dawn' if is_dawn else 'vanilla'
+
+                print(f"    [{model_type.upper()}] {cp_name}...", end=' ', flush=True)
+
+                # Count parameters
+                total_params = sum(p.numel() for p in model.parameters())
+                params_M = total_params / 1e6
+
+                # Estimate FLOPs
+                flops_result = estimate_flops(model, config)
+                flops_G = flops_result.get('total_gflops', 0)
+
+                # Run evaluation
+                val_results = evaluate_model(
+                    model, val_tokens,
+                    batch_size=32, seq_len=512, device=self.device
+                )
+
+                result = {
+                    'name': cp_name,
+                    'path': str(checkpoint_path),
+                    'source': source,
+                    'params_M': params_M,
+                    'flops_G': flops_G,
+                    'perplexity': val_results.get('perplexity', 0),
+                    'accuracy': val_results.get('accuracy', 0),
+                    'loss': val_results.get('loss', 0),
+                }
+
+                if is_dawn:
+                    dawn_results.append(result)
+                else:
+                    vanilla_results.append(result)
+
+                print(f"PPL={result['perplexity']:.2f}, Acc={result['accuracy']:.2f}%")
+
+                # Cleanup
+                del model
+                torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"    Error loading {cp_name}: {e}")
+                continue
+
+        # Calculate statistics for each group
+        def calc_stats(results):
+            if not results:
+                return None
+
+            ppls = np.array([r['perplexity'] for r in results])
+            accs = np.array([r['accuracy'] for r in results])
+
+            # Use first result for params/flops (should be same across seeds)
+            return {
+                'results': results,
+                'ppl_mean': float(np.mean(ppls)),
+                'ppl_std': float(np.std(ppls)),
+                'acc_mean': float(np.mean(accs)),
+                'acc_std': float(np.std(accs)),
+                'params_M': results[0]['params_M'],
+                'flops_G': results[0]['flops_G'],
+                'n_seeds': len(results),
+            }
+
+        self._multi_seed_results = {}
+
+        if dawn_results:
+            self._multi_seed_results['dawn'] = calc_stats(dawn_results)
+            print(f"\n  DAWN: n={len(dawn_results)}, PPL={self._multi_seed_results['dawn']['ppl_mean']:.2f}±{self._multi_seed_results['dawn']['ppl_std']:.2f}")
+
+        if vanilla_results:
+            self._multi_seed_results['vanilla'] = calc_stats(vanilla_results)
+            print(f"  Vanilla: n={len(vanilla_results)}, PPL={self._multi_seed_results['vanilla']['ppl_mean']:.2f}±{self._multi_seed_results['vanilla']['ppl_std']:.2f}")
+
+        return self._multi_seed_results
 
     def _get_text_generator(self) -> TextGenerator:
         """Get or create TextGenerator instance."""
@@ -2663,23 +2818,56 @@ class ModelAnalyzer:
         }
 
         # === TABLES SECTION ===
-        # Table 1: Model Statistics
-        paper_data['tables']['table1_model_stats'] = {
-            'dawn': {
-                'parameters_M': paper_data['models']['dawn']['parameters_M'],
-                'flops_G': paper_data['models']['dawn']['flops_G'],
-                'perplexity': paper_data['models']['dawn']['perplexity'],
-                'accuracy': paper_data['models']['dawn']['accuracy'],
-                'tokens_per_sec': paper_data['models']['dawn']['tokens_per_sec'],
-            },
-            'vanilla': {
-                'parameters_M': paper_data['models'].get('vanilla', {}).get('parameters_M'),
-                'flops_G': paper_data['models'].get('vanilla', {}).get('flops_G'),
-                'perplexity': paper_data['models'].get('vanilla', {}).get('perplexity'),
-                'accuracy': paper_data['models'].get('vanilla', {}).get('accuracy'),
-                'tokens_per_sec': paper_data['models'].get('vanilla', {}).get('tokens_per_sec'),
-            } if 'vanilla' in paper_data['models'] else None,
-        }
+        # Table 1: Model Statistics (with multi-seed support)
+        # Check if multi-seed results are available
+        multi_seed = self._multi_seed_results if hasattr(self, '_multi_seed_results') and self._multi_seed_results else None
+
+        if multi_seed:
+            # Multi-seed format with mean ± std
+            table1_data = {}
+            for model_type in ['dawn', 'vanilla']:
+                data = multi_seed.get(model_type)
+                if data:
+                    table1_data[model_type] = {
+                        'ppl_mean': round(data['ppl_mean'], 2),
+                        'ppl_std': round(data['ppl_std'], 2),
+                        'acc_mean': round(data['acc_mean'], 2),
+                        'acc_std': round(data['acc_std'], 2),
+                        'parameters_M': round(data['params_M'], 2),
+                        'flops_G': round(data['flops_G'], 2),
+                        'n_seeds': data['n_seeds'],
+                        # Individual seed results for reproducibility
+                        'seeds': [
+                            {
+                                'name': r['name'],
+                                'perplexity': round(r['perplexity'], 2),
+                                'accuracy': round(r['accuracy'], 2),
+                            }
+                            for r in data['results']
+                        ],
+                    }
+            paper_data['tables']['table1'] = table1_data
+        else:
+            # Single-seed format (legacy)
+            paper_data['tables']['table1'] = {
+                'dawn': {
+                    'parameters_M': paper_data['models']['dawn']['parameters_M'],
+                    'flops_G': paper_data['models']['dawn']['flops_G'],
+                    'perplexity': paper_data['models']['dawn']['perplexity'],
+                    'accuracy': paper_data['models']['dawn']['accuracy'],
+                    'tokens_per_sec': paper_data['models']['dawn']['tokens_per_sec'],
+                },
+                'vanilla': {
+                    'parameters_M': paper_data['models'].get('vanilla', {}).get('parameters_M'),
+                    'flops_G': paper_data['models'].get('vanilla', {}).get('flops_G'),
+                    'perplexity': paper_data['models'].get('vanilla', {}).get('perplexity'),
+                    'accuracy': paper_data['models'].get('vanilla', {}).get('accuracy'),
+                    'tokens_per_sec': paper_data['models'].get('vanilla', {}).get('tokens_per_sec'),
+                } if 'vanilla' in paper_data['models'] else None,
+            }
+
+        # Keep legacy key for backward compatibility
+        paper_data['tables']['table1_model_stats'] = paper_data['tables']['table1']
 
         # Table 2: Neuron Utilization (forward-pass based)
         # Try neuron_features.utilization first, then fallback to health.activation_distribution
@@ -3358,61 +3546,60 @@ class ModelAnalyzer:
             print(f"  Total: {len(self.results)} result sets loaded")
 
     def _print_summary_table(self):
-        """Print summary table after performance analysis."""
+        """Print summary table after performance analysis.
+
+        If multiple comparison checkpoints provided, runs multi-seed analysis
+        and displays Table 1 with mean ± std format.
+        """
+        # Check if multi-seed analysis is needed
+        if len(self.compare_checkpoints) > 0:
+            self._print_multi_seed_table()
+            return
+
+        # Single checkpoint mode (legacy)
         model_info = self.results.get('model_info', {})
         perf = self.results.get('performance', {})
         val = perf.get('validation', {})
         speed = perf.get('speed', {})
 
-        # Try to get vanilla info if comparison checkpoint exists
-        vanilla_info = {}
-        vanilla_val = {}
-        vanilla_speed = {}
-
-        if self.compare_checkpoint:
-            # Try to load from cached comparison model results
-            comp_path = Path(self.compare_checkpoint)
-            comp_dirs = [
-                comp_path.parent / 'analysis',
-                self.output_dir.parent / comp_path.stem / 'analysis' if comp_path.is_file() else None,
-            ]
-            for comp_dir in comp_dirs:
-                if comp_dir and comp_dir.exists():
-                    comp_params = comp_dir / 'model_info' / 'parameters.json'
-                    comp_val = comp_dir / 'performance' / 'validation.json'
-                    comp_speed = comp_dir / 'performance' / 'speed_benchmark.json'
-                    if comp_params.exists():
-                        with open(comp_params) as f:
-                            vanilla_info = json.load(f)
-                    if comp_val.exists():
-                        with open(comp_val) as f:
-                            vanilla_val = json.load(f)
-                    if comp_speed.exists():
-                        with open(comp_speed) as f:
-                            vanilla_speed = json.load(f)
-                    if vanilla_info:
-                        break
-
-        has_comparison = bool(vanilla_info or vanilla_val)
-
         print("\n  ┌─ Model Statistics ─────────────────────────────────────")
-        if has_comparison:
-            print(f"  │ {'Metric':<12} {'DAWN':>12} {'Vanilla':>12}")
-            print(f"  │ {'-'*12} {'-'*12} {'-'*12}")
-            print(f"  │ {'Parameters':<12} {model_info.get('total_M', 0):>10.2f}M {vanilla_info.get('total_M', 0):>10.2f}M")
-            print(f"  │ {'FLOPs':<12} {model_info.get('flops_G', 0):>10.2f}G {vanilla_info.get('flops_G', 0):>10.2f}G")
-            print(f"  │ {'Perplexity':<12} {val.get('perplexity', 0):>12.2f} {vanilla_val.get('perplexity', 0):>12.2f}")
-            print(f"  │ {'Accuracy':<12} {val.get('accuracy', 0):>11.1f}% {vanilla_val.get('accuracy', 0):>11.1f}%")
-            print(f"  │ {'Speed':<12} {speed.get('tokens_per_sec', 0)/1000:>10.1f}K {vanilla_speed.get('tokens_per_sec', 0)/1000:>10.1f}K tok/s")
-        else:
-            print(f"  │ {'Metric':<15} {'Value':>15}")
-            print(f"  │ {'-'*15} {'-'*15}")
-            print(f"  │ {'Parameters':<15} {model_info.get('total_M', 0):>13.2f}M")
-            print(f"  │ {'FLOPs':<15} {model_info.get('flops_G', 0):>13.2f}G")
-            print(f"  │ {'Perplexity':<15} {val.get('perplexity', 0):>15.2f}")
-            print(f"  │ {'Accuracy':<15} {val.get('accuracy', 0):>14.1f}%")
-            print(f"  │ {'Speed':<15} {speed.get('tokens_per_sec', 0)/1000:>13.1f}K tok/s")
+        print(f"  │ {'Metric':<15} {'Value':>15}")
+        print(f"  │ {'-'*15} {'-'*15}")
+        print(f"  │ {'Parameters':<15} {model_info.get('total_M', 0):>13.2f}M")
+        print(f"  │ {'FLOPs':<15} {model_info.get('flops_G', 0):>13.2f}G")
+        print(f"  │ {'Perplexity':<15} {val.get('perplexity', 0):>15.2f}")
+        print(f"  │ {'Accuracy':<15} {val.get('accuracy', 0):>14.1f}%")
+        print(f"  │ {'Speed':<15} {speed.get('tokens_per_sec', 0)/1000:>13.1f}K tok/s")
         print(f"  └─────────────────────────────────────────────────────────\n")
+
+    def _print_multi_seed_table(self):
+        """Print Table 1 with multi-seed mean ± std format."""
+        # Run multi-seed analysis
+        multi_results = self._analyze_multi_seed_checkpoints()
+
+        if not multi_results:
+            print("\n  [Warning] No multi-seed results available")
+            return
+
+        # Table 1 format
+        print("\n  " + "=" * 70)
+        print("  TABLE 1: Model Performance Comparison (mean ± std)")
+        print("  " + "=" * 70)
+        print(f"  │ {'Model':<8} │ {'Params':>8} │ {'PPL':>14} │ {'Accuracy':>14} │ {'n':>3} │")
+        print(f"  │{'-'*10}│{'-'*10}│{'-'*16}│{'-'*16}│{'-'*5}│")
+
+        for model_type in ['dawn', 'vanilla']:
+            data = multi_results.get(model_type)
+            if data:
+                # Format PPL with ± std
+                ppl_str = f"{data['ppl_mean']:.1f} ± {data['ppl_std']:.1f}"
+                # Format Accuracy with ± std
+                acc_str = f"{data['acc_mean']:.1f} ± {data['acc_std']:.1f}%"
+
+                print(f"  │ {model_type.upper():<8} │ {data['params_M']:>6.1f}M │ {ppl_str:>14} │ {acc_str:>14} │ {data['n_seeds']:>3} │")
+
+        print(f"  └{'─'*10}┴{'─'*10}┴{'─'*16}┴{'─'*16}┴{'─'*5}┘")
+        print()
 
     def _print_final_summary(self):
         """Print final analysis summary."""
@@ -3815,7 +4002,9 @@ Examples:
     # Input/output
     parser.add_argument('--checkpoint', type=str, help='Single checkpoint path')
     parser.add_argument('--checkpoints', type=str, nargs='+', help='Multiple checkpoint paths')
-    parser.add_argument('--compare_checkpoint', type=str, help='Comparison checkpoint for training dynamics (e.g., vanilla baseline)')
+    parser.add_argument('--compare_checkpoint', type=str, nargs='+',
+                        help='Comparison checkpoints for Table 1 (multiple DAWN/Vanilla seeds). '
+                             'Model type auto-detected via shared_neurons attribute.')
     parser.add_argument('--val_data', type=str, required=True, help='Validation data path')
     parser.add_argument('--output', type=str, default='analysis_results', help='Output directory')
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
