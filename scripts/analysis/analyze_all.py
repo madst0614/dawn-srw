@@ -337,6 +337,9 @@ class ModelAnalyzer:
         with open(output_dir / 'architecture.txt', 'w') as f:
             f.write('\n'.join(arch_lines))
 
+        # Console output
+        print(f"    Parameters: {total_params/1e6:.2f}M, FLOPs: {flops/1e9:.2f}G")
+
         self.results['model_info'] = params_info
         return params_info
 
