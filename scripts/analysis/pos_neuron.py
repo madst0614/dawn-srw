@@ -4569,7 +4569,7 @@ class NeuronFeatureAnalyzer:
                 if neurons:
                     print(f"\n{feature.upper()}: {len(neurons)} specialized neurons")
                     for info in neurons[:5]:  # Top 5
-                        print(f"  Neuron {info['neuron']:4d}: {info['specialized_for']:12s} "
+                        print(f"  Neuron {info['neuron']}: {info['specialized_for']:12s} "
                               f"({info['pct']:.1f}%, {info['n_activations']} activations)")
 
         if clusters:
