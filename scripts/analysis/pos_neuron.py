@@ -4840,6 +4840,8 @@ class NeuronFeatureAnalyzer:
                 'mean_selectivity_by_pos': selectivity_data['mean_selectivity_by_pos'],
                 'selectivity_range': selectivity_data['selectivity_range'],
                 'n_active_neurons': selectivity_data['n_active_neurons'],
+                'active_neuron_indices': selectivity_data['active_neuron_indices'],
+                'pool_order': self.pool_order,  # For neuron name conversion in visualization
                 'pos_tags': selectivity_data['pos_tags'],
                 'per_pool': selectivity_data.get('per_pool', {}),
                 'by_pos': selectivity_data.get('by_pos', {}),

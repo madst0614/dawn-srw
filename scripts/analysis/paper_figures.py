@@ -157,6 +157,17 @@ class PaperFigureGenerator:
         active_indices = selectivity.get('active_neuron_indices', list(range(selectivity_matrix.shape[0])))
         pool_order = selectivity.get('pool_order', config.get('pool_order'))
 
+        # Fallback: default pool_order for 40M DAWN model if not provided
+        if not pool_order:
+            pool_order = [
+                ('fqk', 64),
+                ('fv', 264),
+                ('rqk', 64),
+                ('rv', 264),
+                ('fknow', 160),
+                ('rknow', 160),
+            ]
+
         path = plot_pos_selectivity_heatmap(
             selectivity_matrix,
             active_indices,
