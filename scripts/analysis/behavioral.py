@@ -562,6 +562,22 @@ class BehavioralAnalyzer(BaseAnalyzer):
 
         print(f"    Analyzing {len(pools)} pools simultaneously: {pools}")
 
+        # Validate that each target is a single token
+        for target in targets:
+            token_ids = self.tokenizer.encode(target, add_special_tokens=False)
+            if len(token_ids) != 1:
+                print(f"Warning: '{target}' is not a single token (tokenizes to {len(token_ids)} tokens: {self.tokenizer.convert_ids_to_tokens(token_ids)})")
+
+        # Add token validation info to results
+        results['token_validation'] = {
+            target: {
+                'is_single_token': len(self.tokenizer.encode(target, add_special_tokens=False)) == 1,
+                'token_ids': self.tokenizer.encode(target, add_special_tokens=False),
+                'tokens': self.tokenizer.convert_ids_to_tokens(self.tokenizer.encode(target, add_special_tokens=False))
+            }
+            for target in targets
+        }
+
         for prompt_idx, (prompt, target) in enumerate(zip(prompts, targets)):
             # Per-pool counters
             target_neuron_counts = {pool: Counter() for pool in pools}
@@ -662,8 +678,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
                                                 active = (w > 0).nonzero(as_tuple=True)[0].cpu().tolist()
                                                 step_neurons_per_pool[pool].update(active)
 
-                        # Check if target found
-                        if target_lower in token_text.strip().lower():
+                        # Check if target found (exact match)
+                        if token_text.strip().lower() == target_lower:
                             successful_runs += 1
 
                             # Record neurons for ALL pools with unified naming
