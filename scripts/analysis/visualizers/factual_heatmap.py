@@ -111,6 +111,13 @@ def plot_factual_heatmap(
                         neuron = str(neuron).split('_')[-1]
                     all_neurons[target][neuron] = freq
 
+                # Load contrastive scores (target_freq - baseline_freq)
+                contrastive = fknow_data.get('contrastive_scores', {})
+                for neuron, score in contrastive.items():
+                    if '_' in str(neuron):
+                        neuron = str(neuron).split('_')[-1]
+                    all_contrastive[target][neuron] = score
+
             common_neurons_per_target[target] = all_common
 
     if not all_neurons:

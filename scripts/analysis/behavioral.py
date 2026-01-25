@@ -729,6 +729,12 @@ class BehavioralAnalyzer(BaseAnalyzer):
                     pool_baseline_counts = baseline_neuron_counts[pool]
 
                     target_freq = {n: c / successful_runs for n, c in pool_target_counts.items()}
+                    # Calculate baseline frequency and contrastive scores
+                    baseline_freq = {n: c / total_baseline_steps for n, c in pool_baseline_counts.items()} if total_baseline_steps > 0 else {}
+                    # Contrastive = target_freq - baseline_freq (positive = target-specific)
+                    all_neurons_in_pool = set(target_freq.keys()) | set(baseline_freq.keys())
+                    contrastive_scores = {n: target_freq.get(n, 0) - baseline_freq.get(n, 0) for n in all_neurons_in_pool}
+
                     common_100 = [n for n, f in target_freq.items() if f >= 1.0]
                     common_80 = [n for n, f in target_freq.items() if f >= 0.8]
 
@@ -742,6 +748,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
                         )[:20],
                         # Full frequency data for heatmap visualization
                         'all_frequencies': {n: f for n, f in target_freq.items()},
+                        # Contrastive scores: positive = more active on target than baseline
+                        'contrastive_scores': contrastive_scores,
                     }
 
                     print(f"        {pool}: {len(common_100)} neurons@100%, {len(common_80)} neurons@80%")
