@@ -311,6 +311,10 @@ class ModelAnalyzer:
         if self.checkpoint_path:
             all_checkpoints.append(('main', self.checkpoint_path))
 
+        # Add vanilla checkpoint (also used for Fig 6)
+        if self.vanilla_checkpoint:
+            all_checkpoints.append(('vanilla', self.vanilla_checkpoint))
+
         # Add comparison checkpoints
         for cp in self.compare_checkpoints:
             all_checkpoints.append(('compare', cp))
