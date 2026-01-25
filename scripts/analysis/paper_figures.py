@@ -197,7 +197,7 @@ class PaperFigureGenerator:
 
         print("  Using pre-computed factual analysis...", flush=True)
 
-        path = plot_factual_heatmap(factual, os.path.join(output_dir, 'fig5_semantic_clustering_of_knowledge_neurons.png'))
+        path = plot_factual_heatmap(factual, os.path.join(output_dir, 'fig5_semantic_coherence_of_knowledge_neurons.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'factual_analysis': factual, 'visualization': path}

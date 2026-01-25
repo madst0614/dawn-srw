@@ -3244,7 +3244,7 @@ class ModelAnalyzer:
             "### Figures",
             "- `figures/fig3_emergent_qk_functional_separation.png`",
             "- `figures/fig4_pos_selectivity_across_neuron_pools.png`",
-            "- `figures/fig5_semantic_clustering_of_knowledge_neurons.png` (F-Know pool only)",
+            "- `figures/fig5_semantic_coherence_of_knowledge_neurons.png` (F-Know pool only)",
             "- `figures/fig6_convergence_comparison.png`",
             "- `figures/fig7_attention_knowledge_balance.png`",
             "",
