@@ -740,6 +740,8 @@ class BehavioralAnalyzer(BaseAnalyzer):
                             [{'neuron': n, 'freq': f * 100} for n, f in target_freq.items()],
                             key=lambda x: -x['freq']
                         )[:20],
+                        # Full frequency data for heatmap visualization
+                        'all_frequencies': {n: f for n, f in target_freq.items()},
                     }
 
                     print(f"        {pool}: {len(common_100)} neurons@100%, {len(common_80)} neurons@80%")

@@ -102,19 +102,16 @@ def plot_factual_heatmap(
                         all_common.add(idx)
                     else:
                         all_common.add(str(n))
-                # Get top_neurons for frequencies
-                for nf in fknow_data.get('top_neurons', []):
-                    if isinstance(nf, dict):
-                        neuron = nf.get('neuron', '')
-                        # Remove pool prefix
-                        if '_' in str(neuron):
-                            neuron = str(neuron).split('_')[-1]
-                        freq = nf.get('freq', 0) / 100.0
-                        all_neurons[target][neuron] = max(all_neurons[target][neuron], freq)
+
+                # Use all_frequencies for complete freq data
+                all_freqs = fknow_data.get('all_frequencies', {})
+                for neuron, freq in all_freqs.items():
+                    # Remove pool prefix if present
+                    if '_' in str(neuron):
+                        neuron = str(neuron).split('_')[-1]
+                    all_neurons[target][neuron] = freq
+
             common_neurons_per_target[target] = all_common
-            # For new structure, use presence in common_80 as a proxy for high frequency
-            for neuron in all_common:
-                all_neurons[target][neuron] = max(all_neurons[target].get(neuron, 0), 0.8)
 
     if not all_neurons:
         return None
@@ -213,16 +210,18 @@ def plot_factual_heatmap(
     # Select neurons: prioritize categories with interesting patterns
     # Category 0 (Shared) shows common knowledge, then specific categories
     # Exclude Mixed category (3)
-    neurons_per_cat = max(3, top_n_neurons // 3)
+    # 각 카테고리별 최대 5개, mean_freq 기준으로 정렬
+    max_per_category = 5
     sorted_neurons = []
     category_order = [0, 1, 2]  # Shared, Capital-specific, Other-specific (no Mixed)
 
     for cat in category_order:
-        neurons_in_cat = [n for n, _ in categorized[cat][:neurons_per_cat]]
-        sorted_neurons.extend(neurons_in_cat)
-
-    # Trim to top_n_neurons
-    sorted_neurons = sorted_neurons[:top_n_neurons]
+        # Sort by mean_freq instead of composite score
+        neurons_in_cat = sorted(
+            categorized[cat],
+            key=lambda x: -np.mean([all_neurons[t].get(x[0], 0) for t in targets])
+        )[:max_per_category]
+        sorted_neurons.extend([n for n, _ in neurons_in_cat])
 
     if not sorted_neurons:
         # Fallback: just take top neurons by total activity
