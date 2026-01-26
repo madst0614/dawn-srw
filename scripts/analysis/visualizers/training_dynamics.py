@@ -230,11 +230,12 @@ def plot_training_dynamics(
                 linewidth=linewidth, label=label)
 
     # Formatting
-    ax.set_xlabel('Training Steps', fontsize=11)
-    ax.set_ylabel('Validation Loss', fontsize=11)
+    ax.set_xlabel('Training Steps', fontsize=13)
+    ax.set_ylabel('Validation Loss', fontsize=13)
+    ax.tick_params(axis='both', labelsize=11)
 
     if title:
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_title(title, fontsize=14, fontweight='bold')
 
     # Auto log scale if range is large
     if use_log_scale:
@@ -262,7 +263,7 @@ def plot_training_dynamics(
     ax.xaxis.set_major_formatter(plt.FuncFormatter(format_steps))
 
     # Legend
-    ax.legend(loc='upper right', fontsize=9, framealpha=0.95)
+    ax.legend(loc='upper right', fontsize=11, framealpha=0.95)
 
     plt.tight_layout()
 
