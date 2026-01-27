@@ -47,7 +47,7 @@ def count_parameters(model):
     return total, trainable
 
 
-def estimate_flops(model, seq_len=512):
+def estimate_flops(model, config=None, seq_len=512):
     """
     Estimate theoretical FLOPs for forward pass (per sequence).
 
@@ -55,20 +55,38 @@ def estimate_flops(model, seq_len=512):
     Includes both sparse matmul and einsum operations.
 
     FLOPs formula: matmul (m,k) @ (k,n) = 2 * m * k * n
+
+    Args:
+        model: The model instance
+        config: Checkpoint config dict (preferred source for architecture params)
+        seq_len: Sequence length
     """
-    d_model = getattr(model, 'd_model', 384)
-    n_layers = getattr(model, 'n_layers', 12)
-    rank = getattr(model, 'rank', 64)
-    knowledge_rank = getattr(model, 'knowledge_rank', 128)
+    # Helper: read from config first, then model attribute, then default
+    def _get(key, default):
+        if config and key in config and config[key] is not None:
+            return config[key]
+        val = getattr(model, key, None)
+        if val is not None:
+            return val
+        # Check model.config dict if available
+        model_cfg = getattr(model, 'config', {})
+        if isinstance(model_cfg, dict) and key in model_cfg and model_cfg[key] is not None:
+            return model_cfg[key]
+        return default
+
+    d_model = _get('d_model', 384)
+    n_layers = _get('n_layers', 12)
+    rank = _get('rank', 64)
+    knowledge_rank = _get('knowledge_rank', 128)
 
     if hasattr(model, 'shared_neurons'):
         # DAWN - Top-k values
-        top_k_fqk = getattr(model, 'top_k_feature_qk', 16)
-        top_k_fv = getattr(model, 'top_k_feature_v', 6)
-        top_k_rqk = getattr(model, 'top_k_restore_qk', 16)
-        top_k_rv = getattr(model, 'top_k_restore_v', 6)
-        top_k_fknow = getattr(model, 'top_k_feature_know', 4)
-        top_k_rknow = getattr(model, 'top_k_restore_know', 4)
+        top_k_fqk = _get('top_k_feature_qk', 16)
+        top_k_fv = _get('top_k_feature_v', 6)
+        top_k_rqk = _get('top_k_restore_qk', 16)
+        top_k_rv = _get('top_k_restore_v', 6)
+        top_k_fknow = _get('top_k_feature_know', 4)
+        top_k_rknow = _get('top_k_restore_know', 4)
 
         # === Attention Circuit ===
         # Feature sparse matmul: Q, K (각 top_k_fqk), V (top_k_fv)
@@ -105,7 +123,7 @@ def estimate_flops(model, seq_len=512):
                      know_rest + know_rest_ein)
     else:
         # Vanilla transformer
-        d_ff = getattr(model, 'd_ff', 4 * d_model)
+        d_ff = _get('d_ff', 4 * d_model)
 
         # QKV + O projections: 4 * d_model^2
         qkvo = 2 * 4 * d_model * d_model * seq_len

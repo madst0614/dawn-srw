@@ -129,6 +129,7 @@ class VanillaTransformer(nn.Module):
         super().__init__()
 
         self.d_model = d_model
+        self.d_ff = d_ff
         self.vocab_size = vocab_size
         self.n_layers = n_layers
 

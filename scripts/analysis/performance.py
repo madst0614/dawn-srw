@@ -414,7 +414,8 @@ class ModelComparator:
 
         # Model info
         total_params = sum(p.numel() for p in model.parameters())
-        flops = estimate_flops(model, seq_len=512)
+        model_cfg = getattr(model, 'config', None)
+        flops = estimate_flops(model, config=model_cfg, seq_len=512)
         model_info = {
             'total': total_params,
             'total_M': total_params / 1e6,
