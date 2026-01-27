@@ -301,7 +301,7 @@ def plot_factual_heatmap(
             cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
             label = category_names.get(cat_idx, 'Mixed')
             ax.text(mid, 1.02, label, ha='center', va='bottom',
-                   fontsize=S['font_size_annotation'], fontweight='bold', color='darkblue',
+                   fontsize=S['font_size_category'], fontweight='bold', color='darkblue',
                    transform=ax.transAxes)
         prev_boundary = b
 

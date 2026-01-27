@@ -20,8 +20,10 @@ PAPER_STYLE = {
     'font_size_tick': 10,
     # Legend text
     'font_size_legend': 10,
-    # Annotation / cell text
-    'font_size_annotation': 9,
+    # Annotation / cell text (heatmap cell values, bar labels)
+    'font_size_annotation': 10,
+    # Category / group labels (e.g. "Shared", "Capital-specific" above heatmap)
+    'font_size_category': 12,
     # Colorbar label
     'font_size_cbar': 10,
 
