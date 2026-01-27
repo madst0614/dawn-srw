@@ -15,7 +15,7 @@ PAPER_STYLE = {
     # Axis labels (xlabel, ylabel)
     'font_size_label': 14,
     # Subplot / panel titles
-    'font_size_subtitle': 13,
+    'font_size_subtitle': 14,
     # Tick labels
     'font_size_tick': 11,
     # Legend text
