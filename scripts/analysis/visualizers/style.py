@@ -23,7 +23,7 @@ PAPER_STYLE = {
     # Annotation / cell text (heatmap cell values, bar labels)
     'font_size_annotation': 12,
     # Category / group labels (e.g. "Shared", "Capital-specific" above heatmap)
-    'font_size_category': 12,
+    'font_size_category': 14,
 
     # Line widths
     'axes_linewidth': 0.8,
