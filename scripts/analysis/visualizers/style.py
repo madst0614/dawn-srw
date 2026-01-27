@@ -13,15 +13,15 @@ PAPER_STYLE = {
     'font_size_base': 10,
 
     # Axis labels (xlabel, ylabel)
-    'font_size_label': 12,
+    'font_size_label': 14,
     # Subplot / panel titles
     'font_size_subtitle': 13,
     # Tick labels
-    'font_size_tick': 10,
+    'font_size_tick': 11,
     # Legend text
     'font_size_legend': 10,
     # Annotation / cell text (heatmap cell values, bar labels)
-    'font_size_annotation': 10,
+    'font_size_annotation': 12,
     # Category / group labels (e.g. "Shared", "Capital-specific" above heatmap)
     'font_size_category': 12,
     # Colorbar label
