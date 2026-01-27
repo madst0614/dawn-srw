@@ -278,6 +278,7 @@ def plot_factual_heatmap(
         cmap='YlOrRd',
         vmin=0, vmax=1,
         annot=annot_labels, fmt='',
+        annot_kws={'fontsize': S['font_size_annotation']},
         ax=ax,
         cbar_kws={'label': 'Activation Frequency', 'shrink': 0.8, 'pad': 0.02},
         linewidths=0.5
