@@ -22,12 +22,10 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 # Style settings
+from .style import PAPER_STYLE, apply_paper_style
 if HAS_MATPLOTLIB:
-    plt.rcParams['font.family'] = 'serif'
-    plt.rcParams['font.size'] = 10
-    plt.rcParams['axes.linewidth'] = 0.8
-    plt.rcParams['axes.spines.top'] = False
-    plt.rcParams['axes.spines.right'] = False
+    apply_paper_style(plt)
+S = PAPER_STYLE
 
 # Colors and styles for specific models
 MODEL_STYLES = {
@@ -184,7 +182,7 @@ def plot_training_dynamics(
     data: Dict[str, Tuple[List, List]],
     output_path: str,
     use_log_scale: bool = False,
-    title: Optional[str] = 'Convergence Comparison',
+    title: Optional[str] = None,
     dpi: int = 300
 ) -> Optional[str]:
     """
@@ -230,12 +228,12 @@ def plot_training_dynamics(
                 linewidth=linewidth, label=label)
 
     # Formatting
-    ax.set_xlabel('Training Steps', fontsize=13)
-    ax.set_ylabel('Validation Loss', fontsize=13)
-    ax.tick_params(axis='both', labelsize=11)
+    ax.set_xlabel('Training Steps', fontsize=S['font_size_label'])
+    ax.set_ylabel('Validation Loss', fontsize=S['font_size_label'])
+    ax.tick_params(axis='both', labelsize=S['font_size_tick'])
 
     if title:
-        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.set_title(title, fontsize=S['font_size_subtitle'], fontweight='bold')
 
     # Auto log scale if range is large
     if use_log_scale:
@@ -263,7 +261,7 @@ def plot_training_dynamics(
     ax.xaxis.set_major_formatter(plt.FuncFormatter(format_steps))
 
     # Legend
-    ax.legend(loc='upper right', fontsize=11, framealpha=0.95)
+    ax.legend(loc='upper right', fontsize=S['font_size_legend'], framealpha=0.95)
 
     plt.tight_layout()
 

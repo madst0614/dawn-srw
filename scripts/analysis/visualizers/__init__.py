@@ -6,6 +6,7 @@ Visualization functions for DAWN analysis results.
 Each module corresponds to a specific paper figure or analysis type.
 """
 
+from .style import PAPER_STYLE, apply_paper_style
 from .qk_specialization import plot_qk_specialization, plot_qk_usage
 from .neuron_health import (
     plot_dead_neurons, plot_usage_histogram,

@@ -2184,25 +2184,11 @@ class ModelAnalyzer:
         """Run analysis on comparison model for table generation.
 
         Uses cached multi-seed results if available to avoid redundant PPL computation.
+        Speed benchmark always runs (not cached in multi-seed).
         """
         from scripts.evaluation.evaluate import evaluate_model, load_val_data, estimate_flops
 
-        # Check if multi-seed already computed vanilla results
-        if self._multi_seed_results and 'vanilla' in self._multi_seed_results:
-            cached = self._multi_seed_results['vanilla']
-            vanilla_info = {
-                'total_M': cached['params_M'],
-                'flops_G': cached['flops_G'],
-            }
-            vanilla_val = {
-                'perplexity': cached['ppl_mean'],
-                'accuracy': cached['acc_mean'],
-            }
-            vanilla_speed = {'tokens_per_sec': cached.get('speed_tokens_per_sec', 0)}
-            print(f"    Using cached multi-seed vanilla results (PPL={cached['ppl_mean']:.2f})")
-            return vanilla_info, vanilla_val, vanilla_speed
-
-        # Use shared model loader (keeps model cached for later use)
+        # Load model (always needed for speed benchmark)
         comp_model, comp_name, comp_config = self._load_comparison_model()
         if comp_model is None:
             return {}, {}, {}
@@ -2220,12 +2206,20 @@ class ModelAnalyzer:
         }
         print(f"    Parameters: {vanilla_info['total_M']:.2f}M, FLOPs: {vanilla_info['flops_G']:.2f}G")
 
-        # Performance - use same val_batches as main analysis for consistency
-        print(f"    Running validation ({self.val_batches} batches)...")
-        val_tokens = load_val_data(self.val_data_path, max_tokens=self.val_batches * 32 * 512)
-        val_results = evaluate_model(comp_model, val_tokens, batch_size=32, seq_len=512, device=self.device)
-        vanilla_val = val_results
-        print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
+        # PPL: use multi-seed cache if available, otherwise compute
+        if self._multi_seed_results and 'vanilla' in self._multi_seed_results:
+            cached = self._multi_seed_results['vanilla']
+            vanilla_val = {
+                'perplexity': cached['ppl_mean'],
+                'accuracy': cached['acc_mean'],
+            }
+            print(f"    PPL: {cached['ppl_mean']:.2f} (cached from multi-seed)")
+        else:
+            print(f"    Running validation ({self.val_batches} batches)...")
+            val_tokens = load_val_data(self.val_data_path, max_tokens=self.val_batches * 32 * 512)
+            val_results = evaluate_model(comp_model, val_tokens, batch_size=32, seq_len=512, device=self.device)
+            vanilla_val = val_results
+            print(f"    PPL: {vanilla_val.get('perplexity', 0):.2f}, Acc: {vanilla_val.get('accuracy', 0):.1f}%")
 
         # Speed benchmark
         import time

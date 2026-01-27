@@ -28,6 +28,9 @@ except ImportError:
     HAS_SEABORN = False
     sns = None
 
+from .style import PAPER_STYLE
+S = PAPER_STYLE
+
 
 def plot_factual_heatmap(
     factual_data: Dict,
@@ -298,7 +301,7 @@ def plot_factual_heatmap(
             cat_idx = categories[prev_boundary] if prev_boundary < len(categories) else 3
             label = category_names.get(cat_idx, 'Mixed')
             ax.text(mid, 1.02, label, ha='center', va='bottom',
-                   fontsize=9, fontweight='bold', color='darkblue',
+                   fontsize=S['font_size_annotation'], fontweight='bold', color='darkblue',
                    transform=ax.transAxes)
         prev_boundary = b
 
@@ -363,7 +366,7 @@ def plot_factual_comparison(
     ax.invert_yaxis()
 
     for i, (bar, rate) in enumerate(zip(bars, match_rates)):
-        ax.text(rate + 2, i, f'{rate:.0f}%', va='center', fontsize=9)
+        ax.text(rate + 2, i, f'{rate:.0f}%', va='center', fontsize=S['font_size_annotation'])
 
     # 2. Neuron count comparison (100%, 80%, 50%)
     ax = axes[1]

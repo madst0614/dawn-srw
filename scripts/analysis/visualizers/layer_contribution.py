@@ -22,12 +22,10 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 # Style settings
+from .style import PAPER_STYLE, apply_paper_style
 if HAS_MATPLOTLIB:
-    plt.rcParams['font.family'] = 'serif'
-    plt.rcParams['font.size'] = 9
-    plt.rcParams['axes.linewidth'] = 0.8
-    plt.rcParams['axes.spines.top'] = False
-    plt.rcParams['axes.spines.right'] = False
+    apply_paper_style(plt)
+S = PAPER_STYLE
 
 # Colors
 COLOR_ATTENTION = '#4A90D9'
@@ -135,9 +133,8 @@ def plot_routing_stats(
     ax.set_xlim(0.5, n_layers + 0.5)
     ax.set_ylim(35, 75)
     ax.set_xticks(layers)
-    ax.set_xlabel('Layer', fontsize=10)
-    ax.set_ylabel('Attention Contribution (%)', fontsize=10)
-    ax.set_title('Attention-Knowledge Balance Across Layers', fontsize=11, fontweight='bold', pad=10)
+    ax.set_xlabel('Layer', fontsize=S['font_size_label'])
+    ax.set_ylabel('Attention Contribution (%)', fontsize=S['font_size_label'])
     ax.yaxis.grid(True, linestyle='--', alpha=0.3)
     ax.set_axisbelow(True)
 
@@ -147,7 +144,7 @@ def plot_routing_stats(
         mpatches.Patch(color=COLOR_KNOWLEDGE, alpha=0.3, label='Knowledge > 50%'),
         plt.Line2D([0], [0], color=COLOR_GRAY, linestyle='--', label='50% baseline'),
     ]
-    ax.legend(handles=legend_elements, loc='upper right', fontsize=8, framealpha=0.9)
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=S['font_size_legend'], framealpha=0.9)
 
     plt.tight_layout()
 

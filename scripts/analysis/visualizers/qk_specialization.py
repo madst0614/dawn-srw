@@ -22,21 +22,15 @@ except ImportError:
     plt = None
 
 # Paper-quality style settings
+from .style import PAPER_STYLE, apply_paper_style
 if HAS_MATPLOTLIB:
+    apply_paper_style(plt)
     plt.rcParams.update({
-        'font.family': 'serif',
-        'font.size': 10,
-        'axes.linewidth': 0.8,
-        'axes.spines.top': False,
-        'axes.spines.right': False,
-        'axes.labelsize': 12,
-        'axes.titlesize': 13,
-        'xtick.labelsize': 10,
-        'ytick.labelsize': 10,
         'figure.dpi': 150,
         'savefig.dpi': 300,
         'savefig.bbox': 'tight',
     })
+S = PAPER_STYLE
 
 # Color palette
 COLOR_Q = '#C0392B'      # Dark red for Q
@@ -116,8 +110,8 @@ def plot_qk_specialization(
         ax.set_xlabel('Q Selection Count')
         ax.set_ylabel('K Selection Count')
         corr = data.get('correlation', 0)
-        ax.set_title(f'{display_name}: Q vs K Usage (corr={corr:.3f})', fontsize=13, fontweight='bold')
-        ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+        ax.set_title(f'{display_name}: Q vs K Usage (corr={corr:.3f})', fontsize=S['font_size_subtitle'], fontweight='bold')
+        ax.legend(loc='upper right', fontsize=S['font_size_legend'], framealpha=0.9)
         ax.xaxis.grid(True, linestyle='--', alpha=0.3)
         ax.yaxis.grid(True, linestyle='--', alpha=0.3)
         ax.set_axisbelow(True)
@@ -136,11 +130,11 @@ def plot_qk_specialization(
         colors = [COLOR_Q, COLOR_K, COLOR_SHARED]
         bars = ax.bar(categories, values, color=colors, alpha=0.85, edgecolor='white', linewidth=0.5)
         ax.set_ylabel('Neuron Count')
-        ax.set_title(f'{display_name}: Neuron Specialization', fontsize=13, fontweight='bold')
+        ax.set_title(f'{display_name}: Neuron Specialization', fontsize=S['font_size_subtitle'], fontweight='bold')
         for bar, val in zip(bars, values):
             if val > 0:
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5, str(val),
-                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+                       ha='center', va='bottom', fontsize=S['font_size_tick'], fontweight='bold')
         ax.yaxis.grid(True, linestyle='--', alpha=0.3)
         ax.set_axisbelow(True)
 
