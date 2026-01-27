@@ -24,19 +24,20 @@ class PaperFigureGenerator:
     All data must be precomputed via analyze_all.py and passed via precomputed dict.
 
     ICML 2026 Paper Figure Mapping:
-        Fig 3: Emergent Q/K Functional Separation
-        Fig 4: POS Selectivity Across Neuron Pools
-        Fig 5: Semantic Clustering of Knowledge Neurons
-        Fig 6: Convergence Comparison
-        Fig 7: Attention-Knowledge Balance Across Layers
+        Fig 3: F-QK Specialization (main paper)
+        Fig 4: Convergence Comparison (main paper)
+        Fig 5: Attention-Knowledge Balance Across Layers (main paper)
+        Fig 6: R-QK Specialization (appendix)
+        Fig 7: POS Selectivity Heatmap (appendix)
+        Fig 8: Knowledge Neurons (appendix)
     """
 
     FIGURE_MAP = {
-        '3': 'generate_figure3',   # Q/K Specialization
-        '4': 'generate_figure4',   # POS Neurons
-        '5': 'generate_figure5',   # Semantic Coherence (Factual Heatmap)
-        '6': 'generate_figure6',   # Training Dynamics
-        '7': 'generate_figure7',   # Layer Contribution
+        '3': 'generate_figure3',   # F-QK Specialization (+ Fig 6 R-QK in appendix)
+        '4': 'generate_figure4',   # Convergence Comparison
+        '5': 'generate_figure5',   # Attention-Knowledge Balance
+        '7': 'generate_figure7',   # POS Selectivity Heatmap (appendix)
+        '8': 'generate_figure8',   # Knowledge Neurons (appendix)
     }
 
     def __init__(self, checkpoint_path: str = None, val_data_path: str = None,
@@ -93,8 +94,8 @@ class PaperFigureGenerator:
 
     def generate_figure3(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Fig 3: Emergent Q/K Functional Separation.
-        Per-pool files: fig3_fqk (main paper), fig3_rqk (appendix).
+        Fig 3: F-QK Specialization (main paper).
+        Also generates Fig 6: R-QK Specialization (appendix).
 
         Requires: precomputed['routing']['qk_usage']
         """
@@ -107,12 +108,15 @@ class PaperFigureGenerator:
         qk_data = routing['qk_usage']
         print("  Using pre-computed Q/K usage data...", flush=True)
 
-        # Generate per-pool figures
+        # Figure number mapping: fqk → fig3 (main), rqk → fig6 (appendix)
+        pool_fig_map = {'fqk': 'fig3_fqk_specialization', 'rqk': 'fig6_rqk_specialization'}
+
         pools = {k: v for k, v in qk_data.items() if isinstance(v, dict) and 'q_counts' in v}
         paths = {}
         for pool_name, pool_data in pools.items():
             short = pool_name.replace('feature_', 'f').replace('restore_', 'r')
-            out_path = os.path.join(output_dir, f'fig3_{short}_specialization.png')
+            fig_name = pool_fig_map.get(short, f'fig3_{short}_specialization')
+            out_path = os.path.join(output_dir, f'{fig_name}.png')
             path = plot_qk_pool(pool_data, pool_name, out_path)
             if path:
                 print(f"  Saved: {path}", flush=True)
@@ -120,9 +124,9 @@ class PaperFigureGenerator:
 
         return {'qk_usage': qk_data, 'visualizations': paths}
 
-    def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
+    def generate_figure7(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Fig 4: POS Selectivity Across Neuron Pools.
+        Fig 7 (Appendix): POS Selectivity Heatmap.
 
         Uses selectivity data (not 80% threshold specialization).
         Requires: selectivity_matrix.npy file and precomputed['neuron_features']['selectivity']
@@ -180,7 +184,7 @@ class PaperFigureGenerator:
         path = plot_pos_selectivity_heatmap(
             selectivity_matrix,
             active_indices,
-            os.path.join(output_dir, 'fig4_pos_selectivity_across_neuron_pools.png'),
+            os.path.join(output_dir, 'fig7_pos_selectivity_heatmap.png'),
             pool_order=pool_order
         )
 
@@ -191,9 +195,9 @@ class PaperFigureGenerator:
 
         return {'selectivity': selectivity, 'visualization': path}
 
-    def generate_figure5(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
+    def generate_figure8(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Fig 5: Semantic Clustering of Knowledge Neurons.
+        Fig 8 (Appendix): Knowledge Neurons.
 
         Uses F-Know (Factual Knowledge) pool neurons only.
         Requires: precomputed['factual']['per_target']
@@ -206,14 +210,14 @@ class PaperFigureGenerator:
 
         print("  Using pre-computed factual analysis...", flush=True)
 
-        path = plot_factual_heatmap(factual, os.path.join(output_dir, 'fig5_semantic_coherence_of_knowledge_neurons.png'))
+        path = plot_factual_heatmap(factual, os.path.join(output_dir, 'fig8_knowledge_neurons.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'factual_analysis': factual, 'visualization': path}
 
-    def generate_figure6(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
+    def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Fig 6: Convergence Comparison.
+        Fig 4: Convergence Comparison.
 
         Uses training logs from checkpoint paths in config.
         """
@@ -279,14 +283,14 @@ class PaperFigureGenerator:
         if not data:
             return {'error': 'No training logs found. Check checkpoint paths.'}
 
-        path = plot_training_dynamics(data, os.path.join(output_dir, 'fig6_convergence_comparison.png'))
+        path = plot_training_dynamics(data, os.path.join(output_dir, 'fig4_convergence_comparison.png'))
         print(f"  Saved: {path}", flush=True)
 
         return {'visualization': path, 'data': {k: len(v[0]) for k, v in data.items()}}
 
-    def generate_figure7(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
+    def generate_figure5(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
-        Fig 7: Attention-Knowledge Balance Across Layers.
+        Fig 5: Attention-Knowledge Balance Across Layers.
 
         Requires: precomputed['routing']['layer_contribution'] and precomputed['routing']['qk_usage']
         """
@@ -320,7 +324,7 @@ class PaperFigureGenerator:
 
         path = plot_routing_stats(
             combined_data,
-            os.path.join(output_dir, 'fig7_attention_knowledge_balance.png'),
+            os.path.join(output_dir, 'fig5_attention_knowledge_balance.png'),
             router=router
         )
         print(f"  Saved: {path}", flush=True)

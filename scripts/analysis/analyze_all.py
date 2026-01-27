@@ -3002,9 +3002,9 @@ class ModelAnalyzer:
                     'n_neurons': data.get('n_neurons', 0),
                     'sensitivity_analysis': data.get('sensitivity_analysis', {}),
                 }
-        paper_data['figures']['fig3_qk_specialization'] = fig3_data
+        paper_data['figures']['fig3_fqk_specialization'] = fig3_data
 
-        # Fig 4: POS Specialization (selectivity heatmap)
+        # Fig 7 (Appendix): POS Selectivity Heatmap
         if neuron_features:
             selectivity = neuron_features.get('selectivity', {})
             specialized = neuron_features.get('specialized_neurons', {})
@@ -3028,7 +3028,7 @@ class ModelAnalyzer:
                     })
             top_list.sort(key=lambda x: x['concentration'], reverse=True)
 
-            paper_data['figures']['fig4_pos_specialization'] = {
+            paper_data['figures']['fig7_pos_selectivity_heatmap'] = {
                 'total_neurons_analyzed': total_neurons,
                 # Main: selectivity-based heatmap
                 'selectivity': {
@@ -3047,7 +3047,7 @@ class ModelAnalyzer:
                 'specialization_summary': neuron_features.get('specialization_summary', {}),
             }
 
-        # Fig 5: Factual Analysis (multi-pool)
+        # Fig 8 (Appendix): Knowledge Neurons (multi-pool)
         factual = self.results.get('factual', {})
         if factual:
             pools_analyzed = factual.get('pools_analyzed', ['fv'])
@@ -3079,7 +3079,7 @@ class ModelAnalyzer:
                             }
                     per_target_summary[target] = target_summary
 
-            paper_data['figures']['fig5_factual'] = {
+            paper_data['figures']['fig8_knowledge_neurons'] = {
                 'pools_analyzed': pools_analyzed,
                 'per_pool': {
                     pool: {
@@ -3096,16 +3096,16 @@ class ModelAnalyzer:
                 },
             }
 
-        # Fig 6: Training Dynamics
+        # Fig 4: Convergence Comparison
         # Note: Actual loss curves require parsing training_log.txt separately
         # This section contains model/training config for reference
-        paper_data['figures']['fig6_training_dynamics'] = {
+        paper_data['figures']['fig4_convergence_comparison'] = {
             'note': 'Loss curves parsed from training_log.txt by paper_figures.py',
             'dawn_params_M': paper_data['models']['dawn']['parameters_M'],
             'vanilla_params_M': paper_data['models'].get('vanilla', {}).get('parameters_M'),
         }
 
-        # Fig 7: Layer Contribution
+        # Fig 5: Attention-Knowledge Balance
         layer_contrib = routing.get('layer_contribution', {})
         if layer_contrib:
             per_layer = layer_contrib.get('per_layer', {})
@@ -3127,7 +3127,7 @@ class ModelAnalyzer:
             att_arr = np.array(attention_ratios) if attention_ratios else np.array([50])
             know_arr = np.array(knowledge_ratios) if knowledge_ratios else np.array([50])
 
-            paper_data['figures']['fig7_layer_contribution'] = {
+            paper_data['figures']['fig5_attention_knowledge_balance'] = {
                 'per_layer': per_layer_data,
                 'summary': {
                     'attention_mean': round(float(att_arr.mean()), 1),
@@ -3215,11 +3215,11 @@ class ModelAnalyzer:
         paper_results = {
             'table1_model_stats': paper_data['tables']['table1_model_stats'],
             'table2_neuron_util': paper_data['tables']['table2_neuron_util'],
-            'fig3_qk_specialization': paper_data['figures'].get('fig3_qk_specialization', {}),
-            'fig4_pos_specialization': paper_data['figures'].get('fig4_pos_specialization', {}),
-            'fig5_factual': paper_data['figures'].get('fig5_factual', {}),
-            'fig6_training_dynamics': paper_data['figures'].get('fig6_training_dynamics', {}),
-            'fig7_layer_contribution': paper_data['figures'].get('fig7_layer_contribution', {}),
+            'fig3_fqk_specialization': paper_data['figures'].get('fig3_fqk_specialization', {}),
+            'fig4_convergence_comparison': paper_data['figures'].get('fig4_convergence_comparison', {}),
+            'fig5_attention_knowledge_balance': paper_data['figures'].get('fig5_attention_knowledge_balance', {}),
+            'fig7_pos_selectivity_heatmap': paper_data['figures'].get('fig7_pos_selectivity_heatmap', {}),
+            'fig8_knowledge_neurons': paper_data['figures'].get('fig8_knowledge_neurons', {}),
             'appendix_diversity': paper_data['appendix'].get('diversity', {}),
             'appendix_probing': paper_data['appendix'].get('probing', {}),
             'documentation': {
@@ -3297,11 +3297,11 @@ class ModelAnalyzer:
             "",
             "### Figures",
             "- `figures/fig3_fqk_specialization.png` (main paper)",
-            "- `figures/fig3_rqk_specialization.png` (appendix)",
-            "- `figures/fig4_pos_selectivity_across_neuron_pools.png`",
-            "- `figures/fig5_semantic_coherence_of_knowledge_neurons.png` (F-Know pool only)",
-            "- `figures/fig6_convergence_comparison.png`",
-            "- `figures/fig7_attention_knowledge_balance.png`",
+            "- `figures/fig4_convergence_comparison.png` (main paper)",
+            "- `figures/fig5_attention_knowledge_balance.png` (main paper)",
+            "- `figures/fig6_rqk_specialization.png` (appendix)",
+            "- `figures/fig7_pos_selectivity_heatmap.png` (appendix)",
+            "- `figures/fig8_knowledge_neurons.png` (appendix)",
             "",
             "### Tables",
             "- `tables/model_stats.csv` / `.tex`",

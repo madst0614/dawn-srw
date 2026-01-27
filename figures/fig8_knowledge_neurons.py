@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Figure 5: Factual Knowledge Neuron Heatmap
+Figure 8 (Appendix): Knowledge Neurons
 
 Visualizes neuron activation patterns across different factual knowledge prompts.
 Shows which neurons are specialized for specific facts vs. shared across facts.
 
 Usage:
-    python figures/fig5_factual_knowledge.py --input routing_analysis/factual
-    python figures/fig5_factual_knowledge.py --demo  # Use demo data
+    python figures/fig8_knowledge_neurons.py --input routing_analysis/factual
+    python figures/fig8_knowledge_neurons.py --demo  # Use demo data
 """
 
 import json
@@ -193,7 +193,7 @@ def main():
     parser.add_argument('--input', type=str, default='routing_analysis/factual',
                        help='Input directory with JSON results')
     parser.add_argument('--output', type=str, default=None,
-                       help='Output path (default: figures/fig5_factual_knowledge.png)')
+                       help='Output path (default: figures/fig8_knowledge_neurons.png)')
     parser.add_argument('--top_k', type=int, default=15,
                        help='Number of top neurons to show')
     parser.add_argument('--demo', action='store_true',
@@ -201,10 +201,10 @@ def main():
 
     args = parser.parse_args()
 
-    output_path = Path(args.output) if args.output else FIGURES_DIR / 'fig5_factual_knowledge.png'
+    output_path = Path(args.output) if args.output else FIGURES_DIR / 'fig8_knowledge_neurons.png'
 
     print("=" * 50)
-    print("Figure 5: Factual Knowledge Neuron Heatmap")
+    print("Figure 8: Knowledge Neurons")
     print("=" * 50)
 
     if args.demo:

@@ -22,10 +22,11 @@ Usage:
 
 Output:
     figures/fig1_architecture.pdf
-    figures/fig2_feature_restore.pdf
+    figures/fig2_feature_restore_pathway.pdf
     figures/fig3_param_efficiency.pdf
-    figures/fig4_routing_stats.pdf
-    figures/fig5_loss_curve.pdf (if --demo or checkpoint paths provided)
+    figures/fig4_convergence_comparison.pdf (if --demo or checkpoint paths provided)
+    figures/fig5_attention_knowledge_balance.pdf
+    figures/fig8_knowledge_neurons.pdf
 """
 
 import subprocess
@@ -92,7 +93,7 @@ Examples:
         """
     )
 
-    # Fig5 options - checkpoint directories (auto-find training_log.txt)
+    # Fig4 options - checkpoint directories (auto-find training_log.txt)
     parser.add_argument('--dawn', type=str,
                        help='DAWN run directory (will auto-find training_log.txt)')
     parser.add_argument('--vanilla_40m', type=str,
@@ -102,7 +103,7 @@ Examples:
     parser.add_argument('--vanilla_108m', type=str,
                        help='Vanilla-108M run directory')
     parser.add_argument('--demo', action='store_true',
-                       help='Use demo data for fig5 loss curves')
+                       help='Use demo data for fig4 convergence comparison')
 
     # General options
     parser.add_argument('--skip', nargs='+', default=[],
@@ -110,7 +111,7 @@ Examples:
     parser.add_argument('--zip', action='store_true',
                        help='Create zip file of all figures after generation')
     parser.add_argument('--show_annotations', action='store_true',
-                       help='Show final loss values on fig5')
+                       help='Show final loss values on fig4')
 
     args = parser.parse_args()
 
@@ -125,22 +126,18 @@ Examples:
 
     # Figure 2: Feature-Restore Pathway
     if 'fig2' not in args.skip:
-        results['fig2'] = run_script('fig2_feature_restore.py')
+        results['fig2'] = run_script('fig2_feature_restore_pathway.py')
 
-    # Figure 3: Parameter Efficiency
+    # Figure 3: Parameter Efficiency (standalone)
     if 'fig3' not in args.skip:
         results['fig3'] = run_script('fig3_param_efficiency.py')
 
-    # Figure 4: Routing Statistics
+    # Figure 4: Convergence Comparison (optional)
     if 'fig4' not in args.skip:
-        results['fig4'] = run_script('fig4_routing_stats.py')
-
-    # Figure 5: Loss Curves (optional)
-    if 'fig5' not in args.skip:
-        fig5_args = []
+        fig4_args = []
 
         if args.demo:
-            fig5_args.append('--demo')
+            fig4_args.append('--demo')
         elif args.dawn or args.vanilla_40m or args.vanilla_22m or args.vanilla_108m:
             ckpts = []
             labels = []
@@ -159,16 +156,24 @@ Examples:
                 labels.append('Vanilla-108M')
 
             if ckpts:
-                fig5_args.extend(['--checkpoints'] + ckpts)
-                fig5_args.extend(['--labels'] + labels)
+                fig4_args.extend(['--checkpoints'] + ckpts)
+                fig4_args.extend(['--labels'] + labels)
 
         if args.show_annotations:
-            fig5_args.append('--show_annotations')
+            fig4_args.append('--show_annotations')
 
-        if fig5_args:
-            results['fig5'] = run_script('fig5_loss_curve.py', fig5_args)
+        if fig4_args:
+            results['fig4'] = run_script('fig4_convergence_comparison.py', fig4_args)
         else:
-            print("\n[fig5] Skipped: No --demo or checkpoint paths provided")
+            print("\n[fig4] Skipped: No --demo or checkpoint paths provided")
+
+    # Figure 5: Attention-Knowledge Balance
+    if 'fig5' not in args.skip:
+        results['fig5'] = run_script('fig5_attention_knowledge_balance.py')
+
+    # Figure 8: Knowledge Neurons (Appendix)
+    if 'fig8' not in args.skip:
+        results['fig8'] = run_script('fig8_knowledge_neurons.py')
 
     # Summary
     print(f"\n{'='*60}")
