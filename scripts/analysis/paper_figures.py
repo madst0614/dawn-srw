@@ -94,11 +94,11 @@ class PaperFigureGenerator:
     def generate_figure3(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
         Fig 3: Emergent Q/K Functional Separation.
-        Split into fig3a (scatter) and fig3b (bar).
+        Per-pool files: fig3_fqk (main paper), fig3_rqk (appendix).
 
         Requires: precomputed['routing']['qk_usage']
         """
-        from .visualizers import plot_qk_scatter, plot_qk_bar
+        from .visualizers import plot_qk_pool
 
         routing = precomputed.get('routing', {})
         if 'qk_usage' not in routing:
@@ -107,13 +107,18 @@ class PaperFigureGenerator:
         qk_data = routing['qk_usage']
         print("  Using pre-computed Q/K usage data...", flush=True)
 
-        path_a = plot_qk_scatter(qk_data, os.path.join(output_dir, 'fig3a_qk_scatter.png'))
-        print(f"  Saved: {path_a}", flush=True)
+        # Generate per-pool figures
+        pools = {k: v for k, v in qk_data.items() if isinstance(v, dict) and 'q_counts' in v}
+        paths = {}
+        for pool_name, pool_data in pools.items():
+            short = pool_name.replace('feature_', 'f').replace('restore_', 'r')
+            out_path = os.path.join(output_dir, f'fig3_{short}_specialization.png')
+            path = plot_qk_pool(pool_data, pool_name, out_path)
+            if path:
+                print(f"  Saved: {path}", flush=True)
+                paths[pool_name] = path
 
-        path_b = plot_qk_bar(qk_data, os.path.join(output_dir, 'fig3b_qk_bar.png'))
-        print(f"  Saved: {path_b}", flush=True)
-
-        return {'qk_usage': qk_data, 'visualization_scatter': path_a, 'visualization_bar': path_b}
+        return {'qk_usage': qk_data, 'visualizations': paths}
 
     def generate_figure4(self, output_dir: str, precomputed: Dict, config: Dict) -> Dict:
         """
