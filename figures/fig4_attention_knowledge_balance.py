@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Figure 4: Routing Statistics (from checkpoint)
+Figure 4: Attention-Knowledge Balance (from checkpoint)
 
 Extracts real routing statistics from DAWN v17.1 checkpoint:
 - Neuron Utilization: EMA usage from each pool
 - Layer-wise Circuit Contribution: attention vs knowledge per layer
 
 Usage:
-    python figures/fig4_routing_stats.py --checkpoint /path/to/run_dir
-    python figures/fig4_routing_stats.py --demo  # Use demo data
+    python figures/fig4_attention_knowledge_balance.py --checkpoint /path/to/run_dir
+    python figures/fig4_attention_knowledge_balance.py --demo  # Use demo data
 """
 
 import sys
@@ -345,8 +345,8 @@ def create_figure(stats: dict, output_dir: Path):
     plt.tight_layout()
 
     # Save
-    output_png = output_dir / 'fig4_routing_stats.png'
-    output_pdf = output_dir / 'fig4_routing_stats.pdf'
+    output_png = output_dir / 'fig4_attention_knowledge_balance.png'
+    output_pdf = output_dir / 'fig4_attention_knowledge_balance.pdf'
     plt.savefig(output_png, format='png', dpi=300, bbox_inches='tight', facecolor='white')
     plt.savefig(output_pdf, format='pdf', dpi=300, bbox_inches='tight')
     print(f"\nSaved: {output_png}")
@@ -368,7 +368,7 @@ def main():
     output_dir = Path(args.output) if args.output else FIGURES_DIR
 
     print("=" * 50)
-    print("Figure 4: Routing Statistics")
+    print("Figure 5: Attention-Knowledge Balance")
     print("=" * 50)
 
     if args.demo or not args.checkpoint:

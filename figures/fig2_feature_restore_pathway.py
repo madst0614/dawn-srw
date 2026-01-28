@@ -149,9 +149,9 @@ def main():
             fontsize=7, ha='center', va='center', color=COLOR_GRAY, style='italic')
 
     plt.tight_layout()
-    plt.savefig('figures/fig2_feature_restore.pdf', format='pdf', dpi=300, bbox_inches='tight')
-    plt.savefig('figures/fig2_feature_restore.png', format='png', dpi=300, bbox_inches='tight')
-    print("Saved: figures/fig2_feature_restore.pdf")
+    plt.savefig('figures/fig2_feature_restore_pathway.pdf', format='pdf', dpi=300, bbox_inches='tight')
+    plt.savefig('figures/fig2_feature_restore_pathway.png', format='png', dpi=300, bbox_inches='tight')
+    print("Saved: figures/fig2_feature_restore_pathway.pdf")
     plt.close()
 
 if __name__ == '__main__':

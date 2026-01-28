@@ -141,11 +141,12 @@ Consolidated `paper_results.json` and `training_comparison.json` into unified fo
     "validation": {"dataset": "C4", "n_batches": 200}
   },
   "figures": {
-    "fig3_qk_specialization": {...},
-    "fig4_pos_specialization": {...},
-    "fig5_factual": {...},
-    "fig6_training_dynamics": {...},
-    "fig7_layer_contribution": {...}
+    "fig3_fqk_specialization": {...},
+    "fig4_attention_knowledge_balance": {...},
+    "fig5_rqk_specialization": {...},
+    "fig6_convergence_comparison": {...},
+    "fig7_pos_selectivity_heatmap": {...},
+    "fig8_knowledge_neurons": {...}
   },
   "tables": {
     "table1_model_stats": {...},

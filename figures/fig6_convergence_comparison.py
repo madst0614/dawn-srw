@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Figure 5: Training Loss Curve
+Figure 6 (Appendix): Convergence Comparison
 Line plot comparing DAWN vs Vanilla training dynamics.
 
 Usage:
     # From checkpoint directories (will find training_log.txt):
-    python figures/fig5_loss_curve.py \\
+    python figures/fig6_convergence_comparison.py \\
         --checkpoints path/to/dawn_ckpt path/to/vanilla_22m path/to/vanilla_108m \\
         --labels "DAWN-24M" "Vanilla-22M" "Vanilla-108M"
 
     # Example with actual run directories:
-    python figures/fig5_loss_curve.py \\
+    python figures/fig6_convergence_comparison.py \\
         --checkpoints \\
             logs_v17.1_20M_c4_5B/run_v17.1_20251217_172040_8948 \\
             logs_baseline_22M_c4_5B/run_vbaseline_20251210_134902_4447 \\
@@ -18,16 +18,16 @@ Usage:
         --labels "DAWN-24M" "Vanilla-22M" "Vanilla-108M"
 
     # From log files directly:
-    python figures/fig5_loss_curve.py \\
+    python figures/fig6_convergence_comparison.py \\
         --logs path/to/training_log.txt \\
         --labels "DAWN-24M"
 
     # With demo data (for testing):
-    python figures/fig5_loss_curve.py --demo
+    python figures/fig6_convergence_comparison.py --demo
 
 Output:
-    figures/fig5_loss_curve.pdf
-    figures/fig5_loss_curve.png
+    figures/fig6_convergence_comparison.pdf
+    figures/fig6_convergence_comparison.png
 
 Key message:
     DAWN-24M converges faster than Vanilla-22M and achieves lower loss
@@ -259,16 +259,16 @@ def main():
         epilog="""
 Examples:
     # From checkpoint directories:
-    python figures/fig5_loss_curve.py \\
+    python figures/fig6_convergence_comparison.py \\
         --checkpoints ckpts/dawn_v17.1 ckpts/vanilla_22m \\
         --labels "DAWN-24M" "Vanilla-22M"
 
     # From log files:
-    python figures/fig5_loss_curve.py \\
+    python figures/fig6_convergence_comparison.py \\
         --logs logs/dawn/training_log.txt logs/vanilla/training_log.txt
 
     # Demo mode:
-    python figures/fig5_loss_curve.py --demo
+    python figures/fig6_convergence_comparison.py --demo
         """
     )
 
@@ -284,8 +284,8 @@ Examples:
     # Labels and output
     parser.add_argument('--labels', nargs='+',
                        help='Labels for each model (default: extracted from path)')
-    parser.add_argument('--output', type=str, default='figures/fig5_loss_curve',
-                       help='Output path without extension (default: figures/fig5_loss_curve)')
+    parser.add_argument('--output', type=str, default='figures/fig6_convergence_comparison',
+                       help='Output path without extension (default: figures/fig6_convergence_comparison)')
 
     # Plot options
     parser.add_argument('--use_train_loss', action='store_true',
