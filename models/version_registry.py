@@ -10,6 +10,7 @@ Supported Versions:
   v18.0: Fixed Threshold Multi-Path Routing (rank=16, max_paths=4, fixed_tau=0.0, path_min_k=8, path_max_k=16)
   v17.1: Q/K Separate Pool + Knowledge Feature-Restore (default)
   v17.1-tpu: TPU-optimized v17.1 (SSM removed, TPU-friendly computation order)
+  v17.1-tpu-memopt: Memory-optimized TPU version (restore recompute, ~600x memory reduction)
   v17.2: Feature QK Unified + Restore Q/K Separate
   baseline: Vanilla Transformer for comparison
 
@@ -467,6 +468,44 @@ VERSION_REGISTRY = {
             f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
             f"  SSM removed, token-level routing only",
             f"  TPU-optimized: pass through all neurons first, then weighted sum",
+            f"  F-QK: {args.get('n_feature_qk')} (top-k={args.get('top_k_feature_qk', 8)}) - Q/K shared pool",
+            f"  F-V: {args.get('n_feature_v')} (top-k={args.get('top_k_feature_v', 3)})",
+            f"  R-QK: {args.get('n_restore_qk')} (top-k={args.get('top_k_restore_qk', 8)}) - Q/K shared pool",
+            f"  R-V: {args.get('n_restore_v')} (top-k={args.get('top_k_restore_v', 3)})",
+            f"  F-Know: {args.get('n_feature_know')} (k={args.get('top_k_feature_know', 4)}), R-Know: {args.get('n_restore_know')} (k={args.get('top_k_restore_know', 4)})",
+        ],
+    },
+
+    "17.1-tpu-memopt": {
+        "description": "Memory-optimized TPU version (restore recompute)",
+        "aliases": ["171tpumemopt", "17.1tpumemopt", "tpumemopt", "memopt"],
+        "module": "model_v17_1_tpu_memopt",
+        "required_params": [
+            "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
+            "n_feature_qk", "n_feature_v", "n_restore_qk", "n_restore_v",
+            "n_feature_know", "n_restore_know",
+            "rank",
+        ],
+        "optional_params": {
+            "dropout": 0.1,
+            "top_k_feature_qk": 8,
+            "top_k_feature_v": 3,
+            "top_k_restore_qk": 8,
+            "top_k_restore_v": 3,
+            "top_k_feature_know": 4,
+            "top_k_restore_know": 4,
+            "d_space": 64,
+            "knowledge_rank": 128,
+            "gradient_checkpointing": False,
+            "router_dropout": 0.1,
+        },
+        "display_info": lambda args: [
+            f"DAWN v17.1-TPU-MemOpt: Memory-optimized TPU version",
+            f"  rank={args.get('rank', args.get('basis_rank'))}, knowledge_rank={args.get('knowledge_rank', 128)}",
+            f"  SSM removed, token-level routing only",
+            f"  Memory optimization: restore stage recomputes intermediate tensors",
+            f"  ~600x memory reduction for restore stage (60GB → 100MB per layer)",
+            f"  Trade-off: ~1.5x backward FLOPs due to recomputation",
             f"  F-QK: {args.get('n_feature_qk')} (top-k={args.get('top_k_feature_qk', 8)}) - Q/K shared pool",
             f"  F-V: {args.get('n_feature_v')} (top-k={args.get('top_k_feature_v', 3)})",
             f"  R-QK: {args.get('n_restore_qk')} (top-k={args.get('top_k_restore_qk', 8)}) - Q/K shared pool",
