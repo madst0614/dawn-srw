@@ -247,10 +247,10 @@ class GlobalRouters(nn.Module):
         sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-8)
         return sparse_weights, topk_idx
 
-    def get_attention_weights(self, x, attention_mask=None):
+    def get_attention_weights(self, x, attention_mask=None, return_routing_info=False):
         """
         Token-level routing only (SSM causal cumulative routing removed)
-        Returns: fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, aux_loss
+        Returns: fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, routing_info, aux_loss
         """
         (fqk_logits_Q, fqk_logits_K, fv_logits,
          rqk_logits_Q, rqk_logits_K, rv_logits) = self.neuron_router.get_all_logits(x)
@@ -310,9 +310,29 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
             self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
 
-        return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, aux_loss
+        # Build routing_info for analysis (same format as v17.1)
+        if return_routing_info:
+            routing_info = {
+                'fqk_weights_Q': fqk_weights_Q.detach(),
+                'fqk_weights_K': fqk_weights_K.detach(),
+                'fv_weights': fv_weights.detach(),
+                'rqk_weights_Q': rqk_weights_Q.detach(),
+                'rqk_weights_K': rqk_weights_K.detach(),
+                'rv_weights': rv_weights.detach(),
+                'fqk_q_pref': fqk_pref_Q.detach(),
+                'fqk_k_pref': fqk_pref_K.detach(),
+                'fv_pref': fv_pref.detach(),
+                'rqk_q_pref': rqk_pref_Q.detach(),
+                'rqk_k_pref': rqk_pref_K.detach(),
+                'rv_pref': rv_pref.detach(),
+                'token_routing': True,
+            }
+        else:
+            routing_info = None
 
-    def get_knowledge_weights(self, x, attention_mask=None):
+        return fqk_weights_Q, fqk_weights_K, fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights, routing_info, aux_loss
+
+    def get_knowledge_weights(self, x, attention_mask=None, return_routing_info=False):
         """
         Knowledge neuron routing - Feature/Restore separation
         Token-level routing only (SSM causal cumulative routing removed)
@@ -330,7 +350,18 @@ class GlobalRouters(nn.Module):
             self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
             self.neuron_router.update_usage(restore_know_w, 'restore_know', attention_mask)
 
-        return feature_know_w, restore_know_w
+        # Build routing_info for analysis
+        if return_routing_info:
+            routing_info = {
+                'feature_know_w': feature_know_w.detach(),
+                'restore_know_w': restore_know_w.detach(),
+                'feature_know_pref': pref_f.detach(),
+                'restore_know_pref': pref_r.detach(),
+            }
+        else:
+            routing_info = None
+
+        return feature_know_w, restore_know_w, routing_info
 
 
 class AttentionCircuit(nn.Module):
@@ -518,33 +549,25 @@ class DAWNBlock(nn.Module):
         """
         # Attention
         normed_x = self.norm1(x)
-        fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, aux_loss = router.get_attention_weights(
-            normed_x, attention_mask
+        fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attn_routing_info, aux_loss = router.get_attention_weights(
+            normed_x, attention_mask, return_routing_info
         )
         attn_out = self.attn(normed_x, fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w, attention_mask)
         x = x + attn_out
 
         # Knowledge
         normed_x = self.norm2(x)
-        feature_know_w, restore_know_w = router.get_knowledge_weights(normed_x, attention_mask)
+        feature_know_w, restore_know_w, know_routing_info = router.get_knowledge_weights(
+            normed_x, attention_mask, return_routing_info
+        )
         know_out = self.knowledge(normed_x, feature_know_w, restore_know_w, attention_mask)
         x = x + know_out
 
         # Routing info is only collected in analysis mode
         if return_routing_info:
             routing_info = {
-                'attention': {
-                    'fqk_weights_Q': fqk_w_Q.detach(),
-                    'fqk_weights_K': fqk_w_K.detach(),
-                    'fv_weights': fv_w.detach(),
-                    'rqk_weights_Q': rqk_w_Q.detach(),
-                    'rqk_weights_K': rqk_w_K.detach(),
-                    'rv_weights': rv_w.detach(),
-                },
-                'knowledge': {
-                    'feature_know_w': feature_know_w.detach(),
-                    'restore_know_w': restore_know_w.detach(),
-                },
+                'attention': attn_routing_info,
+                'knowledge': know_routing_info,
                 'attn_out_norm': attn_out.norm(dim=-1).mean().detach(),
                 'know_out_norm': know_out.norm(dim=-1).mean().detach(),
             }
