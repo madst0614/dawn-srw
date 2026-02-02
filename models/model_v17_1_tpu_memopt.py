@@ -2,14 +2,18 @@
 DAWN v17.1-TPU-MemOpt: Memory-Optimized TPU Version
 
 Base: model_v17_1_tpu.py (dense all-neurons-first computation)
-Optimization: Restore Recompute — backward에서 restore 중간 텐서 재계산
+Optimization: Full Recompute — Feature와 Restore 모두 중간 텐서 재계산
 
 메모리 절감 원리:
-  TPU naive:  all_r_v = einsum('bsr,nrd->bsnd', h_v, r_v)  → [B,S,N_rv,D] 저장
-  MemOpt:     forward에서 all_r_v 계산하되 autograd에 저장 안 함
-              backward에서 h_v(작음)와 r_v(파라미터)로 재계산
+  TPU naive:  all_h = einsum('bsd,ndr->bsnr', x, neurons)  → [B,S,N,R] 저장
+              all_r = einsum('bsr,nrd->bsnd', h, neurons)  → [B,S,N,D] 저장
+  MemOpt:     forward에서 계산하되 autograd에 저장 안 함
+              backward에서 x/h(작음)와 neurons(파라미터)로 재계산
 
-  100M 기준 (B=32): ~60 GB → ~100 MB per layer (600x 절감)
+  100M 기준 (B=32): Feature + Restore 모두 절감
+  - Feature [B,S,N,R]: 0.28 GB per layer → 거의 0
+  - Restore [B,S,N,D]: 60 GB per layer → ~100 MB
+  - Total: ~600x 메모리 절감
 
 변경 파일: AttentionCircuit, KnowledgeCircuit만 수정
 나머지 (Router, SharedNeurons, DAWN, DAWNBlock 등)는 동일
@@ -80,6 +84,63 @@ class RestoreWithRecompute(torch.autograd.Function):
 def restore_recompute(h, neurons, weights):
     """Drop-in replacement for restore einsum pair with recompute"""
     return RestoreWithRecompute.apply(h, neurons, weights)
+
+
+class FeatureWithRecompute(torch.autograd.Function):
+    """
+    Forward:  all_h = einsum('bsd,ndr->bsnr', x, neurons)
+              result = einsum('bsnr,bsn->bsr', all_h, weights)
+
+    Backward: all_h를 저장하지 않고 x, neurons로부터 재계산
+
+    저장하는 것: x [B,S,D], weights [B,S,N], neurons [N,D,R] (파라미터 ref)
+    저장 안 하는 것: all_h [B,S,N,R]  ← Feature 중간 텐서
+    """
+    @staticmethod
+    def forward(ctx, x, neurons, weights):
+        # x: [B, S, D]
+        # neurons: [N, D, R]  (model parameter)
+        # weights: [B, S, N]  (sparse routing weights)
+
+        all_h = torch.einsum('bsd,ndr->bsnr', x, neurons)  # [B, S, N, R]
+        result = torch.einsum('bsnr,bsn->bsr', all_h, weights)  # [B, S, R]
+
+        # all_h를 저장하지 않음! x, neurons, weights만 저장
+        ctx.save_for_backward(x, neurons, weights)
+
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # grad_output: [B, S, R]
+        x, neurons, weights = ctx.saved_tensors
+
+        # all_h 재계산 (이게 recompute의 핵심)
+        all_h = torch.einsum('bsd,ndr->bsnr', x, neurons)  # [B, S, N, R]
+
+        # grad w.r.t. weights: d(result)/d(weights)
+        # result = einsum('bsnr,bsn->bsr', all_h, weights)
+        # grad_weights = einsum('bsnr,bsr->bsn', all_h, grad_output)
+        grad_weights = torch.einsum('bsnr,bsr->bsn', all_h, grad_output)
+
+        # grad w.r.t. all_h:
+        # grad_all_h = einsum('bsr,bsn->bsnr', grad_output, weights)
+        grad_all_h = torch.einsum('bsr,bsn->bsnr', grad_output, weights)
+
+        # grad w.r.t. x: from all_h = einsum('bsd,ndr->bsnr', x, neurons)
+        # grad_x = einsum('bsnr,ndr->bsd', grad_all_h, neurons)
+        grad_x = torch.einsum('bsnr,ndr->bsd', grad_all_h, neurons)
+
+        # grad w.r.t. neurons:
+        # grad_neurons = einsum('bsd,bsnr->ndr', x, grad_all_h)
+        grad_neurons = torch.einsum('bsd,bsnr->ndr', x, grad_all_h)
+
+        return grad_x, grad_neurons, grad_weights
+
+
+def feature_recompute(x, neurons, weights):
+    """Drop-in replacement for feature einsum pair with recompute"""
+    return FeatureWithRecompute.apply(x, neurons, weights)
 
 
 # ================================================================
@@ -359,13 +420,14 @@ class GlobalRouters(nn.Module):
 
 class AttentionCircuit(nn.Module):
     """
-    v17.1-TPU-MemOpt: Restore Recompute 적용
+    v17.1-TPU-MemOpt: Full Recompute 적용 (Feature + Restore)
 
     변경점 (vs model_v17_1_tpu.py):
-    - Feature: 동일 (dense einsum)
+    - Feature: feature_recompute() 사용 → all_h_* 텐서 저장 안 함
     - Restore: restore_recompute() 사용 → all_r_* 텐서 저장 안 함
 
-    Feature QK의 all_h_qk는 Q, K 두 번 사용되므로 저장 유지 (이미 작음).
+    주의: QK가 f_qk를 공유하는데, Full recompute에서는 x @ f_qk를 Q, K 각각 계산 (2번).
+         Forward에서 1번 추가 계산되지만, all_h_qk [B,S,N_fqk,R] 저장 안 해서 메모리 절약.
     """
     def __init__(self, shared_neurons, d_model, n_heads, rank, dropout=0.1):
         super().__init__()
@@ -382,20 +444,16 @@ class AttentionCircuit(nn.Module):
                 rqk_weights_Q, rqk_weights_K, rv_weights, attention_mask=None):
         B, S, D = x.shape
 
-        # === Feature: dense einsum (변경 없음) ===
-        # Feature QK — all_h_qk를 Q, K가 공유하므로 그대로 유지
+        # === Feature: recompute 적용 ===
+        # QK는 Q, K 두 번 사용 → 개별 recompute (x @ f_qk 2번 계산)
         f_qk = self.shared_neurons.feature_qk_neurons           # [N_fqk, D, R]
-        all_h_qk = torch.einsum('bsd,ndr->bsnr', x, f_qk)      # [B, S, N_fqk, R]
-        h_q = torch.einsum('bsnr,bsn->bsr', all_h_qk, fqk_weights_Q)
-        h_k = torch.einsum('bsnr,bsn->bsr', all_h_qk, fqk_weights_K)
+        h_q = feature_recompute(x, f_qk, fqk_weights_Q)         # [B, S, R]
+        h_k = feature_recompute(x, f_qk, fqk_weights_K)         # [B, S, R]
 
-        # Feature V
         f_v = self.shared_neurons.feature_v_neurons              # [N_fv, D, R]
-        all_h_v = torch.einsum('bsd,ndr->bsnr', x, f_v)         # [B, S, N_fv, R]
-        h_v = torch.einsum('bsnr,bsn->bsr', all_h_v, fv_weights)
+        h_v = feature_recompute(x, f_v, fv_weights)              # [B, S, R]
 
         # === Restore: recompute 적용 ===
-        # restore_recompute()가 [B,S,N,D] 중간 텐서를 저장하지 않음
         r_qk = self.shared_neurons.restore_qk_neurons            # [N_rqk, R, D]
         Q = restore_recompute(h_q, r_qk, rqk_weights_Q)         # [B, S, D]
         K = restore_recompute(h_k, r_qk, rqk_weights_K)         # [B, S, D]
@@ -420,11 +478,11 @@ class AttentionCircuit(nn.Module):
 
 class KnowledgeCircuit(nn.Module):
     """
-    v17.1-TPU-MemOpt: Restore Recompute 적용
+    v17.1-TPU-MemOpt: Full Recompute 적용 (Feature + Restore)
 
     변경점:
-    - Feature: 동일 (dense einsum)
-    - Restore: restore_recompute() 사용
+    - Feature: feature_recompute() 사용 → all_h 텐서 저장 안 함
+    - Restore: restore_recompute() 사용 → 중간 텐서 저장 안 함
     """
     def __init__(self, shared_neurons, d_model, n_feature_know, n_restore_know,
                  knowledge_rank, top_k_feature_know=4, top_k_restore_know=4, dropout=0.1):
@@ -441,10 +499,9 @@ class KnowledgeCircuit(nn.Module):
     def forward(self, x, feature_know_w, restore_know_w, attention_mask=None):
         B, S, D = x.shape
 
-        # Feature: dense einsum (변경 없음)
+        # Feature: recompute 적용
         f_know = self.shared_neurons.feature_know                # [N_f, D, KR]
-        all_h = torch.einsum('bsd,ndr->bsnr', x, f_know)        # [B, S, N_f, KR]
-        h = torch.einsum('bsnr,bsn->bsr', all_h, feature_know_w)  # [B, S, KR]
+        h = feature_recompute(x, f_know, feature_know_w)         # [B, S, KR]
 
         # Restore: recompute 적용
         r_know = self.shared_neurons.restore_know                # [N_r, KR, D]
@@ -506,8 +563,11 @@ class DAWN(nn.Module):
     DAWN v17.1-TPU-MemOpt
 
     Identical to v17.1-TPU except:
-    - AttentionCircuit uses restore_recompute for restore stage
-    - KnowledgeCircuit uses restore_recompute for restore stage
+    - AttentionCircuit uses feature_recompute + restore_recompute (full recompute)
+    - KnowledgeCircuit uses feature_recompute + restore_recompute (full recompute)
+
+    Trade-off: Forward에서 QK feature 계산이 2배 (Q, K 각각)
+              하지만 [B,S,N,R] + [B,S,N,D] 중간 텐서를 저장 안 함
     """
     __version__ = "17.1-TPU-MemOpt"
 
@@ -680,7 +740,8 @@ class DAWN(nn.Module):
             f"  Restore_Know: {self.n_restore_know} × {self.knowledge_rank} × {self.d_model} (top-k={self.top_k_restore_know})",
             f"",
             f"  [Memory Optimization]",
-            f"  Restore Recompute: ON (backward에서 [B,S,N,D] 중간 텐서 재계산)",
+            f"  Full Recompute: ON (Feature + Restore 모두 중간 텐서 재계산)",
+            f"  Feature [B,S,N,R] + Restore [B,S,N,D] 저장 안 함",
             f"",
             f"  [Router]",
             f"  d_space={self.d_space}, router_dropout={self.router_dropout}",
@@ -748,5 +809,5 @@ class DAWN(nn.Module):
             f"  Knowledge: Feature={self.n_feature_know} (k={self.top_k_feature_know}), "
             f"Restore={self.n_restore_know} (k={self.top_k_restore_know})\n"
             f"  Total neurons: {attn_neurons} (attn) + {know_neurons} (know) = {attn_neurons + know_neurons}\n"
-            f"  Memory: Restore Recompute ON"
+            f"  Memory: Full Recompute ON (Feature + Restore)"
         )
