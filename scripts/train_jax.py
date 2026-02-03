@@ -187,8 +187,14 @@ def count_parameters(params):
 # Orthogonality + diversity loss (inline for jit)
 # ============================================================
 
-def compute_orthogonality_loss(params, rank, knowledge_rank):
-    """Compute orthogonality loss from shared neuron params."""
+def compute_orthogonality_loss(params, rank, knowledge_rank, n_feature_qk, n_restore_qk):
+    """Compute orthogonality loss from shared neuron params.
+
+    Matches the model's 6-group computation:
+      f_neurons = [feature_qk ; feature_v]  -> split at n_feature_qk
+      r_neurons = [restore_qk ; restore_v]  -> split at n_restore_qk
+      feature_know, restore_know             -> separate params
+    """
     sn = params['shared_neurons']
     I_rank = jnp.eye(rank)[jnp.newaxis]
     I_know = jnp.eye(knowledge_rank)[jnp.newaxis]
@@ -198,13 +204,21 @@ def compute_orthogonality_loss(params, rank, knowledge_rank):
     feature_know = sn['feature_know']
     restore_know = sn['restore_know']
 
-    # Feature QK + V are stacked in f_neurons
-    # We need n_feature_qk to split, but we can compute on the whole stack
-    WtW_f = jnp.matmul(f_neurons.transpose(0, 2, 1), f_neurons)
-    loss_f = ((WtW_f - I_rank) ** 2).mean()
+    # Split f_neurons into feature_qk [N_fqk, D, R] and feature_v [N_fv, D, R]
+    W_fqk = f_neurons[:n_feature_qk]
+    W_fv = f_neurons[n_feature_qk:]
+    WtW_fqk = jnp.matmul(W_fqk.transpose(0, 2, 1), W_fqk)
+    loss_fqk = ((WtW_fqk - I_rank) ** 2).mean()
+    WtW_fv = jnp.matmul(W_fv.transpose(0, 2, 1), W_fv)
+    loss_fv = ((WtW_fv - I_rank) ** 2).mean()
 
-    WWt_r = jnp.matmul(r_neurons, r_neurons.transpose(0, 2, 1))
-    loss_r = ((WWt_r - I_rank) ** 2).mean()
+    # Split r_neurons into restore_qk [N_rqk, R, D] and restore_v [N_rv, R, D]
+    W_rqk = r_neurons[:n_restore_qk]
+    W_rv = r_neurons[n_restore_qk:]
+    WWt_rqk = jnp.matmul(W_rqk, W_rqk.transpose(0, 2, 1))
+    loss_rqk = ((WWt_rqk - I_rank) ** 2).mean()
+    WWt_rv = jnp.matmul(W_rv, W_rv.transpose(0, 2, 1))
+    loss_rv = ((WWt_rv - I_rank) ** 2).mean()
 
     WtW_fk = jnp.matmul(feature_know.transpose(0, 2, 1), feature_know)
     loss_fk = ((WtW_fk - I_know) ** 2).mean()
@@ -212,7 +226,7 @@ def compute_orthogonality_loss(params, rank, knowledge_rank):
     WWt_rk = jnp.matmul(restore_know, restore_know.transpose(0, 2, 1))
     loss_rk = ((WWt_rk - I_know) ** 2).mean()
 
-    return (loss_f + loss_r + loss_fk + loss_rk) / 4
+    return (loss_fqk + loss_fv + loss_rqk + loss_rv + loss_fk + loss_rk) / 6
 
 
 def compute_knowledge_diversity_loss(params):
@@ -240,7 +254,8 @@ def compute_knowledge_diversity_loss(params):
 # Train / eval steps
 # ============================================================
 
-def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight, rank, knowledge_rank):
+def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
+                      rank, knowledge_rank, n_feature_qk, n_restore_qk):
     """Create a jit-compiled training step function."""
 
     @jax.jit
@@ -262,8 +277,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight, rank
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
 
-            # Auxiliary losses computed from params
-            orth_loss = compute_orthogonality_loss(params, rank, knowledge_rank)
+            # Auxiliary losses computed from params (6-group orthogonality)
+            orth_loss = compute_orthogonality_loss(
+                params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
             div_loss = compute_knowledge_diversity_loss(params)
 
             total_loss = (ce_loss
@@ -281,23 +297,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight, rank
 
         new_ema_state = updated['ema']
 
-        # Accuracy: shifted predictions vs shifted labels
-        logits = result['logits']
-        shift_logits = logits[:, :-1, :]
-        shift_labels = labels[:, 1:]
-        valid_mask = (shift_labels != -100)
-        preds = jnp.argmax(shift_logits, axis=-1)
-        correct = jnp.sum((preds == shift_labels) & valid_mask)
-        valid_count = jnp.sum(valid_mask)
-
+        # Accuracy: computed inside model via _compute_lm_loss (no full logits)
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
             'aux_loss': aux_loss,
             'orth_loss': orth_loss,
             'div_loss': div_loss,
-            'correct': correct,
-            'valid_count': valid_count,
+            'correct': result['correct'],
+            'valid_count': result['n_valid'],
         }
 
         return new_params, new_ema_state, new_opt_state, metrics
@@ -312,22 +320,20 @@ def create_eval_step(model):
     def eval_step(params, ema_state, input_ids, attention_mask):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
         variables = {'params': params, 'ema': ema_state}
-        result = model.apply(
+        # mutable=['ema'] required: update_usage always runs (no deterministic guard).
+        # We discard the updated EMA state for eval.
+        result, _ = model.apply(
             variables,
             input_ids,
             labels=labels,
             attention_mask=attention_mask,
             deterministic=True,
+            mutable=['ema'],
         )
         ce_loss = result['loss']
-        logits = result['logits']
-
-        shift_logits = logits[:, :-1, :]
-        shift_labels = labels[:, 1:]
-        valid_mask = (shift_labels != -100)
-        preds = jnp.argmax(shift_logits, axis=-1)
-        correct = jnp.sum((preds == shift_labels) & valid_mask)
-        valid_count = jnp.sum(valid_mask)
+        # Accuracy computed inside model via _compute_lm_loss (no full logits)
+        correct = result['correct']
+        valid_count = result['n_valid']
 
         return ce_loss, correct, valid_count
 
@@ -529,10 +535,14 @@ def main():
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
 
     # ----------------------------------------------------------
-    # Optimizer (warmup + cosine decay)
+    # Optimizer (warmup + cosine decay + optional gradient accumulation)
     # ----------------------------------------------------------
+    grad_accum_steps = tcfg.get('gradient_accumulation_steps', 1)
+
     steps_per_epoch = len(train_loader)
-    total_steps = num_epochs * steps_per_epoch
+    # Schedule counts optimizer steps (after accumulation), not micro-steps
+    effective_steps_per_epoch = steps_per_epoch // grad_accum_steps
+    total_steps = num_epochs * effective_steps_per_epoch
     warmup_steps = int(total_steps * warmup_ratio)
 
     schedule = optax.warmup_cosine_decay_schedule(
@@ -543,17 +553,24 @@ def main():
         end_value=lr * 0.1,
     )
 
-    optimizer = optax.chain(
+    base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=schedule, weight_decay=weight_decay),
     )
+
+    if grad_accum_steps > 1:
+        optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
+    else:
+        optimizer = base_optimizer
     opt_state = optimizer.init(params)
 
     print(f"\nTraining config:")
     print(f"  Epochs: {num_epochs}")
     print(f"  Batch size: {batch_size}")
-    print(f"  Steps/epoch: {steps_per_epoch}")
-    print(f"  Total steps: {total_steps}")
+    print(f"  Grad accum steps: {grad_accum_steps}")
+    print(f"  Effective batch size: {batch_size * grad_accum_steps}")
+    print(f"  Steps/epoch (micro): {steps_per_epoch}")
+    print(f"  Total optimizer steps: {total_steps}")
     print(f"  Warmup steps: {warmup_steps}")
     print(f"  LR: {lr}")
     print(f"  Weight decay: {weight_decay}")
@@ -603,7 +620,11 @@ def main():
     # ----------------------------------------------------------
     # Create jit-compiled step functions
     # ----------------------------------------------------------
-    train_step_fn = create_train_step(model, optimizer, orth_weight, div_weight, lb_weight, rank, knowledge_rank)
+    n_feature_qk = cfg['model'].get('n_feature_qk', 56)
+    n_restore_qk = cfg['model'].get('n_restore_qk', 56)
+    train_step_fn = create_train_step(
+        model, optimizer, orth_weight, div_weight, lb_weight,
+        rank, knowledge_rank, n_feature_qk, n_restore_qk)
     eval_step_fn = create_eval_step(model)
 
     # ----------------------------------------------------------
@@ -625,6 +646,7 @@ def main():
     print(f"{'='*60}")
 
     train_start_time = time.time()
+    total_micro_steps = num_epochs * steps_per_epoch
     val_interval = 5000
     ckpt_interval = 5000
 
@@ -698,14 +720,15 @@ def main():
                 avg_div = win_div / win_count
                 avg_acc = win_correct / win_valid if win_valid > 0 else 0.0
 
-                # Current LR from schedule
-                current_lr = float(schedule(global_step))
+                # Current LR from schedule (indexed by optimizer step, not micro-step)
+                opt_step = global_step // grad_accum_steps
+                current_lr = float(schedule(opt_step))
 
                 total_elapsed = time.time() - train_start_time
-                progress = global_step / total_steps * 100
+                progress = global_step / total_micro_steps * 100
 
                 msg = (
-                    f"[Step {global_step}/{total_steps} ({progress:.1f}%)] "
+                    f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
                     f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
                     f"orth={avg_orth:.4f} div={avg_div:.4f} | "
                     f"acc={avg_acc:.4f} lr={current_lr:.2e} "
