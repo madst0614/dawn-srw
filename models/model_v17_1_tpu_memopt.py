@@ -7,13 +7,11 @@ Optimization: Full Recompute — Feature와 Restore 모두 중간 텐서 재계�
 메모리 절감 원리:
   TPU naive:  all_h = einsum('bsd,ndr->bsnr', x, neurons)  → [B,S,N,R] 저장
               all_r = einsum('bsr,nrd->bsnd', h, neurons)  → [B,S,N,D] 저장
-  MemOpt:     forward에서 계산하되 autograd에 저장 안 함
-              backward에서 x/h(작음)와 neurons(파라미터)로 재계산
+  MemOpt:     torch.utils.checkpoint로 forward 결과만 저장
+              backward에서 checkpoint가 자동으로 재계산
 
-  100M 기준 (B=32): Feature + Restore 모두 절감
-  - Feature [B,S,N,R]: 0.28 GB per layer → 거의 0
-  - Restore [B,S,N,D]: 60 GB per layer → ~100 MB
-  - Total: ~600x 메모리 절감
+  XLA 네이티브 지원: checkpoint은 XLA 컴파일러가 인식하므로 TPU에서 정상 작동
+  (custom autograd Function은 XLA에서 중간 텐서를 전부 보관해서 OOM 발생)
 
 변경 파일: AttentionCircuit, KnowledgeCircuit만 수정
 나머지 (Router, SharedNeurons, DAWN, DAWNBlock 등)는 동일
@@ -26,121 +24,29 @@ from torch.utils.checkpoint import checkpoint
 
 
 # ================================================================
-# Custom Autograd Functions for Restore Recompute
+# Recompute helpers using torch.utils.checkpoint (XLA-compatible)
 # ================================================================
 
-class RestoreWithRecompute(torch.autograd.Function):
-    """
-    Forward:  all_out = einsum('bsr,nrd->bsnd', h, neurons)
-              result  = einsum('bsnd,bsn->bsd', all_out, weights)
-
-    Backward: all_out를 저장하지 않고 h, neurons로부터 재계산
-
-    저장하는 것: h [B,S,R], weights [B,S,N], neurons [N,R,D] (파라미터 ref)
-    저장 안 하는 것: all_out [B,S,N,D]  ← 이게 메모리 킬러
-    """
-    @staticmethod
-    def forward(ctx, h, neurons, weights):
-        # h: [B, S, R]
-        # neurons: [N, R, D]  (model parameter)
-        # weights: [B, S, N]  (sparse routing weights)
-
-        all_out = torch.einsum('bsr,nrd->bsnd', h, neurons)  # [B, S, N, D]
-        result = torch.einsum('bsnd,bsn->bsd', all_out, weights)  # [B, S, D]
-
-        # all_out를 저장하지 않음! h, neurons, weights만 저장
-        ctx.save_for_backward(h, neurons, weights)
-
-        return result
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # grad_output: [B, S, D]
-        h, neurons, weights = ctx.saved_tensors
-
-        # all_out 재계산 (이게 recompute의 핵심)
-        all_out = torch.einsum('bsr,nrd->bsnd', h, neurons)  # [B, S, N, D]
-
-        # grad w.r.t. weights: d(result)/d(weights)
-        # result = einsum('bsnd,bsn->bsd', all_out, weights)
-        # grad_weights = einsum('bsnd,bsd->bsn', all_out, grad_output)
-        grad_weights = torch.einsum('bsnd,bsd->bsn', all_out, grad_output)
-
-        # grad w.r.t. all_out:
-        # grad_all_out = einsum('bsd,bsn->bsnd', grad_output, weights)
-        grad_all_out = torch.einsum('bsd,bsn->bsnd', grad_output, weights)
-
-        # grad w.r.t. h: from all_out = einsum('bsr,nrd->bsnd', h, neurons)
-        # grad_h = einsum('bsnd,nrd->bsr', grad_all_out, neurons)
-        grad_h = torch.einsum('bsnd,nrd->bsr', grad_all_out, neurons)
-
-        # grad w.r.t. neurons:
-        # grad_neurons = einsum('bsr,bsnd->nrd', h, grad_all_out)
-        grad_neurons = torch.einsum('bsr,bsnd->nrd', h, grad_all_out)
-
-        return grad_h, grad_neurons, grad_weights
-
-
-def restore_recompute(h, neurons, weights):
-    """Drop-in replacement for restore einsum pair with recompute"""
-    return RestoreWithRecompute.apply(h, neurons, weights)
-
-
-class FeatureWithRecompute(torch.autograd.Function):
-    """
-    Forward:  all_h = einsum('bsd,ndr->bsnr', x, neurons)
-              result = einsum('bsnr,bsn->bsr', all_h, weights)
-
-    Backward: all_h를 저장하지 않고 x, neurons로부터 재계산
-
-    저장하는 것: x [B,S,D], weights [B,S,N], neurons [N,D,R] (파라미터 ref)
-    저장 안 하는 것: all_h [B,S,N,R]  ← Feature 중간 텐서
-    """
-    @staticmethod
-    def forward(ctx, x, neurons, weights):
-        # x: [B, S, D]
-        # neurons: [N, D, R]  (model parameter)
-        # weights: [B, S, N]  (sparse routing weights)
-
-        all_h = torch.einsum('bsd,ndr->bsnr', x, neurons)  # [B, S, N, R]
-        result = torch.einsum('bsnr,bsn->bsr', all_h, weights)  # [B, S, R]
-
-        # all_h를 저장하지 않음! x, neurons, weights만 저장
-        ctx.save_for_backward(x, neurons, weights)
-
-        return result
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # grad_output: [B, S, R]
-        x, neurons, weights = ctx.saved_tensors
-
-        # all_h 재계산 (이게 recompute의 핵심)
-        all_h = torch.einsum('bsd,ndr->bsnr', x, neurons)  # [B, S, N, R]
-
-        # grad w.r.t. weights: d(result)/d(weights)
-        # result = einsum('bsnr,bsn->bsr', all_h, weights)
-        # grad_weights = einsum('bsnr,bsr->bsn', all_h, grad_output)
-        grad_weights = torch.einsum('bsnr,bsr->bsn', all_h, grad_output)
-
-        # grad w.r.t. all_h:
-        # grad_all_h = einsum('bsr,bsn->bsnr', grad_output, weights)
-        grad_all_h = torch.einsum('bsr,bsn->bsnr', grad_output, weights)
-
-        # grad w.r.t. x: from all_h = einsum('bsd,ndr->bsnr', x, neurons)
-        # grad_x = einsum('bsnr,ndr->bsd', grad_all_h, neurons)
-        grad_x = torch.einsum('bsnr,ndr->bsd', grad_all_h, neurons)
-
-        # grad w.r.t. neurons:
-        # grad_neurons = einsum('bsd,bsnr->ndr', x, grad_all_h)
-        grad_neurons = torch.einsum('bsd,bsnr->ndr', x, grad_all_h)
-
-        return grad_x, grad_neurons, grad_weights
+def _feature_fn(x, neurons, weights):
+    """Feature stage: x [B,S,D] → h [B,S,R] via neuron pool"""
+    all_h = torch.einsum('bsd,ndr->bsnr', x, neurons)
+    return torch.einsum('bsnr,bsn->bsr', all_h, weights)
 
 
 def feature_recompute(x, neurons, weights):
-    """Drop-in replacement for feature einsum pair with recompute"""
-    return FeatureWithRecompute.apply(x, neurons, weights)
+    """Feature with activation checkpointing — all_h [B,S,N,R] not saved"""
+    return checkpoint(_feature_fn, x, neurons, weights, use_reentrant=False)
+
+
+def _restore_fn(h, neurons, weights):
+    """Restore stage: h [B,S,R] → output [B,S,D] via neuron pool"""
+    all_out = torch.einsum('bsr,nrd->bsnd', h, neurons)
+    return torch.einsum('bsnd,bsn->bsd', all_out, weights)
+
+
+def restore_recompute(h, neurons, weights):
+    """Restore with activation checkpointing — all_out [B,S,N,D] not saved"""
+    return checkpoint(_restore_fn, h, neurons, weights, use_reentrant=False)
 
 
 # ================================================================
