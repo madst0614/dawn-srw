@@ -489,8 +489,8 @@ def main():
     print(f"Config: {config_path}")
     print(f"Seed: {seed}")
 
-    # Enable JIT compile logging — helps distinguish OOM vs compilation errors
-    jax.config.update("jax_log_compiles", True)
+    # jax_log_compiles is too noisy (hundreds of warnings during init).
+    # Use stage-based print markers instead to pinpoint where it dies.
 
     # ----------------------------------------------------------
     # Load data
@@ -521,6 +521,7 @@ def main():
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy_input = jnp.ones((1, max_seq_len), dtype=jnp.int32)
 
+    print("=== Starting model.init ===", flush=True)
     variables = model.init(
         {'params': init_rng, 'dropout': dropout_rng},
         dummy_input,
@@ -528,6 +529,7 @@ def main():
     )
     params = variables['params']
     ema_state = variables.get('ema', {})
+    print("=== model.init done ===", flush=True)
 
     n_params = count_parameters(params)
     print(f"\nModel parameters: {n_params:,}")
@@ -540,7 +542,7 @@ def main():
     # ----------------------------------------------------------
     # OOM check: dummy forward pass with actual batch shape
     # ----------------------------------------------------------
-    print(f"\n--- OOM check: dummy forward with batch_size={batch_size}, seq_len={max_seq_len} ---")
+    print(f"\n=== OOM check: dummy forward with batch_size={batch_size}, seq_len={max_seq_len} ===", flush=True)
     try:
         dummy_batch = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
         dummy_labels = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
@@ -558,7 +560,7 @@ def main():
             mutable=['ema'],
         )
         jax.block_until_ready(dummy_result['loss'])
-        print(f"  Forward OK — loss={float(dummy_result['loss']):.4f}")
+        print(f"  Forward OK — loss={float(dummy_result['loss']):.4f}", flush=True)
 
         # Eval forward (deterministic=True)
         dummy_eval_result, _ = model.apply(
@@ -571,10 +573,10 @@ def main():
             mutable=['ema'],
         )
         jax.block_until_ready(dummy_eval_result['loss'])
-        print(f"  Eval forward OK — loss={float(dummy_eval_result['loss']):.4f}")
+        print(f"  Eval forward OK — loss={float(dummy_eval_result['loss']):.4f}", flush=True)
 
         del dummy_batch, dummy_labels, dummy_mask, dummy_result, dummy_updated, dummy_eval_result
-        print("--- OOM check passed ---\n")
+        print("=== OOM check passed ===\n", flush=True)
     except Exception as e:
         print(f"  *** OOM check FAILED: {e}")
         print(f"  This likely means the model is too large for the device memory.")
@@ -689,13 +691,14 @@ def main():
     # Training loop
     # ----------------------------------------------------------
     print(f"\n{'='*60}")
-    print("Starting training...")
+    print("=== Starting training loop ===", flush=True)
     print(f"{'='*60}")
 
     train_start_time = time.time()
     total_micro_steps = num_epochs * steps_per_epoch
     val_interval = 5000
     ckpt_interval = 5000
+    first_step_done = False
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -723,6 +726,9 @@ def main():
             if step_in_epoch < global_step:
                 continue
 
+            if not first_step_done:
+                print(f"=== First train_step: compiling JIT (this may take minutes) ===", flush=True)
+
             # New dropout key each step
             rng, dropout_key = jax.random.split(rng)
 
@@ -730,6 +736,12 @@ def main():
                 params, ema_state, opt_state,
                 input_ids, attention_mask, dropout_key,
             )
+
+            if not first_step_done:
+                # Force sync to catch OOM here, not later
+                jax.block_until_ready(metrics['total_loss'])
+                print(f"=== First train_step done — loss={float(metrics['total_loss']):.4f} ===", flush=True)
+                first_step_done = True
 
             # Accumulate
             m_total = float(metrics['total_loss'])
