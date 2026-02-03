@@ -397,6 +397,22 @@ class GlobalRouters(nn.Module):
         logits_f, logits_r = self.neuron_router.get_knowledge_logits(x)
         pref_f = F.softmax(logits_f, dim=-1)
         pref_r = F.softmax(logits_r, dim=-1)
+
+        aux_loss = 0.0
+        if self.training:
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(-1).float()
+                count = mask.sum() + 1e-8
+                usage_f = (pref_f * mask).sum(dim=(0, 1)) / count
+                usage_r = (pref_r * mask).sum(dim=(0, 1)) / count
+            else:
+                usage_f = pref_f.mean(dim=(0, 1))
+                usage_r = pref_r.mean(dim=(0, 1))
+            target_f = 1.0 / self.n_feature_know
+            target_r = 1.0 / self.n_restore_know
+            aux_loss += ((usage_f - target_f) ** 2).sum() * self.n_feature_know
+            aux_loss += ((usage_r - target_r) ** 2).sum() * self.n_restore_know
+
         feature_know_w, _ = self._topk_sparsify(pref_f, self.top_k_feature_know)
         restore_know_w, _ = self._topk_sparsify(pref_r, self.top_k_restore_know)
         if self.training:
@@ -411,7 +427,7 @@ class GlobalRouters(nn.Module):
             }
         else:
             routing_info = None
-        return feature_know_w, restore_know_w, routing_info
+        return feature_know_w, restore_know_w, routing_info, aux_loss
 
 
 # ================================================================
@@ -540,7 +556,7 @@ class DAWNBlock(nn.Module):
         x = x + attn_out
 
         normed_x = self.norm2(x)
-        feature_know_w, restore_know_w, know_routing_info = router.get_knowledge_weights(
+        feature_know_w, restore_know_w, know_routing_info, know_aux_loss = router.get_knowledge_weights(
             normed_x, attention_mask, return_routing_info
         )
         know_out = self.knowledge(normed_x, feature_know_w, restore_know_w, attention_mask)
@@ -555,7 +571,7 @@ class DAWNBlock(nn.Module):
             }
         else:
             routing_info = None
-        return x, routing_info, aux_loss
+        return x, routing_info, aux_loss + know_aux_loss
 
 
 class DAWN(nn.Module):
