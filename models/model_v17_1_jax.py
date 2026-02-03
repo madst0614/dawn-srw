@@ -6,7 +6,7 @@ Native JAX implementation:
   - flax.linen modules
   - Weight tying via nn.Embed.attend()
   - EMA usage tracking via mutable 'ema' state collection
-  - nn.remat(DAWNBlock) with static_argnums for layer-level remat
+  - nn.remat(DAWNBlock) for layer-level remat (no static_argnums needed)
   - @jax.checkpoint on logits+loss to avoid [B,S,V] materialization
 
 Structure (same as PyTorch):
@@ -555,12 +555,16 @@ class DAWNBlock(nn.Module):
         self.norm2 = nn.LayerNorm()
 
     def __call__(self, x, shared_neurons, router, attention_mask=None,
-                 deterministic=False, return_routing_info=False):
+                 deterministic=False):
+        # return_routing_info removed from DAWNBlock to eliminate Python bool
+        # branches, making this module fully trace-safe under nn.remat.
+        # Routing info collection can be done at DAWN level if needed.
+
         # Attention
         normed_x = self.norm1(x)
         (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
-         attn_routing_info, aux_loss) = router.get_attention_weights(
-            normed_x, attention_mask, deterministic, return_routing_info)
+         _, aux_loss) = router.get_attention_weights(
+            normed_x, attention_mask, deterministic, False)  # literal False
         attn_out = self.attn(
             normed_x, shared_neurons,
             fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
@@ -569,27 +573,16 @@ class DAWNBlock(nn.Module):
 
         # Knowledge
         normed_x = self.norm2(x)
-        feature_know_w, restore_know_w, know_routing_info, know_aux_loss = \
+        feature_know_w, restore_know_w, _, know_aux_loss = \
             router.get_knowledge_weights(
-                normed_x, attention_mask, deterministic, return_routing_info)
+                normed_x, attention_mask, deterministic, False)  # literal False
         know_out = self.knowledge(
             normed_x, shared_neurons,
             feature_know_w, restore_know_w,
             attention_mask, deterministic)
         x = x + know_out
 
-        routing_info = None
-        if return_routing_info:
-            routing_info = {
-                'attention': attn_routing_info,
-                'knowledge': know_routing_info,
-                'attn_out_norm': jax.lax.stop_gradient(
-                    jnp.linalg.norm(attn_out, axis=-1).mean()),
-                'know_out_norm': jax.lax.stop_gradient(
-                    jnp.linalg.norm(know_out, axis=-1).mean()),
-            }
-
-        return x, routing_info, aux_loss + know_aux_loss
+        return x, aux_loss + know_aux_loss
 
 
 # ================================================================
@@ -602,7 +595,8 @@ class DAWN(nn.Module):
 
     JAX/Flax port of v17.1-TPU-MemOpt.
     - jax.checkpoint for feature/restore intermediate tensor recompute
-    - nn.remat(DAWNBlock, static_argnums=(4,5)) for layer-level recompute
+    - nn.remat(DAWNBlock) for layer-level recompute (no static_argnums needed:
+      all Python bool branches removed from DAWNBlock)
     - @jax.checkpoint on logits+loss to avoid [B,S,V] materialization
     - Weight tying via nn.Embed.attend()
     - Functional API: returns dict with loss, logits, aux_loss
@@ -681,13 +675,10 @@ class DAWN(nn.Module):
 
         block_cls = DAWNBlock
         if self.gradient_checkpointing:
-            # static_argnums=(4, 5) keeps deterministic and return_routing_info
-            # as concrete Python bools, preventing TracerBoolConversionError.
-            # DAWNBlock.__call__(self, x, shared_neurons, router, attention_mask,
-            #                    deterministic, return_routing_info)
-            #                    ^0     ^1              ^2      ^3
-            #                    ^4              ^5
-            block_cls = nn.remat(DAWNBlock, static_argnums=(4, 5))
+            # No static_argnums needed: all Python bool branches removed from
+            # DAWNBlock. deterministic is only passed to nn.Dropout (trace-safe),
+            # return_routing_info removed entirely.
+            block_cls = nn.remat(DAWNBlock)
 
         self.layers = [
             block_cls(
@@ -707,7 +698,7 @@ class DAWN(nn.Module):
         # lm_head uses weight tying via token_emb.attend()
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
-                 deterministic=False, return_routing_info=False):
+                 deterministic=False):
         B, S = input_ids.shape
         if S > self.max_seq_len:
             raise ValueError(
@@ -717,15 +708,12 @@ class DAWN(nn.Module):
         x = self.token_emb(input_ids) + self.pos_emb(positions)
         x = self.emb_dropout(x, deterministic=deterministic)
 
-        routing_infos = [] if return_routing_info else None
         total_aux_loss = jnp.float32(0.0)
 
         for layer in self.layers:
-            x, routing_info, aux_loss = layer(
+            x, aux_loss = layer(
                 x, self.shared_neurons, self.router,
-                attention_mask, deterministic, return_routing_info)
-            if routing_infos is not None:
-                routing_infos.append(routing_info)
+                attention_mask, deterministic)
             total_aux_loss = total_aux_loss + aux_loss
 
         x = self.norm(x)
@@ -751,9 +739,6 @@ class DAWN(nn.Module):
             # Inference path: return full logits
             logits = self.token_emb.attend(x)
             result['logits'] = logits
-
-        if return_routing_info:
-            result['routing_infos'] = routing_infos
 
         return result
 
