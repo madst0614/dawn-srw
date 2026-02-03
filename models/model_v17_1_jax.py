@@ -19,6 +19,28 @@ from typing import Optional, Dict, Any, List, Tuple
 
 
 # ================================================================
+# Trace-safe dropout (no Python bool branch — compatible with nn.remat)
+# ================================================================
+
+def safe_dropout(x, rate, deterministic, rng):
+    """Dropout that uses jnp.where instead of Python if — fully trace-safe.
+
+    Args:
+        x: input tensor
+        rate: dropout rate (0.0 = no dropout)
+        deterministic: if True, no dropout applied (must be static under remat)
+        rng: PRNG key for dropout mask generation
+    """
+    if rate == 0.0:  # Python float check, always constant — OK
+        return x
+    if deterministic:  # Will be static via static_argnums — OK
+        return x
+    keep_rate = 1.0 - rate
+    mask = jax.random.bernoulli(rng, keep_rate, x.shape)
+    return jnp.where(mask, x / keep_rate, 0.0)
+
+
+# ================================================================
 # Recompute helpers (jax.checkpoint = jax.remat)
 # ================================================================
 
@@ -112,7 +134,6 @@ class UnifiedNeuronRouter(nn.Module):
         self.proj_all = nn.Dense(self.d_space * 6)
         self.proj_feature_know = nn.Dense(self.d_space)
         self.proj_restore_know = nn.Dense(self.d_space)
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
 
         self.neuron_emb = self.param('neuron_emb', scaled_normal(0.02),
                                      (total, self.d_space))
@@ -140,12 +161,14 @@ class UnifiedNeuronRouter(nn.Module):
 
     def get_knowledge_logits(self, x, deterministic=False):
         emb_norm = self._normalize_emb()
+        rng = None if deterministic else self.make_rng('dropout')
 
-        h_fk = self.dropout(self.proj_feature_know(x), deterministic=deterministic)
+        h_fk = safe_dropout(self.proj_feature_know(x), self.dropout_rate, deterministic, rng)
         emb_fk = emb_norm[self._restore_v_end:self._feature_know_end]
         logits_fk = jnp.einsum('bsd,nd->bsn', h_fk, emb_fk)
 
-        h_rk = self.dropout(self.proj_restore_know(x), deterministic=deterministic)
+        rng2 = None if deterministic else self.make_rng('dropout')
+        h_rk = safe_dropout(self.proj_restore_know(x), self.dropout_rate, deterministic, rng2)
         emb_rk = emb_norm[self._feature_know_end:]
         logits_rk = jnp.einsum('bsd,nd->bsn', h_rk, emb_rk)
 
@@ -153,7 +176,8 @@ class UnifiedNeuronRouter(nn.Module):
 
     def get_all_logits(self, x, deterministic=False):
         emb_norm = self._normalize_emb()
-        all_proj = self.dropout(self.proj_all(x), deterministic=deterministic)
+        rng = None if deterministic else self.make_rng('dropout')
+        all_proj = safe_dropout(self.proj_all(x), self.dropout_rate, deterministic, rng)
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = jnp.split(all_proj, 6, axis=-1)
 
         fqk_emb = emb_norm[:self._feature_qk_end]
@@ -388,8 +412,6 @@ class AttentionCircuit(nn.Module):
     def setup(self):
         self.d_head = self.d_model // self.n_heads
         self.expand_O = nn.Dense(self.d_model, use_bias=False)
-        self.attn_dropout = nn.Dropout(rate=self.dropout_rate)
-        self.out_dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, shared_neurons, fqk_weights_Q, fqk_weights_K,
                  fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights,
@@ -426,14 +448,18 @@ class AttentionCircuit(nn.Module):
 
         attn_weights = jax.nn.softmax(scores, axis=-1)
 
-        # Attention dropout — nn.Dropout is trace-safe (no Python bool branch)
-        attn_weights = self.attn_dropout(attn_weights, deterministic=deterministic)
+        # Attention dropout — safe_dropout is trace-safe
+        if not deterministic:
+            attn_rng = self.make_rng('dropout')
+            attn_weights = safe_dropout(attn_weights, self.dropout_rate, deterministic, attn_rng)
 
         attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, V)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, D)
 
         output = self.expand_O(attn_out)
-        output = self.out_dropout(output, deterministic=deterministic)
+        if not deterministic:
+            out_rng = self.make_rng('dropout')
+            output = safe_dropout(output, self.dropout_rate, deterministic, out_rng)
         return output
 
 
@@ -455,7 +481,7 @@ class KnowledgeCircuit(nn.Module):
     dropout_rate: float = 0.1
 
     def setup(self):
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        pass  # No sub-modules needed (feature_fn/restore_fn are standalone)
 
     def __call__(self, x, shared_neurons, feature_know_w, restore_know_w,
                  attention_mask=None, deterministic=False):
@@ -467,7 +493,10 @@ class KnowledgeCircuit(nn.Module):
         r_know = shared_neurons.restore_know                    # [N_r, KR, D]
         output = restore_fn(h, r_know, restore_know_w)           # [B, S, D]
 
-        return self.dropout(output, deterministic=deterministic)
+        if not deterministic:
+            rng = self.make_rng('dropout')
+            output = safe_dropout(output, self.dropout_rate, deterministic, rng)
+        return output
 
 
 # ================================================================
@@ -584,7 +613,6 @@ class DAWN(nn.Module):
                                   embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(self.max_seq_len, self.d_model,
                                 embedding_init=scaled_normal(0.02))
-        self.emb_dropout = nn.Dropout(rate=self.dropout_rate)
 
         self.shared_neurons = SharedNeurons(
             d_model=self.d_model, rank=self.rank,
@@ -610,8 +638,8 @@ class DAWN(nn.Module):
 
         block_cls = DAWNBlock
         if self.gradient_checkpointing:
-            # deterministic is arg index 4 of __call__(self, x, shared_neurons, router, attention_mask, deterministic)
-            # Must be static because Flax nn.Dropout does `if deterministic:` internally
+            # deterministic (arg 4) and attention_mask (arg 3) must be static
+            # to avoid TracerBoolConversionError in safe_dropout and if-branches
             block_cls = nn.remat(DAWNBlock, static_argnums=(3, 4))
 
         self.layers = [
@@ -640,7 +668,9 @@ class DAWN(nn.Module):
 
         positions = jnp.arange(S)[jnp.newaxis, :]  # [1, S]
         x = self.token_emb(input_ids) + self.pos_emb(positions)
-        x = self.emb_dropout(x, deterministic=deterministic)
+        if not deterministic:
+            emb_rng = self.make_rng('dropout')
+            x = safe_dropout(x, self.dropout_rate, deterministic, emb_rng)
 
         total_aux_loss = jnp.float32(0.0)
 
