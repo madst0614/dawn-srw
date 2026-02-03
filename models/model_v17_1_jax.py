@@ -610,7 +610,9 @@ class DAWN(nn.Module):
 
         block_cls = DAWNBlock
         if self.gradient_checkpointing:
-            block_cls = nn.remat(DAWNBlock)
+            # deterministic is arg index 4 of __call__(self, x, shared_neurons, router, attention_mask, deterministic)
+            # Must be static because Flax nn.Dropout does `if deterministic:` internally
+            block_cls = nn.remat(DAWNBlock, static_argnums=(3, 4))
 
         self.layers = [
             block_cls(
