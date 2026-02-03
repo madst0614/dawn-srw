@@ -68,6 +68,12 @@ from .model_v18 import DAWN as DAWN_v18
 # v17.1 - Q/K Separate Pool + Knowledge Feature-Restore (default)
 from .model_v17_1 import DAWN as DAWN_v17_1
 
+# v17.1-TPU - SSM removed, TPU-optimized computation order
+from .model_v17_1_tpu import DAWN as DAWN_v17_1_TPU
+
+# v17.1-TPU-MemOpt - Memory-optimized TPU version (restore recompute)
+from .model_v17_1_tpu_memopt import DAWN as DAWN_v17_1_TPU_MemOpt
+
 # v17.2 - Feature QK Unified + Restore Q/K Separate
 from .model_v17_2 import DAWN as DAWN_v17_2
 
@@ -112,6 +118,8 @@ __all__ = [
     'DAWN_v18',
     'DAWN_v17_2',
     'DAWN_v17_1',
+    'DAWN_v17_1_TPU',
+    'DAWN_v17_1_TPU_MemOpt',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
@@ -144,7 +152,7 @@ def create_model_by_version(version, config):
     """Create DAWN model by version string
 
     Args:
-        version: "18.5", "18.4", "18.3", "18.2", "18.1", "18.0", "17.2", "17.1", or "baseline"
+        version: "18.5", "18.4", "18.3", "18.2", "18.1", "18.0", "17.2", "17.1", "17.1-tpu", "17.1-tpu-memopt", or "baseline"
         config: Model configuration dict
 
     Returns:
@@ -171,6 +179,10 @@ def create_model_by_version(version, config):
         return DAWN_v17_2(**config)
     elif version == "17.1":
         return DAWN_v17_1(**config)
+    elif version == "17.1-tpu":
+        return DAWN_v17_1_TPU(**config)
+    elif version == "17.1-tpu-memopt":
+        return DAWN_v17_1_TPU_MemOpt(**config)
     else:
         raise ValueError(f"Unknown model version: {version}. "
-                        f"Supported versions: 18.5, 18.4, 18.3, 18.2, 18.1, 18.0, 17.2, 17.1, baseline")
+                        f"Supported versions: 18.5, 18.4, 18.3, 18.2, 18.1, 18.0, 17.2, 17.1, 17.1-tpu, 17.1-tpu-memopt, baseline")

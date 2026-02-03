@@ -1,0 +1,86 @@
+# DAWN v17.1-TPU-MemOpt Training Config - 40M Scale, 5B tokens (Seed 1, Token Routing, V Expand 6)
+# Full recompute (Feature + Restore) — SSM removed, token-level routing only
+# QK=64(k=12), V=264(k=12), Knowledge=160(k=12), knowledge_rank=64, d_space=256
+
+seed: 1
+
+data:
+  base_dir: /content/drive/MyDrive/data
+  train_files:
+    - train/c4/c4_raw_000.pt
+    - train/c4/c4_raw_001.pt
+    - train/c4/c4_raw_002.pt
+    - train/c4/c4_raw_003.pt
+    - train/c4/c4_raw_004.pt
+    - train/c4/c4_raw_005.pt
+    - train/c4/c4_raw_006.pt
+    - train/c4/c4_raw_007.pt
+    - train/c4/c4_raw_008.pt
+    - train/c4/c4_raw_009.pt
+  val_files:
+    - val/c4/c4_val_50M.pt
+  max_train_tokens: 5000000000
+  max_val_tokens: 2000000
+
+model:
+  model_version: "17.1-tpu-memopt"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  rank: 64
+
+  # Attention - Q/K shared pool (QK=64 k=12, V=264 k=12)
+  n_feature_qk: 64
+  n_feature_v: 264
+  top_k_feature_qk: 12
+  top_k_feature_v: 12
+
+  n_restore_qk: 64
+  n_restore_v: 264
+  top_k_restore_qk: 12
+  top_k_restore_v: 12
+
+  # Knowledge - Feature-Restore pattern (rank=64)
+  n_feature_know: 160
+  n_restore_know: 160
+  knowledge_rank: 64
+  top_k_feature_know: 12
+  top_k_restore_know: 12
+
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: false
+  d_space: 256
+  router_dropout: 0.1
+
+training:
+  batch_size: 128
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.00002
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+
+use_amp: true
+checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_tpu_memopt_40M_c4_5B_seed1_token_routing_v_expand6
+log_dir: /content/drive/MyDrive/dawn/logs_v17.1_tpu_memopt_40M_c4_5B_seed1_token_routing_v_expand6
+
+# v17.1-TPU-MemOpt Token Routing V-Expand6 Architecture
+#
+#   Attention Circuit (per-token routing, full recompute):
+#   - Feature_QK=64 (k=12): per-token Q/K compression
+#   - Feature_V=264 (k=12): per-token V compression
+#   - Restore_QK=64 (k=12): per-token Q/K restoration
+#   - Restore_V=264 (k=12): per-token V restoration
+#
+#   Knowledge Circuit (per-token routing, full recompute):
+#   - Feature_Know=160 (k=12): per-token compression
+#   - Restore_Know=160 (k=12): per-token restoration
+#
+#   Memory Optimization:
+#   - Feature + Restore 중간 텐서 저장 안 함 (backward에서 재계산)
+#   - SSM 제거, gradient_checkpointing 불필요 (recompute가 대체)

@@ -40,10 +40,19 @@ warnings.filterwarnings('ignore', message='.*online softmax.*')
 # CUDA memory optimization
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+# TPU/XLA support (optional)
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    HAS_XLA = True
+except ImportError:
+    HAS_XLA = False
 import argparse
 from tqdm import tqdm
 import json
@@ -928,8 +937,19 @@ def is_v18_model(model):
     return version.startswith('18')
 
 
+def is_tpu_model(model):
+    """Check if model is TPU-optimized version (skip routing_info during training)"""
+    base_model = get_underlying_model(model)
+    version = getattr(base_model, '__version__', '')
+    return 'TPU' in version.upper()
+
+
 def needs_routing_info(model):
-    """Check if model needs routing_info for usage logging"""
+    """Check if model needs routing_info for usage logging.
+    TPU models skip routing_info collection during training for performance.
+    """
+    if is_tpu_model(model):
+        return False
     return is_v16_model(model) or is_v17_model(model) or is_v18_model(model)
 
 
@@ -1206,7 +1226,7 @@ def _get_router_log_lines(router, global_step, total_steps, global_routers=None)
 def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, scaler=None, tokenizer=None, log_file=None,
                 orthogonality_weight=0.0, diversity_weight=0.0, load_balance_weight=0.0, entropy_weight=0.0, tau_reg_weight=0.0,
                 debug_logger=None, ckpt_manager=None, model_config=None, start_step=0, global_step=0, total_steps=1,
-                total_epoch_steps=None, val_loader=None, val_interval=5000):
+                total_epoch_steps=None, val_loader=None, val_interval=5000, is_tpu=False):
     """Train for one epoch
 
     Args:
@@ -1214,6 +1234,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         total_epoch_steps: Total steps in full epoch (for progress bar when using subset)
         global_step: Global training step counter
         total_steps: Total training steps
+        is_tpu: Whether running on TPU/XLA device
     """
     model.train()
 
@@ -1249,8 +1270,13 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         # Calculate actual step (for logging and checkpointing)
         step = local_step + start_step
 
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        if is_tpu:
+            # MpDeviceLoader already moves data to TPU
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+        else:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
 
         # CLM: labels = input_ids (model does shift internally)
         # Set padding positions to -100 so they're ignored in loss
@@ -1266,8 +1292,65 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         if is_log_step:
             set_v18_debug_mode(model, True)
 
-        # Mixed precision training
-        if scaler is not None:
+        # TPU training (bf16 native, no GradScaler)
+        if is_tpu:
+            base_model = get_underlying_model(model)
+
+            # DAWN model forward
+            if load_balance_weight > 0 or entropy_weight > 0 or needs_routing_info(model):
+                ce_loss, logits, routing_infos = model(input_ids, labels, attention_mask=attention_mask, return_routing_info=True)
+            else:
+                ce_loss, logits = model(input_ids, labels, attention_mask=attention_mask)
+                routing_infos = None
+
+            # Orthogonality loss
+            orth_loss = 0.0
+            if orthogonality_weight > 0 and hasattr(base_model, 'orthogonality_loss'):
+                orth_loss = base_model.orthogonality_loss()
+
+            # Knowledge diversity loss
+            diversity_loss = 0.0
+            if diversity_weight > 0 and hasattr(base_model, 'knowledge_diversity_loss'):
+                diversity_loss = base_model.knowledge_diversity_loss()
+
+            # Tau regularization loss
+            tau_reg_loss = 0.0
+            if tau_reg_weight > 0 and hasattr(base_model, 'tau_regularization_loss'):
+                tau_reg_loss = base_model.tau_regularization_loss()
+
+            # Load balance loss
+            lb_loss = 0.0
+            if load_balance_weight > 0:
+                if hasattr(base_model, 'aux_loss') and base_model.aux_loss != 0.0:
+                    lb_loss = base_model.aux_loss
+                elif routing_infos is not None and hasattr(base_model, 'load_balance_loss'):
+                    lb_loss = base_model.load_balance_loss(routing_infos)
+
+            # Total loss
+            loss = ce_loss + orthogonality_weight * orth_loss + diversity_weight * diversity_loss + tau_reg_weight * tau_reg_loss + load_balance_weight * lb_loss
+
+            # Scale loss for accumulation and backward
+            (loss / accumulation_steps).backward()
+
+            # Disable v18 debug_mode after backward
+            if is_log_step:
+                set_v18_debug_mode(model, False)
+
+            # Only update optimizer on accumulation boundary
+            if (local_step + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                # Debug: Log gradient flow at specific steps
+                if debug_logger and debug_logger.should_log_epoch(epoch) and step in debug_log_steps:
+                    debug_logger.log_post_backward(model, epoch, step)
+
+                xm.optimizer_step(optimizer)
+            else:
+                xm.mark_step()
+
+        # Mixed precision training (CUDA)
+        elif scaler is not None:
             with torch.amp.autocast('cuda', enabled=True):
                 # Get underlying model for attribute checks (handles torch.compile)
                 base_model = get_underlying_model(model)
@@ -1413,30 +1496,59 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
         valid_mask = (shift_labels != -100)
         correct_predictions = (predictions == shift_labels) & valid_mask
 
-        correct = correct_predictions.sum().item()
-        valid_tokens = valid_mask.sum().item()
+        # TPU: minimize .item() calls (each triggers host sync)
+        # Only sync on log steps to avoid TPU pipeline stalls
+        if is_tpu:
+            correct = correct_predictions.sum()
+            valid_tokens = valid_mask.sum()
+            batch_size, seq_len = input_ids.shape
+            num_tokens = batch_size * seq_len
 
-        total_correct += correct
-        total_valid_tokens += valid_tokens
+            # Accumulate as tensors (no .item() sync)
+            total_correct += correct.item() if is_log_step else 0
+            total_valid_tokens += valid_tokens.item() if is_log_step else 0
+            total_loss += ce_loss.item() * num_tokens if is_log_step else 0
+            total_tokens += num_tokens
 
-        # Track total loss (ce_loss only, for fair comparison with validation)
-        batch_size, seq_len = input_ids.shape
-        num_tokens = batch_size * seq_len
-        total_loss += ce_loss.item() * num_tokens
-        total_tokens += num_tokens
+            num_batches += 1
 
-        num_batches += 1
-        step_acc = correct / valid_tokens if valid_tokens > 0 else 0.0
-        pbar.set_postfix({
-            "loss": f"{loss.item():.4f}",
-            "acc": f"{step_acc:.4f}"
-        })
+            if is_log_step:
+                step_acc = correct.item() / (valid_tokens.item() + 1e-8)
+                pbar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "acc": f"{step_acc:.4f}"
+                })
+                window_loss += loss.item()
+                window_acc_correct += correct.item()
+                window_acc_valid += valid_tokens.item()
+                window_count += 1
+            else:
+                pbar.update(1)
+        else:
+            correct = correct_predictions.sum().item()
+            valid_tokens = valid_mask.sum().item()
 
-        # Accumulate for window logging
-        window_loss += loss.item()
-        window_acc_correct += correct
-        window_acc_valid += valid_tokens
-        window_count += 1
+            total_correct += correct
+            total_valid_tokens += valid_tokens
+
+            # Track total loss (ce_loss only, for fair comparison with validation)
+            batch_size, seq_len = input_ids.shape
+            num_tokens = batch_size * seq_len
+            total_loss += ce_loss.item() * num_tokens
+            total_tokens += num_tokens
+
+            num_batches += 1
+            step_acc = correct / valid_tokens if valid_tokens > 0 else 0.0
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "acc": f"{step_acc:.4f}"
+            })
+
+            # Accumulate for window logging
+            window_loss += loss.item()
+            window_acc_correct += correct
+            window_acc_valid += valid_tokens
+            window_count += 1
 
         # Real-time entropy monitoring (every log_interval steps)
         if (step + 1) % log_interval == 0 and routing_infos is not None:
@@ -1693,7 +1805,8 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
                 filename=f'checkpoint_epoch{epoch}_step{step+1}.pt',
                 epoch_completed=False  # Mid-epoch checkpoint
             )
-            torch.cuda.empty_cache()
+            if not is_tpu:
+                torch.cuda.empty_cache()
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "acc": f"{step_acc:.4f}",
@@ -1702,14 +1815,15 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
 
         # Mid-epoch validation every val_interval steps
         if val_loader is not None and (step + 1) % val_interval == 0:
-            val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
+            val_dl = pl.MpDeviceLoader(val_loader, device) if is_tpu else val_loader
+            val_loss, val_acc = evaluate(model, val_dl, device, args, tokenizer, is_tpu=is_tpu)
             print(f"\n[Step {step+1}] Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
             if log_file:
                 with open(log_file, 'a') as f:
                     f.write(f"epoch={epoch},step={step+1},val_loss={val_loss:.6f},val_acc={val_acc:.6f}\n")
             model.train()  # Back to training mode
             # Clear CUDA cache after validation
-            if device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device):
+            if not is_tpu and (device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device)):
                 torch.cuda.empty_cache()
 
     # Log remaining steps at end of epoch
@@ -1727,11 +1841,12 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, args, sc
     return avg_loss, avg_acc, last_neuron_metrics, global_step
 
 
-def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
+def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200, is_tpu=False):
     """Evaluate model with MLM masking
 
     Args:
         max_batches: Maximum number of batches to evaluate (default 200 for faster eval)
+        is_tpu: Whether running on TPU/XLA device
     """
     model.eval()
     total_loss = 0
@@ -1740,7 +1855,7 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
     total_valid_tokens = 0
 
     # Clear CUDA cache before evaluation (helps with torch.compile memory)
-    if device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device):
+    if not is_tpu and (device.type == 'cuda' if hasattr(device, 'type') else 'cuda' in str(device)):
         torch.cuda.empty_cache()
 
     # Use original model if torch.compiled (avoids CUDA graph memory issues)
@@ -1750,8 +1865,12 @@ def evaluate(model, dataloader, device, args, tokenizer=None, max_batches=200):
         for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating", leave=False, position=0, dynamic_ncols=True, total=min(max_batches, len(dataloader)))):
             if batch_idx >= max_batches:
                 break
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            if is_tpu:
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+            else:
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
 
             # CLM evaluation
             logits = eval_model(input_ids, attention_mask=attention_mask)
@@ -2012,8 +2131,17 @@ def main():
     args.log_dir = cfg.get('log_dir', 'logs')
 
     # Device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    is_tpu = False
+    if HAS_XLA:
+        device = xm.xla_device()
+        is_tpu = True
+        print(f"Using device: TPU ({device})")
+    elif torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"Using device: {device}")
+    else:
+        device = torch.device('cpu')
+        print(f"Using device: {device}")
 
     # Create directories
     base_checkpoint_dir = Path(args.checkpoint_dir)
@@ -2259,7 +2387,13 @@ def main():
     # Create model
     model = create_model_by_version(model_version, model_kwargs)
 
-    model = model.to(device)
+    if is_tpu:
+        model = model.to(dtype=torch.bfloat16, device=device)
+        # Re-tie lm_head weights after dtype conversion (.to() breaks weight tying)
+        if hasattr(model, 'lm_head') and hasattr(model, 'token_emb'):
+            model.lm_head.weight = model.token_emb.weight
+    else:
+        model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
 
     # Print detailed model info
@@ -2317,9 +2451,14 @@ def main():
     )
 
     # Mixed precision scaler
-    scaler = torch.amp.GradScaler('cuda') if args.use_amp else None
-    if args.use_amp:
+    if is_tpu:
+        scaler = None  # TPU uses bf16 natively, no GradScaler needed
+        print(f"\nUsing bfloat16 (TPU native)")
+    elif args.use_amp:
+        scaler = torch.amp.GradScaler('cuda')
         print(f"\nUsing Automatic Mixed Precision (AMP)")
+    else:
+        scaler = None
 
     # Resume from checkpoint (weights loading)
     start_epoch = 1
@@ -2401,7 +2540,7 @@ def main():
 
     for epoch in range(start_epoch, args.num_epochs + 1):
         # Clear CUDA cache at start of each epoch (helps with torch.compile memory)
-        if torch.cuda.is_available():
+        if not is_tpu and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
@@ -2431,6 +2570,10 @@ def main():
         else:
             epoch_loader = train_loader
 
+        # Wrap DataLoader for TPU (host→device transfer pipeline)
+        if is_tpu:
+            epoch_loader = pl.MpDeviceLoader(epoch_loader, device)
+
         # Train
         train_loss, train_acc, neuron_metrics, global_step = train_epoch(
             model, epoch_loader, optimizer, scheduler, device, epoch, args,
@@ -2448,12 +2591,18 @@ def main():
             global_step=global_step,
             total_steps=total_steps,
             val_loader=val_loader,
-            val_interval=5000  # Validation every 5000 steps
+            val_interval=5000,  # Validation every 5000 steps
+            is_tpu=is_tpu,
         )
 
         # Evaluate
-        val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
-        torch.cuda.empty_cache()
+        if is_tpu:
+            val_loader_wrapped = pl.MpDeviceLoader(val_loader, device)
+            val_loss, val_acc = evaluate(model, val_loader_wrapped, device, args, tokenizer, is_tpu=is_tpu)
+        else:
+            val_loss, val_acc = evaluate(model, val_loader, device, args, tokenizer)
+        if not is_tpu:
+            torch.cuda.empty_cache()
 
         epoch_time = time.time() - epoch_start
 
@@ -2513,7 +2662,8 @@ def main():
             model, optimizer, epoch, val_loss, metrics, is_best=is_best,
             scheduler=scheduler, scaler=scaler, model_config=model_kwargs
         )
-        torch.cuda.empty_cache()
+        if not is_tpu:
+            torch.cuda.empty_cache()
 
     print(f"\n{'='*60}")
     print(f"Training completed!")
