@@ -677,6 +677,50 @@ def main():
     eval_step_fn = create_eval_step(model)
 
     # ----------------------------------------------------------
+    # Pre-compile train_step and check HBM requirements
+    # ----------------------------------------------------------
+    print("\n=== Lowering train_step (no execution) ===", flush=True)
+    try:
+        dummy_ids = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_mask = jnp.ones((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_drng = jax.random.PRNGKey(0)
+
+        lowered = train_step_fn.lower(
+            params, ema_state, opt_state,
+            dummy_ids, dummy_mask, dummy_drng,
+        )
+        print("=== Lowering done, compiling XLA ===", flush=True)
+
+        compiled = lowered.compile()
+        print("=== Compile done ===", flush=True)
+
+        # Memory analysis (may not be available on all backends)
+        try:
+            mem = compiled.memory_analysis()
+            if mem is not None:
+                temp_gb = getattr(mem, 'temp_size_in_bytes', 0) / 1e9
+                arg_gb = getattr(mem, 'argument_size_in_bytes', 0) / 1e9
+                out_gb = getattr(mem, 'output_size_in_bytes', 0) / 1e9
+                alias_gb = getattr(mem, 'alias_size_in_bytes', 0) / 1e9
+                print(f"  HBM temp (activations): {temp_gb:.2f} GB", flush=True)
+                print(f"  HBM args (params+opt): {arg_gb:.2f} GB", flush=True)
+                print(f"  HBM output: {out_gb:.2f} GB", flush=True)
+                print(f"  HBM alias: {alias_gb:.2f} GB", flush=True)
+                print(f"  HBM total: {temp_gb + arg_gb + out_gb:.2f} GB", flush=True)
+            else:
+                print("  memory_analysis() returned None", flush=True)
+        except Exception as me:
+            print(f"  memory_analysis not available: {me}", flush=True)
+
+        del dummy_ids, dummy_mask, dummy_drng
+        print("=== train_step compile check passed ===\n", flush=True)
+
+    except Exception as e:
+        print(f"  *** train_step compile FAILED: {e}", flush=True)
+        print(f"  Backward graph likely exceeds HBM. Try reducing batch_size.", flush=True)
+        raise
+
+    # ----------------------------------------------------------
     # Training log file
     # ----------------------------------------------------------
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
