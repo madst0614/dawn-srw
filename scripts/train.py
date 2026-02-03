@@ -2388,6 +2388,9 @@ def main():
 
     if is_tpu:
         model = model.to(dtype=torch.bfloat16, device=device)
+        # Re-tie lm_head weights after dtype conversion (.to() breaks weight tying)
+        if hasattr(model, 'lm_head') and hasattr(model, 'token_emb'):
+            model.lm_head.weight = model.token_emb.weight
     else:
         model = model.to(device)
     print(f"✅ Model created: v{getattr(model, '__version__', model_version)}")
