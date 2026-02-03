@@ -54,7 +54,8 @@ model:
   router_dropout: 0.1
 
 training:
-  batch_size: 128
+  batch_size: 64
+  gradient_accumulation_steps: 2   # effective batch size = 64 * 2 = 128
   num_epochs: 1
   lr: 0.00065
   weight_decay: 0.1
