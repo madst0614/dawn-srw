@@ -104,6 +104,206 @@ def topk_sparsify(weights, k):
 
 
 # ================================================================
+# Pure functions for jax.lax.scan forward path
+# ================================================================
+
+def _layer_norm(x, scale, bias, eps=1e-6):
+    """Pure functional LayerNorm (matches Flax nn.LayerNorm)."""
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+    return (x - mean) / jnp.sqrt(var + eps) * scale + bias
+
+
+def _router_attn_forward(x, router_params, n_feature_qk, n_feature_v,
+                          n_restore_qk, n_restore_v, d_space,
+                          top_k_feature_qk, top_k_feature_v,
+                          top_k_restore_qk, top_k_restore_v,
+                          router_dropout, attention_mask, deterministic, rng):
+    """Pure function: attention routing weights + load-balance aux loss.
+    Replaces GlobalRouters.get_attention_weights."""
+    nr = router_params['neuron_router']
+    neuron_emb = nr['neuron_emb']
+    emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
+
+    fqk_end = n_feature_qk
+    fv_end = fqk_end + n_feature_v
+    rqk_end = fv_end + n_restore_qk
+    rv_end = rqk_end + n_restore_v
+
+    rng, rng1 = jax.random.split(rng)
+    all_proj = x @ nr['proj_all']['kernel'] + nr['proj_all']['bias']
+    all_proj = safe_dropout(all_proj, router_dropout, deterministic, rng1)
+    h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = jnp.split(all_proj, 6, axis=-1)
+
+    fqk_emb = emb_norm[:fqk_end]
+    fv_emb = emb_norm[fqk_end:fv_end]
+    rqk_emb = emb_norm[fv_end:rqk_end]
+    rv_emb = emb_norm[rqk_end:rv_end]
+
+    logits_fqk_Q = jnp.einsum('bsd,nd->bsn', h_fqk_Q, fqk_emb)
+    logits_fqk_K = jnp.einsum('bsd,nd->bsn', h_fqk_K, fqk_emb)
+    logits_fv = jnp.einsum('bsd,nd->bsn', h_fv, fv_emb)
+    logits_rqk_Q = jnp.einsum('bsd,nd->bsn', h_rqk_Q, rqk_emb)
+    logits_rqk_K = jnp.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
+    logits_rv = jnp.einsum('bsd,nd->bsn', h_rv, rv_emb)
+
+    fqk_pref_Q = jax.nn.softmax(logits_fqk_Q, axis=-1)
+    fqk_pref_K = jax.nn.softmax(logits_fqk_K, axis=-1)
+    fv_pref = jax.nn.softmax(logits_fv, axis=-1)
+    rqk_pref_Q = jax.nn.softmax(logits_rqk_Q, axis=-1)
+    rqk_pref_K = jax.nn.softmax(logits_rqk_K, axis=-1)
+    rv_pref = jax.nn.softmax(logits_rv, axis=-1)
+
+    # Load-balance aux loss
+    if attention_mask is not None:
+        mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
+        count = mask.sum() + 1e-8
+        usage_fqk_Q = (fqk_pref_Q * mask).sum(axis=(0, 1)) / count
+        usage_fqk_K = (fqk_pref_K * mask).sum(axis=(0, 1)) / count
+        usage_fv = (fv_pref * mask).sum(axis=(0, 1)) / count
+        usage_rqk_Q = (rqk_pref_Q * mask).sum(axis=(0, 1)) / count
+        usage_rqk_K = (rqk_pref_K * mask).sum(axis=(0, 1)) / count
+        usage_rv = (rv_pref * mask).sum(axis=(0, 1)) / count
+    else:
+        usage_fqk_Q = fqk_pref_Q.mean(axis=(0, 1))
+        usage_fqk_K = fqk_pref_K.mean(axis=(0, 1))
+        usage_fv = fv_pref.mean(axis=(0, 1))
+        usage_rqk_Q = rqk_pref_Q.mean(axis=(0, 1))
+        usage_rqk_K = rqk_pref_K.mean(axis=(0, 1))
+        usage_rv = rv_pref.mean(axis=(0, 1))
+
+    target_fqk = 1.0 / n_feature_qk
+    target_fv = 1.0 / n_feature_v
+    target_rqk = 1.0 / n_restore_qk
+    target_rv = 1.0 / n_restore_v
+
+    aux_loss = jnp.float32(0.0)
+    aux_loss = aux_loss + ((usage_fqk_Q - target_fqk) ** 2).sum() * n_feature_qk
+    aux_loss = aux_loss + ((usage_fqk_K - target_fqk) ** 2).sum() * n_feature_qk
+    aux_loss = aux_loss + ((usage_fv - target_fv) ** 2).sum() * n_feature_v
+    aux_loss = aux_loss + ((usage_rqk_Q - target_rqk) ** 2).sum() * n_restore_qk
+    aux_loss = aux_loss + ((usage_rqk_K - target_rqk) ** 2).sum() * n_restore_qk
+    aux_loss = aux_loss + ((usage_rv - target_rv) ** 2).sum() * n_restore_v
+
+    fqk_weights_Q, _ = topk_sparsify(fqk_pref_Q, top_k_feature_qk)
+    fqk_weights_K, _ = topk_sparsify(fqk_pref_K, top_k_feature_qk)
+    fv_weights, _ = topk_sparsify(fv_pref, top_k_feature_v)
+    rqk_weights_Q, _ = topk_sparsify(rqk_pref_Q, top_k_restore_qk)
+    rqk_weights_K, _ = topk_sparsify(rqk_pref_K, top_k_restore_qk)
+    rv_weights, _ = topk_sparsify(rv_pref, top_k_restore_v)
+
+    return (fqk_weights_Q, fqk_weights_K, fv_weights,
+            rqk_weights_Q, rqk_weights_K, rv_weights,
+            aux_loss)
+
+
+def _router_know_forward(x, router_params, n_feature_qk, n_feature_v,
+                          n_restore_qk, n_restore_v, n_feature_know, n_restore_know,
+                          top_k_feature_know, top_k_restore_know,
+                          router_dropout, attention_mask, deterministic, rng):
+    """Pure function: knowledge routing weights + load-balance aux loss.
+    Replaces GlobalRouters.get_knowledge_weights."""
+    nr = router_params['neuron_router']
+    neuron_emb = nr['neuron_emb']
+    emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
+
+    rv_end = n_feature_qk + n_feature_v + n_restore_qk + n_restore_v
+    fk_end = rv_end + n_feature_know
+
+    rng, rng1, rng2 = jax.random.split(rng, 3)
+
+    h_fk = x @ nr['proj_feature_know']['kernel'] + nr['proj_feature_know']['bias']
+    h_fk = safe_dropout(h_fk, router_dropout, deterministic, rng1)
+    emb_fk = emb_norm[rv_end:fk_end]
+    logits_fk = jnp.einsum('bsd,nd->bsn', h_fk, emb_fk)
+
+    h_rk = x @ nr['proj_restore_know']['kernel'] + nr['proj_restore_know']['bias']
+    h_rk = safe_dropout(h_rk, router_dropout, deterministic, rng2)
+    emb_rk = emb_norm[fk_end:]
+    logits_rk = jnp.einsum('bsd,nd->bsn', h_rk, emb_rk)
+
+    pref_f = jax.nn.softmax(logits_fk, axis=-1)
+    pref_r = jax.nn.softmax(logits_rk, axis=-1)
+
+    # Load-balance aux loss
+    if attention_mask is not None:
+        mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
+        count = mask.sum() + 1e-8
+        usage_f = (pref_f * mask).sum(axis=(0, 1)) / count
+        usage_r = (pref_r * mask).sum(axis=(0, 1)) / count
+    else:
+        usage_f = pref_f.mean(axis=(0, 1))
+        usage_r = pref_r.mean(axis=(0, 1))
+
+    target_f = 1.0 / n_feature_know
+    target_r = 1.0 / n_restore_know
+    aux_loss = jnp.float32(0.0)
+    aux_loss = aux_loss + ((usage_f - target_f) ** 2).sum() * n_feature_know
+    aux_loss = aux_loss + ((usage_r - target_r) ** 2).sum() * n_restore_know
+
+    feature_know_w, _ = topk_sparsify(pref_f, top_k_feature_know)
+    restore_know_w, _ = topk_sparsify(pref_r, top_k_restore_know)
+
+    return feature_know_w, restore_know_w, aux_loss
+
+
+def _attention_forward(x, sn_params, fqk_w_Q, fqk_w_K, fv_w,
+                        rqk_w_Q, rqk_w_K, rv_w, expand_O_kernel,
+                        n_feature_qk, n_restore_qk, n_heads, d_model,
+                        dropout_rate, deterministic, rng):
+    """Pure function: AttentionCircuit forward."""
+    B, S, D = x.shape
+    d_head = d_model // n_heads
+
+    f_neurons = sn_params['f_neurons']
+    r_neurons = sn_params['r_neurons']
+    f_qk = f_neurons[:n_feature_qk]
+    f_v = f_neurons[n_feature_qk:]
+    r_qk = r_neurons[:n_restore_qk]
+    r_v = r_neurons[n_restore_qk:]
+
+    h_q = feature_fn(x, f_qk, fqk_w_Q)
+    h_k = feature_fn(x, f_qk, fqk_w_K)
+    h_v = feature_fn(x, f_v, fv_w)
+
+    Q = restore_fn(h_q, r_qk, rqk_w_Q)
+    K = restore_fn(h_k, r_qk, rqk_w_K)
+    V = restore_fn(h_v, r_v, rv_w)
+
+    Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+
+    scale = jnp.sqrt(jnp.float32(d_head))
+    scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+    causal_mask = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+    scores = jnp.where(causal_mask, scores, jnp.finfo(scores.dtype).min)
+    attn_weights = jax.nn.softmax(scores, axis=-1)
+
+    rng, rng1, rng2 = jax.random.split(rng, 3)
+    attn_weights = safe_dropout(attn_weights, dropout_rate, deterministic, rng1)
+
+    attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, V)
+    attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, D)
+
+    output = attn_out @ expand_O_kernel
+    output = safe_dropout(output, dropout_rate, deterministic, rng2)
+    return output
+
+
+def _knowledge_forward(x, sn_params, feature_know_w, restore_know_w,
+                        dropout_rate, deterministic, rng):
+    """Pure function: KnowledgeCircuit forward."""
+    f_know = sn_params['feature_know']
+    r_know = sn_params['restore_know']
+
+    h = feature_fn(x, f_know, feature_know_w)
+    output = restore_fn(h, r_know, restore_know_w)
+    output = safe_dropout(output, dropout_rate, deterministic, rng)
+    return output
+
+
+# ================================================================
 # UnifiedNeuronRouter
 # ================================================================
 
@@ -586,13 +786,9 @@ class DAWN(nn.Module):
             top_k_restore_know=self.top_k_restore_know,
             d_space=self.d_space, router_dropout=self.router_dropout)
 
-        block_cls = DAWNBlock
-        if self.gradient_checkpointing:
-            # attention_mask (arg 3) must be static for `if attention_mask is not None:` branches
-            block_cls = nn.remat(block_cls, static_argnums=(3,))
-
+        # Blocks for init only (forward uses jax.lax.scan with pure functions)
         self.layers = [
-            block_cls(
+            DAWNBlock(
                 d_model=self.d_model, n_heads=self.n_heads,
                 rank=self.rank,
                 n_feature_know=self.n_feature_know,
@@ -620,12 +816,89 @@ class DAWN(nn.Module):
         emb_rng = self.make_rng('dropout')
         x = safe_dropout(x, self.dropout_rate, deterministic, emb_rng)
 
-        total_aux_loss = jnp.float32(0.0)
-        for layer in self.layers:
-            x, aux_loss = layer(
-                x, self.shared_neurons, self.router,
-                attention_mask, deterministic)
-            total_aux_loss = total_aux_loss + aux_loss
+        if self.is_initializing():
+            # Init path: for-loop to trigger lazy parameter creation
+            total_aux_loss = jnp.float32(0.0)
+            for layer in self.layers:
+                x, aux_loss = layer(
+                    x, self.shared_neurons, self.router,
+                    attention_mask, deterministic)
+                total_aux_loss = total_aux_loss + aux_loss
+        else:
+            # Forward path: jax.lax.scan with pure functions
+            # shared_neurons + router params captured via closure (not stacked → true sharing)
+            all_params = self.variables['params']
+            sn_params = all_params['shared_neurons']
+            router_params = all_params['router']
+
+            # Stack per-block params along leading axis [n_layers, ...]
+            block_params_list = [all_params[f'block_{i}']
+                                 for i in range(self.n_layers)]
+            stacked_block_params = jax.tree.map(
+                lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+            # Pre-split dropout RNGs: one per layer
+            base_rng = self.make_rng('dropout')
+            layer_rngs = jax.random.split(base_rng, self.n_layers)
+
+            def scan_body(carry, xs):
+                x = carry
+                bp = xs['params']
+                rng = xs['rng']
+                rng, rng_attn_router, rng_know_router, rng_attn, rng_know = \
+                    jax.random.split(rng, 5)
+
+                # --- Attention sub-block ---
+                normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+
+                (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                 attn_aux) = _router_attn_forward(
+                    normed, router_params,
+                    self.n_feature_qk, self.n_feature_v,
+                    self.n_restore_qk, self.n_restore_v,
+                    self.d_space,
+                    self.top_k_feature_qk, self.top_k_feature_v,
+                    self.top_k_restore_qk, self.top_k_restore_v,
+                    self.router_dropout, attention_mask, deterministic,
+                    rng_attn_router)
+
+                attn_out = _attention_forward(
+                    normed, sn_params,
+                    fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                    bp['attn']['expand_O']['kernel'],
+                    self.n_feature_qk, self.n_restore_qk,
+                    self.n_heads, self.d_model,
+                    self.dropout_rate, deterministic, rng_attn)
+
+                x = x + attn_out
+
+                # --- Knowledge sub-block ---
+                normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+                feat_know_w, rest_know_w, know_aux = _router_know_forward(
+                    normed, router_params,
+                    self.n_feature_qk, self.n_feature_v,
+                    self.n_restore_qk, self.n_restore_v,
+                    self.n_feature_know, self.n_restore_know,
+                    self.top_k_feature_know, self.top_k_restore_know,
+                    self.router_dropout, attention_mask, deterministic,
+                    rng_know_router)
+
+                know_out = _knowledge_forward(
+                    normed, sn_params,
+                    feat_know_w, rest_know_w,
+                    self.dropout_rate, deterministic, rng_know)
+
+                x = x + know_out
+                aux_loss = attn_aux + know_aux
+                return x, aux_loss
+
+            if self.gradient_checkpointing:
+                scan_body = jax.checkpoint(scan_body)
+
+            xs = {'params': stacked_block_params, 'rng': layer_rngs}
+            x, aux_losses = jax.lax.scan(scan_body, x, xs)
+            total_aux_loss = aux_losses.sum()
 
         x = self.norm(x)
 
@@ -780,5 +1053,5 @@ class DAWN(nn.Module):
             f"",
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
-            f"  nn.remat per block (gradient checkpointing)",
+            f"  jax.lax.scan layer loop (O(1) XLA compile, true param sharing)",
         ]

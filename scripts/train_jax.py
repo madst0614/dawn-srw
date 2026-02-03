@@ -241,20 +241,27 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
 
 def create_eval_step(model):
-    """Create a jit-compiled evaluation step function."""
+    """Create a jit-compiled evaluation step function.
+
+    Note: dropout RNG is required because the lax.scan forward path always
+    calls make_rng('dropout') (safe_dropout neutralizes it via deterministic flag).
+    """
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
+        # deterministic=True → dropout masks are all-ones, but RNG key is still
+        # needed for tracing (safe_dropout always generates a mask).
+        eval_rng = jax.random.PRNGKey(0)  # fixed key — never used for real randomness
         result = model.apply(
             {'params': params},
             input_ids,
             labels=labels,
             attention_mask=attention_mask,
             deterministic=True,
+            rngs={'dropout': eval_rng},
         )
         ce_loss = result['loss']
-        # Accuracy computed inside model via _compute_lm_loss (no full logits)
         correct = result['correct']
         valid_count = result['valid_count']
 
