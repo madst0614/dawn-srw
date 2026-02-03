@@ -640,22 +640,33 @@ class DAWN(nn.Module):
         block_cls = DAWNBlock
         if self.gradient_checkpointing:
             # attention_mask (arg 3) must be static for `if attention_mask is not None:` branches
-            # deterministic (arg 4) no longer needs static — safe_dropout uses jnp.where
-            block_cls = nn.remat(DAWNBlock, static_argnums=(3,))
+            block_cls = nn.remat(block_cls, static_argnums=(3,))
 
-        self.layers = [
-            block_cls(
-                d_model=self.d_model, n_heads=self.n_heads,
-                rank=self.rank,
-                n_feature_know=self.n_feature_know,
-                n_restore_know=self.n_restore_know,
-                knowledge_rank=self.knowledge_rank,
-                top_k_feature_know=self.top_k_feature_know,
-                top_k_restore_know=self.top_k_restore_know,
-                dropout_rate=self.dropout_rate,
-                name=f'block_{i}')
-            for i in range(self.n_layers)
-        ]
+        # nn.scan: XLA compiles 1-layer graph, repeats n_layers times.
+        # Reduces XLA graph from O(n_layers) unrolled ops to O(1).
+        # - variable_axes={'params': 0}: per-layer params stacked on leading axis
+        # - in_axes=nn.broadcast: shared_neurons, router, attention_mask, deterministic
+        #   are broadcast (same value every iteration, passed via closure)
+        # - out_axes=0: aux_loss collected into [n_layers] array
+        ScanBlock = nn.scan(
+            block_cls,
+            variable_axes={'params': 0},
+            split_rngs={'dropout': True},
+            length=self.n_layers,
+            in_axes=(nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
+            out_axes=0,
+        )
+        self.layers = ScanBlock(
+            d_model=self.d_model, n_heads=self.n_heads,
+            rank=self.rank,
+            n_feature_know=self.n_feature_know,
+            n_restore_know=self.n_restore_know,
+            knowledge_rank=self.knowledge_rank,
+            top_k_feature_know=self.top_k_feature_know,
+            top_k_restore_know=self.top_k_restore_know,
+            dropout_rate=self.dropout_rate,
+            name='scan_layers',
+        )
 
         self.norm = nn.LayerNorm()
         # lm_head uses weight tying via token_emb.attend()
@@ -672,13 +683,13 @@ class DAWN(nn.Module):
         emb_rng = self.make_rng('dropout')
         x = safe_dropout(x, self.dropout_rate, deterministic, emb_rng)
 
-        total_aux_loss = jnp.float32(0.0)
-
-        for layer in self.layers:
-            x, aux_loss = layer(
-                x, self.shared_neurons, self.router,
-                attention_mask, deterministic)
-            total_aux_loss = total_aux_loss + aux_loss
+        # nn.scan: compiles 1-layer XLA graph, repeats n_layers times
+        # carry=x, broadcast=(shared_neurons, router, attention_mask, deterministic)
+        # aux_losses shape: [n_layers]
+        x, aux_losses = self.layers(
+            x, self.shared_neurons, self.router,
+            attention_mask, deterministic)
+        total_aux_loss = aux_losses.sum()
 
         x = self.norm(x)
 
@@ -833,4 +844,5 @@ class DAWN(nn.Module):
             f"",
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
+            f"  nn.scan={self.n_layers} layers (1-layer XLA graph)",
         ]
