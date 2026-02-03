@@ -40,6 +40,9 @@ warnings.filterwarnings('ignore', message='.*online softmax.*')
 # CUDA memory optimization
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
+# XLA/TPU memory optimization: auto-spill intermediate tensors when HBM full
+os.environ.setdefault('XLA_FLAGS', '--xla_auto_spilling=true')
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
