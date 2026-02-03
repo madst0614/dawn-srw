@@ -100,12 +100,21 @@ class CheckpointManager:
         if scaler is not None:
             checkpoint['scaler_state_dict'] = scaler.state_dict()
 
-        torch.save(checkpoint, checkpoint_path)
+        # Use xm.save() on TPU, torch.save() otherwise
+        try:
+            import torch_xla.core.xla_model as xm
+            xm.save(checkpoint, checkpoint_path)
+        except ImportError:
+            torch.save(checkpoint, checkpoint_path)
 
         # Also save as best_model.pt if this is the best
         if is_best:
             best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
-            torch.save(checkpoint, best_path)
+            try:
+                import torch_xla.core.xla_model as xm
+                xm.save(checkpoint, best_path)
+            except ImportError:
+                torch.save(checkpoint, best_path)
             print(f"💾 Saved best model: best_model.pt")
 
         # Track checkpoints
