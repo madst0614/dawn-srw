@@ -125,15 +125,20 @@ def compute_orthogonality_loss(params, rank, knowledge_rank, n_feature_qk, n_res
       f_neurons = [feature_qk ; feature_v]  -> split at n_feature_qk
       r_neurons = [restore_qk ; restore_v]  -> split at n_restore_qk
       feature_know, restore_know             -> separate params
+
+    Note: nn.scan stacks shared_neurons params with a leading [n_layers]
+    axis even though they're broadcast (identical across layers).
+    We take [0] to recover the original 3D shape.
     """
     sn = params['shared_neurons']
     I_rank = jnp.eye(rank)[jnp.newaxis]
     I_know = jnp.eye(knowledge_rank)[jnp.newaxis]
 
-    f_neurons = sn['f_neurons']
-    r_neurons = sn['r_neurons']
-    feature_know = sn['feature_know']
-    restore_know = sn['restore_know']
+    # nn.scan stacks broadcast params: [12, N, D, R] -> take [0] -> [N, D, R]
+    f_neurons = sn['f_neurons'][0]
+    r_neurons = sn['r_neurons'][0]
+    feature_know = sn['feature_know'][0]
+    restore_know = sn['restore_know'][0]
 
     # Split f_neurons into feature_qk [N_fqk, D, R] and feature_v [N_fv, D, R]
     W_fqk = f_neurons[:n_feature_qk]
@@ -164,14 +169,15 @@ def compute_knowledge_diversity_loss(params):
     """Compute knowledge diversity loss from shared neuron params."""
     sn = params['shared_neurons']
 
-    feat_know = sn['feature_know']
+    # nn.scan stacks broadcast params: [12, N, D, R] -> take [0] -> [N, D, R]
+    feat_know = sn['feature_know'][0]
     feat_flat = feat_know.reshape(feat_know.shape[0], -1)
     feat_norm = feat_flat / (jnp.linalg.norm(feat_flat, axis=-1, keepdims=True) + 1e-8)
     feat_sim = jnp.matmul(feat_norm, feat_norm.T)
     mask_f = ~jnp.eye(feat_sim.shape[0], dtype=jnp.bool_)
     feat_loss = jnp.abs(feat_sim * mask_f).sum() / mask_f.sum()
 
-    rest_know = sn['restore_know']
+    rest_know = sn['restore_know'][0]
     rest_flat = rest_know.reshape(rest_know.shape[0], -1)
     rest_norm = rest_flat / (jnp.linalg.norm(rest_flat, axis=-1, keepdims=True) + 1e-8)
     rest_sim = jnp.matmul(rest_norm, rest_norm.T)
