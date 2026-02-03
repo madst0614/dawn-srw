@@ -663,8 +663,8 @@ def main():
 
     train_start_time = time.time()
     total_micro_steps = num_epochs * steps_per_epoch
-    val_interval = 5000
-    ckpt_interval = 5000
+    val_interval = cfg['training'].get('val_interval', 5000)
+    ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     first_step_done = False
 
     for epoch in range(start_epoch, num_epochs):

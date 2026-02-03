@@ -65,6 +65,8 @@ training:
   load_balance_weight: 0.00002
   entropy_weight: 0.0
   process_norm_weight: 0.0
+  checkpoint_interval: 5000
+  val_interval: 5000
 
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_tpu_memopt_40M_c4_5B_seed1_token_routing_v_expand6
