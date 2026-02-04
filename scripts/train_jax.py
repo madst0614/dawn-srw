@@ -757,7 +757,7 @@ def main():
                 msg = (
                     f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
                     f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
-                    f"orth={avg_orth:.4f} div={avg_div:.4f} | "
+                    f"orth={avg_orth:.2e} div={avg_div:.2e} | "
                     f"acc={avg_acc:.4f} lr={current_lr:.2e} "
                     f"step/s={steps_per_sec:.1f} "
                     f"elapsed={format_time(total_elapsed)}"
