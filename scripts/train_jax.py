@@ -1,17 +1,17 @@
 """
-DAWN v17.1-JAX Training Script
+DAWN v17.1-JAX Training Script (TPU Multi-Device)
 
 JAX/Flax native training for DAWN v17.1 model.
+- Multi-device data parallelism via jax.pmap
+- Pure numpy/JAX data pipeline (no PyTorch dependency)
+- GCS checkpoint support for TPU spot instances
 - optax optimizer with warmup + cosine decay
-- jax.jit compiled train/eval steps
-- Neuron usage EMA monitoring
-- orbax checkpointing
-- bf16 mixed precision support
+- jax.jit / jax.pmap compiled train/eval steps
 
 Usage:
-    python scripts/train_jax.py --config configs/train_config_v17_1_tpu_memopt_40M_c4_5B_seed1_token_routing_v_expand6.yaml
-    python scripts/train_jax.py --config configs/train_config.yaml --from-scratch
-    python scripts/train_jax.py --config configs/train_config.yaml --resume checkpoints/run_xxx
+    python scripts/train_jax.py --config configs/train_config_tpu.yaml
+    python scripts/train_jax.py --config configs/train_config_tpu.yaml --from-scratch
+    python scripts/train_jax.py --config configs/train_config_tpu.yaml --resume gs://bucket/checkpoints/step1000.flax
 """
 
 import sys
@@ -55,6 +55,11 @@ def set_seed(seed):
 # ============================================================
 
 def load_config(config_path):
+    """Load config from local or GCS path."""
+    path_str = str(config_path)
+    if path_str.startswith("gs://"):
+        with _open_file(path_str, "r") as f:
+            return yaml.safe_load(f)
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
@@ -62,7 +67,6 @@ def load_config(config_path):
 def build_model_from_config(cfg):
     """Build DAWN model from config dict."""
     mcfg = cfg['model']
-    # Resolve vocab_size from tokenizer later; use default for now
     model = DAWN(
         vocab_size=mcfg.get('vocab_size', 30522),
         d_model=mcfg.get('d_model', 384),
@@ -92,17 +96,84 @@ def build_model_from_config(cfg):
 
 
 # ============================================================
-# Data loading (reuse PyTorch DataLoader, convert to JAX)
+# GCS / file I/O helpers
 # ============================================================
 
-def pytorch_loader_to_jax_batches(dataloader):
-    """Yield JAX arrays from a PyTorch DataLoader."""
-    for batch in dataloader:
-        input_ids = jnp.array(batch['input_ids'].numpy())
-        attention_mask = jnp.array(batch['attention_mask'].numpy())
-        yield input_ids, attention_mask
+def _is_gcs(path):
+    return str(path).startswith("gs://")
 
 
+def _open_file(path, mode="rb"):
+    """Open a file for read/write, supporting GCS paths."""
+    path_str = str(path)
+    if _is_gcs(path_str):
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            return fs.open(path_str, mode)
+        except ImportError:
+            pass
+        try:
+            import tensorflow as tf
+            return tf.io.gfile.GFile(path_str, mode)
+        except ImportError:
+            raise ImportError(
+                "GCS support requires 'gcsfs' or 'tensorflow'. "
+                "Install with: pip install gcsfs"
+            )
+    else:
+        p = Path(path_str)
+        if "w" in mode:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        return open(p, mode)
+
+
+def _file_exists(path):
+    """Check if a file exists (local or GCS)."""
+    path_str = str(path)
+    if _is_gcs(path_str):
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            return fs.exists(path_str)
+        except ImportError:
+            pass
+        try:
+            import tensorflow as tf
+            return tf.io.gfile.exists(path_str)
+        except ImportError:
+            return False
+    return Path(path_str).exists()
+
+
+def _list_files(directory, pattern="*.flax"):
+    """List files in a directory (local or GCS)."""
+    dir_str = str(directory)
+    if _is_gcs(dir_str):
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            if not dir_str.endswith("/"):
+                dir_str += "/"
+            files = fs.glob(dir_str + pattern)
+            return sorted(["gs://" + f for f in files])
+        except ImportError:
+            pass
+        try:
+            import tensorflow as tf
+            if not dir_str.endswith("/"):
+                dir_str += "/"
+            files = tf.io.gfile.glob(dir_str + pattern)
+            return sorted(files)
+        except ImportError:
+            return []
+    return sorted(str(f) for f in Path(dir_str).glob(pattern))
+
+
+def _makedirs(path):
+    """Create directory (local only; GCS doesn't need explicit mkdir)."""
+    if not _is_gcs(path):
+        Path(path).mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
@@ -182,14 +253,19 @@ def compute_knowledge_diversity_loss(params):
 
 
 # ============================================================
-# Train / eval steps
+# Train / eval steps (pmap for multi-device)
 # ============================================================
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
-                      rank, knowledge_rank, n_feature_qk, n_restore_qk):
-    """Create a jit-compiled training step function."""
+                      rank, knowledge_rank, n_feature_qk, n_restore_qk,
+                      n_devices=1):
+    """Create a compiled training step function.
 
-    @jax.jit
+    Uses jax.pmap for multi-device data parallelism.
+    When n_devices=1, pmap degenerates to single-device execution.
+    """
+
+    @partial(jax.pmap, axis_name='dp')
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
         # Labels for CLM: input_ids shifted, padding masked
         labels = jnp.where(attention_mask == 1, input_ids, -100)
@@ -221,18 +297,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         (total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
+        # All-reduce gradients across devices
+        grads = jax.lax.pmean(grads, axis_name='dp')
+
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
-        # Accuracy: computed inside model via _compute_lm_loss (no full logits)
+        # Aggregate metrics across devices
         metrics = {
-            'total_loss': total_loss,
-            'ce_loss': ce_loss,
-            'aux_loss': aux_loss,
-            'orth_loss': orth_loss,
-            'div_loss': div_loss,
-            'correct': result['correct'],
-            'valid_count': result['valid_count'],
+            'total_loss': jax.lax.pmean(total_loss, axis_name='dp'),
+            'ce_loss': jax.lax.pmean(ce_loss, axis_name='dp'),
+            'aux_loss': jax.lax.pmean(aux_loss, axis_name='dp'),
+            'orth_loss': jax.lax.pmean(orth_loss, axis_name='dp'),
+            'div_loss': jax.lax.pmean(div_loss, axis_name='dp'),
+            'correct': jax.lax.psum(result['correct'], axis_name='dp'),
+            'valid_count': jax.lax.psum(result['valid_count'], axis_name='dp'),
         }
 
         return new_params, new_opt_state, metrics
@@ -240,19 +319,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     return train_step
 
 
-def create_eval_step(model):
-    """Create a jit-compiled evaluation step function.
+def create_eval_step(model, n_devices=1):
+    """Create a compiled evaluation step function.
 
     Note: dropout RNG is required because the lax.scan forward path always
     calls make_rng('dropout') (safe_dropout neutralizes it via deterministic flag).
     """
 
-    @jax.jit
+    @partial(jax.pmap, axis_name='dp')
     def eval_step(params, input_ids, attention_mask):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
-        # deterministic=True → dropout masks are all-ones, but RNG key is still
+        # deterministic=True -> dropout masks are all-ones, but RNG key is still
         # needed for tracing (safe_dropout always generates a mask).
-        eval_rng = jax.random.PRNGKey(0)  # fixed key — never used for real randomness
+        eval_rng = jax.random.PRNGKey(0)  # fixed key -- never used for real randomness
         result = model.apply(
             {'params': params},
             input_ids,
@@ -265,28 +344,67 @@ def create_eval_step(model):
         correct = result['correct']
         valid_count = result['valid_count']
 
-        return ce_loss, correct, valid_count
+        return (
+            jax.lax.pmean(ce_loss, axis_name='dp'),
+            jax.lax.psum(correct, axis_name='dp'),
+            jax.lax.psum(valid_count, axis_name='dp'),
+        )
 
     return eval_step
+
+
+# ============================================================
+# Multi-device helpers
+# ============================================================
+
+def replicate(pytree, devices=None):
+    """Replicate a pytree across devices."""
+    if devices is None:
+        devices = jax.devices()
+    return jax.device_put_replicated(pytree, devices)
+
+
+def unreplicate(pytree):
+    """Extract first replica from a replicated pytree."""
+    return jax.tree.map(lambda x: x[0], pytree)
+
+
+def shard_batch(batch, n_devices):
+    """Reshape a batch for pmap: (B, ...) -> (n_devices, B//n_devices, ...).
+
+    If the batch is already sharded (leading dim == n_devices), return as-is.
+    """
+    if isinstance(batch, (tuple, list)):
+        return type(batch)(shard_batch(x, n_devices) for x in batch)
+    if batch.shape[0] == n_devices:
+        return batch  # already sharded by data loader
+    return batch.reshape(n_devices, batch.shape[0] // n_devices, *batch.shape[1:])
 
 
 # ============================================================
 # Evaluation loop
 # ============================================================
 
-def evaluate(eval_step_fn, params, val_loader, max_batches=200):
+def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200):
     """Run evaluation and return avg loss and accuracy."""
     total_loss = 0.0
     total_correct = 0
     total_valid = 0
 
-    for batch_idx, (input_ids, attention_mask) in enumerate(pytorch_loader_to_jax_batches(val_loader)):
+    for batch_idx, (input_ids, attention_mask) in enumerate(val_loader):
         if batch_idx >= max_batches:
             break
+
+        # Ensure sharded for pmap
+        input_ids = shard_batch(input_ids, n_devices)
+        attention_mask = shard_batch(attention_mask, n_devices)
+
         ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
-        n_valid = int(valid_count)
-        total_loss += float(ce_loss) * n_valid
-        total_correct += int(correct)
+
+        # Extract from first device (already aggregated via pmean/psum)
+        n_valid = int(valid_count[0])
+        total_loss += float(ce_loss[0]) * n_valid
+        total_correct += int(correct[0])
         total_valid += n_valid
 
     avg_loss = total_loss / total_valid if total_valid > 0 else 0.0
@@ -295,11 +413,11 @@ def evaluate(eval_step_fn, params, val_loader, max_batches=200):
 
 
 # ============================================================
-# Checkpoint save / load
+# Checkpoint save / load (with GCS support)
 # ============================================================
 
 def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config):
-    """Save checkpoint using flax serialization."""
+    """Save checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
     ckpt = {
         'params': params,
@@ -309,18 +427,17 @@ def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_c
         'best_val_loss': best_val_loss,
         'config': model_config,
     }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     bytes_data = serialization.to_bytes(ckpt)
-    with open(path, 'wb') as f:
+
+    with _open_file(path, 'wb') as f:
         f.write(bytes_data)
     print(f"  Checkpoint saved: {path} ({len(bytes_data) / 1e6:.1f} MB)")
 
 
 def load_checkpoint(path, target_params, target_opt_state):
-    """Load checkpoint using flax serialization."""
+    """Load checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
-    with open(path, 'rb') as f:
+    with _open_file(path, 'rb') as f:
         bytes_data = f.read()
     target = {
         'params': target_params,
@@ -343,8 +460,12 @@ def log_message(msg, log_file=None):
     """Print and optionally write to log file."""
     print(msg)
     if log_file:
-        with open(log_file, 'a') as f:
-            f.write(msg + '\n')
+        try:
+            with _open_file(log_file, 'a') as f:
+                f.write(msg + '\n')
+        except Exception:
+            # Fallback: just print (don't crash on log write failure)
+            pass
 
 
 def format_time(seconds):
@@ -360,17 +481,17 @@ def format_time(seconds):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Train DAWN v17.1 (JAX/Flax)')
+    parser = argparse.ArgumentParser(description='Train DAWN v17.1 (JAX/Flax, Multi-Device)')
     parser.add_argument('--config', type=str, required=True,
                         help='Path to config YAML file')
     parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint file or directory to resume from')
+                        help='Path to checkpoint file or directory to resume from (local or gs://)')
     parser.add_argument('--from-scratch', action='store_true',
                         help='Start training from scratch (ignore existing checkpoints)')
     parser.add_argument('--epochs', type=int, default=None,
                         help='Override num_epochs from config')
     parser.add_argument('--batch-size', type=int, default=None,
-                        help='Override batch_size from config')
+                        help='Override batch_size from config (global)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning rate from config')
     cli_args = parser.parse_args()
@@ -380,7 +501,11 @@ def main():
     # ----------------------------------------------------------
     config_path = Path(PROJECT_ROOT) / cli_args.config
     if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        # Try as absolute path (or GCS)
+        if _file_exists(cli_args.config):
+            config_path = cli_args.config
+        else:
+            raise FileNotFoundError(f"Config file not found: {config_path}")
     cfg = load_config(config_path)
 
     seed = cfg.get('seed', 42)
@@ -388,7 +513,7 @@ def main():
 
     # Training params
     tcfg = cfg['training']
-    batch_size = cli_args.batch_size or tcfg['batch_size']
+    batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
     weight_decay = tcfg.get('weight_decay', 0.1)
@@ -399,26 +524,33 @@ def main():
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
-    checkpoint_dir = Path(cfg.get('checkpoint_dir', 'checkpoints_jax'))
-    log_dir = Path(cfg.get('log_dir', 'logs_jax'))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = cfg.get('checkpoint_dir', 'checkpoints_jax')
+    log_dir = cfg.get('log_dir', 'logs_jax')
+    _makedirs(log_dir)
+    _makedirs(checkpoint_dir)
 
     # ----------------------------------------------------------
-    # Print JAX device info
+    # Detect devices
     # ----------------------------------------------------------
+    n_devices = jax.device_count()
     devices = jax.devices()
+
+    assert batch_size % n_devices == 0, (
+        f"Global batch_size ({batch_size}) must be divisible by n_devices ({n_devices})"
+    )
+    per_device_batch = batch_size // n_devices
+
     print(f"\n{'='*60}")
-    print(f"DAWN v17.1-JAX Training")
+    print(f"DAWN v17.1-JAX Training (Multi-Device)")
     print(f"{'='*60}")
     print(f"JAX version: {jax.__version__}")
     print(f"Devices: {devices}")
+    print(f"Device count: {n_devices}")
     print(f"Backend: {jax.default_backend()}")
     print(f"Config: {config_path}")
     print(f"Seed: {seed}")
-
-    # jax_log_compiles is too noisy (hundreds of warnings during init).
-    # Use stage-based print markers instead to pinpoint where it dies.
+    print(f"Global batch size: {batch_size}")
+    print(f"Per-device batch size: {per_device_batch}")
 
     # ----------------------------------------------------------
     # Load data
@@ -427,13 +559,13 @@ def main():
     print("Loading data...")
     print(f"{'='*60}")
 
-    from utils.data import load_data
-    train_loader, val_loader, tokenizer = load_data(
+    from utils.data_jax import load_data
+    train_loader, val_loader, vocab_size = load_data(
         cfg['data'],
         max_length=max_seq_len,
         batch_size=batch_size,
+        n_devices=n_devices,
     )
-    vocab_size = len(tokenizer)
     print(f"Vocab size: {vocab_size}")
     print(f"Train batches: {len(train_loader)}")
     print(f"Val batches: {len(val_loader)}")
@@ -467,16 +599,16 @@ def main():
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
 
     # ----------------------------------------------------------
-    # OOM check: dummy forward pass with actual batch shape
+    # OOM check: dummy forward pass with per-device batch shape
     # ----------------------------------------------------------
-    print(f"\n=== OOM check: dummy forward with batch_size={batch_size}, seq_len={max_seq_len} ===", flush=True)
+    print(f"\n=== OOM check: dummy forward with per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
     try:
-        dummy_batch = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
-        dummy_labels = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
-        dummy_mask = jnp.ones((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_batch = jnp.zeros((per_device_batch, max_seq_len), dtype=jnp.int32)
+        dummy_labels = jnp.zeros((per_device_batch, max_seq_len), dtype=jnp.int32)
+        dummy_mask = jnp.ones((per_device_batch, max_seq_len), dtype=jnp.int32)
         rng, dummy_dropout_rng = jax.random.split(rng)
 
-        # Training forward (deterministic=False uses dropout → more memory)
+        # Training forward (deterministic=False uses dropout -> more memory)
         dummy_result = model.apply(
             {'params': params},
             dummy_batch,
@@ -486,7 +618,7 @@ def main():
             rngs={'dropout': dummy_dropout_rng},
         )
         jax.block_until_ready(dummy_result['loss'])
-        print(f"  Forward OK — loss={float(dummy_result['loss']):.4f}", flush=True)
+        print(f"  Forward OK -- loss={float(dummy_result['loss']):.4f}", flush=True)
 
         # Eval forward (deterministic=True)
         dummy_eval_result = model.apply(
@@ -498,7 +630,7 @@ def main():
             rngs={'dropout': dummy_dropout_rng},
         )
         jax.block_until_ready(dummy_eval_result['loss'])
-        print(f"  Eval forward OK — loss={float(dummy_eval_result['loss']):.4f}", flush=True)
+        print(f"  Eval forward OK -- loss={float(dummy_eval_result['loss']):.4f}", flush=True)
 
         del dummy_batch, dummy_labels, dummy_mask, dummy_result, dummy_eval_result
         print("=== OOM check passed ===\n", flush=True)
@@ -540,10 +672,12 @@ def main():
 
     print(f"\nTraining config:")
     print(f"  Epochs: {num_epochs}")
-    print(f"  Batch size: {batch_size}")
+    print(f"  Global batch size: {batch_size}")
+    print(f"  Per-device batch size: {per_device_batch}")
+    print(f"  Devices: {n_devices}")
     print(f"  Grad accum steps: {grad_accum_steps}")
     print(f"  Effective batch size: {batch_size * grad_accum_steps}")
-    print(f"  Steps/epoch (micro): {steps_per_epoch}")
+    print(f"  Steps/epoch: {steps_per_epoch}")
     print(f"  Total optimizer steps: {total_steps}")
     print(f"  Warmup steps: {warmup_steps}")
     print(f"  LR: {lr}")
@@ -561,21 +695,21 @@ def main():
 
     resume_path = None
     if cli_args.resume:
-        p = Path(cli_args.resume)
-        if p.is_file():
-            resume_path = p
-        elif p.is_dir():
-            # Find best_model.flax or latest checkpoint
-            candidates = sorted(p.glob('*.flax'))
+        rp = cli_args.resume
+        if _file_exists(rp):
+            resume_path = rp
+        else:
+            # Try as directory
+            candidates = _list_files(rp, "*.flax")
             if candidates:
                 resume_path = candidates[-1]
     elif not cli_args.from_scratch:
         # Auto-search for latest checkpoint
-        candidates = sorted(checkpoint_dir.glob('*.flax'))
+        candidates = _list_files(checkpoint_dir, "*.flax")
         if candidates:
             resume_path = candidates[-1]
 
-    if resume_path and resume_path.exists():
+    if resume_path and _file_exists(resume_path):
         print(f"\nResuming from: {resume_path}")
         ckpt = load_checkpoint(resume_path, params, opt_state)
         params = ckpt['params']
@@ -591,69 +725,57 @@ def main():
             print("\nStarting from scratch (--from-scratch).")
 
     # ----------------------------------------------------------
-    # Create jit-compiled step functions
+    # Replicate params/opt_state across devices
+    # ----------------------------------------------------------
+    params = replicate(params, devices)
+    opt_state = replicate(opt_state, devices)
+
+    # ----------------------------------------------------------
+    # Create pmap-compiled step functions
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
-        rank, knowledge_rank, n_feature_qk, n_restore_qk)
-    eval_step_fn = create_eval_step(model)
+        rank, knowledge_rank, n_feature_qk, n_restore_qk,
+        n_devices=n_devices)
+    eval_step_fn = create_eval_step(model, n_devices=n_devices)
 
     # ----------------------------------------------------------
-    # Pre-compile train_step and check HBM requirements
+    # Pre-compile train_step
     # ----------------------------------------------------------
-    print("\n=== Lowering train_step (no execution) ===", flush=True)
-    try:
-        dummy_ids = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
-        dummy_mask = jnp.ones((batch_size, max_seq_len), dtype=jnp.int32)
-        dummy_drng = jax.random.PRNGKey(0)
-
-        lowered = train_step_fn.lower(
-            params, opt_state,
-            dummy_ids, dummy_mask, dummy_drng,
-        )
-        print("=== Lowering done, compiling XLA ===", flush=True)
-
-        compiled = lowered.compile()
-        print("=== Compile done ===", flush=True)
-
-        # Memory analysis (may not be available on all backends)
-        try:
-            mem = compiled.memory_analysis()
-            if mem is not None:
-                temp_gb = getattr(mem, 'temp_size_in_bytes', 0) / 1e9
-                arg_gb = getattr(mem, 'argument_size_in_bytes', 0) / 1e9
-                out_gb = getattr(mem, 'output_size_in_bytes', 0) / 1e9
-                alias_gb = getattr(mem, 'alias_size_in_bytes', 0) / 1e9
-                print(f"  HBM temp (activations): {temp_gb:.2f} GB", flush=True)
-                print(f"  HBM args (params+opt): {arg_gb:.2f} GB", flush=True)
-                print(f"  HBM output: {out_gb:.2f} GB", flush=True)
-                print(f"  HBM alias: {alias_gb:.2f} GB", flush=True)
-                print(f"  HBM total: {temp_gb + arg_gb + out_gb:.2f} GB", flush=True)
-            else:
-                print("  memory_analysis() returned None", flush=True)
-        except Exception as me:
-            print(f"  memory_analysis not available: {me}", flush=True)
-
-        del dummy_ids, dummy_mask, dummy_drng
-        print("=== train_step compile check passed ===\n", flush=True)
-
-    except Exception as e:
-        print(f"  *** train_step compile FAILED: {e}", flush=True)
-        print(f"  Backward graph likely exceeds HBM. Try reducing batch_size.", flush=True)
-        raise
+    print("\n=== Compiling train_step (pmap, first call will trace) ===", flush=True)
 
     # ----------------------------------------------------------
     # Training log file
     # ----------------------------------------------------------
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    training_log_file = str(log_dir / f'training_log_{timestamp}.txt')
-    log_message(f"DAWN v17.1-JAX Training Log - {timestamp}", training_log_file)
+    if _is_gcs(log_dir):
+        log_dir_str = str(log_dir)
+        if not log_dir_str.endswith("/"):
+            log_dir_str += "/"
+        training_log_file = log_dir_str + f'training_log_{timestamp}.txt'
+    else:
+        training_log_file = str(Path(log_dir) / f'training_log_{timestamp}.txt')
+    log_message(f"DAWN v17.1-JAX Training Log (Multi-Device) - {timestamp}", training_log_file)
     log_message(f"Config: {config_path}", training_log_file)
     log_message(f"Parameters: {n_params:,}", training_log_file)
+    log_message(f"Devices: {n_devices}", training_log_file)
     log_message(f"Total steps: {total_steps}", training_log_file)
     log_message("", training_log_file)
+
+    # ----------------------------------------------------------
+    # Reload data with start_step for resume
+    # ----------------------------------------------------------
+    if global_step > 0:
+        print(f"  Reloading data loader with start_step={global_step} for resume...")
+        train_loader, _, _ = load_data(
+            cfg['data'],
+            max_length=max_seq_len,
+            batch_size=batch_size,
+            n_devices=n_devices,
+            start_step=global_step % steps_per_epoch if steps_per_epoch > 0 else 0,
+        )
 
     # ----------------------------------------------------------
     # Training loop
@@ -686,39 +808,38 @@ def main():
         win_count = 0
         win_start_time = time.time()
 
-        for local_step, (input_ids, attention_mask) in enumerate(
-                pytorch_loader_to_jax_batches(train_loader)):
-
-            # Skip steps if resuming mid-epoch
-            step_in_epoch = epoch * steps_per_epoch + local_step
-            if step_in_epoch < global_step:
-                continue
+        for local_step, (input_ids, attention_mask) in enumerate(train_loader):
 
             if not first_step_done:
-                print(f"=== First train_step: compiling JIT (this may take minutes) ===", flush=True)
+                print(f"=== First train_step: compiling pmap JIT (this may take minutes) ===", flush=True)
 
-            # New dropout key each step
-            rng, dropout_key = jax.random.split(rng)
+            # Ensure sharded for pmap
+            input_ids = shard_batch(input_ids, n_devices)
+            attention_mask = shard_batch(attention_mask, n_devices)
+
+            # Different dropout key per device per step
+            rng, step_rng = jax.random.split(rng)
+            dropout_keys = jax.random.split(step_rng, n_devices)
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, dropout_key,
+                input_ids, attention_mask, dropout_keys,
             )
 
             if not first_step_done:
                 # Force sync to catch OOM here, not later
                 jax.block_until_ready(metrics['total_loss'])
-                print(f"=== First train_step done — loss={float(metrics['total_loss']):.4f} ===", flush=True)
+                print(f"=== First train_step done -- loss={float(metrics['total_loss'][0]):.4f} ===", flush=True)
                 first_step_done = True
 
-            # Accumulate
-            m_total = float(metrics['total_loss'])
-            m_ce = float(metrics['ce_loss'])
-            m_aux = float(metrics['aux_loss'])
-            m_orth = float(metrics['orth_loss'])
-            m_div = float(metrics['div_loss'])
-            m_correct = int(metrics['correct'])
-            m_valid = int(metrics['valid_count'])
+            # Extract metrics (take first device, already aggregated via pmean/psum)
+            m_total = float(metrics['total_loss'][0])
+            m_ce = float(metrics['ce_loss'][0])
+            m_aux = float(metrics['aux_loss'][0])
+            m_orth = float(metrics['orth_loss'][0])
+            m_div = float(metrics['div_loss'][0])
+            m_correct = int(metrics['correct'][0])
+            m_valid = int(metrics['valid_count'][0])
 
             epoch_loss += m_ce * m_valid
             epoch_correct += m_correct
@@ -792,7 +913,7 @@ def main():
             # ---- Mid-epoch validation ----
             if global_step % val_interval == 0 and global_step > 0:
                 log_message(f"\n  Mid-epoch validation at step {global_step}...", training_log_file)
-                val_loss, val_acc = evaluate(eval_step_fn, params, val_loader)
+                val_loss, val_acc = evaluate(eval_step_fn, params, val_loader, n_devices)
                 log_message(
                     f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}",
                     training_log_file,
@@ -800,22 +921,39 @@ def main():
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    # Unreplicate for saving
+                    params_single = unreplicate(params)
+                    opt_state_single = unreplicate(opt_state)
+                    ckpt_path = (
+                        checkpoint_dir + "/best_model.flax"
+                        if _is_gcs(checkpoint_dir)
+                        else str(Path(checkpoint_dir) / 'best_model.flax')
+                    )
                     save_checkpoint(
-                        checkpoint_dir / 'best_model.flax',
-                        params, opt_state,
+                        ckpt_path,
+                        params_single, opt_state_single,
                         epoch, global_step, best_val_loss,
                         cfg['model'],
                     )
+                    del params_single, opt_state_single
                     log_message(f"  New best model saved! val_loss={best_val_loss:.4f}", training_log_file)
 
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:
+                params_single = unreplicate(params)
+                opt_state_single = unreplicate(opt_state)
+                ckpt_path = (
+                    checkpoint_dir + f"/checkpoint_step{global_step}.flax"
+                    if _is_gcs(checkpoint_dir)
+                    else str(Path(checkpoint_dir) / f'checkpoint_step{global_step}.flax')
+                )
                 save_checkpoint(
-                    checkpoint_dir / f'checkpoint_step{global_step}.flax',
-                    params, opt_state,
+                    ckpt_path,
+                    params_single, opt_state_single,
                     epoch, global_step, best_val_loss,
                     cfg['model'],
                 )
+                del params_single, opt_state_single
 
         # ---- End of epoch ----
         epoch_elapsed = time.time() - epoch_start
@@ -832,7 +970,7 @@ def main():
 
         # End-of-epoch validation
         log_message("  Running end-of-epoch validation...", training_log_file)
-        val_loss, val_acc = evaluate(eval_step_fn, params, val_loader)
+        val_loss, val_acc = evaluate(eval_step_fn, params, val_loader, n_devices)
         log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}", training_log_file)
 
         is_best = val_loss < best_val_loss
@@ -840,25 +978,50 @@ def main():
             best_val_loss = val_loss
 
         # Save epoch checkpoint
+        params_single = unreplicate(params)
+        opt_state_single = unreplicate(opt_state)
+
+        epoch_ckpt_path = (
+            checkpoint_dir + f"/checkpoint_epoch{epoch}.flax"
+            if _is_gcs(checkpoint_dir)
+            else str(Path(checkpoint_dir) / f'checkpoint_epoch{epoch}.flax')
+        )
         save_checkpoint(
-            checkpoint_dir / f'checkpoint_epoch{epoch}.flax',
-            params, opt_state,
+            epoch_ckpt_path,
+            params_single, opt_state_single,
             epoch + 1, global_step, best_val_loss,
             cfg['model'],
         )
         if is_best:
+            best_ckpt_path = (
+                checkpoint_dir + "/best_model.flax"
+                if _is_gcs(checkpoint_dir)
+                else str(Path(checkpoint_dir) / 'best_model.flax')
+            )
             save_checkpoint(
-                checkpoint_dir / 'best_model.flax',
-                params, opt_state,
+                best_ckpt_path,
+                params_single, opt_state_single,
                 epoch + 1, global_step, best_val_loss,
                 cfg['model'],
             )
             log_message(f"  New best model! val_loss={best_val_loss:.4f}", training_log_file)
 
+        del params_single, opt_state_single
+
         log_message(
             f"  Best val loss so far: {best_val_loss:.4f}",
             training_log_file,
         )
+
+        # Reload data loader for next epoch (reset position)
+        if epoch < num_epochs - 1:
+            train_loader, _, _ = load_data(
+                cfg['data'],
+                max_length=max_seq_len,
+                batch_size=batch_size,
+                n_devices=n_devices,
+                start_step=0,
+            )
 
     # ----------------------------------------------------------
     # Done

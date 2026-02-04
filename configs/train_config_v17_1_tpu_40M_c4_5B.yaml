@@ -1,0 +1,65 @@
+# DAWN v17.1-TPU Training Config - 40M Scale, 5B tokens
+# For TPU multi-device training with pretokenized .bin data
+# QK=64(k=12), V=264(k=12), Knowledge=160(k=12), knowledge_rank=64, d_space=256
+
+seed: 1
+
+data:
+  # Pretokenized .bin files (produced by scripts/pretokenize_c4.py)
+  # Supports local paths and GCS paths (gs://...)
+  bin_train: gs://YOUR_BUCKET/data/c4_train.bin
+  bin_val: gs://YOUR_BUCKET/data/c4_val.bin
+  max_train_tokens: 5000000000   # 5B tokens
+  max_val_tokens: 10000000       # 10M tokens
+
+model:
+  model_version: "17.1"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  rank: 64
+
+  # Attention - Q/K shared pool (QK=64 k=12, V=264 k=12)
+  n_feature_qk: 64
+  n_feature_v: 264
+  top_k_feature_qk: 12
+  top_k_feature_v: 12
+
+  n_restore_qk: 64
+  n_restore_v: 264
+  top_k_restore_qk: 12
+  top_k_restore_v: 12
+
+  # Knowledge - Feature-Restore pattern (rank=64)
+  n_feature_know: 160
+  n_restore_know: 160
+  knowledge_rank: 64
+  top_k_feature_know: 12
+  top_k_restore_know: 12
+
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+  d_space: 256
+  router_dropout: 0.1
+
+training:
+  batch_size: 128               # global batch size (divided across devices)
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.00002
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+  checkpoint_interval: 500
+  val_interval: 500
+
+use_amp: true
+
+# GCS paths for checkpoint and log persistence (survives spot preemption)
+checkpoint_dir: gs://YOUR_BUCKET/checkpoints/dawn_v17_1_40M_c4_5B
+log_dir: gs://YOUR_BUCKET/logs/dawn_v17_1_40M_c4_5B
