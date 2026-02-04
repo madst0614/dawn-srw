@@ -55,6 +55,7 @@ model:
 
 training:
   batch_size: 128
+  gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.00065
   weight_decay: 0.1
@@ -64,6 +65,8 @@ training:
   load_balance_weight: 0.00002
   entropy_weight: 0.0
   process_norm_weight: 0.0
+  checkpoint_interval: 500
+  val_interval: 500
 
 use_amp: true
 checkpoint_dir: /content/drive/MyDrive/dawn/checkpoints_v17.1_tpu_memopt_40M_c4_5B_seed1_token_routing_v_expand6

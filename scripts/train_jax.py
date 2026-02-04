@@ -25,7 +25,6 @@ import jax
 import jax.numpy as jnp
 import optax
 import numpy as np
-import math
 import time
 import random
 import argparse
@@ -39,7 +38,6 @@ from models.model_v17_1_jax import DAWN
 # Constants
 # ============================================================
 
-DEAD_NEURON_THRESHOLD = 0.01
 LOG_INTERVAL = 100
 
 
@@ -105,73 +103,6 @@ def pytorch_loader_to_jax_batches(dataloader):
         yield input_ids, attention_mask
 
 
-# ============================================================
-# Neuron usage stats
-# ============================================================
-
-def gini_coefficient(x):
-    """Gini coefficient from a 1D array (0=equal, 1=concentrated)."""
-    x_sorted = jnp.sort(x)
-    n = x_sorted.shape[0]
-    idx = jnp.arange(1, n + 1, dtype=jnp.float32)
-    return (2.0 * jnp.sum(idx * x_sorted) / (n * jnp.sum(x_sorted) + 1e-8) - (n + 1) / n).item()
-
-
-def normalized_entropy(x):
-    """Normalized entropy (0=concentrated, 100=uniform)."""
-    p = x / (jnp.sum(x) + 1e-8)
-    log_p = jnp.log(p + 1e-8)
-    ent = -jnp.sum(p * log_p)
-    max_ent = math.log(x.shape[0])
-    return (ent / max_ent * 100).item() if max_ent > 0 else 0.0
-
-
-def format_neuron_usage(ema_state):
-    """Format neuron usage stats from EMA state dict."""
-    lines = []
-
-    # Extract EMA arrays from nested state
-    # EMA state is nested: router -> neuron_router -> usage_*
-    router_ema = ema_state.get('router', {}).get('neuron_router', {})
-    if not router_ema:
-        return ["  (no EMA data)"]
-
-    ema_names = [
-        ('usage_feature_q', 'FQ'),
-        ('usage_feature_k', 'FK'),
-        ('usage_feature_v', 'FV'),
-        ('usage_restore_q', 'RQ'),
-        ('usage_restore_k', 'RK'),
-        ('usage_restore_v', 'RV'),
-        ('usage_feature_know', 'FKnow'),
-        ('usage_restore_know', 'RKnow'),
-    ]
-
-    usage_parts = []
-    dead_parts = []
-    gini_parts = []
-    ent_parts = []
-
-    for key, label in ema_names:
-        ema = router_ema.get(key)
-        if ema is None:
-            continue
-        n = ema.shape[0]
-        active = int(jnp.sum(ema > DEAD_NEURON_THRESHOLD))
-        dead_ratio = float(jnp.mean((ema < DEAD_NEURON_THRESHOLD).astype(jnp.float32)))
-        g = gini_coefficient(ema)
-        e = normalized_entropy(ema)
-
-        usage_parts.append(f"{label}={active}/{n}")
-        dead_parts.append(f"{label}={dead_ratio:.1%}")
-        gini_parts.append(f"{label}={g:.2f}")
-        ent_parts.append(f"{label}={e:.0f}")
-
-    lines.append(f"      Usage: {' '.join(usage_parts)}")
-    lines.append(f"      Ent:   {' '.join(ent_parts)}")
-    lines.append(f"      Dead:  {' '.join(dead_parts)}")
-    lines.append(f"      Gini:  {' '.join(gini_parts)}")
-    return lines
 
 
 # ============================================================
@@ -259,20 +190,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     """Create a jit-compiled training step function."""
 
     @jax.jit
-    def train_step(params, ema_state, opt_state, input_ids, attention_mask, dropout_key):
+    def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
         # Labels for CLM: input_ids shifted, padding masked
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
-            variables = {'params': params, 'ema': ema_state}
-            result, updated = model.apply(
-                variables,
+            result = model.apply(
+                {'params': params},
                 input_ids,
                 labels=labels,
                 attention_mask=attention_mask,
                 deterministic=False,
                 rngs={'dropout': dropout_key},
-                mutable=['ema'],
             )
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
@@ -287,15 +216,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                           + orth_weight * orth_loss
                           + div_weight * div_loss)
 
-            return total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result, updated)
+            return total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)
 
-        (total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result, updated)), grads = \
+        (total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-
-        new_ema_state = updated['ema']
 
         # Accuracy: computed inside model via _compute_lm_loss (no full logits)
         metrics = {
@@ -308,30 +235,33 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'valid_count': result['valid_count'],
         }
 
-        return new_params, new_ema_state, new_opt_state, metrics
+        return new_params, new_opt_state, metrics
 
     return train_step
 
 
 def create_eval_step(model):
-    """Create a jit-compiled evaluation step function."""
+    """Create a jit-compiled evaluation step function.
+
+    Note: dropout RNG is required because the lax.scan forward path always
+    calls make_rng('dropout') (safe_dropout neutralizes it via deterministic flag).
+    """
 
     @jax.jit
-    def eval_step(params, ema_state, input_ids, attention_mask):
+    def eval_step(params, input_ids, attention_mask):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
-        variables = {'params': params, 'ema': ema_state}
-        # mutable=['ema'] required: update_usage always runs (no deterministic guard).
-        # We discard the updated EMA state for eval.
-        result, _ = model.apply(
-            variables,
+        # deterministic=True → dropout masks are all-ones, but RNG key is still
+        # needed for tracing (safe_dropout always generates a mask).
+        eval_rng = jax.random.PRNGKey(0)  # fixed key — never used for real randomness
+        result = model.apply(
+            {'params': params},
             input_ids,
             labels=labels,
             attention_mask=attention_mask,
             deterministic=True,
-            mutable=['ema'],
+            rngs={'dropout': eval_rng},
         )
         ce_loss = result['loss']
-        # Accuracy computed inside model via _compute_lm_loss (no full logits)
         correct = result['correct']
         valid_count = result['valid_count']
 
@@ -344,7 +274,7 @@ def create_eval_step(model):
 # Evaluation loop
 # ============================================================
 
-def evaluate(eval_step_fn, params, ema_state, val_loader, max_batches=200):
+def evaluate(eval_step_fn, params, val_loader, max_batches=200):
     """Run evaluation and return avg loss and accuracy."""
     total_loss = 0.0
     total_correct = 0
@@ -353,7 +283,7 @@ def evaluate(eval_step_fn, params, ema_state, val_loader, max_batches=200):
     for batch_idx, (input_ids, attention_mask) in enumerate(pytorch_loader_to_jax_batches(val_loader)):
         if batch_idx >= max_batches:
             break
-        ce_loss, correct, valid_count = eval_step_fn(params, ema_state, input_ids, attention_mask)
+        ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
         n_valid = int(valid_count)
         total_loss += float(ce_loss) * n_valid
         total_correct += int(correct)
@@ -368,12 +298,11 @@ def evaluate(eval_step_fn, params, ema_state, val_loader, max_batches=200):
 # Checkpoint save / load
 # ============================================================
 
-def save_checkpoint(path, params, ema_state, opt_state, epoch, step, best_val_loss, model_config):
+def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config):
     """Save checkpoint using flax serialization."""
     import flax.serialization as serialization
     ckpt = {
         'params': params,
-        'ema': ema_state,
         'opt_state': opt_state,
         'epoch': epoch,
         'step': step,
@@ -388,14 +317,13 @@ def save_checkpoint(path, params, ema_state, opt_state, epoch, step, best_val_lo
     print(f"  Checkpoint saved: {path} ({len(bytes_data) / 1e6:.1f} MB)")
 
 
-def load_checkpoint(path, target_params, target_ema, target_opt_state):
+def load_checkpoint(path, target_params, target_opt_state):
     """Load checkpoint using flax serialization."""
     import flax.serialization as serialization
     with open(path, 'rb') as f:
         bytes_data = f.read()
     target = {
         'params': target_params,
-        'ema': target_ema,
         'opt_state': target_opt_state,
         'epoch': 0,
         'step': 0,
@@ -489,6 +417,9 @@ def main():
     print(f"Config: {config_path}")
     print(f"Seed: {seed}")
 
+    # jax_log_compiles is too noisy (hundreds of warnings during init).
+    # Use stage-based print markers instead to pinpoint where it dies.
+
     # ----------------------------------------------------------
     # Load data
     # ----------------------------------------------------------
@@ -518,13 +449,14 @@ def main():
     rng, init_rng, dropout_rng = jax.random.split(rng, 3)
     dummy_input = jnp.ones((1, max_seq_len), dtype=jnp.int32)
 
+    print("=== Starting model.init ===", flush=True)
     variables = model.init(
         {'params': init_rng, 'dropout': dropout_rng},
         dummy_input,
         deterministic=True,
     )
     params = variables['params']
-    ema_state = variables.get('ema', {})
+    print("=== model.init done ===", flush=True)
 
     n_params = count_parameters(params)
     print(f"\nModel parameters: {n_params:,}")
@@ -533,6 +465,48 @@ def main():
 
     rank = cfg['model'].get('rank', 64)
     knowledge_rank = cfg['model'].get('knowledge_rank', 128)
+
+    # ----------------------------------------------------------
+    # OOM check: dummy forward pass with actual batch shape
+    # ----------------------------------------------------------
+    print(f"\n=== OOM check: dummy forward with batch_size={batch_size}, seq_len={max_seq_len} ===", flush=True)
+    try:
+        dummy_batch = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_labels = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_mask = jnp.ones((batch_size, max_seq_len), dtype=jnp.int32)
+        rng, dummy_dropout_rng = jax.random.split(rng)
+
+        # Training forward (deterministic=False uses dropout → more memory)
+        dummy_result = model.apply(
+            {'params': params},
+            dummy_batch,
+            labels=dummy_labels,
+            attention_mask=dummy_mask,
+            deterministic=False,
+            rngs={'dropout': dummy_dropout_rng},
+        )
+        jax.block_until_ready(dummy_result['loss'])
+        print(f"  Forward OK — loss={float(dummy_result['loss']):.4f}", flush=True)
+
+        # Eval forward (deterministic=True)
+        dummy_eval_result = model.apply(
+            {'params': params},
+            dummy_batch,
+            labels=dummy_labels,
+            attention_mask=dummy_mask,
+            deterministic=True,
+            rngs={'dropout': dummy_dropout_rng},
+        )
+        jax.block_until_ready(dummy_eval_result['loss'])
+        print(f"  Eval forward OK — loss={float(dummy_eval_result['loss']):.4f}", flush=True)
+
+        del dummy_batch, dummy_labels, dummy_mask, dummy_result, dummy_eval_result
+        print("=== OOM check passed ===\n", flush=True)
+    except Exception as e:
+        print(f"  *** OOM check FAILED: {e}")
+        print(f"  This likely means the model is too large for the device memory.")
+        print(f"  Try reducing batch_size or enabling gradient_checkpointing.")
+        raise
 
     # ----------------------------------------------------------
     # Optimizer (warmup + cosine decay + optional gradient accumulation)
@@ -603,9 +577,8 @@ def main():
 
     if resume_path and resume_path.exists():
         print(f"\nResuming from: {resume_path}")
-        ckpt = load_checkpoint(resume_path, params, ema_state, opt_state)
+        ckpt = load_checkpoint(resume_path, params, opt_state)
         params = ckpt['params']
-        ema_state = ckpt['ema']
         opt_state = ckpt['opt_state']
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
@@ -628,6 +601,50 @@ def main():
     eval_step_fn = create_eval_step(model)
 
     # ----------------------------------------------------------
+    # Pre-compile train_step and check HBM requirements
+    # ----------------------------------------------------------
+    print("\n=== Lowering train_step (no execution) ===", flush=True)
+    try:
+        dummy_ids = jnp.zeros((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_mask = jnp.ones((batch_size, max_seq_len), dtype=jnp.int32)
+        dummy_drng = jax.random.PRNGKey(0)
+
+        lowered = train_step_fn.lower(
+            params, opt_state,
+            dummy_ids, dummy_mask, dummy_drng,
+        )
+        print("=== Lowering done, compiling XLA ===", flush=True)
+
+        compiled = lowered.compile()
+        print("=== Compile done ===", flush=True)
+
+        # Memory analysis (may not be available on all backends)
+        try:
+            mem = compiled.memory_analysis()
+            if mem is not None:
+                temp_gb = getattr(mem, 'temp_size_in_bytes', 0) / 1e9
+                arg_gb = getattr(mem, 'argument_size_in_bytes', 0) / 1e9
+                out_gb = getattr(mem, 'output_size_in_bytes', 0) / 1e9
+                alias_gb = getattr(mem, 'alias_size_in_bytes', 0) / 1e9
+                print(f"  HBM temp (activations): {temp_gb:.2f} GB", flush=True)
+                print(f"  HBM args (params+opt): {arg_gb:.2f} GB", flush=True)
+                print(f"  HBM output: {out_gb:.2f} GB", flush=True)
+                print(f"  HBM alias: {alias_gb:.2f} GB", flush=True)
+                print(f"  HBM total: {temp_gb + arg_gb + out_gb:.2f} GB", flush=True)
+            else:
+                print("  memory_analysis() returned None", flush=True)
+        except Exception as me:
+            print(f"  memory_analysis not available: {me}", flush=True)
+
+        del dummy_ids, dummy_mask, dummy_drng
+        print("=== train_step compile check passed ===\n", flush=True)
+
+    except Exception as e:
+        print(f"  *** train_step compile FAILED: {e}", flush=True)
+        print(f"  Backward graph likely exceeds HBM. Try reducing batch_size.", flush=True)
+        raise
+
+    # ----------------------------------------------------------
     # Training log file
     # ----------------------------------------------------------
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -642,13 +659,14 @@ def main():
     # Training loop
     # ----------------------------------------------------------
     print(f"\n{'='*60}")
-    print("Starting training...")
+    print("=== Starting training loop ===", flush=True)
     print(f"{'='*60}")
 
     train_start_time = time.time()
     total_micro_steps = num_epochs * steps_per_epoch
-    val_interval = 5000
-    ckpt_interval = 5000
+    val_interval = cfg['training'].get('val_interval', 5000)
+    ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
+    first_step_done = False
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -676,13 +694,22 @@ def main():
             if step_in_epoch < global_step:
                 continue
 
+            if not first_step_done:
+                print(f"=== First train_step: compiling JIT (this may take minutes) ===", flush=True)
+
             # New dropout key each step
             rng, dropout_key = jax.random.split(rng)
 
-            params, ema_state, opt_state, metrics = train_step_fn(
-                params, ema_state, opt_state,
+            params, opt_state, metrics = train_step_fn(
+                params, opt_state,
                 input_ids, attention_mask, dropout_key,
             )
+
+            if not first_step_done:
+                # Force sync to catch OOM here, not later
+                jax.block_until_ready(metrics['total_loss'])
+                print(f"=== First train_step done — loss={float(metrics['total_loss']):.4f} ===", flush=True)
+                first_step_done = True
 
             # Accumulate
             m_total = float(metrics['total_loss'])
@@ -730,17 +757,26 @@ def main():
                 msg = (
                     f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
                     f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
-                    f"orth={avg_orth:.4f} div={avg_div:.4f} | "
+                    f"orth={avg_orth:.2e} div={avg_div:.2e} | "
                     f"acc={avg_acc:.4f} lr={current_lr:.2e} "
                     f"step/s={steps_per_sec:.1f} "
                     f"elapsed={format_time(total_elapsed)}"
                 )
                 log_message(msg, training_log_file)
 
-                # Neuron usage stats
-                usage_lines = format_neuron_usage(ema_state)
-                for line in usage_lines:
-                    log_message(line, training_log_file)
+                # TPU memory stats
+                try:
+                    mem = jax.devices()[0].memory_stats()
+                    if mem:
+                        used = mem.get('bytes_in_use', 0) / 1e9
+                        peak = mem.get('peak_bytes_in_use', 0) / 1e9
+                        limit = mem.get('bytes_limit', 0) / 1e9
+                        log_message(
+                            f"      HBM: {used:.2f}G / {limit:.2f}G "
+                            f"(peak={peak:.2f}G, free={limit - used:.2f}G)",
+                            training_log_file)
+                except Exception:
+                    pass
 
                 # Reset window
                 win_loss = 0.0
@@ -756,7 +792,7 @@ def main():
             # ---- Mid-epoch validation ----
             if global_step % val_interval == 0 and global_step > 0:
                 log_message(f"\n  Mid-epoch validation at step {global_step}...", training_log_file)
-                val_loss, val_acc = evaluate(eval_step_fn, params, ema_state, val_loader)
+                val_loss, val_acc = evaluate(eval_step_fn, params, val_loader)
                 log_message(
                     f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}",
                     training_log_file,
@@ -766,7 +802,7 @@ def main():
                     best_val_loss = val_loss
                     save_checkpoint(
                         checkpoint_dir / 'best_model.flax',
-                        params, ema_state, opt_state,
+                        params, opt_state,
                         epoch, global_step, best_val_loss,
                         cfg['model'],
                     )
@@ -776,7 +812,7 @@ def main():
             if global_step % ckpt_interval == 0 and global_step > 0:
                 save_checkpoint(
                     checkpoint_dir / f'checkpoint_step{global_step}.flax',
-                    params, ema_state, opt_state,
+                    params, opt_state,
                     epoch, global_step, best_val_loss,
                     cfg['model'],
                 )
@@ -796,7 +832,7 @@ def main():
 
         # End-of-epoch validation
         log_message("  Running end-of-epoch validation...", training_log_file)
-        val_loss, val_acc = evaluate(eval_step_fn, params, ema_state, val_loader)
+        val_loss, val_acc = evaluate(eval_step_fn, params, val_loader)
         log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}", training_log_file)
 
         is_best = val_loss < best_val_loss
@@ -806,14 +842,14 @@ def main():
         # Save epoch checkpoint
         save_checkpoint(
             checkpoint_dir / f'checkpoint_epoch{epoch}.flax',
-            params, ema_state, opt_state,
+            params, opt_state,
             epoch + 1, global_step, best_val_loss,
             cfg['model'],
         )
         if is_best:
             save_checkpoint(
                 checkpoint_dir / 'best_model.flax',
-                params, ema_state, opt_state,
+                params, opt_state,
                 epoch + 1, global_step, best_val_loss,
                 cfg['model'],
             )

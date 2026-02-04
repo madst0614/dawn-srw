@@ -5,7 +5,6 @@ Native JAX implementation:
   - jax.checkpoint for feature/restore recompute (memory optimization)
   - flax.linen modules
   - Weight tying via nn.Embed.attend()
-  - EMA usage tracking via mutable 'ema' state collection
 
 Structure (same as PyTorch):
   SharedNeurons, UnifiedNeuronRouter, GlobalRouters,
@@ -16,6 +15,32 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from typing import Optional, Dict, Any, List, Tuple
+
+
+# ================================================================
+# Trace-safe dropout (no Python bool branch — compatible with nn.remat)
+# ================================================================
+
+def safe_dropout(x, rate, deterministic, rng):
+    """Dropout that is fully trace-safe — no Python bool branch on deterministic.
+
+    Always generates a mask, but neutralizes it when deterministic=True
+    via jnp.where. This avoids TracerBoolConversionError when deterministic
+    is a traced value inside nn.remat sub-modules.
+
+    Args:
+        x: input tensor
+        rate: dropout rate (0.0 = no dropout)
+        deterministic: if True, mask is ignored (can be traced or concrete)
+        rng: PRNG key for dropout mask generation (always required)
+    """
+    if rate == 0.0:  # Python float check on constant — always OK
+        return x
+    keep_rate = 1.0 - rate
+    mask = jax.random.bernoulli(rng, keep_rate, x.shape)
+    # deterministic이면 mask 무시 (전부 keep)
+    mask = jnp.where(deterministic, jnp.ones_like(mask), mask)
+    return jnp.where(mask, x / keep_rate, 0.0)
 
 
 # ================================================================
@@ -79,6 +104,206 @@ def topk_sparsify(weights, k):
 
 
 # ================================================================
+# Pure functions for jax.lax.scan forward path
+# ================================================================
+
+def _layer_norm(x, scale, bias, eps=1e-6):
+    """Pure functional LayerNorm (matches Flax nn.LayerNorm)."""
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+    return (x - mean) / jnp.sqrt(var + eps) * scale + bias
+
+
+def _router_attn_forward(x, router_params, n_feature_qk, n_feature_v,
+                          n_restore_qk, n_restore_v, d_space,
+                          top_k_feature_qk, top_k_feature_v,
+                          top_k_restore_qk, top_k_restore_v,
+                          router_dropout, attention_mask, deterministic, rng):
+    """Pure function: attention routing weights + load-balance aux loss.
+    Replaces GlobalRouters.get_attention_weights."""
+    nr = router_params['neuron_router']
+    neuron_emb = nr['neuron_emb']
+    emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
+
+    fqk_end = n_feature_qk
+    fv_end = fqk_end + n_feature_v
+    rqk_end = fv_end + n_restore_qk
+    rv_end = rqk_end + n_restore_v
+
+    rng, rng1 = jax.random.split(rng)
+    all_proj = x @ nr['proj_all']['kernel'] + nr['proj_all']['bias']
+    all_proj = safe_dropout(all_proj, router_dropout, deterministic, rng1)
+    h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = jnp.split(all_proj, 6, axis=-1)
+
+    fqk_emb = emb_norm[:fqk_end]
+    fv_emb = emb_norm[fqk_end:fv_end]
+    rqk_emb = emb_norm[fv_end:rqk_end]
+    rv_emb = emb_norm[rqk_end:rv_end]
+
+    logits_fqk_Q = jnp.einsum('bsd,nd->bsn', h_fqk_Q, fqk_emb)
+    logits_fqk_K = jnp.einsum('bsd,nd->bsn', h_fqk_K, fqk_emb)
+    logits_fv = jnp.einsum('bsd,nd->bsn', h_fv, fv_emb)
+    logits_rqk_Q = jnp.einsum('bsd,nd->bsn', h_rqk_Q, rqk_emb)
+    logits_rqk_K = jnp.einsum('bsd,nd->bsn', h_rqk_K, rqk_emb)
+    logits_rv = jnp.einsum('bsd,nd->bsn', h_rv, rv_emb)
+
+    fqk_pref_Q = jax.nn.softmax(logits_fqk_Q, axis=-1)
+    fqk_pref_K = jax.nn.softmax(logits_fqk_K, axis=-1)
+    fv_pref = jax.nn.softmax(logits_fv, axis=-1)
+    rqk_pref_Q = jax.nn.softmax(logits_rqk_Q, axis=-1)
+    rqk_pref_K = jax.nn.softmax(logits_rqk_K, axis=-1)
+    rv_pref = jax.nn.softmax(logits_rv, axis=-1)
+
+    # Load-balance aux loss
+    if attention_mask is not None:
+        mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
+        count = mask.sum() + 1e-8
+        usage_fqk_Q = (fqk_pref_Q * mask).sum(axis=(0, 1)) / count
+        usage_fqk_K = (fqk_pref_K * mask).sum(axis=(0, 1)) / count
+        usage_fv = (fv_pref * mask).sum(axis=(0, 1)) / count
+        usage_rqk_Q = (rqk_pref_Q * mask).sum(axis=(0, 1)) / count
+        usage_rqk_K = (rqk_pref_K * mask).sum(axis=(0, 1)) / count
+        usage_rv = (rv_pref * mask).sum(axis=(0, 1)) / count
+    else:
+        usage_fqk_Q = fqk_pref_Q.mean(axis=(0, 1))
+        usage_fqk_K = fqk_pref_K.mean(axis=(0, 1))
+        usage_fv = fv_pref.mean(axis=(0, 1))
+        usage_rqk_Q = rqk_pref_Q.mean(axis=(0, 1))
+        usage_rqk_K = rqk_pref_K.mean(axis=(0, 1))
+        usage_rv = rv_pref.mean(axis=(0, 1))
+
+    target_fqk = 1.0 / n_feature_qk
+    target_fv = 1.0 / n_feature_v
+    target_rqk = 1.0 / n_restore_qk
+    target_rv = 1.0 / n_restore_v
+
+    aux_loss = jnp.float32(0.0)
+    aux_loss = aux_loss + ((usage_fqk_Q - target_fqk) ** 2).sum() * n_feature_qk
+    aux_loss = aux_loss + ((usage_fqk_K - target_fqk) ** 2).sum() * n_feature_qk
+    aux_loss = aux_loss + ((usage_fv - target_fv) ** 2).sum() * n_feature_v
+    aux_loss = aux_loss + ((usage_rqk_Q - target_rqk) ** 2).sum() * n_restore_qk
+    aux_loss = aux_loss + ((usage_rqk_K - target_rqk) ** 2).sum() * n_restore_qk
+    aux_loss = aux_loss + ((usage_rv - target_rv) ** 2).sum() * n_restore_v
+
+    fqk_weights_Q, _ = topk_sparsify(fqk_pref_Q, top_k_feature_qk)
+    fqk_weights_K, _ = topk_sparsify(fqk_pref_K, top_k_feature_qk)
+    fv_weights, _ = topk_sparsify(fv_pref, top_k_feature_v)
+    rqk_weights_Q, _ = topk_sparsify(rqk_pref_Q, top_k_restore_qk)
+    rqk_weights_K, _ = topk_sparsify(rqk_pref_K, top_k_restore_qk)
+    rv_weights, _ = topk_sparsify(rv_pref, top_k_restore_v)
+
+    return (fqk_weights_Q, fqk_weights_K, fv_weights,
+            rqk_weights_Q, rqk_weights_K, rv_weights,
+            aux_loss)
+
+
+def _router_know_forward(x, router_params, n_feature_qk, n_feature_v,
+                          n_restore_qk, n_restore_v, n_feature_know, n_restore_know,
+                          top_k_feature_know, top_k_restore_know,
+                          router_dropout, attention_mask, deterministic, rng):
+    """Pure function: knowledge routing weights + load-balance aux loss.
+    Replaces GlobalRouters.get_knowledge_weights."""
+    nr = router_params['neuron_router']
+    neuron_emb = nr['neuron_emb']
+    emb_norm = neuron_emb / (jnp.linalg.norm(neuron_emb, axis=-1, keepdims=True) + 1e-8)
+
+    rv_end = n_feature_qk + n_feature_v + n_restore_qk + n_restore_v
+    fk_end = rv_end + n_feature_know
+
+    rng, rng1, rng2 = jax.random.split(rng, 3)
+
+    h_fk = x @ nr['proj_feature_know']['kernel'] + nr['proj_feature_know']['bias']
+    h_fk = safe_dropout(h_fk, router_dropout, deterministic, rng1)
+    emb_fk = emb_norm[rv_end:fk_end]
+    logits_fk = jnp.einsum('bsd,nd->bsn', h_fk, emb_fk)
+
+    h_rk = x @ nr['proj_restore_know']['kernel'] + nr['proj_restore_know']['bias']
+    h_rk = safe_dropout(h_rk, router_dropout, deterministic, rng2)
+    emb_rk = emb_norm[fk_end:]
+    logits_rk = jnp.einsum('bsd,nd->bsn', h_rk, emb_rk)
+
+    pref_f = jax.nn.softmax(logits_fk, axis=-1)
+    pref_r = jax.nn.softmax(logits_rk, axis=-1)
+
+    # Load-balance aux loss
+    if attention_mask is not None:
+        mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
+        count = mask.sum() + 1e-8
+        usage_f = (pref_f * mask).sum(axis=(0, 1)) / count
+        usage_r = (pref_r * mask).sum(axis=(0, 1)) / count
+    else:
+        usage_f = pref_f.mean(axis=(0, 1))
+        usage_r = pref_r.mean(axis=(0, 1))
+
+    target_f = 1.0 / n_feature_know
+    target_r = 1.0 / n_restore_know
+    aux_loss = jnp.float32(0.0)
+    aux_loss = aux_loss + ((usage_f - target_f) ** 2).sum() * n_feature_know
+    aux_loss = aux_loss + ((usage_r - target_r) ** 2).sum() * n_restore_know
+
+    feature_know_w, _ = topk_sparsify(pref_f, top_k_feature_know)
+    restore_know_w, _ = topk_sparsify(pref_r, top_k_restore_know)
+
+    return feature_know_w, restore_know_w, aux_loss
+
+
+def _attention_forward(x, sn_params, fqk_w_Q, fqk_w_K, fv_w,
+                        rqk_w_Q, rqk_w_K, rv_w, expand_O_kernel,
+                        n_feature_qk, n_restore_qk, n_heads, d_model,
+                        dropout_rate, deterministic, rng):
+    """Pure function: AttentionCircuit forward."""
+    B, S, D = x.shape
+    d_head = d_model // n_heads
+
+    f_neurons = sn_params['f_neurons']
+    r_neurons = sn_params['r_neurons']
+    f_qk = f_neurons[:n_feature_qk]
+    f_v = f_neurons[n_feature_qk:]
+    r_qk = r_neurons[:n_restore_qk]
+    r_v = r_neurons[n_restore_qk:]
+
+    h_q = feature_fn(x, f_qk, fqk_w_Q)
+    h_k = feature_fn(x, f_qk, fqk_w_K)
+    h_v = feature_fn(x, f_v, fv_w)
+
+    Q = restore_fn(h_q, r_qk, rqk_w_Q)
+    K = restore_fn(h_k, r_qk, rqk_w_K)
+    V = restore_fn(h_v, r_v, rv_w)
+
+    Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+    V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+
+    scale = jnp.sqrt(jnp.float32(d_head))
+    scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+    causal_mask = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+    scores = jnp.where(causal_mask, scores, jnp.finfo(scores.dtype).min)
+    attn_weights = jax.nn.softmax(scores, axis=-1)
+
+    rng, rng1, rng2 = jax.random.split(rng, 3)
+    attn_weights = safe_dropout(attn_weights, dropout_rate, deterministic, rng1)
+
+    attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, V)
+    attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, D)
+
+    output = attn_out @ expand_O_kernel
+    output = safe_dropout(output, dropout_rate, deterministic, rng2)
+    return output
+
+
+def _knowledge_forward(x, sn_params, feature_know_w, restore_know_w,
+                        dropout_rate, deterministic, rng):
+    """Pure function: KnowledgeCircuit forward."""
+    f_know = sn_params['feature_know']
+    r_know = sn_params['restore_know']
+
+    h = feature_fn(x, f_know, feature_know_w)
+    output = restore_fn(h, r_know, restore_know_w)
+    output = safe_dropout(output, dropout_rate, deterministic, rng)
+    return output
+
+
+# ================================================================
 # UnifiedNeuronRouter
 # ================================================================
 
@@ -95,7 +320,6 @@ class UnifiedNeuronRouter(nn.Module):
     n_restore_know: int
     d_space: int = 64
     dropout_rate: float = 0.1
-    ema_alpha: float = 0.01
 
     def setup(self):
         total = (self.n_feature_qk + self.n_feature_v +
@@ -112,40 +336,23 @@ class UnifiedNeuronRouter(nn.Module):
         self.proj_all = nn.Dense(self.d_space * 6)
         self.proj_feature_know = nn.Dense(self.d_space)
         self.proj_restore_know = nn.Dense(self.d_space)
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
 
         self.neuron_emb = self.param('neuron_emb', scaled_normal(0.02),
                                      (total, self.d_space))
-
-        # EMA usage tracking (mutable state, not gradient-tracked)
-        self.ema_feature_q = self.variable('ema', 'usage_feature_q',
-                                           jnp.zeros, (self.n_feature_qk,))
-        self.ema_feature_k = self.variable('ema', 'usage_feature_k',
-                                           jnp.zeros, (self.n_feature_qk,))
-        self.ema_feature_v = self.variable('ema', 'usage_feature_v',
-                                           jnp.zeros, (self.n_feature_v,))
-        self.ema_restore_q = self.variable('ema', 'usage_restore_q',
-                                           jnp.zeros, (self.n_restore_qk,))
-        self.ema_restore_k = self.variable('ema', 'usage_restore_k',
-                                           jnp.zeros, (self.n_restore_qk,))
-        self.ema_restore_v = self.variable('ema', 'usage_restore_v',
-                                           jnp.zeros, (self.n_restore_v,))
-        self.ema_feature_know = self.variable('ema', 'usage_feature_know',
-                                              jnp.zeros, (self.n_feature_know,))
-        self.ema_restore_know = self.variable('ema', 'usage_restore_know',
-                                              jnp.zeros, (self.n_restore_know,))
 
     def _normalize_emb(self):
         return self.neuron_emb / (jnp.linalg.norm(self.neuron_emb, axis=-1, keepdims=True) + 1e-8)
 
     def get_knowledge_logits(self, x, deterministic=False):
         emb_norm = self._normalize_emb()
+        rng = self.make_rng('dropout')
 
-        h_fk = self.dropout(self.proj_feature_know(x), deterministic=deterministic)
+        h_fk = safe_dropout(self.proj_feature_know(x), self.dropout_rate, deterministic, rng)
         emb_fk = emb_norm[self._restore_v_end:self._feature_know_end]
         logits_fk = jnp.einsum('bsd,nd->bsn', h_fk, emb_fk)
 
-        h_rk = self.dropout(self.proj_restore_know(x), deterministic=deterministic)
+        rng2 = self.make_rng('dropout')
+        h_rk = safe_dropout(self.proj_restore_know(x), self.dropout_rate, deterministic, rng2)
         emb_rk = emb_norm[self._feature_know_end:]
         logits_rk = jnp.einsum('bsd,nd->bsn', h_rk, emb_rk)
 
@@ -153,7 +360,8 @@ class UnifiedNeuronRouter(nn.Module):
 
     def get_all_logits(self, x, deterministic=False):
         emb_norm = self._normalize_emb()
-        all_proj = self.dropout(self.proj_all(x), deterministic=deterministic)
+        rng = self.make_rng('dropout')
+        all_proj = safe_dropout(self.proj_all(x), self.dropout_rate, deterministic, rng)
         h_fqk_Q, h_fqk_K, h_fv, h_rqk_Q, h_rqk_K, h_rv = jnp.split(all_proj, 6, axis=-1)
 
         fqk_emb = emb_norm[:self._feature_qk_end]
@@ -169,24 +377,6 @@ class UnifiedNeuronRouter(nn.Module):
         logits_rv = jnp.einsum('bsd,nd->bsn', h_rv, rv_emb)
 
         return logits_fqk_Q, logits_fqk_K, logits_fv, logits_rqk_Q, logits_rqk_K, logits_rv
-
-    def update_usage(self, weights, neuron_type, attention_mask=None):
-        """Update EMA usage stats. Always runs — eval safety via mutable=['ema']."""
-        if weights.ndim == 3:
-            active = (weights > 0).astype(jnp.float32)
-            if attention_mask is not None:
-                mask = attention_mask[..., jnp.newaxis].astype(jnp.float32)
-                active = active * mask
-                count = mask.sum() + 1e-8
-                usage = active.sum(axis=(0, 1)) / count
-            else:
-                usage = active.mean(axis=(0, 1))
-        else:
-            usage = (weights > 0).astype(jnp.float32).mean(axis=0)
-
-        decay = 1.0 - self.ema_alpha
-        ema_var = getattr(self, f'ema_{neuron_type}')
-        ema_var.value = ema_var.value * decay + usage * self.ema_alpha
 
 
 # ================================================================
@@ -323,14 +513,6 @@ class GlobalRouters(nn.Module):
         rqk_weights_K, _ = topk_sparsify(rqk_pref_K, self.top_k_restore_qk)
         rv_weights, _ = topk_sparsify(rv_pref, self.top_k_restore_v)
 
-        # EMA usage update — always runs (no deterministic branch)
-        self.neuron_router.update_usage(fqk_weights_Q, 'feature_q', attention_mask)
-        self.neuron_router.update_usage(fqk_weights_K, 'feature_k', attention_mask)
-        self.neuron_router.update_usage(fv_weights, 'feature_v', attention_mask)
-        self.neuron_router.update_usage(rqk_weights_Q, 'restore_q', attention_mask)
-        self.neuron_router.update_usage(rqk_weights_K, 'restore_k', attention_mask)
-        self.neuron_router.update_usage(rv_weights, 'restore_v', attention_mask)
-
         return (fqk_weights_Q, fqk_weights_K, fv_weights,
                 rqk_weights_Q, rqk_weights_K, rv_weights,
                 aux_loss)
@@ -361,10 +543,6 @@ class GlobalRouters(nn.Module):
         feature_know_w, _ = topk_sparsify(pref_f, self.top_k_feature_know)
         restore_know_w, _ = topk_sparsify(pref_r, self.top_k_restore_know)
 
-        # EMA usage update — always runs
-        self.neuron_router.update_usage(feature_know_w, 'feature_know', attention_mask)
-        self.neuron_router.update_usage(restore_know_w, 'restore_know', attention_mask)
-
         return feature_know_w, restore_know_w, aux_loss
 
 
@@ -388,8 +566,6 @@ class AttentionCircuit(nn.Module):
     def setup(self):
         self.d_head = self.d_model // self.n_heads
         self.expand_O = nn.Dense(self.d_model, use_bias=False)
-        self.attn_dropout = nn.Dropout(rate=self.dropout_rate)
-        self.out_dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, shared_neurons, fqk_weights_Q, fqk_weights_K,
                  fv_weights, rqk_weights_Q, rqk_weights_K, rv_weights,
@@ -426,14 +602,16 @@ class AttentionCircuit(nn.Module):
 
         attn_weights = jax.nn.softmax(scores, axis=-1)
 
-        # Attention dropout — nn.Dropout is trace-safe (no Python bool branch)
-        attn_weights = self.attn_dropout(attn_weights, deterministic=deterministic)
+        # Attention dropout — always call make_rng, safe_dropout handles deterministic
+        attn_rng = self.make_rng('dropout')
+        attn_weights = safe_dropout(attn_weights, self.dropout_rate, deterministic, attn_rng)
 
         attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, V)
         attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, D)
 
         output = self.expand_O(attn_out)
-        output = self.out_dropout(output, deterministic=deterministic)
+        out_rng = self.make_rng('dropout')
+        output = safe_dropout(output, self.dropout_rate, deterministic, out_rng)
         return output
 
 
@@ -455,7 +633,7 @@ class KnowledgeCircuit(nn.Module):
     dropout_rate: float = 0.1
 
     def setup(self):
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        pass  # No sub-modules needed (feature_fn/restore_fn are standalone)
 
     def __call__(self, x, shared_neurons, feature_know_w, restore_know_w,
                  attention_mask=None, deterministic=False):
@@ -467,7 +645,9 @@ class KnowledgeCircuit(nn.Module):
         r_know = shared_neurons.restore_know                    # [N_r, KR, D]
         output = restore_fn(h, r_know, restore_know_w)           # [B, S, D]
 
-        return self.dropout(output, deterministic=deterministic)
+        rng = self.make_rng('dropout')
+        output = safe_dropout(output, self.dropout_rate, deterministic, rng)
+        return output
 
 
 # ================================================================
@@ -546,8 +726,7 @@ class DAWN(nn.Module):
         variables = model.init(rng, input_ids)
         output = model.apply(variables, input_ids, labels=labels,
                              deterministic=False,
-                             rngs={'dropout': dropout_rng},
-                             mutable=['ema'])
+                             rngs={'dropout': dropout_rng})
     """
     __version__ = "17.1-JAX"
 
@@ -584,7 +763,6 @@ class DAWN(nn.Module):
                                   embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(self.max_seq_len, self.d_model,
                                 embedding_init=scaled_normal(0.02))
-        self.emb_dropout = nn.Dropout(rate=self.dropout_rate)
 
         self.shared_neurons = SharedNeurons(
             d_model=self.d_model, rank=self.rank,
@@ -608,12 +786,9 @@ class DAWN(nn.Module):
             top_k_restore_know=self.top_k_restore_know,
             d_space=self.d_space, router_dropout=self.router_dropout)
 
-        block_cls = DAWNBlock
-        if self.gradient_checkpointing:
-            block_cls = nn.remat(DAWNBlock)
-
+        # Blocks for init only (forward uses jax.lax.scan with pure functions)
         self.layers = [
-            block_cls(
+            DAWNBlock(
                 d_model=self.d_model, n_heads=self.n_heads,
                 rank=self.rank,
                 n_feature_know=self.n_feature_know,
@@ -638,15 +813,92 @@ class DAWN(nn.Module):
 
         positions = jnp.arange(S)[jnp.newaxis, :]  # [1, S]
         x = self.token_emb(input_ids) + self.pos_emb(positions)
-        x = self.emb_dropout(x, deterministic=deterministic)
+        emb_rng = self.make_rng('dropout')
+        x = safe_dropout(x, self.dropout_rate, deterministic, emb_rng)
 
-        total_aux_loss = jnp.float32(0.0)
+        if self.is_initializing():
+            # Init path: for-loop to trigger lazy parameter creation
+            total_aux_loss = jnp.float32(0.0)
+            for layer in self.layers:
+                x, aux_loss = layer(
+                    x, self.shared_neurons, self.router,
+                    attention_mask, deterministic)
+                total_aux_loss = total_aux_loss + aux_loss
+        else:
+            # Forward path: jax.lax.scan with pure functions
+            # shared_neurons + router params captured via closure (not stacked → true sharing)
+            all_params = self.variables['params']
+            sn_params = all_params['shared_neurons']
+            router_params = all_params['router']
 
-        for layer in self.layers:
-            x, aux_loss = layer(
-                x, self.shared_neurons, self.router,
-                attention_mask, deterministic)
-            total_aux_loss = total_aux_loss + aux_loss
+            # Stack per-block params along leading axis [n_layers, ...]
+            block_params_list = [all_params[f'block_{i}']
+                                 for i in range(self.n_layers)]
+            stacked_block_params = jax.tree.map(
+                lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+            # Pre-split dropout RNGs: one per layer
+            base_rng = self.make_rng('dropout')
+            layer_rngs = jax.random.split(base_rng, self.n_layers)
+
+            def scan_body(carry, xs):
+                x = carry
+                bp = xs['params']
+                rng = xs['rng']
+                rng, rng_attn_router, rng_know_router, rng_attn, rng_know = \
+                    jax.random.split(rng, 5)
+
+                # --- Attention sub-block ---
+                normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+
+                (fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                 attn_aux) = _router_attn_forward(
+                    normed, router_params,
+                    self.n_feature_qk, self.n_feature_v,
+                    self.n_restore_qk, self.n_restore_v,
+                    self.d_space,
+                    self.top_k_feature_qk, self.top_k_feature_v,
+                    self.top_k_restore_qk, self.top_k_restore_v,
+                    self.router_dropout, attention_mask, deterministic,
+                    rng_attn_router)
+
+                attn_out = _attention_forward(
+                    normed, sn_params,
+                    fqk_w_Q, fqk_w_K, fv_w, rqk_w_Q, rqk_w_K, rv_w,
+                    bp['attn']['expand_O']['kernel'],
+                    self.n_feature_qk, self.n_restore_qk,
+                    self.n_heads, self.d_model,
+                    self.dropout_rate, deterministic, rng_attn)
+
+                x = x + attn_out
+
+                # --- Knowledge sub-block ---
+                normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+
+                feat_know_w, rest_know_w, know_aux = _router_know_forward(
+                    normed, router_params,
+                    self.n_feature_qk, self.n_feature_v,
+                    self.n_restore_qk, self.n_restore_v,
+                    self.n_feature_know, self.n_restore_know,
+                    self.top_k_feature_know, self.top_k_restore_know,
+                    self.router_dropout, attention_mask, deterministic,
+                    rng_know_router)
+
+                know_out = _knowledge_forward(
+                    normed, sn_params,
+                    feat_know_w, rest_know_w,
+                    self.dropout_rate, deterministic, rng_know)
+
+                x = x + know_out
+                aux_loss = attn_aux + know_aux
+                return x, aux_loss
+
+            if self.gradient_checkpointing:
+                scan_body = jax.checkpoint(scan_body)
+
+            xs = {'params': stacked_block_params, 'rng': layer_rngs}
+            x, aux_losses = jax.lax.scan(scan_body, x, xs)
+            total_aux_loss = aux_losses.sum()
 
         x = self.norm(x)
 
@@ -801,4 +1053,5 @@ class DAWN(nn.Module):
             f"",
             f"  [Other]",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
+            f"  jax.lax.scan layer loop (O(1) XLA compile, true param sharing)",
         ]
