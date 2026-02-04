@@ -16,6 +16,7 @@ Usage:
 
 import sys
 import os
+import signal
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -416,7 +417,8 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200):
 # Checkpoint save / load (with GCS support)
 # ============================================================
 
-def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config):
+def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_config,
+                    step_in_epoch=0, steps_per_epoch=0):
     """Save checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
     ckpt = {
@@ -424,6 +426,8 @@ def save_checkpoint(path, params, opt_state, epoch, step, best_val_loss, model_c
         'opt_state': opt_state,
         'epoch': epoch,
         'step': step,
+        'step_in_epoch': step_in_epoch,
+        'steps_per_epoch': steps_per_epoch,
         'best_val_loss': best_val_loss,
         'config': model_config,
     }
@@ -444,6 +448,8 @@ def load_checkpoint(path, target_params, target_opt_state):
         'opt_state': target_opt_state,
         'epoch': 0,
         'step': 0,
+        'step_in_epoch': 0,
+        'steps_per_epoch': 0,
         'best_val_loss': float('inf'),
         'config': {},
     }
@@ -691,6 +697,7 @@ def main():
     # ----------------------------------------------------------
     start_epoch = 0
     global_step = 0
+    start_step_in_epoch = 0
     best_val_loss = float('inf')
 
     resume_path = None
@@ -699,12 +706,12 @@ def main():
         if _file_exists(rp):
             resume_path = rp
         else:
-            # Try as directory
+            # Try as directory — pick latest (including emergency checkpoints)
             candidates = _list_files(rp, "*.flax")
             if candidates:
                 resume_path = candidates[-1]
     elif not cli_args.from_scratch:
-        # Auto-search for latest checkpoint
+        # Auto-search for latest checkpoint (including emergency)
         candidates = _list_files(checkpoint_dir, "*.flax")
         if candidates:
             resume_path = candidates[-1]
@@ -717,7 +724,18 @@ def main():
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        print(f"  Resuming from epoch {start_epoch}, step {global_step}, best_val_loss={best_val_loss:.4f}")
+        # Precise resume: use step_in_epoch if available
+        saved_step_in_epoch = ckpt.get('step_in_epoch', 0)
+        saved_steps_per_epoch = ckpt.get('steps_per_epoch', 0)
+        if saved_step_in_epoch > 0 and saved_steps_per_epoch == steps_per_epoch:
+            start_step_in_epoch = saved_step_in_epoch
+        elif saved_step_in_epoch > 0:
+            # steps_per_epoch changed (batch size or data changed) — fallback
+            print(f"  Warning: steps_per_epoch changed ({saved_steps_per_epoch} -> {steps_per_epoch}), "
+                  f"cannot use step_in_epoch for resume. Starting epoch from beginning.")
+            start_step_in_epoch = 0
+        print(f"  Resuming: epoch={start_epoch}, global_step={global_step}, "
+              f"step_in_epoch={start_step_in_epoch}, best_val_loss={best_val_loss:.4f}")
     else:
         if not cli_args.from_scratch:
             print("\nNo checkpoint found. Starting from scratch.")
@@ -765,17 +783,45 @@ def main():
     log_message("", training_log_file)
 
     # ----------------------------------------------------------
-    # Reload data with start_step for resume
+    # Set data loader resume position
     # ----------------------------------------------------------
-    if global_step > 0:
-        print(f"  Reloading data loader with start_step={global_step} for resume...")
-        train_loader, _, _ = load_data(
-            cfg['data'],
-            max_length=max_seq_len,
-            batch_size=batch_size,
-            n_devices=n_devices,
-            start_step=global_step % steps_per_epoch if steps_per_epoch > 0 else 0,
-        )
+    if start_step_in_epoch > 0:
+        print(f"  Resuming data loader at step_in_epoch={start_step_in_epoch}")
+        train_loader.reset(start_step=start_step_in_epoch)
+
+    # ----------------------------------------------------------
+    # SIGTERM handler for spot TPU preemption
+    # ----------------------------------------------------------
+    preemption_requested = [False]  # mutable container for closure
+
+    def _ckpt_path(name):
+        if _is_gcs(checkpoint_dir):
+            return checkpoint_dir + "/" + name
+        return str(Path(checkpoint_dir) / name)
+
+    def handle_preemption(signum, frame):
+        """Emergency checkpoint on SIGTERM (spot preemption)."""
+        if preemption_requested[0]:
+            return  # avoid double-save
+        preemption_requested[0] = True
+        print(f"\n!!! SIGTERM received — saving emergency checkpoint (step={global_step}) !!!", flush=True)
+        try:
+            params_single = unreplicate(params)
+            opt_state_single = unreplicate(opt_state)
+            epath = _ckpt_path(f"emergency_step{global_step}.flax")
+            save_checkpoint(
+                epath, params_single, opt_state_single,
+                start_epoch, global_step, best_val_loss,
+                cfg['model'],
+                step_in_epoch=epoch_step_counter,
+                steps_per_epoch=steps_per_epoch,
+            )
+            print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
+        except Exception as e:
+            print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
+
+    signal.signal(signal.SIGTERM, handle_preemption)
+    print("  SIGTERM handler registered (spot preemption safety)")
 
     # ----------------------------------------------------------
     # Training loop
@@ -789,6 +835,7 @@ def main():
     val_interval = cfg['training'].get('val_interval', 5000)
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     first_step_done = False
+    epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -809,6 +856,10 @@ def main():
         win_start_time = time.time()
 
         for local_step, (input_ids, attention_mask) in enumerate(train_loader):
+
+            if preemption_requested[0]:
+                print("Preemption requested — exiting training loop.", flush=True)
+                break
 
             if not first_step_done:
                 print(f"=== First train_step: compiling pmap JIT (this may take minutes) ===", flush=True)
@@ -856,6 +907,7 @@ def main():
             win_count += 1
 
             global_step += 1
+            epoch_step_counter += 1
 
             # ---- Periodic logging ----
             if global_step % LOG_INTERVAL == 0:
@@ -913,6 +965,7 @@ def main():
             # ---- Mid-epoch validation ----
             if global_step % val_interval == 0 and global_step > 0:
                 log_message(f"\n  Mid-epoch validation at step {global_step}...", training_log_file)
+                val_loader.reset()
                 val_loss, val_acc = evaluate(eval_step_fn, params, val_loader, n_devices)
                 log_message(
                     f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}",
@@ -921,19 +974,15 @@ def main():
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    # Unreplicate for saving
                     params_single = unreplicate(params)
                     opt_state_single = unreplicate(opt_state)
-                    ckpt_path = (
-                        checkpoint_dir + "/best_model.flax"
-                        if _is_gcs(checkpoint_dir)
-                        else str(Path(checkpoint_dir) / 'best_model.flax')
-                    )
                     save_checkpoint(
-                        ckpt_path,
+                        _ckpt_path("best_model.flax"),
                         params_single, opt_state_single,
                         epoch, global_step, best_val_loss,
                         cfg['model'],
+                        step_in_epoch=epoch_step_counter,
+                        steps_per_epoch=steps_per_epoch,
                     )
                     del params_single, opt_state_single
                     log_message(f"  New best model saved! val_loss={best_val_loss:.4f}", training_log_file)
@@ -942,18 +991,18 @@ def main():
             if global_step % ckpt_interval == 0 and global_step > 0:
                 params_single = unreplicate(params)
                 opt_state_single = unreplicate(opt_state)
-                ckpt_path = (
-                    checkpoint_dir + f"/checkpoint_step{global_step}.flax"
-                    if _is_gcs(checkpoint_dir)
-                    else str(Path(checkpoint_dir) / f'checkpoint_step{global_step}.flax')
-                )
                 save_checkpoint(
-                    ckpt_path,
+                    _ckpt_path(f"checkpoint_step{global_step}.flax"),
                     params_single, opt_state_single,
                     epoch, global_step, best_val_loss,
                     cfg['model'],
+                    step_in_epoch=epoch_step_counter,
+                    steps_per_epoch=steps_per_epoch,
                 )
                 del params_single, opt_state_single
+
+        if preemption_requested[0]:
+            break
 
         # ---- End of epoch ----
         epoch_elapsed = time.time() - epoch_start
@@ -970,6 +1019,7 @@ def main():
 
         # End-of-epoch validation
         log_message("  Running end-of-epoch validation...", training_log_file)
+        val_loader.reset()
         val_loss, val_acc = evaluate(eval_step_fn, params, val_loader, n_devices)
         log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}", training_log_file)
 
@@ -981,28 +1031,22 @@ def main():
         params_single = unreplicate(params)
         opt_state_single = unreplicate(opt_state)
 
-        epoch_ckpt_path = (
-            checkpoint_dir + f"/checkpoint_epoch{epoch}.flax"
-            if _is_gcs(checkpoint_dir)
-            else str(Path(checkpoint_dir) / f'checkpoint_epoch{epoch}.flax')
-        )
         save_checkpoint(
-            epoch_ckpt_path,
+            _ckpt_path(f"checkpoint_epoch{epoch}.flax"),
             params_single, opt_state_single,
             epoch + 1, global_step, best_val_loss,
             cfg['model'],
+            step_in_epoch=0,  # start of next epoch
+            steps_per_epoch=steps_per_epoch,
         )
         if is_best:
-            best_ckpt_path = (
-                checkpoint_dir + "/best_model.flax"
-                if _is_gcs(checkpoint_dir)
-                else str(Path(checkpoint_dir) / 'best_model.flax')
-            )
             save_checkpoint(
-                best_ckpt_path,
+                _ckpt_path("best_model.flax"),
                 params_single, opt_state_single,
                 epoch + 1, global_step, best_val_loss,
                 cfg['model'],
+                step_in_epoch=0,
+                steps_per_epoch=steps_per_epoch,
             )
             log_message(f"  New best model! val_loss={best_val_loss:.4f}", training_log_file)
 
@@ -1013,15 +1057,10 @@ def main():
             training_log_file,
         )
 
-        # Reload data loader for next epoch (reset position)
+        # Reset data loader for next epoch (no re-read, just reset position)
         if epoch < num_epochs - 1:
-            train_loader, _, _ = load_data(
-                cfg['data'],
-                max_length=max_seq_len,
-                batch_size=batch_size,
-                n_devices=n_devices,
-                start_step=0,
-            )
+            train_loader.reset(start_step=0)
+            epoch_step_counter = 0
 
     # ----------------------------------------------------------
     # Done

@@ -6,11 +6,13 @@ seed: 1
 
 data:
   # Pretokenized .bin files (produced by scripts/pretokenize_c4.py)
-  # Supports local paths and GCS paths (gs://...)
-  bin_train: gs://YOUR_BUCKET/data/c4_train.bin
+  # Supports: single .bin, sharded (base name, reads _meta.json), GCS paths
+  bin_train: gs://YOUR_BUCKET/data/c4_train    # base name for sharded, or .bin for single
   bin_val: gs://YOUR_BUCKET/data/c4_val.bin
   max_train_tokens: 5000000000   # 5B tokens
   max_val_tokens: 10000000       # 10M tokens
+  # Optional: download GCS files to local SSD for memmap (faster I/O, avoids OOM)
+  # local_cache_dir: /tmp/data
 
 model:
   model_version: "17.1"
