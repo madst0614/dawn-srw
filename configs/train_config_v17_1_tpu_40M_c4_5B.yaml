@@ -6,13 +6,12 @@ seed: 1
 
 data:
   # Pretokenized .bin files (produced by scripts/pretokenize_c4.py)
-  # Supports: single .bin, sharded (base name, reads _meta.json), GCS paths
-  bin_train: gs://YOUR_BUCKET/data/c4_train    # base name for sharded, or .bin for single
-  bin_val: gs://YOUR_BUCKET/data/c4_val.bin
-  max_train_tokens: 5000000000   # 5B tokens
+  # Train: 20 shards, 20B tokens total (loader uses max_train_tokens subset)
+  bin_train: gs://dawn-tpu-data-c4/c4_train    # sharded — reads c4_train_meta.json
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin     # TODO: pretokenize val set if not done
+  max_train_tokens: 5000000000   # 5B tokens (out of 20B available)
   max_val_tokens: 10000000       # 10M tokens
-  # Optional: download GCS files to local SSD for memmap (faster I/O, avoids OOM)
-  # local_cache_dir: /tmp/data
+  local_cache_dir: /tmp/data     # GCS → local SSD for memmap (40GB won't fit in RAM)
 
 model:
   model_version: "17.1"
@@ -63,5 +62,5 @@ training:
 use_amp: true
 
 # GCS paths for checkpoint and log persistence (survives spot preemption)
-checkpoint_dir: gs://YOUR_BUCKET/checkpoints/dawn_v17_1_40M_c4_5B
-log_dir: gs://YOUR_BUCKET/logs/dawn_v17_1_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_v17_1_40M_c4_5B
