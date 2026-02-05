@@ -53,7 +53,7 @@ training:
   entropy_weight: 0.0
   process_norm_weight: 0.0
   checkpoint_interval: 500
-  val_interval: 500
+  val_interval: 100
 
 use_amp: true
 
