@@ -527,15 +527,80 @@ def load_checkpoint(path, target_params, target_opt_state):
 # Logging
 # ============================================================
 
-def log_message(msg, log_file=None):
-    """Print and optionally write to log file."""
-    print(msg)
-    if log_file:
+class GCSLogger:
+    """Logger that writes to a local file and periodically syncs to GCS.
+
+    GCS doesn't support true append — each open('a')/write/close overwrites.
+    So we always append to a local file and upload the full file to GCS
+    on every sync() call.
+    """
+
+    def __init__(self, gcs_path, local_path):
+        self.gcs_path = gcs_path
+        self.local_path = local_path
+        self._dirty = False
+        # Ensure local parent dir exists
+        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, text):
+        with open(self.local_path, 'a') as f:
+            f.write(text)
+        self._dirty = True
+
+    def sync(self):
+        """Upload local file to GCS if there are new writes."""
+        if not self._dirty or not self.gcs_path:
+            return
         try:
-            with _open_file(log_file, 'a') as f:
-                f.write(msg + '\n')
+            with open(self.local_path, 'rb') as f:
+                data = f.read()
+            with _open_file(self.gcs_path, 'wb') as f:
+                f.write(data)
+            self._dirty = False
+        except Exception as e:
+            print(f"  [warn] GCS sync failed: {e}")
+
+
+# Module-level loggers — set up in main()
+_train_logger = None
+_jsonl_logger = None
+
+
+def _setup_loggers(training_log_file, jsonl_log_file):
+    """Create GCSLogger instances for training log and JSONL log."""
+    global _train_logger, _jsonl_logger
+    import tempfile
+    tmpdir = Path(tempfile.gettempdir()) / "dawn_logs"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
+    if _is_gcs(training_log_file):
+        local_txt = str(tmpdir / Path(training_log_file).name)
+        _train_logger = GCSLogger(training_log_file, local_txt)
+    else:
+        _train_logger = GCSLogger(None)
+
+    if _is_gcs(jsonl_log_file):
+        local_jsonl = str(tmpdir / Path(jsonl_log_file).name)
+        _jsonl_logger = GCSLogger(jsonl_log_file, local_jsonl)
+    else:
+        _jsonl_logger = GCSLogger(None, jsonl_log_file)
+
+
+def sync_logs():
+    """Flush local logs to GCS. Call periodically (e.g. every LOG_INTERVAL)."""
+    if _train_logger:
+        _train_logger.sync()
+    if _jsonl_logger:
+        _jsonl_logger.sync()
+
+
+def log_message(msg, log_file=None):
+    """Print and write to training log file."""
+    print(msg, flush=True)
+    if _train_logger:
+        try:
+            _train_logger.write(msg + '\n')
         except Exception:
-            # Fallback: just print (don't crash on log write failure)
             pass
 
 
@@ -547,14 +612,13 @@ def format_time(seconds):
     return f"{h}:{m:02d}:{s:02d}"
 
 
-def log_jsonl(jsonl_file, record):
-    """Append a JSON-lines record to a .jsonl log file."""
-    if not jsonl_file:
+def log_jsonl(record):
+    """Append a JSON-lines record to the JSONL log file."""
+    if not _jsonl_logger:
         return
     try:
         line = json.dumps(record, default=str)
-        with _open_file(jsonl_file, 'a') as f:
-            f.write(line + '\n')
+        _jsonl_logger.write(line + '\n')
     except Exception:
         pass
 
@@ -906,18 +970,23 @@ def main():
         training_log_file = log_dir_str + f'training_log_{timestamp}.txt'
     else:
         training_log_file = str(Path(log_dir) / f'training_log_{timestamp}.txt')
-    log_message(f"DAWN v17.1-JAX Training Log (Multi-Device) - {timestamp}", training_log_file)
-    log_message(f"Config: {config_path}", training_log_file)
-    log_message(f"Parameters: {n_params:,}", training_log_file)
-    log_message(f"Devices: {n_devices}", training_log_file)
-    log_message(f"Total steps: {total_steps}", training_log_file)
-    log_message("", training_log_file)
 
     # JSONL structured log file (machine-readable metrics)
     if _is_gcs(log_dir):
         jsonl_log_file = log_dir_str + f'metrics_{timestamp}.jsonl'
     else:
         jsonl_log_file = str(Path(log_dir) / f'metrics_{timestamp}.jsonl')
+
+    # Set up loggers (local append + periodic GCS sync)
+    _setup_loggers(training_log_file, jsonl_log_file)
+
+    log_message(f"DAWN v17.1-JAX Training Log (Multi-Device) - {timestamp}")
+    log_message(f"Config: {config_path}")
+    log_message(f"Parameters: {n_params:,}")
+    log_message(f"Devices: {n_devices}")
+    log_message(f"Total steps: {total_steps}")
+    log_message("")
+    sync_logs()
 
     # ----------------------------------------------------------
     # Set data loader resume position
@@ -1075,10 +1144,10 @@ def main():
                     f"acc={avg_acc:.4f} lr={current_lr:.2e} "
                     f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
                 )
-                log_message(msg, training_log_file)
+                log_message(msg)
 
                 # JSONL structured log
-                log_jsonl(jsonl_log_file, {
+                log_jsonl({
                     'type': 'train',
                     'step': global_step,
                     'epoch': epoch,
@@ -1103,10 +1172,12 @@ def main():
                         limit = mem.get('bytes_limit', 0) / 1e9
                         log_message(
                             f"      HBM: {used:.2f}G / {limit:.2f}G "
-                            f"(peak={peak:.2f}G, free={limit - used:.2f}G)",
-                            training_log_file)
+                            f"(peak={peak:.2f}G, free={limit - used:.2f}G)")
                 except Exception:
                     pass
+
+                # Sync logs to GCS
+                sync_logs()
 
                 # Reset window
                 win_loss = 0.0
@@ -1121,14 +1192,11 @@ def main():
 
             # ---- Mid-epoch validation ----
             if global_step % val_interval == 0 and global_step > 0:
-                log_message(f"\n  Mid-epoch validation at step {global_step}...", training_log_file)
+                log_message(f"\n  Mid-epoch validation at step {global_step}...")
                 val_loader.reset()
                 val_loss, val_acc = evaluate(eval_step_fn, params, val_loader, n_devices)
-                log_message(
-                    f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}",
-                    training_log_file,
-                )
-                log_jsonl(jsonl_log_file, {
+                log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+                log_jsonl({
                     'type': 'val',
                     'step': global_step,
                     'epoch': epoch,
@@ -1151,7 +1219,7 @@ def main():
                         training_config=training_config,
                     )
                     del params_single, opt_state_single
-                    log_message(f"  New best model saved! val_loss={best_val_loss:.4f}", training_log_file)
+                    log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
 
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:
@@ -1181,16 +1249,15 @@ def main():
             f"\n{'='*60}\n"
             f"Epoch {epoch} complete in {format_time(epoch_elapsed)}\n"
             f"  Train loss={epoch_avg_loss:.4f}, Train acc={epoch_avg_acc:.4f}\n"
-            f"{'='*60}",
-            training_log_file,
+            f"{'='*60}"
         )
 
         # End-of-epoch validation
-        log_message("  Running end-of-epoch validation...", training_log_file)
+        log_message("  Running end-of-epoch validation...")
         val_loader.reset()
         val_loss, val_acc = evaluate(eval_step_fn, params, val_loader, n_devices)
-        log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}", training_log_file)
-        log_jsonl(jsonl_log_file, {
+        log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+        log_jsonl({
             'type': 'val_epoch',
             'step': global_step,
             'epoch': epoch,
@@ -1229,14 +1296,12 @@ def main():
                 steps_per_epoch=steps_per_epoch,
                 training_config=training_config,
             )
-            log_message(f"  New best model! val_loss={best_val_loss:.4f}", training_log_file)
+            log_message(f"  New best model! val_loss={best_val_loss:.4f}")
 
         del params_single, opt_state_single
 
-        log_message(
-            f"  Best val loss so far: {best_val_loss:.4f}",
-            training_log_file,
-        )
+        log_message(f"  Best val loss so far: {best_val_loss:.4f}")
+        sync_logs()
 
         # Reset data loader for next epoch (no re-read, just reset position)
         if epoch < num_epochs - 1:
@@ -1253,9 +1318,9 @@ def main():
         f"  Total time: {format_time(total_time)}\n"
         f"  Best val loss: {best_val_loss:.4f}\n"
         f"  Final step: {global_step}\n"
-        f"{'='*60}",
-        training_log_file,
+        f"{'='*60}"
     )
+    sync_logs()
 
 
 if __name__ == '__main__':
