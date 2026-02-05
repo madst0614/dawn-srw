@@ -1,0 +1,42 @@
+# Vanilla Transformer Baseline — TPU Training Config
+# For fair comparison with DAWN v17.1 40M at 5B tokens
+# Parameter-matched: d_model=384, n_layers=12, d_ff=1536 ≈ 40M params
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "baseline"
+  d_model: 384
+  d_ff: 1536
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  orthogonality_weight: 0.0
+  diversity_weight: 0.0
+  load_balance_weight: 0.0
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+  checkpoint_interval: 500
+  val_interval: 500
+
+use_amp: true
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/baseline_40M_c4_5B

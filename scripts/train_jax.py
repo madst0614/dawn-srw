@@ -34,6 +34,7 @@ from datetime import datetime
 from functools import partial
 
 from models.model_v17_1_jax import DAWN
+from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
 # Constants
@@ -66,33 +67,47 @@ def load_config(config_path):
 
 
 def build_model_from_config(cfg):
-    """Build DAWN model from config dict."""
+    """Build model from config dict. Supports DAWN and baseline."""
     mcfg = cfg['model']
-    model = DAWN(
-        vocab_size=mcfg.get('vocab_size', 30522),
-        d_model=mcfg.get('d_model', 384),
-        n_layers=mcfg.get('n_layers', 12),
-        n_heads=mcfg.get('n_heads', 6),
-        rank=mcfg.get('rank', 64),
-        max_seq_len=mcfg.get('max_seq_len', 512),
-        d_space=mcfg.get('d_space', 64),
-        n_feature_qk=mcfg.get('n_feature_qk', 56),
-        n_feature_v=mcfg.get('n_feature_v', 24),
-        top_k_feature_qk=mcfg.get('top_k_feature_qk', 16),
-        top_k_feature_v=mcfg.get('top_k_feature_v', 6),
-        n_restore_qk=mcfg.get('n_restore_qk', 56),
-        n_restore_v=mcfg.get('n_restore_v', 24),
-        top_k_restore_qk=mcfg.get('top_k_restore_qk', 16),
-        top_k_restore_v=mcfg.get('top_k_restore_v', 6),
-        n_feature_know=mcfg.get('n_feature_know', 24),
-        n_restore_know=mcfg.get('n_restore_know', 24),
-        top_k_feature_know=mcfg.get('top_k_feature_know', 4),
-        top_k_restore_know=mcfg.get('top_k_restore_know', 4),
-        knowledge_rank=mcfg.get('knowledge_rank', 128),
-        dropout_rate=mcfg.get('dropout', 0.1),
-        router_dropout=mcfg.get('router_dropout', 0.1),
-        gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
-    )
+    version = mcfg.get('model_version', '17.1')
+
+    if version == 'baseline':
+        model = VanillaTransformer(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            d_ff=mcfg.get('d_ff', 1536),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+        )
+    else:
+        model = DAWN(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            rank=mcfg.get('rank', 64),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_space=mcfg.get('d_space', 64),
+            n_feature_qk=mcfg.get('n_feature_qk', 56),
+            n_feature_v=mcfg.get('n_feature_v', 24),
+            top_k_feature_qk=mcfg.get('top_k_feature_qk', 16),
+            top_k_feature_v=mcfg.get('top_k_feature_v', 6),
+            n_restore_qk=mcfg.get('n_restore_qk', 56),
+            n_restore_v=mcfg.get('n_restore_v', 24),
+            top_k_restore_qk=mcfg.get('top_k_restore_qk', 16),
+            top_k_restore_v=mcfg.get('top_k_restore_v', 6),
+            n_feature_know=mcfg.get('n_feature_know', 24),
+            n_restore_know=mcfg.get('n_restore_know', 24),
+            top_k_feature_know=mcfg.get('top_k_feature_know', 4),
+            top_k_restore_know=mcfg.get('top_k_restore_know', 4),
+            knowledge_rank=mcfg.get('knowledge_rank', 128),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+        )
     return model
 
 
@@ -259,7 +274,7 @@ def compute_knowledge_diversity_loss(params):
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
-                      n_devices=1):
+                      n_devices=1, is_baseline=False):
     """Create a compiled training step function.
 
     Uses jax.pmap for multi-device data parallelism.
@@ -283,15 +298,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
 
-            # Auxiliary losses computed from params (6-group orthogonality)
-            orth_loss = compute_orthogonality_loss(
-                params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
-            div_loss = compute_knowledge_diversity_loss(params)
-
-            total_loss = (ce_loss
-                          + lb_weight * aux_loss
-                          + orth_weight * orth_loss
-                          + div_weight * div_loss)
+            if is_baseline:
+                orth_loss = jnp.float32(0.0)
+                div_loss = jnp.float32(0.0)
+                total_loss = ce_loss
+            else:
+                orth_loss = compute_orthogonality_loss(
+                    params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
+                div_loss = compute_knowledge_diversity_loss(params)
+                total_loss = (ce_loss
+                              + lb_weight * aux_loss
+                              + orth_weight * orth_loss
+                              + div_weight * div_loss)
 
             return total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)
 
@@ -753,10 +771,11 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
+    is_baseline = cfg['model'].get('model_version', '17.1') == 'baseline'
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
-        n_devices=n_devices)
+        n_devices=n_devices, is_baseline=is_baseline)
     eval_step_fn = create_eval_step(model, n_devices=n_devices)
 
     # ----------------------------------------------------------
