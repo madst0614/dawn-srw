@@ -192,6 +192,44 @@ def _makedirs(path):
         Path(path).mkdir(parents=True, exist_ok=True)
 
 
+def _delete_file(path):
+    """Delete a single file (local or GCS)."""
+    path_str = str(path)
+    if _is_gcs(path_str):
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            fs.rm(path_str)
+            return
+        except ImportError:
+            pass
+        try:
+            import tensorflow as tf
+            tf.io.gfile.remove(path_str)
+            return
+        except ImportError:
+            pass
+    else:
+        p = Path(path_str)
+        if p.exists():
+            p.unlink()
+
+
+def cleanup_old_checkpoints(checkpoint_dir, keep_last=3):
+    """Keep only the last N step checkpoints. best_model/epoch/emergency are never deleted."""
+    all_files = _list_files(checkpoint_dir, "checkpoint_step*.flax")
+    if len(all_files) <= keep_last:
+        return
+    import re
+    def _step_num(path):
+        m = re.search(r'checkpoint_step(\d+)\.flax', str(path))
+        return int(m.group(1)) if m else 0
+    all_files.sort(key=_step_num)
+    to_delete = all_files[:-keep_last]
+    for f in to_delete:
+        _delete_file(f)
+
+
 # ============================================================
 # Parameter count
 # ============================================================
@@ -1019,6 +1057,7 @@ def main():
                     steps_per_epoch=steps_per_epoch,
                 )
                 del params_single, opt_state_single
+                cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
 
         if preemption_requested[0]:
             break
