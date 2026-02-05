@@ -33,7 +33,6 @@ import argparse
 import yaml
 from datetime import datetime
 from functools import partial
-from tqdm import tqdm
 
 from models.model_v17_1_jax import DAWN
 from models.baseline_transformer_jax import VanillaTransformer
@@ -451,10 +450,9 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200):
     total_valid = 0
 
     eval_total = min(max_batches, len(val_loader))
-    eval_pbar = tqdm(val_loader, desc="Evaluating", leave=False,
-                     total=eval_total, dynamic_ncols=True, position=0)
+    eval_start = time.time()
 
-    for batch_idx, (input_ids, attention_mask) in enumerate(eval_pbar):
+    for batch_idx, (input_ids, attention_mask) in enumerate(val_loader):
         if batch_idx >= max_batches:
             break
 
@@ -470,7 +468,9 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200):
         total_correct += int(correct[0])
         total_valid += n_valid
 
-    eval_pbar.close()
+    eval_elapsed = time.time() - eval_start
+    done = min(batch_idx + 1, eval_total)
+    print(f"  Eval: {done}/{eval_total} batches, {eval_elapsed:.1f}s", flush=True)
     avg_loss = total_loss / total_valid if total_valid > 0 else 0.0
     avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
     return avg_loss, avg_acc
@@ -992,12 +992,7 @@ def main():
         win_count = 0
         win_start_time = time.time()
 
-        pbar_initial = start_step_in_epoch if epoch == start_epoch else 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]",
-                    initial=pbar_initial, total=steps_per_epoch,
-                    dynamic_ncols=True, position=0)
-
-        for local_step, (input_ids, attention_mask) in enumerate(pbar):
+        for local_step, (input_ids, attention_mask) in enumerate(train_loader):
 
             if preemption_requested[0]:
                 print("Preemption requested — exiting training loop.", flush=True)
@@ -1030,7 +1025,6 @@ def main():
                 'total_loss': m_total, 'ce_loss': m_ce, 'aux_loss': m_aux,
                 'orth_loss': m_orth, 'div_loss': m_div,
             }, global_step + 1, epoch):
-                pbar.close()
                 raise ValueError(f"NaN/INF loss detected at epoch {epoch}, step {global_step + 1}")
 
             epoch_loss += m_ce * m_valid
@@ -1066,25 +1060,22 @@ def main():
                 current_lr = float(schedule(opt_step))
 
                 total_elapsed = time.time() - train_start_time
+                epoch_elapsed = time.time() - epoch_start
                 progress = global_step / total_micro_steps * 100
+
+                # Timing: elapsed<remaining, s/it
+                s_per_it = epoch_elapsed / epoch_steps if epoch_steps > 0 else 0
+                remaining_steps = steps_per_epoch - epoch_steps
+                eta = s_per_it * remaining_steps
 
                 msg = (
                     f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
                     f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
                     f"orth={avg_orth:.2e} div={avg_div:.2e} | "
                     f"acc={avg_acc:.4f} lr={current_lr:.2e} "
-                    f"step/s={steps_per_sec:.1f} "
-                    f"elapsed={format_time(total_elapsed)}"
+                    f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
                 )
                 log_message(msg, training_log_file)
-
-                # Update tqdm postfix
-                pbar.set_postfix(
-                    loss=f"{avg_loss:.4f}",
-                    ce=f"{avg_ce:.4f}",
-                    acc=f"{avg_acc:.4f}",
-                    lr=f"{current_lr:.2e}",
-                )
 
                 # JSONL structured log
                 log_jsonl(jsonl_log_file, {
@@ -1177,8 +1168,6 @@ def main():
                 )
                 del params_single, opt_state_single
                 cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
-
-        pbar.close()
 
         if preemption_requested[0]:
             break
