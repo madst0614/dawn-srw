@@ -685,35 +685,102 @@ def main():
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
-    checkpoint_dir = cfg.get('checkpoint_dir', 'checkpoints_jax')
-    log_dir = cfg.get('log_dir', 'logs_jax')
-    _makedirs(log_dir)
-    _makedirs(checkpoint_dir)
+    base_checkpoint_dir = cfg.get('checkpoint_dir', 'checkpoints_jax')
+    _makedirs(base_checkpoint_dir)
 
     # ----------------------------------------------------------
-    # Detect resume path early (for config override)
+    # Run folder: base_checkpoint_dir/run_v{version}_{timestamp}_{rand}/
+    # All checkpoints + logs go in the same run folder (like train.py).
     # ----------------------------------------------------------
     resume_path = None
+    checkpoint_dir = None  # will be set to a run folder
+
+    def _join(base, name):
+        if _is_gcs(base):
+            return base.rstrip('/') + '/' + name
+        return str(Path(base) / name)
+
+    def _list_run_folders(base):
+        """List run_* subdirectories under base (local or GCS)."""
+        if _is_gcs(base):
+            try:
+                import gcsfs
+                fs = gcsfs.GCSFileSystem()
+                prefix = base.rstrip('/') + '/run_'
+                # strip gs:// for gcsfs
+                bucket_path = base.replace('gs://', '').rstrip('/')
+                entries = fs.ls(bucket_path)
+                runs = sorted([
+                    'gs://' + e for e in entries
+                    if '/run_' in e
+                ])
+                return runs
+            except Exception:
+                return []
+        else:
+            p = Path(base)
+            if not p.exists():
+                return []
+            return sorted([
+                str(d) for d in p.iterdir()
+                if d.is_dir() and d.name.startswith('run_')
+            ])
+
     if cli_args.resume:
         rp = cli_args.resume
         if _file_exists(rp):
+            # Direct .flax file — run folder is its parent
             resume_path = rp
+            if _is_gcs(rp):
+                checkpoint_dir = rp.rsplit('/', 1)[0]
+            else:
+                checkpoint_dir = str(Path(rp).parent)
+            print(f"  Resuming from checkpoint: {resume_path}")
+            print(f"  Continuing in run folder: {checkpoint_dir}")
         else:
+            # Could be a folder path
             candidates = _list_files(rp, "*.flax")
             if candidates:
                 resume_path = candidates[-1]
+                checkpoint_dir = rp.rstrip('/')
+                print(f"  Resuming from: {resume_path}")
+                print(f"  Continuing in run folder: {checkpoint_dir}")
+
     elif not cli_args.from_scratch:
-        candidates = _list_files(checkpoint_dir, "*.flax")
-        if candidates:
-            resume_path = candidates[-1]
+        # Auto-resume: find latest run folder with checkpoints
+        run_folders = _list_run_folders(base_checkpoint_dir)
+        for folder in reversed(run_folders):
+            candidates = _list_files(folder, "*.flax")
+            if candidates:
+                resume_path = candidates[-1]
+                checkpoint_dir = folder
+                print(f"  Auto-resume: {resume_path}")
+                print(f"  Continuing in run folder: {checkpoint_dir}")
+                break
+
+    # Create new run folder if not resuming
+    if checkpoint_dir is None:
+        import random as _random
+        from datetime import timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
+        rand_suffix = _random.randint(1000, 9999)
+        version = cfg['model'].get('model_version', 'v17.1')
+        run_name = f"run_v{version}_{ts}_{rand_suffix}"
+        checkpoint_dir = _join(base_checkpoint_dir, run_name)
+        _makedirs(checkpoint_dir)
+        if cli_args.from_scratch:
+            print(f"  Starting from scratch (--from-scratch)")
+        print(f"  Created new run folder: {checkpoint_dir}")
+
+    log_dir = checkpoint_dir  # logs go in same run folder
 
     # ----------------------------------------------------------
     # Resume config override: load training config from checkpoint
     # ----------------------------------------------------------
     if resume_path and _file_exists(resume_path):
-        # Try config.json in checkpoint dir first (lightweight)
-        ckpt_parent = str(resume_path).rsplit('/', 1)[0] if '/' in str(resume_path) else str(Path(resume_path).parent)
-        config_json_path = ckpt_parent + '/config.json' if _is_gcs(ckpt_parent) else str(Path(ckpt_parent) / 'config.json')
+        # Try config.json in run folder
+        config_json_path = _join(checkpoint_dir, 'config.json')
 
         saved_training_config = None
         if _file_exists(config_json_path):
@@ -773,6 +840,7 @@ def main():
     print(f"Device count: {n_devices}")
     print(f"Backend: {jax.default_backend()}")
     print(f"Config: {config_path}")
+    print(f"Run folder: {checkpoint_dir}")
     print(f"Seed: {seed}")
     print(f"Global batch size: {batch_size}")
     print(f"Per-device batch size: {per_device_batch}")
@@ -905,10 +973,7 @@ def main():
 
     # Save config.json for this run (model + training config)
     try:
-        if _is_gcs(checkpoint_dir):
-            cj_path = checkpoint_dir.rstrip('/') + '/config.json'
-        else:
-            cj_path = str(Path(checkpoint_dir) / 'config.json')
+        cj_path = _join(checkpoint_dir, 'config.json')
         full_cfg = {'model': cfg['model'], 'training': training_config}
         with _open_file(cj_path, 'w') as f:
             f.write(json.dumps(full_cfg, indent=2, default=str))
@@ -963,19 +1028,8 @@ def main():
     # Training log file
     # ----------------------------------------------------------
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if _is_gcs(log_dir):
-        log_dir_str = str(log_dir)
-        if not log_dir_str.endswith("/"):
-            log_dir_str += "/"
-        training_log_file = log_dir_str + f'training_log_{timestamp}.txt'
-    else:
-        training_log_file = str(Path(log_dir) / f'training_log_{timestamp}.txt')
-
-    # JSONL structured log file (machine-readable metrics)
-    if _is_gcs(log_dir):
-        jsonl_log_file = log_dir_str + f'metrics_{timestamp}.jsonl'
-    else:
-        jsonl_log_file = str(Path(log_dir) / f'metrics_{timestamp}.jsonl')
+    training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
+    jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
 
     # Set up loggers (local append + periodic GCS sync)
     _setup_loggers(training_log_file, jsonl_log_file)
@@ -1001,9 +1055,7 @@ def main():
     preemption_requested = [False]  # mutable container for closure
 
     def _ckpt_path(name):
-        if _is_gcs(checkpoint_dir):
-            return checkpoint_dir + "/" + name
-        return str(Path(checkpoint_dir) / name)
+        return _join(checkpoint_dir, name)
 
     def handle_preemption(signum, frame):
         """Emergency checkpoint on SIGTERM (spot preemption)."""
