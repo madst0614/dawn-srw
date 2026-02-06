@@ -857,3 +857,190 @@ def get_neuron_embeddings_jax(params) -> np.ndarray:
     emb = np.array(emb)
     norm = np.linalg.norm(emb, axis=-1, keepdims=True) + 1e-8
     return emb / norm
+
+
+# ============================================================
+# FLOPs Estimation
+# ============================================================
+
+def estimate_flops_jax(config: Dict, seq_len: int = 512) -> int:
+    """
+    Estimate theoretical FLOPs for forward pass (per sequence) for JAX model.
+
+    Reports theoretical FLOPs based on active neurons (top-k sparse).
+
+    Args:
+        config: Model configuration dict
+        seq_len: Sequence length
+
+    Returns:
+        Estimated FLOPs as int
+    """
+    d_model = config.get('d_model', 384)
+    n_layers = config.get('n_layers', 12)
+    rank = config.get('rank', 64)
+    knowledge_rank = config.get('knowledge_rank', 128)
+    vocab_size = config.get('vocab_size', 30522)
+    n_heads = config.get('n_heads', 8)
+    d_space = config.get('d_space', 64)
+
+    # Neuron counts
+    n_feature_qk = config.get('n_feature_qk', 56)
+    n_feature_v = config.get('n_feature_v', 24)
+    n_restore_qk = config.get('n_restore_qk', 56)
+    n_restore_v = config.get('n_restore_v', 24)
+    n_feature_know = config.get('n_feature_know', 24)
+    n_restore_know = config.get('n_restore_know', 24)
+
+    # Top-k values
+    top_k_feature_qk = config.get('top_k_feature_qk', 16)
+    top_k_feature_v = config.get('top_k_feature_v', 6)
+    top_k_restore_qk = config.get('top_k_restore_qk', 16)
+    top_k_restore_v = config.get('top_k_restore_v', 6)
+    top_k_feature_know = config.get('top_k_feature_know', 4)
+    top_k_restore_know = config.get('top_k_restore_know', 4)
+
+    S = seq_len
+    d_head = d_model // n_heads
+
+    # Check model type
+    model_version = config.get('model_version', '')
+    is_baseline = model_version in ('baseline', 'baseline-JAX')
+
+    if is_baseline:
+        # Standard transformer FLOPs
+        d_ff = config.get('d_ff', d_model * 4)
+
+        # Per layer
+        # QKV projections: 3 * 2 * S * d_model * d_model
+        qkv_flops = 3 * 2 * S * d_model * d_model
+
+        # Attention: QK^T (S*S*d_model) + softmax + AV (S*S*d_model)
+        attn_flops = 2 * 2 * S * S * d_model
+
+        # Output projection: 2 * S * d_model * d_model
+        o_proj_flops = 2 * S * d_model * d_model
+
+        # FFN: up (2*S*d_model*d_ff) + down (2*S*d_ff*d_model)
+        ffn_flops = 2 * 2 * S * d_model * d_ff
+
+        layer_flops = qkv_flops + attn_flops + o_proj_flops + ffn_flops
+        total_layers = n_layers * layer_flops
+
+        # Embeddings: token lookup (negligible) + position lookup
+        embed_flops = 2 * S * d_model  # LayerNorm
+
+        # LM head: 2 * S * d_model * vocab_size
+        lm_head_flops = 2 * S * d_model * vocab_size
+
+        return embed_flops + total_layers + lm_head_flops
+
+    # DAWN model FLOPs
+    # Per layer
+    # 1. Router projections: 6 attention + 2 knowledge
+    router_attn_flops = 2 * S * d_model * (6 * d_space)  # proj_all
+    router_know_flops = 2 * S * d_model * (2 * d_space)  # proj_feature_know + proj_restore_know
+
+    # Router logits: einsum('bsd,nd->bsn') for each pool
+    router_logits_flops = (
+        2 * S * d_space * n_feature_qk * 2 +  # fqk Q/K
+        2 * S * d_space * n_feature_v +
+        2 * S * d_space * n_restore_qk * 2 +  # rqk Q/K
+        2 * S * d_space * n_restore_v +
+        2 * S * d_space * n_feature_know +
+        2 * S * d_space * n_restore_know
+    )
+
+    router_flops = router_attn_flops + router_know_flops + router_logits_flops
+
+    # 2. Attention circuit (sparse)
+    # Feature: einsum('bsd,ndr->bsnr') then weighted sum -> [B,S,R]
+    # Only top-k neurons active
+    feature_qk_flops = 2 * S * d_model * rank * top_k_feature_qk * 2  # Q and K
+    feature_v_flops = 2 * S * d_model * rank * top_k_feature_v
+
+    # Restore: [B,S,R] -> [B,S,D] via sparse neurons
+    restore_qk_flops = 2 * S * rank * d_model * top_k_restore_qk * 2  # Q and K
+    restore_v_flops = 2 * S * rank * d_model * top_k_restore_v
+
+    # Attention: QK^T (S*S*d_model) + softmax + AV
+    attn_flops = 2 * 2 * S * S * d_model
+
+    # Output projection
+    o_proj_flops = 2 * S * d_model * d_model
+
+    attn_circuit_flops = (feature_qk_flops + feature_v_flops +
+                          restore_qk_flops + restore_v_flops +
+                          attn_flops + o_proj_flops)
+
+    # 3. Knowledge circuit (sparse)
+    feature_know_flops = 2 * S * d_model * knowledge_rank * top_k_feature_know
+    restore_know_flops = 2 * S * knowledge_rank * d_model * top_k_restore_know
+
+    know_circuit_flops = feature_know_flops + restore_know_flops
+
+    # LayerNorms (approx)
+    layernorm_flops = 4 * S * d_model  # 2 per block
+
+    layer_flops = router_flops + attn_circuit_flops + know_circuit_flops + layernorm_flops
+    total_layers = n_layers * layer_flops
+
+    # Embeddings
+    embed_flops = 2 * S * d_model
+
+    # LM head
+    lm_head_flops = 2 * S * d_model * vocab_size
+
+    return embed_flops + total_layers + lm_head_flops
+
+
+def count_params_jax(params) -> int:
+    """Count total parameters in JAX model.
+
+    Args:
+        params: FrozenDict of model parameters
+
+    Returns:
+        Total parameter count
+    """
+    def count_leaves(tree):
+        return sum(np.prod(leaf.shape) for leaf in jax.tree_util.tree_leaves(tree))
+
+    if HAS_JAX:
+        return count_leaves(params)
+    else:
+        # Fallback: manual counting
+        total = 0
+        def _count(d):
+            nonlocal total
+            if isinstance(d, dict):
+                for v in d.values():
+                    _count(v)
+            elif hasattr(d, 'shape'):
+                total += np.prod(d.shape)
+        _count(params)
+        return total
+
+
+def convert_to_serializable(obj):
+    """
+    Convert numpy/JAX types to JSON-serializable format.
+
+    Args:
+        obj: Object to convert
+
+    Returns:
+        JSON-serializable object
+    """
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(v) for v in obj]
+    elif isinstance(obj, (np.ndarray, np.generic)):
+        return obj.tolist()
+    elif HAS_JAX and hasattr(obj, 'device_buffer'):
+        # JAX DeviceArray
+        return np.asarray(obj).tolist()
+    elif isinstance(obj, (np.integer, np.floating)):
+        return float(obj)
+    return obj
