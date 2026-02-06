@@ -1,24 +1,30 @@
 """
-Neuron Health Analysis (JAX Version)
-====================================
-Analyze neuron health status using JAX/Flax models.
+Neuron Health Analysis (Forward-based) - JAX Version
+=====================================================
+Analyze neuron health status using forward pass data.
+
+JAX/Flax compatible version for TPU analysis.
 
 All metrics computed from actual routing weights during inference,
-using JAXRoutingDataExtractor.
+not from EMA statistics.
+
+NOTE: This is a JAX port of neuron_health.py (354 lines).
 """
 
+import os
 import numpy as np
-from typing import Dict, Optional, List, Any
-from pathlib import Path
-import json
+from typing import Dict, Optional
+from collections import defaultdict
 
-from .utils_jax import (
-    JAXRoutingDataExtractor, JAXRoutingData,
-    get_shared_neurons_jax, get_neuron_embeddings_jax,
-    gini_coefficient, calc_entropy,
-    create_batches, load_val_data_jax,
-    POOL_N_ATTR, POOL_DISPLAY_NAMES,
-)
+# JAX imports
+try:
+    import jax
+    import jax.numpy as jnp
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+    jax = None
+    jnp = None
 
 try:
     from tqdm import tqdm
@@ -27,71 +33,126 @@ except ImportError:
     HAS_TQDM = False
     def tqdm(x, **kwargs): return x
 
+from .base_jax import BaseAnalyzerJAX
+from .utils_jax import (
+    ALL_ROUTING_KEYS, POOL_N_ATTR,
+    gini_coefficient,
+    create_batches,
+    JAXRoutingData,
+)
 
-class NeuronHealthAnalyzerJAX:
-    """Forward-based neuron health analyzer for JAX models."""
 
-    def __init__(self, model, params, config: Dict, extractor: JAXRoutingDataExtractor = None):
+class NeuronHealthAnalyzerJAX(BaseAnalyzerJAX):
+    """Forward-based neuron health analyzer (JAX version)."""
+
+    def __init__(self, model, params, config: Dict):
         """
+        Initialize analyzer.
+
         Args:
-            model: JAX model class
+            model: JAX/Flax model class
             params: FrozenDict of model parameters
             config: Model configuration dict
-            extractor: Optional pre-created JAXRoutingDataExtractor
         """
-        self.model = model
-        self.params = params
-        self.config = config
-        self.extractor = extractor or JAXRoutingDataExtractor(model, params, config)
-
-        # Pool keys to analyze
-        self.pools = ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv', 'fknow', 'rknow']
+        super().__init__(model, params, config)
 
     def analyze_activation_distribution(
         self,
-        batches: List[np.ndarray],
+        val_tokens: np.ndarray,
         n_batches: int = 50,
-        threshold: float = 0.01
+        threshold: float = 0.01,
+        batch_size: int = 32,
+        seq_len: int = 512
     ) -> Dict:
         """
         Analyze neuron activation distribution from forward passes.
 
         Args:
-            batches: List of input batches [batch_size, seq_len]
+            val_tokens: Validation token array
             n_batches: Number of batches to process
             threshold: Weight threshold for "active" classification
+            batch_size: Batch size
+            seq_len: Sequence length
 
         Returns:
             Dictionary with per-pool activation statistics
         """
-        # Accumulators: pool -> array of activation counts
-        activation_counts = {}
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        # Get pool configuration
+        pools = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
+
+        # Initialize accumulators
+        activation_counts = {pool: np.zeros(n) for pool, n in pools.items() if n > 0}
         total_tokens = 0
 
-        # Initialize counters
-        for key in self.pools:
-            n_neurons = self.config.get(POOL_N_ATTR.get(key, ''), 0)
-            if n_neurons > 0:
-                activation_counts[key] = np.zeros(n_neurons)
+        # Create batches
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
 
-        # Process batches
-        batches_to_process = batches[:min(n_batches, len(batches))]
-        for i, batch in enumerate(tqdm(batches_to_process, desc='Health Analysis', disable=not HAS_TQDM)):
-            batch_tokens = batch.size
+        for batch in tqdm(batches, desc='Health Analysis'):
+            input_ids = np.array(batch)
+            batch_tokens = input_ids.size
             total_tokens += batch_tokens
 
-            # Extract routing weights
-            routing = self.extractor.extract_routing(batch)
-            routing_data = JAXRoutingData(routing)
+            # Extract routing data
+            routing_info = self.extractor.extract_routing(input_ids)
+            routing = JAXRoutingData(routing_info)
 
-            for key in activation_counts.keys():
-                weights = routing_data.get_weight(key)
+            # Process attention weights
+            for key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
+                weights = routing.get_weight(key)
                 if weights is None:
                     continue
 
+                # Map key to pool
+                if key.startswith('fqk'):
+                    pool = 'feature_qk'
+                elif key == 'fv':
+                    pool = 'feature_v'
+                elif key.startswith('rqk'):
+                    pool = 'restore_qk'
+                elif key == 'rv':
+                    pool = 'restore_v'
+                else:
+                    continue
+
+                if pool not in activation_counts:
+                    continue
+
                 # Count activations (weight > threshold)
-                active = (weights > threshold).sum(axis=(0, 1))
-                activation_counts[key] += active
+                if weights.ndim == 3:  # [B, S, N]
+                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
+                else:  # [B, N]
+                    active = (weights > threshold).astype(np.float32).sum(axis=0)
+
+                activation_counts[pool] += active
+
+            # Process knowledge weights
+            for key in ['fknow', 'rknow']:
+                weights = routing.get_weight(key)
+                if weights is None:
+                    continue
+
+                pool = 'feature_know' if key == 'fknow' else 'restore_know'
+                if pool not in activation_counts:
+                    continue
+
+                if weights.ndim == 3:
+                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
+                else:
+                    active = (weights > threshold).astype(np.float32).sum(axis=0)
+
+                activation_counts[pool] += active
 
         # Compute statistics
         results = {}
@@ -104,13 +165,12 @@ class NeuronHealthAnalyzerJAX:
             freq = counts / (total_tokens + 1e-8)
 
             results[pool] = {
-                'display': POOL_DISPLAY_NAMES.get(pool, pool),
                 'total': n_total,
                 'active': n_active,
                 'dead': n_dead,
                 'active_ratio': n_active / n_total if n_total > 0 else 0,
                 'dead_ratio': n_dead / n_total if n_total > 0 else 0,
-                'gini': float(gini_coefficient(freq)),
+                'gini': gini_coefficient(freq),
                 'stats': {
                     'min_freq': float(freq.min()),
                     'max_freq': float(freq.max()),
@@ -125,44 +185,100 @@ class NeuronHealthAnalyzerJAX:
 
     def analyze_dead_neurons(
         self,
-        batches: List[np.ndarray],
+        val_tokens: np.ndarray,
         n_batches: int = 50,
-        threshold: float = 0.01
+        threshold: float = 0.01,
+        output_dir: Optional[str] = None,
+        batch_size: int = 32,
+        seq_len: int = 512
     ) -> Dict:
         """
         Identify dead neurons from forward passes.
 
         Args:
-            batches: List of input batches
+            val_tokens: Validation token array
             n_batches: Number of batches to process
             threshold: Weight threshold for activation
+            output_dir: Directory for visualization output
+            batch_size: Batch size
+            seq_len: Sequence length
 
         Returns:
             Dictionary with dead neuron analysis
         """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        # Get pool configuration
+        pools = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
+
         # Track which neurons were ever activated
-        ever_activated = {}
+        ever_activated = {pool: np.zeros(n, dtype=bool) for pool, n in pools.items() if n > 0}
 
-        # Initialize
-        for key in self.pools:
-            n_neurons = self.config.get(POOL_N_ATTR.get(key, ''), 0)
-            if n_neurons > 0:
-                ever_activated[key] = np.zeros(n_neurons, dtype=bool)
+        # Create batches
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
 
-        # Process batches
-        batches_to_process = batches[:min(n_batches, len(batches))]
-        for batch in tqdm(batches_to_process, desc='Dead Neuron Analysis', disable=not HAS_TQDM):
-            routing = self.extractor.extract_routing(batch)
-            routing_data = JAXRoutingData(routing)
+        for batch in tqdm(batches, desc='Dead Neuron Analysis'):
+            input_ids = np.array(batch)
 
-            for key in ever_activated.keys():
-                weights = routing_data.get_weight(key)
+            # Extract routing data
+            routing_info = self.extractor.extract_routing(input_ids)
+            routing = JAXRoutingData(routing_info)
+
+            # Process attention weights
+            for key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
+                weights = routing.get_weight(key)
                 if weights is None:
                     continue
 
+                # Map key to pool
+                if key.startswith('fqk'):
+                    pool = 'feature_qk'
+                elif key == 'fv':
+                    pool = 'feature_v'
+                elif key.startswith('rqk'):
+                    pool = 'restore_qk'
+                elif key == 'rv':
+                    pool = 'restore_v'
+                else:
+                    continue
+
+                if pool not in ever_activated:
+                    continue
+
                 # Mark neurons that were activated
-                active = (weights > threshold).any(axis=(0, 1))
-                ever_activated[key] |= active
+                if weights.ndim == 3:
+                    active = (weights > threshold).any(axis=0).any(axis=0)
+                else:
+                    active = (weights > threshold).any(axis=0)
+
+                ever_activated[pool] |= active
+
+            # Process knowledge weights
+            for key in ['fknow', 'rknow']:
+                weights = routing.get_weight(key)
+                if weights is None:
+                    continue
+
+                pool = 'feature_know' if key == 'fknow' else 'restore_know'
+                if pool not in ever_activated:
+                    continue
+
+                if weights.ndim == 3:
+                    active = (weights > threshold).any(axis=0).any(axis=0)
+                else:
+                    active = (weights > threshold).any(axis=0)
+
+                ever_activated[pool] |= active
 
         # Compile results
         results = {}
@@ -179,7 +295,6 @@ class NeuronHealthAnalyzerJAX:
             total_neurons += n_total
 
             results[pool] = {
-                'display': POOL_DISPLAY_NAMES.get(pool, pool),
                 'n_total': n_total,
                 'n_active': n_active,
                 'n_dead': n_dead,
@@ -193,154 +308,195 @@ class NeuronHealthAnalyzerJAX:
             'dead_ratio': total_dead / total_neurons if total_neurons > 0 else 0,
         }
 
-        return results
-
-    def analyze_neuron_norms(self) -> Dict:
-        """Analyze neuron weight norms from model parameters."""
-        neurons = get_shared_neurons_jax(self.params)
-
-        results = {}
-
-        pool_configs = [
-            ('fqk', 'f_neurons', 0, self.config.get('n_feature_qk', 0)),
-            ('fv', 'f_neurons', self.config.get('n_feature_qk', 0), None),
-            ('rqk', 'r_neurons', 0, self.config.get('n_restore_qk', 0)),
-            ('rv', 'r_neurons', self.config.get('n_restore_qk', 0), None),
-            ('fknow', 'feature_know', None, None),
-            ('rknow', 'restore_know', None, None),
-        ]
-
-        for pool_name, neuron_key, start_idx, end_idx in pool_configs:
-            pool_neurons = neurons.get(neuron_key)
-            if pool_neurons is None or len(pool_neurons) == 0:
-                continue
-
-            if start_idx is not None and end_idx is not None:
-                pool_neurons = pool_neurons[start_idx:end_idx]
-            elif start_idx is not None:
-                pool_neurons = pool_neurons[start_idx:]
-
-            if len(pool_neurons) == 0:
-                continue
-
-            # Compute norms
-            norms = np.linalg.norm(pool_neurons.reshape(len(pool_neurons), -1), axis=-1)
-
-            results[pool_name] = {
-                'display': POOL_DISPLAY_NAMES.get(pool_name, pool_name),
-                'count': len(pool_neurons),
-                'mean_norm': float(norms.mean()),
-                'std_norm': float(norms.std()),
-                'min_norm': float(norms.min()),
-                'max_norm': float(norms.max()),
-                'median_norm': float(np.median(norms)),
-            }
+        # Visualization (skip for JAX version - requires matplotlib)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            # TODO: Add JAX-compatible visualization
 
         return results
 
     def analyze_diversity(
         self,
-        batches: List[np.ndarray],
-        n_batches: int = 50
+        val_tokens: np.ndarray,
+        n_batches: int = 50,
+        threshold: float = 0.01,
+        batch_size: int = 32,
+        seq_len: int = 512
     ) -> Dict:
-        """Analyze routing diversity (entropy-based metrics)."""
-        # Accumulate routing preferences
-        pool_prefs = {}
+        """
+        Analyze neuron usage diversity from forward passes.
 
-        for key in self.pools:
-            n_neurons = self.config.get(POOL_N_ATTR.get(key, ''), 0)
-            if n_neurons > 0:
-                pool_prefs[key] = np.zeros(n_neurons)
+        Args:
+            val_tokens: Validation token array
+            n_batches: Number of batches to process
+            threshold: Weight threshold for activation
+            batch_size: Batch size
+            seq_len: Sequence length
 
-        # Process batches
-        batches_to_process = batches[:min(n_batches, len(batches))]
-        for batch in tqdm(batches_to_process, desc='Diversity Analysis', disable=not HAS_TQDM):
-            routing = self.extractor.extract_routing(batch)
-            routing_data = JAXRoutingData(routing)
+        Returns:
+            Dictionary with diversity metrics
+        """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
 
-            for key in pool_prefs.keys():
-                pref = routing_data.get_pref(key)
-                if pref is not None:
-                    # Sum preferences across batch and sequence
-                    pool_prefs[key] += pref.sum(axis=(0, 1))
+        # Get pool configuration
+        pools = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
+
+        # Initialize accumulators
+        activation_counts = {pool: np.zeros(n) for pool, n in pools.items() if n > 0}
+
+        # Create batches
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
+
+        for batch in tqdm(batches, desc='Diversity Analysis'):
+            input_ids = np.array(batch)
+
+            # Extract routing data
+            routing_info = self.extractor.extract_routing(input_ids)
+            routing = JAXRoutingData(routing_info)
+
+            # Process attention weights
+            for key in ['fqk_q', 'fqk_k', 'fv', 'rqk_q', 'rqk_k', 'rv']:
+                weights = routing.get_weight(key)
+                if weights is None:
+                    continue
+
+                # Map key to pool
+                if key.startswith('fqk'):
+                    pool = 'feature_qk'
+                elif key == 'fv':
+                    pool = 'feature_v'
+                elif key.startswith('rqk'):
+                    pool = 'restore_qk'
+                elif key == 'rv':
+                    pool = 'restore_v'
+                else:
+                    continue
+
+                if pool not in activation_counts:
+                    continue
+
+                if weights.ndim == 3:
+                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
+                else:
+                    active = (weights > threshold).astype(np.float32).sum(axis=0)
+
+                activation_counts[pool] += active
+
+            # Process knowledge weights
+            for key in ['fknow', 'rknow']:
+                weights = routing.get_weight(key)
+                if weights is None:
+                    continue
+
+                pool = 'feature_know' if key == 'fknow' else 'restore_know'
+                if pool not in activation_counts:
+                    continue
+
+                if weights.ndim == 3:
+                    active = (weights > threshold).astype(np.float32).sum(axis=(0, 1))
+                else:
+                    active = (weights > threshold).astype(np.float32).sum(axis=0)
+
+                activation_counts[pool] += active
 
         # Compute diversity metrics
         results = {}
-        for key, prefs in pool_prefs.items():
-            n_total = len(prefs)
-            if n_total == 0:
+        entropies = []
+
+        for pool, counts in activation_counts.items():
+            n_total = len(counts)
+            active_mask = counts > 0
+            n_active = int(active_mask.sum())
+
+            if n_active == 0:
+                results[pool] = {
+                    'n_active': 0,
+                    'n_total': n_total,
+                    'entropy': 0,
+                    'normalized_entropy': 0,
+                    'effective_count': 0,
+                    'coverage': 0,
+                }
                 continue
 
-            # Normalize to probability distribution
-            probs = prefs / (prefs.sum() + 1e-8)
+            # Compute entropy from activation distribution
+            active_counts = counts[active_mask]
+            p = active_counts / active_counts.sum()
 
-            # Entropy
-            ent = float(calc_entropy(probs))
-            max_ent = np.log(n_total) if n_total > 1 else 1.0
+            entropy = -np.sum(p * np.log(p + 1e-8))
+            max_entropy = np.log(n_active)
+            normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
+            effective_count = np.exp(entropy)
 
-            # Effective count (exponential of entropy)
-            eff_count = float(np.exp(ent))
+            # Top-k concentration
+            top5_indices = np.argsort(active_counts)[-min(5, n_active):]
+            top5 = active_counts[top5_indices]
+            top5_share = float(top5.sum() / active_counts.sum())
 
-            # Coverage (non-zero neurons)
-            coverage = (probs > 1e-8).sum() / n_total
-
-            results[key] = {
-                'display': POOL_DISPLAY_NAMES.get(key, key),
-                'entropy': ent,
-                'max_entropy': float(max_ent),
-                'normalized_entropy': ent / max_ent if max_ent > 0 else 0,
-                'effective_count': eff_count,
-                'coverage': float(coverage),
+            results[pool] = {
+                'n_active': n_active,
                 'n_total': n_total,
+                'entropy': float(entropy),
+                'normalized_entropy': float(normalized_entropy),
+                'effective_count': float(effective_count),
+                'coverage': n_active / n_total,
+                'top5_share': top5_share,
+                'gini': gini_coefficient(counts),
             }
+            entropies.append(normalized_entropy)
+
+        # Overall score
+        overall = sum(entropies) / len(entropies) if entropies else 0
+        results['overall'] = {
+            'diversity_score': overall,
+            'health': 'good' if overall > 0.7 else 'warning' if overall > 0.4 else 'critical'
+        }
 
         return results
 
     def run_all(
         self,
-        batches: List[np.ndarray],
-        output_dir: str,
-        n_batches: int = 50
+        val_tokens: np.ndarray,
+        output_dir: str = './neuron_health',
+        n_batches: int = 50,
+        batch_size: int = 32,
+        seq_len: int = 512
     ) -> Dict:
-        """Run all health analyses.
+        """
+        Run all neuron health analyses (forward-based).
 
         Args:
-            batches: List of input batches
-            output_dir: Directory to save results
+            val_tokens: Validation token array
+            output_dir: Directory for outputs
             n_batches: Number of batches to process
+            batch_size: Batch size
+            seq_len: Sequence length
 
         Returns:
             Combined results dictionary
         """
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
 
-        results = {}
-
-        # Activation distribution
-        print("  [1/4] Analyzing activation distribution...")
-        results['activation_distribution'] = self.analyze_activation_distribution(
-            batches, n_batches=n_batches
-        )
-
-        # Dead neurons
-        print("  [2/4] Analyzing dead neurons...")
-        results['dead_neurons'] = self.analyze_dead_neurons(
-            batches, n_batches=n_batches
-        )
-
-        # Neuron norms
-        print("  [3/4] Analyzing neuron norms...")
-        results['neuron_norms'] = self.analyze_neuron_norms()
-
-        # Diversity
-        print("  [4/4] Analyzing routing diversity...")
-        results['diversity'] = self.analyze_diversity(
-            batches, n_batches=n_batches
-        )
-
-        # Save results
-        with open(output_path / 'results.json', 'w') as f:
-            json.dump(results, f, indent=2, default=str)
+        results = {
+            'activation_distribution': self.analyze_activation_distribution(
+                val_tokens, n_batches, batch_size=batch_size, seq_len=seq_len
+            ),
+            'diversity': self.analyze_diversity(
+                val_tokens, n_batches, batch_size=batch_size, seq_len=seq_len
+            ),
+            'dead_neurons': self.analyze_dead_neurons(
+                val_tokens, n_batches, output_dir=output_dir, batch_size=batch_size, seq_len=seq_len
+            ),
+        }
 
         return results

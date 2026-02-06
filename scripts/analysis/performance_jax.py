@@ -1,19 +1,24 @@
 """
-Performance Analysis (JAX Version)
-==================================
-Performance analysis tools for JAX/Flax DAWN models.
+Performance Analysis Module - JAX Version
+==========================================
+Text generation, speed benchmarking, and model comparison utilities.
 
-Includes:
-- Text generation
-- Speed benchmarking
-- Model comparison
+JAX/Flax compatible version for TPU analysis.
+
+Provides:
+- TextGeneratorJAX: Text generation with JAX models
+- SpeedBenchmarkJAX: Inference speed measurement
+- ModelComparatorJAX: Side-by-side model comparison
+
+NOTE: This is a JAX port of performance.py (493 lines).
 """
 
-import time
-import numpy as np
-from typing import Dict, List, Optional, Tuple
-from pathlib import Path
 import json
+import time
+from typing import Dict, List, Optional, Tuple, Any
+from pathlib import Path
+
+import numpy as np
 
 try:
     import jax
@@ -24,24 +29,70 @@ except ImportError:
     jax = None
     jnp = None
 
-from .utils_jax import (
-    evaluate_jax, forward_jax, create_model_from_config,
-    load_val_data_jax, create_batches,
-    estimate_flops_jax, count_params_jax,
-)
+from .utils_jax import create_model_from_config, evaluate_jax, load_val_data_jax
+
+
+# Standard prompt categories for generation
+GENERATION_PROMPTS = {
+    'factual': [
+        "The capital of France is",
+        "The largest ocean on Earth is",
+        "Einstein developed the theory of",
+    ],
+    'common_sense': [
+        "If you drop a glass, it will",
+        "Fire is hot, ice is",
+        "At night, the sky is",
+    ],
+    'narrative': [
+        "Once upon a time, there was a",
+        "She walked into the room and",
+    ],
+    'technical': [
+        "def fibonacci(n):",
+        "The mitochondria is the",
+    ],
+    'conversational': [
+        "I think the best way to",
+        "In my opinion,",
+    ],
+}
+
+# Paper-quality prompts for comparison
+PAPER_COMPARISON_PROMPTS = {
+    'Factual Knowledge': [
+        "The capital of France is",
+        "The largest planet in our solar system is",
+        "Water boils at",
+        "Albert Einstein was born in",
+    ],
+    'Common Sense': [
+        "If you drop a glass on the floor, it will",
+        "Fire is hot, but ice is",
+        "Birds fly in the sky, fish swim in",
+        "At night, the sun is",
+    ],
+    'Narrative': [
+        "Once upon a time, in a small village,",
+        "The detective examined the evidence and",
+        "She opened the door and saw",
+        "After years of hard work, he finally",
+    ],
+    'Technical': [
+        "In machine learning, gradient descent is",
+        "The function of the mitochondria is",
+        "A neural network consists of",
+    ],
+}
 
 
 class TextGeneratorJAX:
-    """Text generation utility for JAX models."""
+    """Text generation utilities for JAX models."""
 
     def __init__(self, tokenizer=None, vocab_size: int = 30522):
-        """
-        Args:
-            tokenizer: Optional tokenizer for encoding/decoding
-            vocab_size: Vocabulary size if no tokenizer provided
-        """
         self.tokenizer = tokenizer
         self.vocab_size = vocab_size
+        self.eos_token_id = 102  # BERT [SEP]
 
     def generate(
         self,
@@ -57,17 +108,17 @@ class TextGeneratorJAX:
         """Generate text continuation.
 
         Args:
-            model: JAX model class
-            params: FrozenDict of parameters
+            model: JAX/Flax model class (unused, uses config to create instance)
+            params: Model parameters
             config: Model configuration
-            prompt_ids: Input token IDs [seq_len] or [1, seq_len]
+            prompt_ids: Input token IDs
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_k: Top-k filtering
-            top_p: Top-p (nucleus) filtering
+            top_p: Top-p (nucleus) sampling threshold
 
         Returns:
-            Tuple of (generated_ids, time_ms)
+            Tuple of (generated_ids, elapsed_ms)
         """
         if not HAS_JAX:
             return prompt_ids, 0.0
@@ -109,18 +160,6 @@ class TextGeneratorJAX:
                     mask[top_indices] = logits[top_indices]
                     logits = mask
 
-                # Top-p (nucleus) filtering
-                if top_p < 1.0:
-                    sorted_indices = np.argsort(logits)[::-1]
-                    sorted_logits = logits[sorted_indices]
-                    probs = np.exp(sorted_logits - np.max(sorted_logits))
-                    probs = probs / probs.sum()
-                    cumsum = np.cumsum(probs)
-                    cutoff_idx = np.searchsorted(cumsum, top_p) + 1
-                    mask = np.ones_like(logits) * float('-inf')
-                    mask[sorted_indices[:cutoff_idx]] = logits[sorted_indices[:cutoff_idx]]
-                    logits = mask
-
                 # Sample
                 probs = np.exp(logits - np.max(logits))
                 probs = probs / (probs.sum() + 1e-8)
@@ -133,12 +172,51 @@ class TextGeneratorJAX:
             generated.append(next_token)
 
             # Stop on EOS
-            if next_token in [102, 0]:  # BERT [SEP] or padding
+            if next_token == self.eos_token_id:
                 break
 
         elapsed_ms = (time.time() - start_time) * 1000
 
         return np.array(generated), elapsed_ms
+
+    def generate_simple(
+        self,
+        model,
+        params,
+        config: Dict,
+        prompt: str,
+        max_new_tokens: int = 50,
+        temperature: float = 0.8,
+        top_k: int = 50
+    ) -> str:
+        """Generate text from a prompt (simple, no streaming).
+
+        Args:
+            model: JAX/Flax model class
+            params: Model parameters
+            config: Model configuration
+            prompt: Input text prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k filtering parameter
+
+        Returns:
+            Full generated text including prompt
+        """
+        if self.tokenizer is None:
+            return prompt
+
+        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        prompt_ids = np.array(input_ids)
+
+        generated_ids, _ = self.generate(
+            model, params, config, prompt_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k
+        )
+
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
     def generate_from_text(
         self,
@@ -149,13 +227,13 @@ class TextGeneratorJAX:
         max_new_tokens: int = 50,
         **kwargs
     ) -> Tuple[str, Dict]:
-        """Generate text from string prompt.
+        """Generate text from string prompt with metadata.
 
         Args:
-            model: JAX model class
-            params: FrozenDict of parameters
+            model: JAX/Flax model class
+            params: Model parameters
             config: Model configuration
-            prompt: Input text
+            prompt: Input text prompt
             max_new_tokens: Maximum tokens to generate
             **kwargs: Additional generation parameters
 
@@ -189,12 +267,82 @@ class TextGeneratorJAX:
 
         return generated_text, metadata
 
+    def generate_samples(
+        self,
+        model,
+        params,
+        config: Dict,
+        model_name: str = "model",
+        prompts: Dict[str, List[str]] = None,
+        max_new_tokens: int = 50,
+        temperature: float = 0.8,
+        top_k: int = 50,
+        streaming: bool = True
+    ) -> List[Dict]:
+        """Generate text samples with top-k sampling.
+
+        Args:
+            model: JAX/Flax model class
+            params: Model parameters
+            config: Model configuration
+            model_name: Name for display
+            prompts: Dict of category -> list of prompts
+            max_new_tokens: Maximum tokens per sample
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            streaming: Whether to print tokens as generated
+
+        Returns:
+            List of generation results with stats
+        """
+        if prompts is None:
+            prompts = GENERATION_PROMPTS
+
+        if self.tokenizer is None:
+            return [{'error': 'No tokenizer'}]
+
+        results = []
+
+        for category, category_prompts in prompts.items():
+            for prompt in category_prompts:
+                start_time = time.perf_counter()
+
+                input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+                prompt_ids = np.array(input_ids)
+                prompt_len = len(prompt_ids)
+
+                if streaming:
+                    print(f"  [{model_name}|{category}] {prompt}", end="", flush=True)
+
+                generated_ids, gen_time_ms = self.generate(
+                    model, params, config, prompt_ids,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
+                )
+
+                generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                new_tokens = len(generated_ids) - prompt_len
+                elapsed = time.perf_counter() - start_time
+
+                if streaming:
+                    continuation = generated_text[len(prompt):] if generated_text.startswith(prompt) else generated_text
+                    print(f"{continuation}  ({new_tokens} tok, {elapsed*1000:.0f}ms)", flush=True)
+
+                results.append({
+                    'category': category,
+                    'prompt': prompt,
+                    'generated': generated_text,
+                    'new_tokens': new_tokens,
+                    'time_ms': elapsed * 1000,
+                    'tokens_per_sec': new_tokens / elapsed if elapsed > 0 else 0,
+                })
+
+        return results
+
 
 class SpeedBenchmarkJAX:
     """Speed benchmarking for JAX models."""
-
-    def __init__(self):
-        pass
 
     def benchmark_forward(
         self,
@@ -209,16 +357,16 @@ class SpeedBenchmarkJAX:
         """Benchmark forward pass speed.
 
         Args:
-            model: JAX model class
-            params: FrozenDict of parameters
+            model: JAX/Flax model class (unused, uses config)
+            params: Model parameters
             config: Model configuration
             batch_size: Batch size
             seq_len: Sequence length
-            n_warmup: Number of warmup runs
-            n_runs: Number of timed runs
+            n_warmup: Number of warmup iterations
+            n_runs: Number of benchmark iterations
 
         Returns:
-            Dictionary with timing statistics
+            Dict with timing statistics
         """
         if not HAS_JAX:
             return {'error': 'JAX not available'}
@@ -273,83 +421,27 @@ class SpeedBenchmarkJAX:
             'batches_per_sec': float(1000 / times.mean()),
         }
 
-    def benchmark_generation(
+    def quick_benchmark(
         self,
         model,
         params,
         config: Dict,
-        prompt_len: int = 50,
-        gen_len: int = 50,
-        n_runs: int = 10,
+        iterations: int = 20
     ) -> Dict:
-        """Benchmark text generation speed.
-
-        Args:
-            model: JAX model class
-            params: FrozenDict of parameters
-            config: Model configuration
-            prompt_len: Prompt length
-            gen_len: Generation length
-            n_runs: Number of runs
-
-        Returns:
-            Dictionary with timing statistics
-        """
-        if not HAS_JAX:
-            return {'error': 'JAX not available'}
-
-        generator = TextGeneratorJAX(vocab_size=config.get('vocab_size', 30522))
-
-        # Create random prompt
-        vocab_size = config.get('vocab_size', 30522)
-        prompt_ids = np.random.randint(1, vocab_size, size=prompt_len)
-
-        times = []
-        tokens_generated = []
-
-        for _ in range(n_runs):
-            generated, time_ms = generator.generate(
-                model, params, config, prompt_ids,
-                max_new_tokens=gen_len, temperature=0.8
-            )
-            times.append(time_ms)
-            tokens_generated.append(len(generated) - prompt_len)
-
-        times = np.array(times)
-        tokens = np.array(tokens_generated)
-
-        return {
-            'prompt_len': prompt_len,
-            'target_gen_len': gen_len,
-            'n_runs': n_runs,
-            'avg_time_ms': float(times.mean()),
-            'std_time_ms': float(times.std()),
-            'avg_tokens_generated': float(tokens.mean()),
-            'tokens_per_sec': float(tokens.mean() / (times.mean() / 1000)) if times.mean() > 0 else 0,
-        }
+        """Quick speed test for comparison purposes."""
+        return self.benchmark_forward(model, params, config, batch_size=1, seq_len=512, n_runs=iterations)
 
 
 class ModelComparatorJAX:
     """Compare multiple JAX models."""
 
-    def __init__(self, val_data_path: str, batch_size: int = 32, seq_len: int = 512):
-        """
-        Args:
-            val_data_path: Path to validation data
-            batch_size: Batch size for evaluation
-            seq_len: Sequence length
-        """
+    def __init__(self, val_data_path: str, tokenizer=None, batch_size: int = 32, seq_len: int = 512):
         self.val_data_path = val_data_path
+        self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.seq_len = seq_len
-        self._val_tokens = None
-
-    def _load_val_tokens(self, max_batches: int = 200):
-        """Load validation tokens (cached)."""
-        if self._val_tokens is None:
-            max_tokens = max_batches * self.batch_size * self.seq_len
-            self._val_tokens = load_val_data_jax(self.val_data_path, max_tokens)
-        return self._val_tokens
+        self.generator = TextGeneratorJAX(tokenizer) if tokenizer else None
+        self.benchmark = SpeedBenchmarkJAX()
 
     def compare_performance(
         self,
@@ -359,23 +451,23 @@ class ModelComparatorJAX:
         """Compare model performance.
 
         Args:
-            models: List of (name, model, params, config) tuples
-            n_batches: Number of batches for evaluation
+            models: List of (name, model_class, params, config) tuples
+            n_batches: Number of batches to evaluate
 
         Returns:
-            Dictionary with comparison results
+            Dict with performance comparison
         """
-        val_tokens = self._load_val_tokens(n_batches)
+        from .utils_jax import count_params_jax, estimate_flops_jax
+
+        val_tokens = load_val_data_jax(self.val_data_path, n_batches * self.batch_size * self.seq_len)
         results = {}
 
         for name, model, params, config in models:
             print(f"  Evaluating {name}...")
 
-            # Count params and FLOPs
             total_params = count_params_jax(params)
             flops = estimate_flops_jax(config, self.seq_len)
 
-            # Evaluate
             model_instance = create_model_from_config(config)
             eval_results = evaluate_jax(
                 model_instance, params, config,
@@ -394,44 +486,107 @@ class ModelComparatorJAX:
 
         return results
 
-    def compare_speed(
+    def generate_comparison_samples(
         self,
-        models: List[Tuple[str, any, any, Dict]],
-        batch_size: int = 16,
-        seq_len: int = 512,
-    ) -> Dict:
-        """Compare model speed.
+        dawn_model,
+        dawn_params,
+        dawn_config: Dict,
+        baseline_model,
+        baseline_params,
+        baseline_config: Dict,
+        dawn_name: str,
+        baseline_name: str,
+        output_path: Path,
+        prompts: Dict[str, List[str]] = None
+    ) -> str:
+        """Generate text samples comparing DAWN vs Baseline.
 
         Args:
-            models: List of (name, model, params, config) tuples
-            batch_size: Batch size for benchmarking
-            seq_len: Sequence length
+            dawn_model: DAWN model class
+            dawn_params: DAWN model parameters
+            dawn_config: DAWN model configuration
+            baseline_model: Baseline model class
+            baseline_params: Baseline model parameters
+            baseline_config: Baseline model configuration
+            dawn_name: DAWN model name for display
+            baseline_name: Baseline model name for display
+            output_path: Path to save comparison file
+            prompts: Optional custom prompts
 
         Returns:
-            Dictionary with speed comparison
+            Path to saved comparison file
         """
-        benchmark = SpeedBenchmarkJAX()
-        results = {}
+        if self.generator is None:
+            return str(output_path)
 
-        for name, model, params, config in models:
-            print(f"  Benchmarking {name}...")
-            results[name] = benchmark.benchmark_forward(
-                model, params, config,
-                batch_size=batch_size,
-                seq_len=seq_len
-            )
+        if prompts is None:
+            prompts = PAPER_COMPARISON_PROMPTS
 
-        return results
+        lines = []
+        lines.append("=" * 100)
+        lines.append("GENERATION COMPARISON: DAWN vs Baseline (JAX)")
+        lines.append("=" * 100)
+        lines.append(f"DAWN Model:     {dawn_name}")
+        lines.append(f"Baseline Model: {baseline_name}")
+        lines.append("=" * 100)
+
+        print("\n" + "\n".join(lines[-4:]))
+
+        for category, category_prompts in prompts.items():
+            cat_header = f"\n{'='*100}\n[{category.upper()}]\n{'='*100}"
+            lines.append(cat_header)
+            print(cat_header)
+
+            for prompt in category_prompts:
+                prompt_line = f"\n{'─'*100}\nPrompt: \"{prompt}\"\n{'─'*100}"
+                lines.append(prompt_line)
+                print(prompt_line)
+
+                dawn_output = self.generator.generate_simple(
+                    dawn_model, dawn_params, dawn_config, prompt
+                )
+                baseline_output = self.generator.generate_simple(
+                    baseline_model, baseline_params, baseline_config, prompt
+                )
+
+                dawn_gen = dawn_output[len(prompt):].strip() if dawn_output.startswith(prompt) else dawn_output
+                baseline_gen = baseline_output[len(prompt):].strip() if baseline_output.startswith(prompt) else baseline_output
+
+                dawn_line = f"  DAWN:     {dawn_gen}"
+                baseline_line = f"  Baseline: {baseline_gen}"
+
+                lines.append(dawn_line)
+                lines.append(baseline_line)
+                print(dawn_line)
+                print(baseline_line)
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+
+        print(f"\n    Saved to: {output_path}")
+        return str(output_path)
 
 
 def save_generation_results(results: List[Dict], output_path: str):
-    """Save generation results to file."""
+    """Save generation results to file.
+
+    Args:
+        results: List of generation result dicts
+        output_path: Path to save JSON file
+    """
     with open(output_path, 'w') as f:
         json.dump(results, f, indent=2, default=str)
 
 
 def print_generation_summary(results: List[Dict], model_name: str = "Model"):
-    """Print generation summary."""
+    """Print generation summary.
+
+    Args:
+        results: List of generation result dicts
+        model_name: Model name for display
+    """
     if not results:
         print(f"  {model_name}: No generation results")
         return

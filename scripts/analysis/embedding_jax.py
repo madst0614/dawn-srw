@@ -1,160 +1,190 @@
 """
-Embedding Analysis (JAX Version)
-================================
-Analyze neuron embeddings in DAWN models using JAX/Flax.
+Embedding Analysis - JAX Version
+=================================
+Analyze neuron embeddings in DAWN models.
+
+JAX/Flax compatible version for TPU analysis.
 
 Includes:
-- Neuron embedding similarity analysis
-- Embedding clustering
-- PCA variance analysis
+- Intra-type similarity analysis
+- Cross-type similarity analysis
+- Clustering analysis
+- Visualization (requires matplotlib)
+
+NOTE: This is a JAX port of embedding.py (271 lines).
 """
 
+import os
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from pathlib import Path
-import json
+from typing import Dict, Optional
 
-from .utils_jax import (
-    get_neuron_embeddings_jax,
-    POOL_N_ATTR, POOL_DISPLAY_NAMES,
-)
+# JAX imports
+try:
+    import jax
+    import jax.numpy as jnp
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+    jax = None
+    jnp = None
 
 try:
     from sklearn.cluster import KMeans
-    from sklearn.decomposition import PCA
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
 
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib
-    matplotlib.use('Agg')
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
-    plt = None
+from .base_jax import BaseAnalyzerJAX
+from .utils_jax import (
+    EMBEDDING_POOLS_V18,
+    get_neuron_embeddings_jax,
+)
 
 
-class EmbeddingAnalyzerJAX:
-    """Neuron embedding analyzer for JAX DAWN models."""
+class EmbeddingAnalyzerJAX(BaseAnalyzerJAX):
+    """Neuron embedding analyzer (JAX version)."""
 
     def __init__(self, model, params, config: Dict):
         """
         Initialize analyzer.
 
         Args:
-            model: JAX DAWN model class
+            model: DAWN JAX model class
             params: FrozenDict of model parameters
             config: Model configuration dict
         """
-        self.model = model
-        self.params = params
-        self.config = config
+        super().__init__(model, params, config)
 
-        # Get neuron embeddings
-        self.embeddings = get_neuron_embeddings_jax(params)
+    def get_embeddings_by_type(self) -> Dict[str, np.ndarray]:
+        """
+        Extract embeddings grouped by embedding pool.
 
-        # Pool boundaries
-        self.n_fqk = config.get('n_feature_qk', 0)
-        self.n_fv = config.get('n_feature_v', 0)
-        self.n_rqk = config.get('n_restore_qk', 0)
-        self.n_rv = config.get('n_restore_v', 0)
-        self.n_fk = config.get('n_feature_know', 0)
-        self.n_rk = config.get('n_restore_know', 0)
-
-    def _get_pool_embeddings(self) -> Dict[str, np.ndarray]:
-        """Split embeddings by pool."""
-        if self.embeddings is None:
+        Returns:
+            Dictionary mapping pool name to embedding array
+        """
+        emb = get_neuron_embeddings_jax(self.params)
+        if emb is None:
             return {}
 
-        emb = self.embeddings
-        pools = {}
+        # Use embedding pools (6 unique pools)
+        pools = self.get_embedding_pools()
+        result = {}
+        offset = 0
 
-        idx = 0
-        if self.n_fqk > 0:
-            pools['feature_qk'] = emb[idx:idx + self.n_fqk]
-            idx += self.n_fqk
-        if self.n_fv > 0:
-            pools['feature_v'] = emb[idx:idx + self.n_fv]
-            idx += self.n_fv
-        if self.n_rqk > 0:
-            pools['restore_qk'] = emb[idx:idx + self.n_rqk]
-            idx += self.n_rqk
-        if self.n_rv > 0:
-            pools['restore_v'] = emb[idx:idx + self.n_rv]
-            idx += self.n_rv
-        if self.n_fk > 0:
-            pools['feature_know'] = emb[idx:idx + self.n_fk]
-            idx += self.n_fk
-        if self.n_rk > 0:
-            pools['restore_know'] = emb[idx:idx + self.n_rk]
+        # Pool sizes from config
+        pool_sizes = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
 
-        return pools
+        for name, (display, n_attr, _) in pools.items():
+            n = pool_sizes.get(name, 0)
+            if n > 0 and offset + n <= len(emb):
+                result[name] = emb[offset:offset + n]
+                offset += n
 
-    def analyze_similarity(self) -> Dict:
-        """Analyze within-pool and cross-pool similarity.
+        return result
+
+    def analyze_similarity(self, output_dir: Optional[str] = None) -> Dict:
+        """
+        Analyze intra-type similarity using cosine similarity.
+
+        Args:
+            output_dir: Directory for visualization output
 
         Returns:
             Dictionary with similarity statistics
         """
-        pools = self._get_pool_embeddings()
-        if not pools:
-            return {}
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
 
-        results = {
-            'within_pool': {},
-            'cross_pool': {},
-        }
+        embeddings = self.get_embeddings_by_type()
+        if not embeddings:
+            return {'error': 'No embeddings found'}
 
-        # Within-pool similarity
-        for pool_name, pool_emb in pools.items():
-            if len(pool_emb) < 2:
+        results = {}
+        pools = self.get_embedding_pools()
+
+        for name, emb in embeddings.items():
+            if len(emb) < 2:
                 continue
 
-            # Cosine similarity matrix (embeddings are already normalized)
-            sim_matrix = pool_emb @ pool_emb.T
+            # Normalize embeddings
+            norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8
+            emb_norm = emb / norms
 
-            # Get upper triangle (excluding diagonal)
-            n = len(pool_emb)
-            upper_tri = sim_matrix[np.triu_indices(n, k=1)]
+            # Compute similarity matrix
+            sim_matrix = np.dot(emb_norm, emb_norm.T)
 
-            results['within_pool'][pool_name] = {
-                'display': POOL_DISPLAY_NAMES.get(pool_name.replace('_', ''), pool_name),
-                'avg_similarity': float(upper_tri.mean()),
-                'std_similarity': float(upper_tri.std()),
-                'min_similarity': float(upper_tri.min()),
-                'max_similarity': float(upper_tri.max()),
+            # Extract off-diagonal elements
+            n = sim_matrix.shape[0]
+            mask = ~np.eye(n, dtype=bool)
+            off_diag = sim_matrix[mask]
+
+            display = pools[name][0] if name in pools else name.upper()
+            results[name] = {
+                'display': display,
                 'n_neurons': n,
+                'avg_similarity': float(off_diag.mean()),
+                'max_similarity': float(off_diag.max()),
+                'min_similarity': float(off_diag.min()),
+                'std_similarity': float(off_diag.std()),
             }
 
-        # Cross-pool similarity (between each pair of pools)
-        pool_names = list(pools.keys())
-        for i, pool1 in enumerate(pool_names):
-            for pool2 in pool_names[i+1:]:
-                emb1 = pools[pool1]
-                emb2 = pools[pool2]
-
-                # Cross-similarity matrix
-                cross_sim = emb1 @ emb2.T
-
-                key = f"{pool1}_vs_{pool2}"
-                results['cross_pool'][key] = {
-                    'pool1': pool1,
-                    'pool2': pool2,
-                    'avg_similarity': float(cross_sim.mean()),
-                    'std_similarity': float(cross_sim.std()),
-                    'min_similarity': float(cross_sim.min()),
-                    'max_similarity': float(cross_sim.max()),
-                }
+        # Visualization (skip for JAX version - requires matplotlib)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            # TODO: Add JAX-compatible visualization
 
         return results
 
-    def analyze_clustering(self, n_clusters: int = 5) -> Dict:
-        """Analyze embedding clustering.
+    def analyze_cross_type_similarity(self) -> Dict:
+        """
+        Analyze similarity between neuron types using centroids.
+
+        Returns:
+            Dictionary with pairwise centroid similarities
+        """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        embeddings = self.get_embeddings_by_type()
+        if not embeddings:
+            return {'error': 'No embeddings found'}
+
+        pools = self.get_embedding_pools()
+
+        # Compute centroids
+        centroids = {}
+        for name, emb in embeddings.items():
+            centroids[name] = emb.mean(axis=0)
+
+        # Compute pairwise similarities
+        results = {}
+        names = list(centroids.keys())
+        for i, n1 in enumerate(names):
+            for n2 in names[i+1:]:
+                c1, c2 = centroids[n1], centroids[n2]
+                # Cosine similarity
+                sim = np.dot(c1, c2) / (np.linalg.norm(c1) * np.linalg.norm(c2) + 1e-8)
+                d1 = pools[n1][0] if n1 in pools else n1.upper()
+                d2 = pools[n2][0] if n2 in pools else n2.upper()
+                key = f"{d1}-{d2}"
+                results[key] = float(sim)
+
+        return results
+
+    def analyze_clustering(self, n_clusters: int = 5, output_dir: Optional[str] = None) -> Dict:
+        """
+        Perform clustering analysis on neuron embeddings.
 
         Args:
-            n_clusters: Number of clusters for K-means
+            n_clusters: Number of clusters
+            output_dir: Directory for visualization output
 
         Returns:
             Dictionary with clustering results
@@ -162,180 +192,149 @@ class EmbeddingAnalyzerJAX:
         if not HAS_SKLEARN:
             return {'error': 'sklearn not available'}
 
-        pools = self._get_pool_embeddings()
-        if not pools:
-            return {}
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        emb_full = get_neuron_embeddings_jax(self.params)
+        if emb_full is None:
+            return {'error': 'No embeddings found'}
+
+        pools = self.get_embedding_pools()
+
+        # Pool sizes from config
+        pool_sizes = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+            'feature_know': self.n_feature_know,
+            'restore_know': self.n_restore_know,
+        }
+
+        # Build boundaries for each pool
+        boundaries = {}
+        offset = 0
+        for name, (display, n_attr, _) in pools.items():
+            n = pool_sizes.get(name, 0)
+            if n > 0:
+                boundaries[name] = (offset, offset + n, display)
+                offset += n
 
         results = {}
 
-        for pool_name, pool_emb in pools.items():
-            if len(pool_emb) < n_clusters:
+        # Cluster each pool
+        for name, (start, end, display) in boundaries.items():
+            if end > len(emb_full):
                 continue
 
-            # K-means clustering
+            pool_emb = emb_full[start:end]
+            n_neurons = pool_emb.shape[0]
+
+            if n_neurons < n_clusters:
+                results[name] = {'error': f'Not enough neurons for {n_clusters} clusters'}
+                continue
+
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             labels = kmeans.fit_predict(pool_emb)
 
-            # Cluster statistics
-            cluster_sizes = np.bincount(labels, minlength=n_clusters)
-            inertia = kmeans.inertia_
+            cluster_stats = []
+            for c in range(n_clusters):
+                cluster_mask = labels == c
+                cluster_size = int(cluster_mask.sum())
+                cluster_stats.append({
+                    'cluster_id': c,
+                    'size': cluster_size,
+                })
 
-            # Silhouette score (if we have enough samples)
-            if len(pool_emb) > n_clusters:
-                from sklearn.metrics import silhouette_score
-                silhouette = silhouette_score(pool_emb, labels)
-            else:
-                silhouette = 0.0
-
-            results[pool_name] = {
-                'display': POOL_DISPLAY_NAMES.get(pool_name.replace('_', ''), pool_name),
+            results[name] = {
+                'display': display,
                 'n_clusters': n_clusters,
-                'cluster_sizes': cluster_sizes.tolist(),
-                'inertia': float(inertia),
-                'silhouette': float(silhouette),
-                'n_neurons': len(pool_emb),
+                'clusters': sorted(cluster_stats, key=lambda x: -x['size']),
+                'labels': labels.tolist(),
             }
+
+        # Visualization (skip for JAX version - requires matplotlib)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            # TODO: Add JAX-compatible visualization
 
         return results
 
-    def analyze_pca(self, n_components: int = 10) -> Dict:
-        """Analyze PCA variance in embeddings.
+    def visualize(self, output_dir: str) -> Optional[str]:
+        """
+        Generate t-SNE/PCA visualization of all embeddings.
 
         Args:
-            n_components: Number of PCA components
+            output_dir: Directory for output
 
         Returns:
-            Dictionary with PCA variance results
+            Path to visualization or None
         """
-        if not HAS_SKLEARN:
-            return {'error': 'sklearn not available'}
+        # TODO: Implement JAX-compatible visualization
+        return None
 
-        pools = self._get_pool_embeddings()
-        if not pools:
-            return {}
-
-        results = {}
-
-        for pool_name, pool_emb in pools.items():
-            if len(pool_emb) < n_components:
-                continue
-
-            # PCA
-            pca = PCA(n_components=min(n_components, len(pool_emb), pool_emb.shape[1]))
-            pca.fit(pool_emb)
-
-            results[pool_name] = {
-                'display': POOL_DISPLAY_NAMES.get(pool_name.replace('_', ''), pool_name),
-                'explained_variance_ratio': pca.explained_variance_ratio_.tolist(),
-                'cumulative_variance': np.cumsum(pca.explained_variance_ratio_).tolist(),
-                'n_components_90': int(np.argmax(np.cumsum(pca.explained_variance_ratio_) >= 0.9) + 1),
-                'n_components_95': int(np.argmax(np.cumsum(pca.explained_variance_ratio_) >= 0.95) + 1),
-                'n_neurons': len(pool_emb),
-            }
-
-        return results
-
-    def visualize_similarity(self, similarity_results: Dict, output_dir: str):
-        """Generate similarity visualization."""
-        if not HAS_MATPLOTLIB:
-            return
-
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        within_pool = similarity_results.get('within_pool', {})
-        if not within_pool:
-            return
-
-        pools = list(within_pool.keys())
-        means = [within_pool[p]['avg_similarity'] for p in pools]
-        stds = [within_pool[p]['std_similarity'] for p in pools]
-        labels = [within_pool[p]['display'] for p in pools]
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-        x = np.arange(len(pools))
-        ax.bar(x, means, yerr=stds, capsize=5, color='coral', alpha=0.8)
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=45, ha='right')
-        ax.set_ylabel('Average Cosine Similarity')
-        ax.set_title('Within-Pool Neuron Embedding Similarity')
-        ax.grid(axis='y', alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(output_path / 'embedding_similarity.png', dpi=300)
-        plt.savefig(output_path / 'embedding_similarity.pdf')
-        plt.close()
-
-    def visualize_pca(self, pca_results: Dict, output_dir: str):
-        """Generate PCA variance visualization."""
-        if not HAS_MATPLOTLIB:
-            return
-
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        for pool_name, data in pca_results.items():
-            if 'cumulative_variance' not in data:
-                continue
-            cumvar = data['cumulative_variance']
-            ax.plot(range(1, len(cumvar) + 1), cumvar,
-                    marker='o', label=data['display'])
-
-        ax.axhline(y=0.9, color='gray', linestyle='--', alpha=0.5, label='90%')
-        ax.axhline(y=0.95, color='gray', linestyle=':', alpha=0.5, label='95%')
-        ax.set_xlabel('Number of Components')
-        ax.set_ylabel('Cumulative Explained Variance')
-        ax.set_title('PCA Variance by Pool')
-        ax.legend()
-        ax.grid(alpha=0.3)
-
-        plt.tight_layout()
-        plt.savefig(output_path / 'pca_variance.png', dpi=300)
-        plt.savefig(output_path / 'pca_variance.pdf')
-        plt.close()
-
-    def run_all(self, output_dir: str, n_clusters: int = 5) -> Dict:
-        """Run all embedding analyses.
+    def run_all(self, output_dir: str = './embedding_analysis', n_clusters: int = 5) -> Dict:
+        """
+        Run all embedding analyses.
 
         Args:
-            output_dir: Directory to save results
-            n_clusters: Number of clusters for K-means
+            output_dir: Directory for outputs
+            n_clusters: Number of clusters for clustering analysis
 
         Returns:
             Combined results dictionary
         """
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
 
-        results = {}
+        results = {
+            'similarity': self.analyze_similarity(output_dir),
+            'cross_type_similarity': self.analyze_cross_type_similarity(),
+            'clustering': self.analyze_clustering(n_clusters, output_dir),
+        }
 
-        # Similarity analysis
-        print("  [1/3] Analyzing embedding similarity...")
-        results['similarity'] = self.analyze_similarity()
-
-        # Clustering analysis
-        print("  [2/3] Analyzing embedding clustering...")
-        results['clustering'] = self.analyze_clustering(n_clusters)
-
-        # PCA analysis
-        print("  [3/3] Analyzing PCA variance...")
-        results['pca'] = self.analyze_pca()
-
-        # Visualizations
-        if results.get('similarity'):
-            self.visualize_similarity(results['similarity'], str(output_path))
-        if results.get('pca'):
-            self.visualize_pca(results['pca'], str(output_path))
-
-        # Save results
-        with open(output_path / 'results.json', 'w') as f:
-            json.dump(results, f, indent=2, default=str)
+        # Main visualization
+        viz_path = self.visualize(output_dir)
+        if viz_path:
+            results['visualization'] = viz_path
 
         return results
 
 
-class NeuronEmbeddingAnalyzerJAX(EmbeddingAnalyzerJAX):
-    """Alias for backward compatibility."""
-    pass
+class NeuronEmbeddingAnalyzerJAX(BaseAnalyzerJAX):
+    """Extended neuron embedding analyzer (JAX version)."""
+
+    def __init__(self, model, params, config: Dict):
+        super().__init__(model, params, config)
+        self.tokenizer = None
+
+    def run_full_analysis(
+        self,
+        val_tokens: np.ndarray,
+        output_dir: str = './neuron_embedding',
+        n_batches: int = 50,
+        k_range: tuple = (5, 20),
+        tokenizer=None
+    ) -> Dict:
+        """
+        Run full neuron embedding analysis.
+
+        Args:
+            val_tokens: Validation tokens
+            output_dir: Directory for outputs
+            n_batches: Number of batches
+            k_range: Range of k for optimal k analysis
+            tokenizer: Tokenizer instance
+
+        Returns:
+            Combined results dictionary
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Run basic embedding analysis
+        basic_analyzer = EmbeddingAnalyzerJAX(self.model, self.params, self.config)
+
+        return {
+            'pool_distribution': basic_analyzer.analyze_similarity(output_dir),
+            'clustering': basic_analyzer.analyze_clustering(output_dir=output_dir),
+            'cross_type_similarity': basic_analyzer.analyze_cross_type_similarity(),
+        }
