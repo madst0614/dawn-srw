@@ -793,6 +793,390 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
         results['n_batches'] = n_batches
         return results
 
+    def analyze_layer_contribution(
+        self,
+        val_tokens: np.ndarray,
+        n_batches: int = 50,
+        batch_size: int = 32,
+        seq_len: int = 512
+    ) -> Dict:
+        """
+        Analyze layer-wise contribution to output.
+
+        Args:
+            val_tokens: Validation token array
+            n_batches: Number of batches to process
+            batch_size: Batch size
+            seq_len: Sequence length
+
+        Returns:
+            Dictionary with layer contribution statistics
+        """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        n_layers = self.config.get('n_layers', 12)
+        layer_norms = {i: [] for i in range(n_layers)}
+
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
+
+        for batch in tqdm(batches, desc='Layer Contribution'):
+            input_ids = np.array(batch)
+
+            # Forward pass to get hidden states
+            rng_key = jax.random.PRNGKey(0)
+            result = self.model_instance.apply(
+                self.params,
+                jnp.array(input_ids),
+                deterministic=True,
+                rngs={'dropout': rng_key}
+            )
+
+            # Get hidden states if available
+            if 'hidden_states' in result:
+                for i, h in enumerate(result['hidden_states']):
+                    if i < n_layers:
+                        norm = float(np.linalg.norm(np.array(h)))
+                        layer_norms[i].append(norm)
+
+        # Compute statistics
+        results = {}
+        for layer_idx, norms in layer_norms.items():
+            if norms:
+                results[f'L{layer_idx}'] = {
+                    'mean_norm': float(np.mean(norms)),
+                    'std_norm': float(np.std(norms)),
+                    'contribution_pct': 0,  # Computed below
+                }
+
+        # Compute relative contribution
+        total_mean = sum(r['mean_norm'] for r in results.values())
+        if total_mean > 0:
+            for layer_key in results:
+                results[layer_key]['contribution_pct'] = results[layer_key]['mean_norm'] / total_mean * 100
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_qk_union_coverage(
+        self,
+        val_tokens: np.ndarray,
+        n_batches: int = 100,
+        batch_size: int = 32,
+        seq_len: int = 512
+    ) -> Dict:
+        """
+        Analyze Q/K union coverage over batches.
+
+        Args:
+            val_tokens: Validation token array
+            n_batches: Number of batches to process
+            batch_size: Batch size
+            seq_len: Sequence length
+
+        Returns:
+            Dictionary with Q/K union coverage statistics
+        """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        pool_sizes = {
+            'feature_qk': self.n_feature_qk,
+            'restore_qk': self.n_restore_qk,
+        }
+
+        q_unions = {}
+        k_unions = {}
+
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
+
+        for batch in tqdm(batches, desc='Q/K Union Coverage'):
+            input_ids = np.array(batch)
+
+            routing_info = self.extractor.extract_routing(input_ids)
+            routing = JAXRoutingData(routing_info)
+
+            for pool_name in ['feature_qk', 'restore_qk']:
+                prefix = 'fqk' if pool_name == 'feature_qk' else 'rqk'
+                q_key, k_key = f'{prefix}_q', f'{prefix}_k'
+
+                w_q = routing.get_weight(q_key)
+                w_k = routing.get_weight(k_key)
+
+                if w_q is None or w_k is None:
+                    continue
+
+                n_neurons = pool_sizes.get(pool_name, 0)
+                if n_neurons == 0:
+                    continue
+
+                if pool_name not in q_unions:
+                    q_unions[pool_name] = np.zeros(n_neurons, dtype=bool)
+                    k_unions[pool_name] = np.zeros(n_neurons, dtype=bool)
+
+                if w_q.ndim == 3:
+                    q_selected = (w_q > 0).any(axis=0).any(axis=0)
+                    k_selected = (w_k > 0).any(axis=0).any(axis=0)
+                else:
+                    q_selected = (w_q > 0).any(axis=0)
+                    k_selected = (w_k > 0).any(axis=0)
+
+                q_unions[pool_name] |= q_selected
+                k_unions[pool_name] |= k_selected
+
+        results = {}
+        for pool_name in pool_sizes:
+            if pool_name not in q_unions:
+                continue
+
+            n_total = pool_sizes[pool_name]
+            q_count = int(q_unions[pool_name].sum())
+            k_count = int(k_unions[pool_name].sum())
+            union = q_unions[pool_name] | k_unions[pool_name]
+            union_count = int(union.sum())
+            intersection = q_unions[pool_name] & k_unions[pool_name]
+            intersect_count = int(intersection.sum())
+
+            results[pool_name] = {
+                'q_coverage': q_count / n_total if n_total > 0 else 0,
+                'k_coverage': k_count / n_total if n_total > 0 else 0,
+                'union_coverage': union_count / n_total if n_total > 0 else 0,
+                'intersection_coverage': intersect_count / n_total if n_total > 0 else 0,
+                'q_unique': q_count,
+                'k_unique': k_count,
+                'union_count': union_count,
+                'intersection_count': intersect_count,
+                'n_total': n_total,
+            }
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_path_usage(
+        self,
+        val_tokens: np.ndarray,
+        n_batches: int = 50,
+        batch_size: int = 32,
+        seq_len: int = 512
+    ) -> Dict:
+        """
+        Analyze path usage for multi-path routing (v18+).
+
+        Args:
+            val_tokens: Validation token array
+            n_batches: Number of batches to process
+            batch_size: Batch size
+            seq_len: Sequence length
+
+        Returns:
+            Dictionary with path usage statistics
+        """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        max_paths = self.config.get('max_paths', 1)
+        if max_paths <= 1:
+            return {'note': 'Single-path model, path usage analysis not applicable'}
+
+        path_counts = np.zeros(max_paths, dtype=np.int64)
+        total_selections = 0
+
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
+
+        for batch in tqdm(batches, desc='Path Usage'):
+            input_ids = np.array(batch)
+
+            routing_info = self.extractor.extract_routing(input_ids)
+
+            # Look for path selection info
+            if 'path_indices' in routing_info:
+                paths = routing_info['path_indices']
+                for p in range(max_paths):
+                    path_counts[p] += (paths == p).sum()
+                total_selections += paths.size
+
+        if total_selections == 0:
+            return {'note': 'No path selection data available'}
+
+        results = {
+            'max_paths': max_paths,
+            'path_distribution': (path_counts / total_selections).tolist(),
+            'path_counts': path_counts.tolist(),
+            'total_selections': int(total_selections),
+            'entropy': float(-np.sum((path_counts / total_selections) * np.log(path_counts / total_selections + 1e-8))),
+        }
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_token_coselection(
+        self,
+        val_tokens: np.ndarray,
+        n_batches: int = 50,
+        batch_size: int = 32,
+        seq_len: int = 512
+    ) -> Dict:
+        """
+        Analyze token-level co-selection patterns.
+
+        Args:
+            val_tokens: Validation token array
+            n_batches: Number of batches to process
+            batch_size: Batch size
+            seq_len: Sequence length
+
+        Returns:
+            Dictionary with co-selection statistics
+        """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        # Track co-selection between Feature and Restore pools
+        coselect_counts = defaultdict(lambda: {'both': 0, 'feature_only': 0, 'restore_only': 0, 'total': 0})
+
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
+
+        for batch in tqdm(batches, desc='Token Coselection'):
+            input_ids = np.array(batch)
+
+            routing_info = self.extractor.extract_routing(input_ids)
+            routing = JAXRoutingData(routing_info)
+
+            # Compare FQK vs RQK selection
+            fqk_w = routing.get_weight('fqk_q')
+            rqk_w = routing.get_weight('rqk_q')
+
+            if fqk_w is not None and rqk_w is not None:
+                if fqk_w.ndim == 3:
+                    fqk_active = (fqk_w > 0).any(axis=-1)  # [B, S]
+                    rqk_active = (rqk_w > 0).any(axis=-1)  # [B, S]
+                else:
+                    fqk_active = (fqk_w > 0).any(axis=-1)
+                    rqk_active = (rqk_w > 0).any(axis=-1)
+
+                both = (fqk_active & rqk_active).sum()
+                fqk_only = (fqk_active & ~rqk_active).sum()
+                rqk_only = (~fqk_active & rqk_active).sum()
+                total = fqk_active.size
+
+                coselect_counts['qk']['both'] += int(both)
+                coselect_counts['qk']['feature_only'] += int(fqk_only)
+                coselect_counts['qk']['restore_only'] += int(rqk_only)
+                coselect_counts['qk']['total'] += int(total)
+
+            # Compare FV vs RV selection
+            fv_w = routing.get_weight('fv')
+            rv_w = routing.get_weight('rv')
+
+            if fv_w is not None and rv_w is not None:
+                if fv_w.ndim == 3:
+                    fv_active = (fv_w > 0).any(axis=-1)
+                    rv_active = (rv_w > 0).any(axis=-1)
+                else:
+                    fv_active = (fv_w > 0).any(axis=-1)
+                    rv_active = (rv_w > 0).any(axis=-1)
+
+                both = (fv_active & rv_active).sum()
+                fv_only = (fv_active & ~rv_active).sum()
+                rv_only = (~fv_active & rv_active).sum()
+                total = fv_active.size
+
+                coselect_counts['v']['both'] += int(both)
+                coselect_counts['v']['feature_only'] += int(fv_only)
+                coselect_counts['v']['restore_only'] += int(rv_only)
+                coselect_counts['v']['total'] += int(total)
+
+        results = {}
+        for key, counts in coselect_counts.items():
+            total = counts['total']
+            if total > 0:
+                results[key] = {
+                    'both_pct': counts['both'] / total * 100,
+                    'feature_only_pct': counts['feature_only'] / total * 100,
+                    'restore_only_pct': counts['restore_only'] / total * 100,
+                    'counts': dict(counts),
+                }
+
+        results['n_batches'] = n_batches
+        return results
+
+    def analyze_coverage_progression(
+        self,
+        val_tokens: np.ndarray,
+        n_batches: int = 50,
+        batch_size: int = 32,
+        seq_len: int = 512
+    ) -> Dict:
+        """
+        Analyze how neuron coverage increases over batches.
+
+        Args:
+            val_tokens: Validation token array
+            n_batches: Number of batches to process
+            batch_size: Batch size
+            seq_len: Sequence length
+
+        Returns:
+            Dictionary with coverage progression data
+        """
+        if not HAS_JAX:
+            return {'error': 'JAX not available'}
+
+        pool_sizes = {
+            'feature_qk': self.n_feature_qk,
+            'feature_v': self.n_feature_v,
+            'restore_qk': self.n_restore_qk,
+            'restore_v': self.n_restore_v,
+        }
+
+        # Track cumulative coverage
+        cumulative = {pool: np.zeros(n, dtype=bool) for pool, n in pool_sizes.items() if n > 0}
+        progression = {pool: [] for pool in cumulative}
+
+        batches = create_batches(val_tokens, batch_size, seq_len)
+        if n_batches:
+            batches = batches[:n_batches]
+
+        for batch_idx, batch in enumerate(tqdm(batches, desc='Coverage Progression')):
+            input_ids = np.array(batch)
+
+            routing_info = self.extractor.extract_routing(input_ids)
+            routing = JAXRoutingData(routing_info)
+
+            for key in ROUTING_KEYS.keys():
+                pool = ROUTING_KEYS[key][3]
+                weights = routing.get_weight(key)
+                if weights is None or pool not in cumulative:
+                    continue
+
+                if weights.ndim == 3:
+                    selected = (weights > 0).any(axis=0).any(axis=0)
+                else:
+                    selected = (weights > 0).any(axis=0)
+
+                cumulative[pool] |= selected
+
+            # Record coverage at this batch
+            for pool in cumulative:
+                coverage = cumulative[pool].sum() / len(cumulative[pool])
+                progression[pool].append(float(coverage))
+
+        results = {
+            'progression': {pool: prog for pool, prog in progression.items()},
+            'final_coverage': {pool: float(cumulative[pool].sum() / len(cumulative[pool]))
+                              for pool in cumulative},
+            'n_batches': len(batches),
+        }
+
+        return results
+
     def run_all(
         self,
         val_tokens: np.ndarray,
@@ -827,6 +1211,11 @@ class RoutingAnalyzerJAX(BaseAnalyzerJAX):
             'qk_entropy': self.analyze_qk_entropy(val_tokens, n_batches, batch_size, seq_len),
             'activation_sparsity': self.analyze_activation_sparsity(val_tokens, n_batches, batch_size, seq_len),
             'weight_concentration': self.analyze_weight_concentration(val_tokens, n_batches, batch_size, seq_len),
+            'layer_contribution': self.analyze_layer_contribution(val_tokens, n_batches, batch_size, seq_len),
+            'qk_union_coverage': self.analyze_qk_union_coverage(val_tokens, n_batches, batch_size, seq_len),
+            'path_usage': self.analyze_path_usage(val_tokens, n_batches, batch_size, seq_len),
+            'token_coselection': self.analyze_token_coselection(val_tokens, n_batches, batch_size, seq_len),
+            'coverage_progression': self.analyze_coverage_progression(val_tokens, n_batches, batch_size, seq_len),
         }
 
         # Save results

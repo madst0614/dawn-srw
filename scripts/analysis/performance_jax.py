@@ -486,6 +486,57 @@ class ModelComparatorJAX:
 
         return results
 
+    def analyze_comparison_model(
+        self,
+        model,
+        params,
+        config: Dict,
+        model_name: str,
+        n_batches: int = 50
+    ) -> Tuple[Dict, Dict, Dict]:
+        """Run quick analysis on a model for table generation.
+
+        Args:
+            model: Model class (unused, uses config)
+            params: Model parameters
+            config: Model configuration
+            model_name: Name for display
+            n_batches: Number of batches for validation
+
+        Returns:
+            Tuple of (model_info, validation_results, speed_results)
+        """
+        from .utils_jax import count_params_jax, estimate_flops_jax
+
+        print(f"    Analyzing: {model_name}")
+
+        # Model info
+        total_params = count_params_jax(params)
+        flops = estimate_flops_jax(config, seq_len=512)
+        model_info = {
+            'total': total_params,
+            'total_M': total_params / 1e6,
+            'flops': flops,
+            'flops_G': flops / 1e9,
+        }
+        print(f"    Parameters: {model_info['total_M']:.2f}M, FLOPs: {model_info['flops_G']:.2f}G")
+
+        # Performance (quick eval)
+        print(f"    Running validation...")
+        val_tokens = load_val_data_jax(self.val_data_path, max_tokens=n_batches * self.batch_size * self.seq_len)
+        model_instance = create_model_from_config(config)
+        val_results = evaluate_jax(
+            model_instance, params, config,
+            val_tokens, batch_size=self.batch_size, seq_len=self.seq_len
+        )
+        print(f"    PPL: {val_results.get('perplexity', 0):.2f}, Acc: {val_results.get('accuracy', 0):.1f}%")
+
+        # Speed benchmark
+        speed_results = self.benchmark.quick_benchmark(model, params, config)
+        print(f"    Speed: {speed_results.get('tokens_per_sec', 0)/1000:.1f}K tok/s")
+
+        return model_info, val_results, speed_results
+
     def generate_comparison_samples(
         self,
         dawn_model,
