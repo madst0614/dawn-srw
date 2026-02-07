@@ -1,7 +1,7 @@
 # DAWN v17.1-TPU Training Config - 400M Scale, 5B tokens, v4-32 Pod
 # For TPU v4-32 Pod (32 chips, 4 hosts) multi-host training
-# Scaled from v4-16 config: batch 256→512, lr sqrt-scaled, warmup extended
-# Global batch: 512 = 32 chips × 16 per_device_batch
+# Scaled from v4-16 config: batch 256→1024, lr sqrt-scaled, warmup extended
+# Global batch: 1024 = 32 chips × 32 per_device_batch
 
 seed: 1
 
@@ -42,10 +42,10 @@ model:
   router_dropout: 0.1
 
 training:
-  batch_size: 512
+  batch_size: 1024
   gradient_accumulation_steps: 1
   num_epochs: 1
-  lr: 0.00035
+  lr: 0.0006
   weight_decay: 0.1
   warmup_ratio: 0.08
   orthogonality_weight: 0.01
