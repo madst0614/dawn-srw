@@ -1,7 +1,7 @@
-# DAWN v17.1-TPU Training Config - 400M Scale, 20B tokens, v4-32 Pod, kr128
-# Ablation: fewer knowledge neurons × wider rank (param-matched)
-# Base: 624 neurons × rank64, top_k=24
-# This: 312 neurons × rank128, top_k=24
+# DAWN v17.1-TPU Training Config - 400M Scale, 20B tokens, v4-32 Pod, kr128, top_k=12
+# Ablation: fewer knowledge neurons × wider rank (param + compute matched)
+# Base: 624 neurons × rank64, top_k=24 → per-token: 24×64=1536
+# This: 312 neurons × rank128, top_k=12 → per-token: 12×128=1536 (same compute)
 
 seed: 1
 
@@ -32,8 +32,8 @@ model:
   n_feature_know: 312
   n_restore_know: 312
   knowledge_rank: 128
-  top_k_feature_know: 24
-  top_k_restore_know: 24
+  top_k_feature_know: 12
+  top_k_restore_know: 12
 
   max_seq_len: 512
   dropout: 0.1
@@ -58,4 +58,4 @@ training:
 
 use_amp: true
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_20B_v4_32_kr128
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_20B_v4_32_kr128_tk12
