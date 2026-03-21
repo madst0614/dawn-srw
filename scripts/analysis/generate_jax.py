@@ -257,19 +257,29 @@ def main():
             top_k=args.top_k,
             top_p=args.top_p,
         )
-        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+        # Decode ALL token IDs at once (never decode per-token and concat)
+        full_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+        # Split prompt vs continuation by decoding prompt IDs separately
+        prompt_decoded = tokenizer.decode(input_ids, skip_special_tokens=True)
+        if full_text.startswith(prompt_decoded):
+            continuation = full_text[len(prompt_decoded):]
+        else:
+            continuation = full_text
+
         new_tokens = len(gen_ids) - len(input_ids)
         tok_per_sec = new_tokens / (elapsed / 1000) if elapsed > 0 else 0
 
-        continuation = text[len(prompt):] if text.startswith(prompt) else text
-        print(f"  [{category}] {prompt}\033[1m{continuation}\033[0m")
+        print(f"  [{category}] {prompt_decoded}\033[1m{continuation}\033[0m")
         print(f"           ({new_tokens} tokens, {elapsed:.0f}ms, "
               f"{tok_per_sec:.1f} tok/s)")
 
         results.append({
             'category': category,
             'prompt': prompt,
-            'generated': text,
+            'generated': full_text,
+            'continuation': continuation.strip(),
             'new_tokens': new_tokens,
             'time_ms': round(elapsed, 1),
             'tokens_per_sec': round(tok_per_sec, 1),

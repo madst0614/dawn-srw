@@ -322,11 +322,15 @@ class TextGeneratorJAX:
                 )
 
                 generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                prompt_decoded = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
                 new_tokens = len(generated_ids) - prompt_len
                 elapsed = time.perf_counter() - start_time
 
                 if streaming:
-                    continuation = generated_text[len(prompt):] if generated_text.startswith(prompt) else generated_text
+                    if generated_text.startswith(prompt_decoded):
+                        continuation = generated_text[len(prompt_decoded):]
+                    else:
+                        continuation = generated_text
                     print(f"{continuation}  ({new_tokens} tok, {elapsed*1000:.0f}ms)", flush=True)
 
                 results.append({
