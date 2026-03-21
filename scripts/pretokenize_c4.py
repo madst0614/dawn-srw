@@ -9,6 +9,8 @@ Designed for TPU training pipeline — outputs are consumed by
 utils/data_jax.py (pure numpy/JAX data loader, no PyTorch).
 
 Supports shard splitting for large datasets (--num_shards).
+Supports --resume to continue from a previous run (reads existing _meta.json,
+skips already-processed documents, and appends new shards).
 
 Usage:
     # Single file
@@ -19,6 +21,9 @@ Usage:
 
     # Validation
     python scripts/pretokenize_c4.py --split validation --num_tokens 10_000_000 --output ./data/c4_val.bin
+
+    # Resume: extend 40B -> 60B (skips first 40B worth of docs, appends new shards)
+    python scripts/pretokenize_c4.py --split train --num_tokens 60_000_000_000 --num_shards 60 --output gs://my-bucket/data/c4_train --resume
 """
 
 import argparse
@@ -56,6 +61,23 @@ def open_output(path: str, mode: str = "wb"):
         return open(path, mode)
 
 
+def read_json(path: str) -> dict:
+    """Read JSON from local or GCS."""
+    if is_gcs_path(path):
+        try:
+            import gcsfs
+            fs = gcsfs.GCSFileSystem()
+            with fs.open(path, 'r') as f:
+                return json.load(f)
+        except ImportError:
+            import tensorflow as tf
+            with tf.io.gfile.GFile(path, 'r') as f:
+                return json.load(f)
+    else:
+        with open(path, 'r') as f:
+            return json.load(f)
+
+
 def write_json(path: str, data: dict):
     """Write JSON metadata, supporting both local and GCS paths."""
     content = json.dumps(data, indent=2)
@@ -89,6 +111,9 @@ def main():
                         help="HuggingFace tokenizer name (default: bert-base-uncased)")
     parser.add_argument("--flush_every", type=int, default=100_000,
                         help="Flush buffer to disk every N sequences (default: 100000)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from previous run. Reads existing _meta.json, "
+                             "skips already-processed docs, appends new shards.")
     args = parser.parse_args()
 
     seq_len = args.seq_len
@@ -104,14 +129,53 @@ def main():
     is_sharded = num_shards > 1
     seqs_per_shard = target_seqs // num_shards if is_sharded else target_seqs
 
+    # ---- Resume: load previous state ----
+    resume_docs = 0
+    resume_tokens = 0
+    resume_seqs = 0
+    resume_shards = 0
+    prev_shard_infos = []
+    prev_tail_tokens = []  # leftover token_buffer from previous run
+
+    meta_path = output_base + "_meta.json"
+
+    if args.resume:
+        try:
+            prev_meta = read_json(meta_path)
+            resume_docs = prev_meta["docs_consumed"]
+            resume_tokens = prev_meta["total_tokens"]
+            resume_seqs = prev_meta["total_sequences"]
+            resume_shards = prev_meta["num_shards"]
+            prev_shard_infos = prev_meta.get("shards", [])
+            prev_tail_tokens = prev_meta.get("tail_token_buffer", [])
+            print(f"{'='*60}")
+            print(f"RESUME MODE")
+            print(f"{'='*60}")
+            print(f"Previous run: {resume_tokens:,} tokens, {resume_docs:,} docs, {resume_shards} shards")
+            print(f"Remaining: {target_tokens - resume_tokens:,} tokens to collect")
+            print(f"Will skip {resume_docs:,} docs then continue...")
+            if prev_tail_tokens:
+                print(f"Restoring {len(prev_tail_tokens)} leftover tokens from previous run")
+            print()
+
+            if resume_tokens >= target_tokens:
+                print(f"Already have {resume_tokens:,} >= target {target_tokens:,}. Nothing to do.")
+                return
+        except (FileNotFoundError, KeyError) as e:
+            print(f"WARNING: --resume specified but no valid meta found at {meta_path}: {e}")
+            print(f"Starting from scratch.")
+            args.resume = False
+
     print(f"{'='*60}")
     print(f"Pretokenize C4 (TPU)")
     print(f"{'='*60}")
     print(f"Split: {args.split}")
     print(f"Target tokens: {target_tokens:,}")
     print(f"Target sequences: {target_seqs:,} (seq_len={seq_len})")
+    if args.resume and resume_tokens > 0:
+        print(f"Already collected: {resume_tokens:,} tokens ({resume_tokens/target_tokens*100:.1f}%)")
     if is_sharded:
-        print(f"Shards: {num_shards}")
+        print(f"Total shards: {num_shards}")
         print(f"Sequences per shard: ~{seqs_per_shard:,}")
         print(f"Output pattern: {output_base}_XXX.bin")
     else:
@@ -131,26 +195,48 @@ def main():
     print(f"\nLoading C4 ({args.split}) in streaming mode...")
     dataset = load_dataset("allenai/c4", "en", split=args.split, streaming=True)
 
+    # ---- Skip docs if resuming ----
+    data_iter = iter(dataset)
+    if args.resume and resume_docs > 0:
+        print(f"Skipping {resume_docs:,} previously processed docs...")
+        skip_start = time.time()
+        for i in range(resume_docs):
+            try:
+                next(data_iter)
+            except StopIteration:
+                print(f"ERROR: Dataset exhausted after {i:,} docs (expected {resume_docs:,})")
+                return
+            if (i + 1) % 1_000_000 == 0:
+                elapsed = time.time() - skip_start
+                rate = (i + 1) / elapsed
+                remaining = (resume_docs - i - 1) / rate
+                print(f"  Skipped {i+1:,}/{resume_docs:,} docs "
+                      f"({(i+1)/resume_docs*100:.1f}%, "
+                      f"{rate:.0f} docs/s, ~{remaining/60:.0f}min remaining)")
+        skip_elapsed = time.time() - skip_start
+        print(f"  Skip complete: {resume_docs:,} docs in {skip_elapsed:.0f}s "
+              f"({resume_docs/skip_elapsed:.0f} docs/s)")
+
     # ---- Tokenize and pack ----
     print("Starting tokenization and packing...")
 
-    token_buffer = []
-    total_tokens_written = 0
-    total_seqs_written = 0
-    docs_processed = 0
+    token_buffer = list(prev_tail_tokens)  # restore leftover from previous run
+    total_tokens_written = resume_tokens
+    total_seqs_written = resume_seqs
+    docs_processed = resume_docs
     start_time = time.time()
-    last_log_tokens = 0
+    last_log_tokens = total_tokens_written
 
     flush_every = args.flush_every
     pending_seqs = []
 
-    # Shard tracking
-    current_shard = 0
+    # Shard tracking (continue from where we left off)
+    current_shard = resume_shards
     shard_seqs_written = 0
     shard_files = []
-    shard_infos = []
+    shard_infos = list(prev_shard_infos)  # keep previous shard records
 
-    # Open first output file
+    # Open next output file
     if is_sharded:
         current_path = shard_path(output_base, current_shard)
     else:
@@ -187,7 +273,7 @@ def main():
         f_out = open_output(current_path, "wb")
 
     try:
-        for example in dataset:
+        for example in data_iter:
             text = example.get("text", "")
             if not text or len(text.strip()) == 0:
                 continue
@@ -211,17 +297,20 @@ def main():
                 if len(pending_seqs) >= flush_every:
                     flush_pending()
 
-                # Progress logging every 1M tokens
-                if total_tokens_written - last_log_tokens >= 1_000_000:
+                # Progress logging every 1B tokens
+                if total_tokens_written - last_log_tokens >= 1_000_000_000:
                     elapsed = time.time() - start_time
-                    tok_per_sec = total_tokens_written / elapsed if elapsed > 0 else 0
+                    new_tokens = total_tokens_written - resume_tokens
+                    tok_per_sec = new_tokens / elapsed if elapsed > 0 else 0
                     progress = total_tokens_written / target_tokens * 100
                     shard_info = f" shard={current_shard}" if is_sharded else ""
+                    remaining_tokens = target_tokens - total_tokens_written
+                    eta = remaining_tokens / tok_per_sec if tok_per_sec > 0 else 0
                     print(
-                        f"  [{progress:6.2f}%] {total_tokens_written/1e6:.1f}M tokens, "
+                        f"  [{progress:6.2f}%] {total_tokens_written/1e9:.1f}B tokens, "
                         f"{total_seqs_written:,} seqs, {docs_processed:,} docs, "
                         f"{tok_per_sec/1e6:.2f}M tok/s, "
-                        f"elapsed={elapsed:.0f}s{shard_info}"
+                        f"elapsed={elapsed/3600:.1f}h, ETA={eta/3600:.1f}h{shard_info}"
                     )
                     last_log_tokens = total_tokens_written
 
@@ -251,58 +340,43 @@ def main():
     elapsed = time.time() - start_time
 
     # ---- Write metadata ----
-    if is_sharded:
-        meta_path = output_base + "_meta.json"
-        metadata = {
-            "total_tokens": total_tokens_written,
-            "total_sequences": total_seqs_written,
-            "seq_len": seq_len,
-            "vocab_size": vocab_size,
-            "tokenizer": args.tokenizer,
-            "dtype": "uint16",
-            "split": args.split,
-            "num_shards": len(shard_files),
-            "shards": shard_infos,
-            "docs_processed": docs_processed,
-            "discarded_tail_tokens": len(token_buffer),
-            "elapsed_seconds": round(elapsed, 1),
-            "tokens_per_second": round(total_tokens_written / elapsed, 1) if elapsed > 0 else 0,
-        }
-    else:
-        meta_path = output_base + "_meta.json"
-        metadata = {
-            "total_tokens": total_tokens_written,
-            "total_sequences": total_seqs_written,
-            "seq_len": seq_len,
-            "vocab_size": vocab_size,
-            "tokenizer": args.tokenizer,
-            "dtype": "uint16",
-            "split": args.split,
-            "num_shards": 1,
-            "shards": shard_infos,
-            "docs_processed": docs_processed,
-            "discarded_tail_tokens": len(token_buffer),
-            "elapsed_seconds": round(elapsed, 1),
-            "tokens_per_second": round(total_tokens_written / elapsed, 1) if elapsed > 0 else 0,
-        }
+    metadata = {
+        "total_tokens": total_tokens_written,
+        "total_sequences": total_seqs_written,
+        "seq_len": seq_len,
+        "vocab_size": vocab_size,
+        "tokenizer": args.tokenizer,
+        "dtype": "uint16",
+        "split": args.split,
+        "num_shards": len(shard_infos),
+        "shards": shard_infos,
+        "docs_consumed": docs_processed,
+        "tail_token_buffer": token_buffer[:seq_len],  # save leftover for resume
+        "discarded_tail_tokens": len(token_buffer),
+        "elapsed_seconds": round(elapsed, 1),
+        "tokens_per_second": round(
+            (total_tokens_written - resume_tokens) / elapsed, 1
+        ) if elapsed > 0 else 0,
+    }
     write_json(meta_path, metadata)
 
     print(f"\n{'='*60}")
     print(f"Done!")
     print(f"{'='*60}")
     print(f"  Tokens written: {total_tokens_written:,}")
+    if resume_tokens > 0:
+        print(f"  New tokens this run: {total_tokens_written - resume_tokens:,}")
     print(f"  Sequences: {total_seqs_written:,}")
-    print(f"  Docs processed: {docs_processed:,}")
+    print(f"  Docs consumed: {docs_processed:,}")
     print(f"  Discarded tail: {len(token_buffer)} tokens")
-    if is_sharded:
-        print(f"  Shards: {len(shard_files)}")
-        for i, info in enumerate(shard_infos):
-            print(f"    [{i:03d}] {info['path']} ({info['sequences']:,} seqs)")
-    else:
-        print(f"  Output: {shard_files[0]}")
+    print(f"  Shards: {len(shard_infos)}")
+    for i, info in enumerate(shard_infos):
+        marker = " (new)" if i >= resume_shards else ""
+        print(f"    [{i:03d}] {info['path']} ({info['sequences']:,} seqs){marker}")
     print(f"  Metadata: {meta_path}")
     print(f"  Total size: ~{total_seqs_written * seq_len * 2 / 1e9:.2f} GB")
-    print(f"  Elapsed: {elapsed:.0f}s ({total_tokens_written / elapsed / 1e6:.2f}M tok/s)")
+    new_tokens = total_tokens_written - resume_tokens
+    print(f"  Elapsed: {elapsed:.0f}s ({new_tokens / elapsed / 1e6:.2f}M tok/s)")
 
 
 if __name__ == "__main__":
