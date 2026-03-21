@@ -1,0 +1,61 @@
+# DAWN v17.1-TPU Training Config - 400M Scale, 40B tokens, v4-32 Pod, kr256, top_k=6
+# Ablation: fewer knowledge neurons × wider rank (param + compute matched)
+# Base: 624 neurons × rank64, top_k=24 → per-token: 24×64=1536
+# This: 156 neurons × rank256, top_k=6 → per-token: 6×256=1536 (same compute)
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "17.1"
+  d_model: 1536
+  n_layers: 24
+  n_heads: 16
+  rank: 64
+
+  n_feature_qk: 192
+  n_feature_v: 624
+  top_k_feature_qk: 24
+  top_k_feature_v: 24
+
+  n_restore_qk: 192
+  n_restore_v: 624
+  top_k_restore_qk: 24
+  top_k_restore_v: 24
+
+  n_feature_know: 156
+  n_restore_know: 156
+  knowledge_rank: 256
+  top_k_feature_know: 6
+  top_k_restore_know: 6
+
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+  d_space: 256
+  router_dropout: 0.1
+
+training:
+  batch_size: 1024
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_ratio: 0.08
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.0001
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+  checkpoint_interval: 200
+  val_interval: 200
+
+use_amp: true
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_v17_1_400M_c4_40B_v4_32_kr256_tk6
