@@ -796,7 +796,10 @@ def _get_routing_weight(routing_data: Dict, pool_key: str) -> Optional[np.ndarra
 
     attn = routing_data.get('attention', {})
     know = routing_data.get('knowledge', {})
-    return attn.get(raw_key) or know.get(raw_key)
+    result = attn.get(raw_key)
+    if result is None:
+        result = know.get(raw_key)
+    return result
 
 
 # ============================================================
