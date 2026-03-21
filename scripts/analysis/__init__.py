@@ -38,79 +38,88 @@ Usage:
     analyzer.run_all()
 """
 
-from .utils import (
-    # Model loading
-    load_model,
-    get_router,
-    get_neurons,
-    get_shared_neurons,  # Alias
-    create_dataloader,
+# All torch-dependent imports are guarded so that JAX-only environments
+# (e.g., TPU VMs without PyTorch) can still import submodules like utils_jax.
+try:
+    from .utils import (
+        # Model loading
+        load_model,
+        get_router,
+        get_neurons,
+        get_shared_neurons,  # Alias
+        create_dataloader,
 
-    # Constants
-    NEURON_TYPES,
-    NEURON_TYPES_V18,
-    ROUTING_KEYS,
-    KNOWLEDGE_ROUTING_KEYS,
-    ALL_ROUTING_KEYS,
-    NEURON_ATTRS,
-    COSELECTION_PAIRS,
-    QK_POOLS,
+        # Constants
+        NEURON_TYPES,
+        NEURON_TYPES_V18,
+        ROUTING_KEYS,
+        KNOWLEDGE_ROUTING_KEYS,
+        ALL_ROUTING_KEYS,
+        NEURON_ATTRS,
+        COSELECTION_PAIRS,
+        QK_POOLS,
 
-    # Utilities
-    gini_coefficient,
-    calc_entropy,
-    calc_entropy_ratio,
-    convert_to_serializable,
-    save_results,
-    simple_pos_tag,
+        # Utilities
+        gini_coefficient,
+        calc_entropy,
+        calc_entropy_ratio,
+        convert_to_serializable,
+        save_results,
+        simple_pos_tag,
 
-    # Flags
-    HAS_MATPLOTLIB,
-    HAS_SKLEARN,
-    HAS_TQDM,
-)
+        # Flags
+        HAS_MATPLOTLIB,
+        HAS_SKLEARN,
+        HAS_TQDM,
+    )
 
-# Base analyzer
-from .base import BaseAnalyzer
+    # Base analyzer
+    from .base import BaseAnalyzer
 
-# Analyzers
-from .neuron_health import NeuronHealthAnalyzer
-from .routing import RoutingAnalyzer
-from .embedding import EmbeddingAnalyzer
-from .weight import WeightAnalyzer
-from .behavioral import BehavioralAnalyzer
-from .semantic import SemanticAnalyzer
-from .coselection import CoselectionAnalyzer
-from .paper_figures import PaperFigureGenerator
+    # Analyzers
+    from .neuron_health import NeuronHealthAnalyzer
+    from .routing import RoutingAnalyzer
+    from .embedding import EmbeddingAnalyzer
+    from .weight import WeightAnalyzer
+    from .behavioral import BehavioralAnalyzer
+    from .semantic import SemanticAnalyzer
+    from .coselection import CoselectionAnalyzer
+    from .paper_figures import PaperFigureGenerator
 
-# Visualizers
-from . import visualizers
-from .standalone.routing_analysis import (
-    GenerationRoutingAnalyzer,
-    analyze_common_neurons,
-    analyze_token_neurons,
-    plot_routing_heatmap,
-    plot_routing_comparison,
-)
-# POS Neuron Analyzer (refactored)
-from .pos_neuron import POSNeuronAnalyzer
+    # Visualizers
+    from . import visualizers
+    from .standalone.routing_analysis import (
+        GenerationRoutingAnalyzer,
+        analyze_common_neurons,
+        analyze_token_neurons,
+        plot_routing_heatmap,
+        plot_routing_comparison,
+    )
+    # POS Neuron Analyzer (refactored)
+    from .pos_neuron import POSNeuronAnalyzer
 
-# Neuron Embedding Analyzer (clustering, token projections, neuron-POS mapping)
-from .neuron_embedding import NeuronEmbeddingAnalyzer
+    # Neuron Embedding Analyzer (clustering, token projections, neuron-POS mapping)
+    from .neuron_embedding import NeuronEmbeddingAnalyzer
 
-# V18.x Specific Analyzer
-from .v18 import V18Analyzer
+    # V18.x Specific Analyzer
+    from .v18 import V18Analyzer
 
-# Complete analysis tool
-from .analyze_all import ModelAnalyzer, MultiModelAnalyzer
+    # Complete analysis tool
+    from .analyze_all import ModelAnalyzer, MultiModelAnalyzer
 
-# Legacy imports from visualizers for backward compatibility
-from .visualizers.pos_neurons import (
-    plot_pos_heatmap,
-    plot_pos_clustering,
-    plot_top_neurons_by_pos,
-    plot_pos_specificity as plot_specificity,
-)
+    # Legacy imports from visualizers for backward compatibility
+    from .visualizers.pos_neurons import (
+        plot_pos_heatmap,
+        plot_pos_clustering,
+        plot_top_neurons_by_pos,
+        plot_pos_specificity as plot_specificity,
+    )
+
+    _HAS_TORCH = True
+except (ImportError, ModuleNotFoundError):
+    # Running in a torch-free environment (e.g., TPU with JAX only).
+    # Individual submodules like utils_jax can still be imported directly.
+    _HAS_TORCH = False
 
 
 __all__ = [
