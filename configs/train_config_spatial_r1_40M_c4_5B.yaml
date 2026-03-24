@@ -1,19 +1,16 @@
 # DAWN Spatial-R1 Training Config - 40M Scale, 5B tokens (TPU)
-# Rank-1 neuron architecture: each neuron is a single [D] vector
-# Transform: out = V^T diag(gate) V x  (sum of rank-1 outer products)
+# Rank-1 neuron: each neuron is a single [D] vector
+# Transform: out = V^T diag(gate) V x
 # Gate: learnable tau threshold (v18.5 style)
-# For TPU multi-device training with pretokenized .bin data
 
 seed: 1
 
 data:
-  # Pretokenized .bin files (produced by scripts/pretokenize_c4.py)
-  # Train: 20 shards, 20B tokens total (loader uses max_train_tokens subset)
-  bin_train: gs://dawn-tpu-data-c4/c4_train    # sharded — reads c4_train_meta.json
+  bin_train: gs://dawn-tpu-data-c4/c4_train
   bin_val: gs://dawn-tpu-data-c4/c4_val.bin
-  max_train_tokens: 5000000000   # 5B tokens (out of 20B available)
-  max_val_tokens: 10000000       # 10M tokens
-  local_cache_dir: /tmp/data     # GCS → local SSD for memmap (40GB won't fit in RAM)
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
 
 model:
   model_version: "spatial-r1"
@@ -24,51 +21,38 @@ model:
   dropout: 0.1
   gradient_checkpointing: true
 
-  # Rank-1 neuron pools
-  n_qk: 256        # Q/K shared neurons [N, D]
-  n_v: 256          # V neurons [N, D]
-  n_know: 512       # Knowledge neurons [N, D]
-  max_k: 32         # Safety cap on active neurons per token
+  # Rank-1 neuron pools (~40M total)
+  n_qk: 8192        # Q/K shared neurons — 8192 × 384 = 3.15M
+  n_v: 8192          # V neurons — 8192 × 384 = 3.15M
+  n_know: 24576      # Knowledge neurons — 24576 × 384 = 9.44M
+  max_k: 64
 
-  # Router
-  d_space: 256      # Neuron embedding dimension (same as v17.1 TPU)
+  d_space: 256
   router_dropout: 0.1
 
 training:
-  batch_size: 128               # global batch size (divided across devices)
+  batch_size: 128
   gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.00065
   weight_decay: 0.1
   warmup_ratio: 0.06
-  orthogonality_weight: 0.0     # not used (rank-1 has no matrix orthogonality)
+  orthogonality_weight: 0.0
   diversity_weight: 0.1
-  load_balance_weight: 0.00002  # same as v17.1 TPU
-  entropy_weight: 0.0
-  process_norm_weight: 0.0
+  load_balance_weight: 0.00002
   checkpoint_interval: 500
   val_interval: 500
 
 use_amp: true
-
-# GCS paths for checkpoint and log persistence (survives spot preemption)
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1_40M_c4_5B
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1_40M_c4_5B
 
-# Architecture Notes:
-#
-#   Rank-1 vs v17.1:
-#   - v17.1 neuron: [N, D, R] matrix → feature [B,S,R], restore [B,S,D]
-#   - spatial-r1 neuron: [N, D] vector → sense scalar, emit [D]
-#   - No separate feature/restore: one vector senses AND emits
-#   - Q/K share qk_neurons pool, V uses v_neurons pool
-#
-#   Parameter count (approximately):
-#   - qk_neurons: 256 × 384 = 98K
-#   - v_neurons:  256 × 384 = 98K
-#   - know_neurons: 512 × 384 = 197K
-#   - neuron_emb: 1024 × 256 = 262K
-#   - Router projections: ~600K
-#   - Per-block (LayerNorm + O_proj): ~300K × 12 = 3.6M
-#   - Embeddings: 30522 × 384 + 512 × 384 = 11.9M
-#   - Total: ~17M (smaller than v17.1 40M — increase n_qk/n_v/n_know for scale)
+# Parameter budget (40.3M):
+#   qk_neurons:   8192 × 384 =  3.15M
+#   v_neurons:    8192 × 384 =  3.15M
+#   know_neurons: 24576 × 384 =  9.44M
+#   neuron_emb:   40960 × 256 = 10.49M
+#   Router proj + tau:           0.40M
+#   Blocks (LN×2 + O_proj) ×12: 1.79M
+#   Embeddings (tok + pos):     11.92M
+#   Total:                      40.3M
