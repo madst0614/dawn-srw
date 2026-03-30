@@ -2,6 +2,11 @@
 DAWN-Spatial v2: Rank-1 Neuron Architecture with 2D Positional Routing (JAX/Flax)
 
 Changelog:
+  spatial-r1-v2.0.1 (2026-03-31):
+    - CRITICAL: Know distance OOM fix (chunked sequence processing)
+    - pos_loss distance reuse (take_along_axis / chunked return)
+    - diversity_loss: random sampling -> deterministic strided sampling
+
   spatial-r1-v2.0.0 (2026-03-31):
     - neuron_emb dot-product routing -> 2D positional routing
     - Per-circuit max_k (max_k_qk, max_k_v, max_k_know)
@@ -273,15 +278,11 @@ class Router(nn.Module):
         gate_K = threshold_gate(scores_K, tau_K, self.max_k_qk)
         gate_V = threshold_gate(scores_V, tau_V, self.max_k_v)
 
-        # --- pos_loss: pull activated neurons toward query_pos ---
-        cand_dist_qk = jnp.sum(
-            (qk_pos[:, :, None, :] - npos_qk[cand_idx_qk]) ** 2,
-            axis=-1)  # [B, S, n_cand_qk]
+        # --- pos_loss: reuse distances from candidate selection ---
+        cand_dist_qk = jnp.take_along_axis(dist_qk, cand_idx_qk, axis=-1)
         pos_loss_qk = (jax.lax.stop_gradient(gate_Q) * cand_dist_qk).mean()
 
-        cand_dist_v = jnp.sum(
-            (v_pos[:, :, None, :] - npos_v[cand_idx_v]) ** 2,
-            axis=-1)  # [B, S, n_cand_v]
+        cand_dist_v = jnp.take_along_axis(dist_v, cand_idx_v, axis=-1)
         pos_loss_v = (jax.lax.stop_gradient(gate_V) * cand_dist_v).mean()
 
         pos_loss = pos_loss_qk + pos_loss_v
@@ -304,12 +305,11 @@ class Router(nn.Module):
 
         n_cand = self.max_k_know * self.candidates_multiplier
 
-        # Distance-based candidate selection
-        dist = jnp.sum(
-            (know_pos[:, :, None, :] - npos_know[None, None, :, :]) ** 2,
-            axis=-1)  # [B, S, N_know]
-        _, cand_idx = jax.lax.top_k(-dist, n_cand)
+        # Chunked distance-based candidate selection (OOM-safe for large N)
+        cand_idx, cand_dist = _chunked_distance_topk(
+            know_pos, npos_know, n_cand, chunk_size=32)
         cand_idx = jax.lax.stop_gradient(cand_idx)
+        cand_dist = jax.lax.stop_gradient(cand_dist)  # pos_loss recomputes below
 
         # Precise scoring
         cand_neurons = know_neurons[cand_idx]  # [B, S, n_cand, D]
@@ -321,11 +321,12 @@ class Router(nn.Module):
         tau = self.tau_know(x)  # [B, S, 1]
         gate = threshold_gate(scores, tau, self.max_k_know)
 
-        # pos_loss
-        cand_dist = jnp.sum(
-            (know_pos[:, :, None, :] - npos_know[cand_idx]) ** 2,
-            axis=-1)  # [B, S, n_cand]
-        pos_loss = (jax.lax.stop_gradient(gate) * cand_dist).mean()
+        # pos_loss: recompute distance for gradient flow to neuron_pos & proj_pos
+        cand_npos = npos_know[cand_idx]  # [B, S, n_cand, 2]
+        cand_dist_grad = jnp.sum(
+            (know_pos[:, :, None, :] - cand_npos) ** 2,
+            axis=-1)  # [B, S, n_cand] — small tensor, OK
+        pos_loss = (jax.lax.stop_gradient(gate) * cand_dist_grad).mean()
 
         return gate, cand_idx, pos_loss
 
@@ -333,6 +334,51 @@ class Router(nn.Module):
 # ================================================================
 # 8. Pure functions for jax.lax.scan forward path
 # ================================================================
+
+def _chunked_distance_topk(query_pos, neuron_pos, k, chunk_size=32):
+    """Sequence-chunked distance top-k to avoid OOM on large N.
+
+    Splits the sequence axis into chunks, computes distance + top-k per chunk,
+    then reassembles. Peak memory: B * chunk_size * N * 4 bytes.
+
+    Args:
+        query_pos:  [B, S, pos_dim]
+        neuron_pos: [N, pos_dim]
+        k:          number of candidates
+        chunk_size: sequence chunk size (32 recommended)
+
+    Returns:
+        cand_idx:  [B, S, k] candidate neuron indices
+        cand_dist: [B, S, k] squared distances to candidates
+    """
+    B, S, P = query_pos.shape
+    # Pad S to multiple of chunk_size for scan compatibility
+    pad_S = ((S + chunk_size - 1) // chunk_size) * chunk_size
+    if pad_S > S:
+        query_pos = jnp.pad(query_pos, ((0, 0), (0, pad_S - S), (0, 0)))
+
+    # [B, n_chunks, chunk_size, pos_dim]
+    query_chunks = query_pos.reshape(B, -1, chunk_size, P)
+
+    def process_chunk(carry, q_chunk):
+        # q_chunk: [B, chunk_size, pos_dim]
+        dist = jnp.sum(
+            (q_chunk[:, :, None, :] - neuron_pos[None, None, :, :]) ** 2,
+            axis=-1)  # [B, chunk_size, N]
+        vals, idx = jax.lax.top_k(-dist, k)
+        return carry, (idx, -vals)  # return positive distances
+
+    _, (all_idx, all_dist) = jax.lax.scan(
+        process_chunk, None,
+        jnp.moveaxis(query_chunks, 1, 0))  # scan over n_chunks dim
+
+    # [n_chunks, B, chunk_size, k] -> [B, n_chunks*chunk_size, k]
+    all_idx = jnp.moveaxis(all_idx, 0, 1).reshape(B, -1, k)
+    all_dist = jnp.moveaxis(all_dist, 0, 1).reshape(B, -1, k)
+
+    # Remove padding
+    return all_idx[:, :S, :], all_dist[:, :S, :]
+
 
 def _router_attn_gates(x, router_params, pool_params,
                        n_qk, n_v, pos_dim, max_k_qk, max_k_v,
@@ -387,15 +433,11 @@ def _router_attn_gates(x, router_params, pool_params,
     gate_K = threshold_gate(scores_K, tau_K, max_k_qk)
     gate_V = threshold_gate(scores_V, tau_V, max_k_v)
 
-    # pos_loss
-    cand_dist_qk = jnp.sum(
-        (qk_pos[:, :, None, :] - npos_qk[cand_idx_qk]) ** 2,
-        axis=-1)
+    # pos_loss: reuse distances from candidate selection
+    cand_dist_qk = jnp.take_along_axis(dist_qk, cand_idx_qk, axis=-1)
     pos_loss_qk = (jax.lax.stop_gradient(gate_Q) * cand_dist_qk).mean()
 
-    cand_dist_v = jnp.sum(
-        (v_pos[:, :, None, :] - npos_v[cand_idx_v]) ** 2,
-        axis=-1)
+    cand_dist_v = jnp.take_along_axis(dist_v, cand_idx_v, axis=-1)
     pos_loss_v = (jax.lax.stop_gradient(gate_V) * cand_dist_v).mean()
 
     aux = pos_loss_qk + pos_loss_v
@@ -415,10 +457,9 @@ def _router_know_gates(x, router_params, pool_params,
 
     n_cand = max_k_know * candidates_multiplier
 
-    dist = jnp.sum(
-        (know_pos[:, :, None, :] - npos_know[None, None, :, :]) ** 2,
-        axis=-1)  # [B, S, N_know]
-    _, cand_idx = jax.lax.top_k(-dist, n_cand)
+    # Chunked distance (OOM-safe for large N_know)
+    cand_idx, cand_dist_sg = _chunked_distance_topk(
+        know_pos, npos_know, n_cand, chunk_size=32)
     cand_idx = jax.lax.stop_gradient(cand_idx)
 
     cand_neurons = know_neurons[cand_idx]  # [B, S, n_cand, D]
@@ -430,11 +471,12 @@ def _router_know_gates(x, router_params, pool_params,
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     gate = threshold_gate(scores, tau, max_k_know)
 
-    # pos_loss
-    cand_dist = jnp.sum(
-        (know_pos[:, :, None, :] - npos_know[cand_idx]) ** 2,
-        axis=-1)
-    pos_loss = (jax.lax.stop_gradient(gate) * cand_dist).mean()
+    # pos_loss: recompute on candidates for gradient flow to neuron_pos & proj_pos
+    cand_npos = npos_know[cand_idx]  # [B, S, n_cand, 2]
+    cand_dist_grad = jnp.sum(
+        (know_pos[:, :, None, :] - cand_npos) ** 2,
+        axis=-1)  # [B, S, n_cand] — small tensor
+    pos_loss = (jax.lax.stop_gradient(gate) * cand_dist_grad).mean()
 
     return gate, cand_idx, pos_loss
 
@@ -586,7 +628,7 @@ class DAWN(nn.Module):
     Uses jax.lax.scan for O(1) XLA compile, jax.checkpoint for memory.
     Weight tying: lm_head reuses token_emb via nn.Embed.attend().
     """
-    __version__ = "spatial-r1-v2.0.0"
+    __version__ = "spatial-r1-v2.0.1"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -784,15 +826,15 @@ class DAWN(nn.Module):
     def diversity_loss(self):
         """Encourage diversity among neurons via cosine similarity penalty.
 
-        For large pools (>4096), uses random sampling to avoid O(N^2).
+        For large pools (>4096), uses deterministic strided sampling
+        to avoid O(N^2). No rng needed — safe outside forward pass.
         """
         def _pool_div(neurons, max_sample=4096):
             N = neurons.shape[0]
             if N > max_sample:
-                # Random sample for large pools
-                rng = self.make_rng('dropout')
-                idx = jax.random.permutation(rng, N)[:max_sample]
-                neurons = neurons[idx]
+                # Deterministic strided sampling (no rng needed)
+                stride = N // max_sample
+                neurons = neurons[::stride][:max_sample]
             n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
             sim = n @ n.T
             mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)

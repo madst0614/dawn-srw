@@ -39,6 +39,7 @@ from functools import partial
 
 from models.model_v17_1_jax import DAWN
 from models.dawn_spatial import DAWN as DAWN_Spatial
+from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -109,6 +110,28 @@ def build_model_from_config(cfg):
             k_cluster_qk=mcfg.get('k_cluster_qk', 8),
             k_cluster_v=mcfg.get('k_cluster_v', 8),
             k_cluster_know=mcfg.get('k_cluster_know', 8),
+        )
+    elif version.startswith('spatial-r1-v2'):
+        model = DAWN_SpatialV2(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            pos_dim=mcfg.get('pos_dim', 2),
+            grid_size=mcfg.get('grid_size', 64),
+            candidates_multiplier=mcfg.get('candidates_multiplier', 3),
+            grid_rebuild_interval=mcfg.get('grid_rebuild_interval', 100),
+            pos_loss_weight=mcfg.get('pos_loss_weight', 0.01),
+            n_qk=mcfg.get('n_qk', 3140),
+            n_v=mcfg.get('n_v', 5240),
+            n_know=mcfg.get('n_know', 42000),
+            max_k_qk=mcfg.get('max_k_qk', 157),
+            max_k_v=mcfg.get('max_k_v', 262),
+            max_k_know=mcfg.get('max_k_know', 1536),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
         )
     else:
         model = DAWN(
@@ -339,10 +362,15 @@ def compute_spatial_diversity_loss(params):
 
     Penalizes high cosine similarity between neurons in each pool.
     Replaces orthogonality + knowledge diversity for spatial-r1.
+    For large pools (>4096), uses deterministic strided sampling to avoid O(N^2).
     """
     pool = params['neuron_pool']
 
-    def _pool_div(neurons):
+    def _pool_div(neurons, max_sample=4096):
+        N = neurons.shape[0]
+        if N > max_sample:
+            stride = N // max_sample
+            neurons = neurons[::stride][:max_sample]
         n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
         sim = jnp.matmul(n, n.T)
         mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
@@ -359,7 +387,8 @@ def compute_spatial_diversity_loss(params):
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
-                      n_devices=1, is_baseline=False, is_spatial=False):
+                      n_devices=1, is_baseline=False, is_spatial=False,
+                      pos_loss_weight=0.0):
     """Create a compiled training step function.
 
     Uses jax.pmap for multi-device data parallelism.
@@ -389,10 +418,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 total_loss = ce_loss
             elif is_spatial:
                 # Spatial-r1: no orthogonality (rank-1 vectors), diversity only
+                # aux_loss includes pos_loss for v2 (2D positional routing)
                 orth_loss = jnp.float32(0.0)
                 div_loss = compute_spatial_diversity_loss(params)
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
+                              + pos_loss_weight * aux_loss
                               + div_weight * div_loss)
             else:
                 orth_loss = compute_orthogonality_loss(
@@ -1065,12 +1096,14 @@ def main():
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
     model_version = cfg['model'].get('model_version', '17.1')
     is_baseline = model_version == 'baseline'
-    is_spatial = model_version == 'spatial-r1'
+    is_spatial = model_version == 'spatial-r1' or model_version.startswith('spatial-r1-v2')
+    is_spatial_v2 = model_version.startswith('spatial-r1-v2')
+    pos_loss_weight = cfg['training'].get('pos_loss_weight', 0.01) if is_spatial_v2 else 0.0
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         n_devices=n_local_devices, is_baseline=is_baseline,
-        is_spatial=is_spatial)
+        is_spatial=is_spatial, pos_loss_weight=pos_loss_weight)
     eval_step_fn = create_eval_step(model, n_devices=n_local_devices)
 
     # ----------------------------------------------------------
