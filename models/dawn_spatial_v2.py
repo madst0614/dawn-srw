@@ -598,7 +598,10 @@ class DAWN(nn.Module):
 
     # 2D spatial routing
     pos_dim: int = 2
+    grid_size: int = 64
     candidates_multiplier: int = 3
+    grid_rebuild_interval: int = 100
+    pos_loss_weight: float = 0.01
 
     # Balanced neuron pools (ratio 1 : 1.5 : 5)
     n_qk: int = 3140
@@ -819,7 +822,10 @@ class DAWN(nn.Module):
             'max_k_qk': self.max_k_qk, 'max_k_v': self.max_k_v,
             'max_k_know': self.max_k_know,
             'pos_dim': self.pos_dim,
+            'grid_size': self.grid_size,
             'candidates_multiplier': self.candidates_multiplier,
+            'grid_rebuild_interval': self.grid_rebuild_interval,
+            'pos_loss_weight': self.pos_loss_weight,
         }
 
     def get_model_info(self):
