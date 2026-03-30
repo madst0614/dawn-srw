@@ -38,6 +38,7 @@ from datetime import datetime
 from functools import partial
 
 from models.model_v17_1_jax import DAWN
+from models.dawn_spatial import DAWN as DAWN_Spatial
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -85,6 +86,29 @@ def build_model_from_config(cfg):
             max_seq_len=mcfg.get('max_seq_len', 512),
             dropout_rate=mcfg.get('dropout', 0.1),
             gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+        )
+    elif version == 'spatial-r1':
+        model = DAWN_Spatial(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_space=mcfg.get('d_space', 64),
+            n_qk=mcfg.get('n_qk', 256),
+            n_v=mcfg.get('n_v', 256),
+            n_know=mcfg.get('n_know', 512),
+            max_k=mcfg.get('max_k', 32),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            # Hierarchical routing
+            n_clusters_qk=mcfg.get('n_clusters_qk', 64),
+            n_clusters_v=mcfg.get('n_clusters_v', 64),
+            n_clusters_know=mcfg.get('n_clusters_know', 128),
+            k_cluster_qk=mcfg.get('k_cluster_qk', 8),
+            k_cluster_v=mcfg.get('k_cluster_v', 8),
+            k_cluster_know=mcfg.get('k_cluster_know', 8),
         )
     else:
         model = DAWN(
@@ -310,13 +334,32 @@ def compute_knowledge_diversity_loss(params):
     return (feat_loss + rest_loss) / 2
 
 
+def compute_spatial_diversity_loss(params):
+    """Compute neuron diversity loss for rank-1 spatial neurons.
+
+    Penalizes high cosine similarity between neurons in each pool.
+    Replaces orthogonality + knowledge diversity for spatial-r1.
+    """
+    pool = params['neuron_pool']
+
+    def _pool_div(neurons):
+        n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
+        sim = jnp.matmul(n, n.T)
+        mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
+        return jnp.abs(sim * mask).sum() / mask.sum()
+
+    return (_pool_div(pool['qk_neurons']) +
+            _pool_div(pool['v_neurons']) +
+            _pool_div(pool['know_neurons'])) / 3
+
+
 # ============================================================
 # Train / eval steps (pmap for multi-device)
 # ============================================================
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
-                      n_devices=1, is_baseline=False):
+                      n_devices=1, is_baseline=False, is_spatial=False):
     """Create a compiled training step function.
 
     Uses jax.pmap for multi-device data parallelism.
@@ -344,6 +387,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 orth_loss = jnp.float32(0.0)
                 div_loss = jnp.float32(0.0)
                 total_loss = ce_loss
+            elif is_spatial:
+                # Spatial-r1: no orthogonality (rank-1 vectors), diversity only
+                orth_loss = jnp.float32(0.0)
+                div_loss = compute_spatial_diversity_loss(params)
+                total_loss = (ce_loss
+                              + lb_weight * aux_loss
+                              + div_weight * div_loss)
             else:
                 orth_loss = compute_orthogonality_loss(
                     params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
@@ -1013,11 +1063,14 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
-    is_baseline = cfg['model'].get('model_version', '17.1') == 'baseline'
+    model_version = cfg['model'].get('model_version', '17.1')
+    is_baseline = model_version == 'baseline'
+    is_spatial = model_version == 'spatial-r1'
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
-        n_devices=n_local_devices, is_baseline=is_baseline)
+        n_devices=n_local_devices, is_baseline=is_baseline,
+        is_spatial=is_spatial)
     eval_step_fn = create_eval_step(model, n_devices=n_local_devices)
 
     # ----------------------------------------------------------

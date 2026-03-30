@@ -60,6 +60,7 @@ def __getattr__(name):
         'DAWN_v17_1_TPU': ('.model_v17_1_tpu', 'DAWN'),
         'DAWN_v17_1_TPU_MemOpt': ('.model_v17_1_tpu_memopt', 'DAWN'),
         'DAWN_v17_2': ('.model_v17_2', 'DAWN'),
+        'DAWN_Spatial': ('.dawn_spatial', 'DAWN'),
         'DAWN': ('.model_v17_1', 'DAWN'),
         'VanillaTransformer': ('.baseline_transformer', 'VanillaTransformer'),
     }
@@ -98,6 +99,7 @@ __all__ = [
     'DAWN_v17_1',
     'DAWN_v17_1_TPU',
     'DAWN_v17_1_TPU_MemOpt',
+    'DAWN_Spatial',
     'VanillaTransformer',
     # Version utilities
     'VERSION_REGISTRY',
