@@ -421,7 +421,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     For v3: cell_maps passed as extra argument to train_step.
     """
 
-    @partial(jax.pmap, axis_name='dp')
+    # in_axes: all args split on axis 0 except cell_maps (broadcast)
+    @partial(jax.pmap, axis_name='dp',
+             in_axes=(0, 0, 0, 0, 0, None))
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
                    cell_maps=None):
         # Labels for CLM: input_ids shifted, padding masked
@@ -1142,21 +1144,14 @@ def main():
         is_spatial_v3=is_spatial_v3)
     eval_step_fn = create_eval_step(model, n_devices=n_local_devices)
 
-    # Build initial cell_maps for v3
-    cell_maps_replicated = None
+    # Build initial cell_maps for v3 (broadcast via in_axes=None, no replication)
+    v3_cell_maps = None
     if is_spatial_v3:
-        # unreplicate params for cell map building
         params_single = jax.tree.map(lambda x: x[0], params)
         n_cells_side = cfg['model'].get('n_cells_per_side', 32)
-        cell_maps = build_all_cell_maps(
+        v3_cell_maps = build_all_cell_maps(
             params_single,
             cfg['model']['n_qk'], cfg['model']['n_v'], n_cells_side)
-        # Replicate cell_maps across devices
-        cell_maps_replicated = jax.tree.map(
-            lambda x: jnp.broadcast_to(
-                x[jnp.newaxis], (n_local_devices,) + x.shape)
-            if isinstance(x, jnp.ndarray) else x,
-            cell_maps)
 
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile: real train_step (forward + backward)
@@ -1175,7 +1170,7 @@ def main():
         jit_start = time.time()
         _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys,
-            cell_maps_replicated,
+            v3_cell_maps,
         )
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
@@ -1188,7 +1183,7 @@ def main():
         step_start = time.time()
         _dummy_params2, _dummy_opt2, dummy_metrics2 = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys2,
-            cell_maps_replicated,
+            v3_cell_maps,
         )
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
@@ -1338,22 +1333,17 @@ def main():
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
                 input_ids, attention_mask, dropout_keys,
-                cell_maps_replicated,
+                v3_cell_maps,
             )
 
             # Periodic cell_maps rebuild for v3
             if (is_spatial_v3 and global_step > 0
                     and global_step % cfg['model'].get('map_rebuild_interval', 100) == 0):
                 params_single = jax.tree.map(lambda x: x[0], params)
-                cell_maps = build_all_cell_maps(
+                v3_cell_maps = build_all_cell_maps(
                     params_single,
                     cfg['model']['n_qk'], cfg['model']['n_v'],
                     cfg['model'].get('n_cells_per_side', 32))
-                cell_maps_replicated = jax.tree.map(
-                    lambda x: jnp.broadcast_to(
-                        x[jnp.newaxis], (n_local_devices,) + x.shape)
-                    if isinstance(x, jnp.ndarray) else x,
-                    cell_maps)
 
             # Extract metrics (take first device, already aggregated via pmean/psum)
             m_total = float(metrics['total_loss'][0])

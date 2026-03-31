@@ -186,7 +186,6 @@ def build_all_cell_maps(params, n_qk, n_v, n_cells_per_side):
         'pos_range_v': jnp.array(range_v),
         'pos_min_know': jnp.array(min_know),
         'pos_range_know': jnp.array(range_know),
-        'n_cells_per_side': n_cells_per_side,
     }
 
 
