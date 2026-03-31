@@ -1,41 +1,30 @@
 """
-DAWN-Spatial v3: Rank-1 Neuron Architecture with Map-Based Routing (JAX/Flax)
+DAWN-Spatial v3: Rank-1 Neuron Architecture with Cell-Dense Routing (JAX/Flax)
 
 Changelog:
-  spatial-r1-v3.0.0 (2026-03-31):
-    - Replace distance brute-force routing with cell map lookup
-    - build_cell_map (numpy, CPU) creates fixed-shape lookup table
-    - cell_lookup (JAX) does O(1) grid lookup instead of O(N) distance
-    - Both Attn and Know pipelines use cell lookup + chunked gather
-    - Remove candidates_multiplier (cell size determines candidates)
-    - Add n_cells_per_side, map_rebuild_interval config
+  spatial-r1-v3.1.0 (2026-03-31):
+    - Cell-dense routing: block_data stores original neuron indices per cell
+      (not neuron copies). Actual neurons gathered from latest params.
+    - _attn_dense: QK/V full sequence (small candidate count)
+    - _know_dense_chunked: Python for loop + jax.checkpoint per chunk
+    - No distance computation. cell_id integer division + 3x3 neighbor lookup.
+    - block_data rebuilt every map_rebuild_interval steps (index map only)
 
-  spatial-r1-v2.0.6 (2026-03-31):
-    - Both Attn and Know fully chunked with carry accumulation
+  spatial-r1-v3.0.0 (2026-03-31):
+    - Map-based routing (cell lookup + gather + chunked). 30s/step.
 
 Key concept:
   - Every neuron is a single vector v_i [D] (rank-1).
-  - Sense: activation_i = v_i . x  (scalar)
-  - Fire:  gate decides which neurons fire (threshold tau)
-  - Emit:  out = sum gate_i * activation_i * v_i
-
-Map-Based Routing:
-  - Each neuron has a learnable 2D coordinate neuron_pos [N, 2]
-  - 2D space divided into grid cells (n_cells_per_side x n_cells_per_side)
-  - cell_map[cell_id] = list of neuron indices in that cell (fixed shape)
-  - Forward: query_pos -> cell_id (integer division) -> 3x3 neighbor lookup
-  - No distance computation. O(1) candidate selection.
-  - cell_map rebuilt periodically (every map_rebuild_interval steps, CPU)
+  - Transform: out = V^T diag(gate) V x
+  - Cell-based routing: neuron_pos -> cell assignment -> index map
+  - Forward: query_pos -> cell_id -> neighbor indices -> original gather
 
 Architecture:
-  build_cell_map      -- numpy CPU: neuron_pos -> cell lookup table
-  cell_lookup          -- JAX: query_pos -> candidate indices via grid
-  sense_emit_mapped    -- rank-1 transform with valid_mask
-  NeuronPool           -- shared [N, D] rank-1 vectors
-  Router               -- 2D pos projections + tau (no distance logic)
-  _attn_pipeline_mapped_chunked  -- cell lookup + chunked Q/K/V + full self-attn
-  _know_pipeline_mapped_chunked  -- cell lookup + chunked gather/score/gate/emit
-  DAWN                 -- embedding + jax.lax.scan + weight-tied lm_head
+  build_cell_index_map  -- numpy CPU: neuron_pos -> index-only lookup table
+  get_cell_block_indices -- JAX: query_pos -> original neuron indices
+  _attn_dense           -- full sequence QK/V, block index -> original gather
+  _know_dense_chunked   -- chunked Know, Python loop + checkpoint
+  DAWN                  -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
 import jax
@@ -111,60 +100,55 @@ def threshold_gate(scores, tau, max_k=None):
 
 
 # ================================================================
-# 5. Cell Map Builder (numpy, CPU -- called outside JIT)
+# 5. Cell Index Map Builder (numpy, CPU -- called outside JIT)
+#    Stores original neuron indices per cell, NOT neuron copies.
 # ================================================================
 
-def build_cell_map(neuron_pos_np, n_cells_per_side, max_per_cell):
-    """Build cell lookup table from neuron positions.
+def build_cell_index_map(neuron_pos_np, n_cells_per_side, block_size):
+    """Build cell index map: which original neuron indices are in each cell.
 
     Args:
         neuron_pos_np: [N, 2] numpy array
         n_cells_per_side: grid resolution per axis
-        max_per_cell: max neurons per cell (overflow truncated)
+        block_size: max neurons per cell (overflow truncated)
 
     Returns:
-        cell_map: [n_cells, max_per_cell] int32 (-1 = padding)
-        cell_counts: [n_cells] int32
-        pos_min: [2] float32
-        pos_range: [2] float32
+        cell_idx: [n_cells, block_size] int32 (-1 = padding)
+        cell_valid: [n_cells, block_size] bool
+        pos_min: [2], pos_range: [2]
     """
     N = neuron_pos_np.shape[0]
     n_cells = n_cells_per_side ** 2
 
     pos_min = neuron_pos_np.min(axis=0)
-    pos_max = neuron_pos_np.max(axis=0)
-    pos_range = pos_max - pos_min + 1e-8
-    normalized = (neuron_pos_np - pos_min) / pos_range  # [0, 1)
+    pos_range = neuron_pos_np.max(axis=0) - pos_min + 1e-8
+    normalized = (neuron_pos_np - pos_min) / pos_range
 
     cell_xy = np.clip(
         (normalized * n_cells_per_side).astype(np.int32),
         0, n_cells_per_side - 1)
     cell_ids = cell_xy[:, 0] * n_cells_per_side + cell_xy[:, 1]
 
-    cell_map = np.full((n_cells, max_per_cell), -1, dtype=np.int32)
-    cell_counts = np.zeros(n_cells, dtype=np.int32)
+    cell_idx = np.full((n_cells, block_size), -1, dtype=np.int32)
+    cell_valid = np.zeros((n_cells, block_size), dtype=np.bool_)
+    counts = np.zeros(n_cells, dtype=np.int32)
 
     for i in range(N):
         cid = cell_ids[i]
-        if cell_counts[cid] < max_per_cell:
-            cell_map[cid, cell_counts[cid]] = i
-            cell_counts[cid] += 1
+        if counts[cid] < block_size:
+            cell_idx[cid, counts[cid]] = i  # original index
+            cell_valid[cid, counts[cid]] = True
+            counts[cid] += 1
 
-    return cell_map, cell_counts, pos_min.astype(np.float32), pos_range.astype(np.float32)
+    return cell_idx, cell_valid, pos_min.astype(np.float32), pos_range.astype(np.float32)
 
 
-def build_all_cell_maps(params, n_qk, n_v, n_cells_per_side,
-                        max_k_qk=157, max_k_v=262, max_k_know=1536):
-    """Build cell maps for all three pools. Called outside JIT.
+def build_all_blocks(params, n_qk, n_v, n_cells_per_side,
+                     max_k_qk=157, max_k_v=262, max_k_know=1536):
+    """Build block_data (index maps) for all pools. Called outside JIT.
 
-    Args:
-        params: model params dict (has 'router'/'neuron_pos')
-        n_qk, n_v: pool sizes
-        n_cells_per_side: grid resolution
-        max_k_qk, max_k_v, max_k_know: per-circuit max_k (for sizing)
-
-    Returns:
-        dict of JAX arrays (fixed shapes, no recompilation on rebuild)
+    block_data contains only original neuron indices per cell.
+    Actual neuron vectors are gathered from latest params at forward time.
     """
     neuron_pos = np.array(params['router']['neuron_pos'])
     pos_qk = neuron_pos[:n_qk]
@@ -172,34 +156,38 @@ def build_all_cell_maps(params, n_qk, n_v, n_cells_per_side,
     pos_know = neuron_pos[n_qk + n_v:]
 
     n_cells = n_cells_per_side ** 2
-    # max_per_cell must ensure 9*max_per_cell >= max_k for each pool
-    # ceil(max_k / 9) + 2 for safety margin
-    mpc_qk = max(max_k_qk // 9 + 2, n_qk // n_cells * 4, 20)
-    mpc_v = max(max_k_v // 9 + 2, n_v // n_cells * 4, 32)
-    mpc_know = max(max_k_know // 9 + 2, len(pos_know) // n_cells * 3, 176)
+    # block_size: ensure 9*block >= max_k, also ~4x avg
+    bs_qk = max(max_k_qk // 9 + 4, n_qk // n_cells * 4, 16)
+    bs_v = max(max_k_v // 9 + 4, n_v // n_cells * 4, 16)
+    bs_know = max(max_k_know // 9 + 4, len(pos_know) // n_cells * 4, 64)
 
-    cm_qk, _, min_qk, range_qk = build_cell_map(pos_qk, n_cells_per_side, mpc_qk)
-    cm_v, _, min_v, range_v = build_cell_map(pos_v, n_cells_per_side, mpc_v)
-    cm_know, _, min_know, range_know = build_cell_map(pos_know, n_cells_per_side, mpc_know)
+    idx_qk, val_qk, pmin_qk, prng_qk = build_cell_index_map(
+        pos_qk, n_cells_per_side, bs_qk)
+    idx_v, val_v, pmin_v, prng_v = build_cell_index_map(
+        pos_v, n_cells_per_side, bs_v)
+    idx_know, val_know, pmin_know, prng_know = build_cell_index_map(
+        pos_know, n_cells_per_side, bs_know)
 
     return {
-        'qk': jnp.array(cm_qk),
-        'v': jnp.array(cm_v),
-        'know': jnp.array(cm_know),
-        'pos_min_qk': jnp.array(min_qk),
-        'pos_range_qk': jnp.array(range_qk),
-        'pos_min_v': jnp.array(min_v),
-        'pos_range_v': jnp.array(range_v),
-        'pos_min_know': jnp.array(min_know),
-        'pos_range_know': jnp.array(range_know),
+        'qk_idx': jnp.array(idx_qk),        # [n_cells, bs_qk]
+        'qk_valid': jnp.array(val_qk),
+        'v_idx': jnp.array(idx_v),
+        'v_valid': jnp.array(val_v),
+        'know_idx': jnp.array(idx_know),
+        'know_valid': jnp.array(val_know),
+        'pos_min_qk': jnp.array(pmin_qk),
+        'pos_range_qk': jnp.array(prng_qk),
+        'pos_min_v': jnp.array(pmin_v),
+        'pos_range_v': jnp.array(prng_v),
+        'pos_min_know': jnp.array(pmin_know),
+        'pos_range_know': jnp.array(prng_know),
     }
 
 
 # ================================================================
-# 6. Cell Lookup (JAX, inside JIT)
+# 6. Cell Block Index Lookup (JAX, inside JIT)
 # ================================================================
 
-# 3x3 neighbor offsets (self + 8 directions)
 _NEIGHBOR_OFFSETS = jnp.array([
     [-1, -1], [-1, 0], [-1, 1],
     [0, -1],  [0, 0],  [0, 1],
@@ -207,66 +195,46 @@ _NEIGHBOR_OFFSETS = jnp.array([
 ], dtype=jnp.int32)  # [9, 2]
 
 
-def cell_lookup(query_pos, cell_map, pos_min, pos_range, n_cells_per_side):
-    """Look up candidate neuron indices from cell map via grid position.
+def get_cell_block_indices(query_pos, cell_idx_map, cell_valid_map,
+                           pos_min, pos_range, n_cells_per_side):
+    """Look up original neuron indices from cell index map.
 
     Args:
-        query_pos:        [B, S, 2]
-        cell_map:         [n_cells, max_per_cell] int32 (-1 = padding)
-        pos_min:          [2] normalization offset
-        pos_range:        [2] normalization scale
+        query_pos:      [B, S, 2]
+        cell_idx_map:   [n_cells, block_size] int32 (original indices, -1=pad)
+        cell_valid_map: [n_cells, block_size] bool
+        pos_min, pos_range: normalization params
         n_cells_per_side: int
 
     Returns:
-        cand_idx:   [B, S, 9 * max_per_cell] int32 (padding replaced with 0)
-        valid_mask: [B, S, 9 * max_per_cell] bool
+        cand_idx:   [B, S, 9*block_size] int32 (safe, 0 for invalid)
+        valid_mask: [B, S, 9*block_size] bool
     """
     B, S, _ = query_pos.shape
-    max_per_cell = cell_map.shape[1]
+    block_size = cell_idx_map.shape[1]
 
-    # Normalize to [0, 1) and compute cell coordinates
-    normalized = (query_pos - pos_min) / pos_range  # [B, S, 2]
+    normalized = (query_pos - pos_min) / pos_range
     cell_xy = jnp.clip(
         (normalized * n_cells_per_side).astype(jnp.int32),
-        0, n_cells_per_side - 1)  # [B, S, 2]
+        0, n_cells_per_side - 1)
 
-    # 3x3 neighbor cells: [B, S, 9, 2]
     neighbor_xy = cell_xy[:, :, None, :] + _NEIGHBOR_OFFSETS[None, None, :, :]
     neighbor_xy = jnp.clip(neighbor_xy, 0, n_cells_per_side - 1)
+    neighbor_cell = (neighbor_xy[:, :, :, 0] * n_cells_per_side
+                     + neighbor_xy[:, :, :, 1])  # [B, S, 9]
 
-    # Flatten to cell index: [B, S, 9]
-    neighbor_idx = (neighbor_xy[:, :, :, 0] * n_cells_per_side
-                    + neighbor_xy[:, :, :, 1])
+    # Gather index blocks: [B, S, 9, block_size]
+    cand_idx = cell_idx_map[neighbor_cell]
+    valid_mask = cell_valid_map[neighbor_cell]
 
-    # Gather from cell_map: [B, S, 9, max_per_cell]
-    cand_idx = cell_map[neighbor_idx]
-    cand_idx = cand_idx.reshape(B, S, 9 * max_per_cell)
+    # Flatten
+    cand_idx = cand_idx.reshape(B, S, 9 * block_size)
+    valid_mask = valid_mask.reshape(B, S, 9 * block_size)
 
-    # Valid mask and safe indices
-    valid_mask = (cand_idx >= 0)
+    # Safe indices (replace -1 with 0 for gather safety)
     cand_idx = jnp.where(valid_mask, cand_idx, 0)
 
     return cand_idx, valid_mask
-
-
-# ================================================================
-# 7. Sense-Emit with valid mask
-# ================================================================
-
-def sense_emit_mapped(x, neurons, gate, cand_idx, valid_mask):
-    """Rank-1 sense-emit with masking for invalid (padding) candidates.
-
-    x:          [B, S, D]
-    neurons:    [N, D]
-    gate:       [B, S, n_cand]
-    cand_idx:   [B, S, n_cand]
-    valid_mask: [B, S, n_cand] bool
-    """
-    cand_neurons = neurons[cand_idx]                        # [B, S, n_cand, D]
-    activations = jnp.einsum('bsd,bsnd->bsn', x, cand_neurons)
-    masked_gate = gate * valid_mask
-    gated = activations * masked_gate
-    return jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)
 
 
 # ================================================================
@@ -289,13 +257,11 @@ class NeuronPool(nn.Module):
 
 
 # ================================================================
-# 9. Router -- 2D positional projections + tau (no distance logic)
+# 8. Router -- 2D positional projections + tau
 # ================================================================
 
 class Router(nn.Module):
-    """Router for map-based routing. Only produces query positions and tau.
-    Cell lookup and scoring happen in the pipeline functions.
-    """
+    """Router: produces query positions and tau. Cell lookup in pipelines."""
     d_model: int
     pos_dim: int
     n_qk: int
@@ -308,265 +274,141 @@ class Router(nn.Module):
 
     def setup(self):
         total = self.n_qk + self.n_v + self.n_know
-
-        # Learnable 2D coordinates for all neurons
         self.neuron_pos = self.param(
             'neuron_pos', scaled_normal(1.0), (total, self.pos_dim))
-
-        # Input -> query position projections (per circuit)
         self.proj_pos_qk = nn.Dense(self.pos_dim, name='proj_pos_qk')
         self.proj_pos_v = nn.Dense(self.pos_dim, name='proj_pos_v')
         self.proj_pos_know = nn.Dense(self.pos_dim, name='proj_pos_know')
-
-        # Learnable tau
         self.tau_attn = nn.Dense(3, name='tau_attn')
         self.tau_know = nn.Dense(1, name='tau_know')
 
-    def get_attention_gates(self, x, neuron_pool, deterministic, rng,
-                            cell_maps=None, n_cells_per_side=32):
-        """Compute Q, K, V gates via cell map lookup (init path).
-
-        If cell_maps is None, falls back to brute-force distance (init only).
-        """
+    def get_attention_gates(self, x, neuron_pool, deterministic, rng):
+        """Init path: brute-force fallback (small batch, no OOM)."""
         B, S, D = x.shape
-        qk_neurons = neuron_pool.qk_neurons
-        v_neurons = neuron_pool.v_neurons
-
         qk_pos = self.proj_pos_qk(x)
         v_pos = self.proj_pos_v(x)
-
         npos_qk = self.neuron_pos[:self.n_qk]
         npos_v = self.neuron_pos[self.n_qk:self.n_qk + self.n_v]
 
-        if cell_maps is not None:
-            cand_idx_qk, mask_qk = cell_lookup(
-                qk_pos, cell_maps['qk'],
-                cell_maps['pos_min_qk'], cell_maps['pos_range_qk'],
-                n_cells_per_side)
-            cand_idx_v, mask_v = cell_lookup(
-                v_pos, cell_maps['v'],
-                cell_maps['pos_min_v'], cell_maps['pos_range_v'],
-                n_cells_per_side)
-        else:
-            # Brute-force fallback (init path, small batch)
-            dist_qk = jnp.sum(
-                (qk_pos[:, :, None, :] - npos_qk[None, None, :, :]) ** 2,
-                axis=-1)
-            n_cand_qk = min(self.max_k_qk * 2, self.n_qk)
-            _, cand_idx_qk = jax.lax.top_k(-dist_qk, n_cand_qk)
-            mask_qk = jnp.ones_like(cand_idx_qk, dtype=jnp.bool_)
+        # Brute-force distance (init only)
+        n_cand_qk = min(self.max_k_qk * 2, self.n_qk)
+        dist_qk = jnp.sum(
+            (qk_pos[:, :, None, :] - npos_qk[None, None, :, :]) ** 2, axis=-1)
+        _, ci_qk = jax.lax.top_k(-dist_qk, n_cand_qk)
+        n_cand_v = min(self.max_k_v * 2, self.n_v)
+        dist_v = jnp.sum(
+            (v_pos[:, :, None, :] - npos_v[None, None, :, :]) ** 2, axis=-1)
+        _, ci_v = jax.lax.top_k(-dist_v, n_cand_v)
 
-            dist_v = jnp.sum(
-                (v_pos[:, :, None, :] - npos_v[None, None, :, :]) ** 2,
-                axis=-1)
-            n_cand_v = min(self.max_k_v * 2, self.n_v)
-            _, cand_idx_v = jax.lax.top_k(-dist_v, n_cand_v)
-            mask_v = jnp.ones_like(cand_idx_v, dtype=jnp.bool_)
+        ci_qk = jax.lax.stop_gradient(ci_qk)
+        ci_v = jax.lax.stop_gradient(ci_v)
 
-        cand_idx_qk = jax.lax.stop_gradient(cand_idx_qk)
-        cand_idx_v = jax.lax.stop_gradient(cand_idx_v)
-
-        cand_qk = qk_neurons[cand_idx_qk]
-        cand_v = v_neurons[cand_idx_v]
+        cand_qk = neuron_pool.qk_neurons[ci_qk]
+        cand_v = neuron_pool.v_neurons[ci_v]
 
         rng, rng1 = jax.random.split(rng)
         x_drop = safe_dropout(x, self.router_dropout, deterministic, rng1)
-
-        scores_Q = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
-        scores_K = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
-        scores_V = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_v)
-
-        scores_Q = jnp.where(mask_qk, scores_Q, -1e9)
-        scores_K = jnp.where(mask_qk, scores_K, -1e9)
-        scores_V = jnp.where(mask_v, scores_V, -1e9)
+        s_Q = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
+        s_K = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk)
+        s_V = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_v)
 
         tau_all = self.tau_attn(x)
-        gate_Q = threshold_gate(scores_Q, tau_all[:, :, 0:1], self.max_k_qk)
-        gate_K = threshold_gate(scores_K, tau_all[:, :, 1:2], self.max_k_qk)
-        gate_V = threshold_gate(scores_V, tau_all[:, :, 2:3], self.max_k_v)
+        g_Q = threshold_gate(s_Q, tau_all[:, :, 0:1], self.max_k_qk)
+        g_K = threshold_gate(s_K, tau_all[:, :, 1:2], self.max_k_qk)
+        g_V = threshold_gate(s_V, tau_all[:, :, 2:3], self.max_k_v)
 
-        # pos_loss
-        pos_dist_qk = jnp.sum(
-            (qk_pos[:, :, None, :] - npos_qk[cand_idx_qk]) ** 2, axis=-1)
-        pos_loss_qk = (jax.lax.stop_gradient(gate_Q) * pos_dist_qk * mask_qk
-                        ).sum() / (mask_qk.sum() + 1e-8)
-        pos_dist_v = jnp.sum(
-            (v_pos[:, :, None, :] - npos_v[cand_idx_v]) ** 2, axis=-1)
-        pos_loss_v = (jax.lax.stop_gradient(gate_V) * pos_dist_v * mask_v
-                       ).sum() / (mask_v.sum() + 1e-8)
+        return g_Q, g_K, g_V, ci_qk, ci_v, jnp.float32(0.0)
 
-        return (gate_Q, gate_K, gate_V, cand_idx_qk, cand_idx_v,
-                mask_qk, mask_v, pos_loss_qk + pos_loss_v)
-
-    def get_knowledge_gates(self, x, neuron_pool, deterministic, rng,
-                            cell_maps=None, n_cells_per_side=32):
-        """Compute knowledge gates via cell map lookup (init path)."""
-        B, S, D = x.shape
-        know_neurons = neuron_pool.know_neurons
-
+    def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
+        """Init path: brute-force fallback."""
         know_pos = self.proj_pos_know(x)
         npos_know = self.neuron_pos[self.n_qk + self.n_v:]
 
-        if cell_maps is not None:
-            cand_idx, valid_mask = cell_lookup(
-                know_pos, cell_maps['know'],
-                cell_maps['pos_min_know'], cell_maps['pos_range_know'],
-                n_cells_per_side)
-        else:
-            dist = jnp.sum(
-                (know_pos[:, :, None, :] - npos_know[None, None, :, :]) ** 2,
-                axis=-1)
-            n_cand = min(self.max_k_know * 2, self.n_know)
-            _, cand_idx = jax.lax.top_k(-dist, n_cand)
-            valid_mask = jnp.ones_like(cand_idx, dtype=jnp.bool_)
+        n_cand = min(self.max_k_know * 2, self.n_know)
+        dist = jnp.sum(
+            (know_pos[:, :, None, :] - npos_know[None, None, :, :]) ** 2,
+            axis=-1)
+        _, ci = jax.lax.top_k(-dist, n_cand)
+        ci = jax.lax.stop_gradient(ci)
 
-        cand_idx = jax.lax.stop_gradient(cand_idx)
-        cand_neurons = know_neurons[cand_idx]
-
+        cand = neuron_pool.know_neurons[ci]
         rng, rng1 = jax.random.split(rng)
         x_drop = safe_dropout(x, self.router_dropout, deterministic, rng1)
-        scores = jnp.einsum('bsd,bsnd->bsn', x_drop, cand_neurons)
-        scores = jnp.where(valid_mask, scores, -1e9)
-
+        scores = jnp.einsum('bsd,bsnd->bsn', x_drop, cand)
         tau = self.tau_know(x)
         gate = threshold_gate(scores, tau, self.max_k_know)
 
-        cand_npos = npos_know[cand_idx]
-        pos_dist = jnp.sum(
-            (know_pos[:, :, None, :] - cand_npos) ** 2, axis=-1)
-        pos_loss = (jax.lax.stop_gradient(gate) * pos_dist * valid_mask
-                    ).sum() / (valid_mask.sum() + 1e-8)
-
-        return gate, cand_idx, valid_mask, pos_loss
+        return gate, ci, jnp.float32(0.0)
 
 
 # ================================================================
-# 10. Chunked Pipeline Functions (scan body)
+# 9. Dense Pipeline Functions (scan body)
+#    block_data has only index maps. Neurons from latest params.
 # ================================================================
 
-def _attn_pipeline_mapped_chunked(
-    x, qk_pos, v_pos, tau_Q, tau_K, tau_V,
-    qk_neurons, v_neurons, npos_qk, npos_v,
-    cell_map_qk, cell_map_v,
-    pos_min_qk, pos_range_qk, pos_min_v, pos_range_v,
-    expand_O_kernel, rng,
-    # static:
-    n_cells_per_side, max_k_qk, max_k_v,
-    n_heads, d_model,
-    router_dropout, dropout_rate, deterministic,
-    chunk_size,
-):
-    """Attention: cell lookup (full seq) + chunked Q/K/V sense_emit + full self-attn.
+def _attn_dense(x, router_params, pool_params, block_data,
+                expand_O_kernel, rng,
+                n_qk, n_v, n_cells_per_side,
+                max_k_qk, max_k_v,
+                n_heads, d_model,
+                router_dropout, dropout_rate, deterministic):
+    """Cell-dense attention: block index lookup -> original gather -> dense ops.
 
-    Cell lookup produces small index tensors [B,S,n_cand].
-    Gather+score+gate+emit via Python for loop + jax.checkpoint per chunk
-    (scan would stack intermediate tensors across chunks -> OOM).
-    Self-attention runs on full sequence (Q/K/V are [B,S,D] = small).
+    QK/V processed full sequence (small candidate count).
+    block_data has only original indices; neurons from pool_params (latest).
     """
     B, S, D = x.shape
-    pos_dim = qk_pos.shape[-1]
+    qk_neurons = pool_params['qk_neurons']
+    v_neurons = pool_params['v_neurons']
 
-    # Cell lookup over full sequence (int tensors, small)
-    cand_idx_qk, mask_qk = cell_lookup(
-        qk_pos, cell_map_qk, pos_min_qk, pos_range_qk, n_cells_per_side)
-    cand_idx_v, mask_v = cell_lookup(
-        v_pos, cell_map_v, pos_min_v, pos_range_v, n_cells_per_side)
-    cand_idx_qk = jax.lax.stop_gradient(cand_idx_qk)
-    cand_idx_v = jax.lax.stop_gradient(cand_idx_v)
+    # Query positions + tau
+    qk_pos = x @ router_params['proj_pos_qk']['kernel'] + router_params['proj_pos_qk']['bias']
+    v_pos = x @ router_params['proj_pos_v']['kernel'] + router_params['proj_pos_v']['bias']
 
-    n_cand_qk = cand_idx_qk.shape[-1]
-    n_cand_v = cand_idx_v.shape[-1]
+    # Cell lookup -> original indices (no distance)
+    ci_qk, m_qk = get_cell_block_indices(
+        qk_pos, block_data['qk_idx'], block_data['qk_valid'],
+        block_data['pos_min_qk'], block_data['pos_range_qk'], n_cells_per_side)
+    ci_v, m_v = get_cell_block_indices(
+        v_pos, block_data['v_idx'], block_data['v_valid'],
+        block_data['pos_min_v'], block_data['pos_range_v'], n_cells_per_side)
+    ci_qk = jax.lax.stop_gradient(ci_qk)
+    ci_v = jax.lax.stop_gradient(ci_v)
 
-    # Pad sequence
-    pad_S = ((S + chunk_size - 1) // chunk_size) * chunk_size
-    if pad_S > S:
-        pad2 = ((0, 0), (0, pad_S - S), (0, 0))
-        x = jnp.pad(x, pad2)
-        qk_pos = jnp.pad(qk_pos, pad2[:2] + ((0, 0),))
-        v_pos = jnp.pad(v_pos, pad2[:2] + ((0, 0),))
-        tau_Q = jnp.pad(tau_Q, pad2[:2] + ((0, 0),))
-        tau_K = jnp.pad(tau_K, pad2[:2] + ((0, 0),))
-        tau_V = jnp.pad(tau_V, pad2[:2] + ((0, 0),))
-        cand_idx_qk = jnp.pad(cand_idx_qk, pad2[:2] + ((0, 0),))
-        mask_qk = jnp.pad(mask_qk, pad2[:2] + ((0, 0),))
-        cand_idx_v = jnp.pad(cand_idx_v, pad2[:2] + ((0, 0),))
-        mask_v = jnp.pad(mask_v, pad2[:2] + ((0, 0),))
+    # Gather from ORIGINAL params (latest, gradient flows)
+    cand_qk = qk_neurons[ci_qk]   # [B, S, n_cand_qk, D]
+    cand_v = v_neurons[ci_v]       # [B, S, n_cand_v, D]
 
-    n_chunks = pad_S // chunk_size
-    chunk_rngs = jax.random.split(rng, n_chunks + 1)
-    rng_final = chunk_rngs[-1]
-    chunk_rngs = chunk_rngs[:-1]
+    # Score
+    rng, rng_drop = jax.random.split(rng)
+    x_drop = safe_dropout(x, router_dropout, deterministic, rng_drop)
+    s_Q = jnp.where(m_qk, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk), -1e9)
+    s_K = jnp.where(m_qk, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk), -1e9)
+    s_V = jnp.where(m_v, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_v), -1e9)
 
-    def _attn_chunk(x_c, qk_pos_c, v_pos_c, tau_Q_c, tau_K_c, tau_V_c,
-                    ci_qk, m_qk, ci_v, m_v, rng_c,
-                    max_k_qk, max_k_v, router_dropout, deterministic):
-        """Process one attention chunk. Checkpointed per call."""
-        cand_qk = qk_neurons[ci_qk]
-        cand_v = v_neurons[ci_v]
+    # Tau + Gate
+    tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+    g_Q = threshold_gate(s_Q, tau_all[:, :, 0:1], max_k_qk)
+    g_K = threshold_gate(s_K, tau_all[:, :, 1:2], max_k_qk)
+    g_V = threshold_gate(s_V, tau_all[:, :, 2:3], max_k_v)
 
-        rng_c, rng_drop = jax.random.split(rng_c)
-        x_drop = safe_dropout(x_c, router_dropout, deterministic, rng_drop)
-        scores_Q = jnp.where(m_qk, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk), -1e9)
-        scores_K = jnp.where(m_qk, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_qk), -1e9)
-        scores_V = jnp.where(m_v, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_v), -1e9)
+    # Sense-emit Q/K/V
+    act_Q = jnp.einsum('bsd,bsnd->bsn', x, cand_qk)
+    Q = jnp.einsum('bsn,bsnd->bsd', act_Q * g_Q * m_qk, cand_qk)
+    act_K = jnp.einsum('bsd,bsnd->bsn', x, cand_qk)
+    K = jnp.einsum('bsn,bsnd->bsd', act_K * g_K * m_qk, cand_qk)
+    act_V = jnp.einsum('bsd,bsnd->bsn', x, cand_v)
+    V = jnp.einsum('bsn,bsnd->bsd', act_V * g_V * m_v, cand_v)
 
-        gate_Q = threshold_gate(scores_Q, tau_Q_c, max_k_qk)
-        gate_K = threshold_gate(scores_K, tau_K_c, max_k_qk)
-        gate_V = threshold_gate(scores_V, tau_V_c, max_k_v)
+    # pos_loss (gradient flows to original neuron_pos)
+    npos_qk = router_params['neuron_pos'][:n_qk]
+    npos_v = router_params['neuron_pos'][n_qk:n_qk + n_v]
+    pd_qk = jnp.sum((qk_pos[:, :, None, :] - npos_qk[ci_qk]) ** 2, axis=-1)
+    pl_qk = (jax.lax.stop_gradient(g_Q) * pd_qk * m_qk).sum() / (m_qk.sum() + 1e-8)
+    pd_v = jnp.sum((v_pos[:, :, None, :] - npos_v[ci_v]) ** 2, axis=-1)
+    pl_v = (jax.lax.stop_gradient(g_V) * pd_v * m_v).sum() / (m_v.sum() + 1e-8)
 
-        act_Q = jnp.einsum('bsd,bsnd->bsn', x_c, cand_qk)
-        Q_c = jnp.einsum('bsn,bsnd->bsd', act_Q * gate_Q * m_qk, cand_qk)
-        act_K = jnp.einsum('bsd,bsnd->bsn', x_c, cand_qk)
-        K_c = jnp.einsum('bsn,bsnd->bsd', act_K * gate_K * m_qk, cand_qk)
-        act_V = jnp.einsum('bsd,bsnd->bsn', x_c, cand_v)
-        V_c = jnp.einsum('bsn,bsnd->bsd', act_V * gate_V * m_v, cand_v)
-
-        pd_qk = jnp.sum(
-            (qk_pos_c[:, :, None, :] - npos_qk[ci_qk]) ** 2, axis=-1)
-        pl_qk = (jax.lax.stop_gradient(gate_Q) * pd_qk * m_qk
-                  ).sum() / (m_qk.sum() + 1e-8)
-        pd_v = jnp.sum(
-            (v_pos_c[:, :, None, :] - npos_v[ci_v]) ** 2, axis=-1)
-        pl_v = (jax.lax.stop_gradient(gate_V) * pd_v * m_v
-                ).sum() / (m_v.sum() + 1e-8)
-
-        return Q_c, K_c, V_c, pl_qk + pl_v
-
-    _attn_chunk_ckpt = jax.checkpoint(
-        _attn_chunk, static_argnums=(11, 12, 13, 14))
-
-    # Python for loop -- no scan stacking of intermediate tensors
-    Q_parts, K_parts, V_parts = [], [], []
-    total_pos_loss = jnp.float32(0.0)
-
-    for i in range(n_chunks):
-        start = i * chunk_size
-        x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
-        qk_pos_c = jax.lax.dynamic_slice(qk_pos, (0, start, 0), (B, chunk_size, pos_dim))
-        v_pos_c = jax.lax.dynamic_slice(v_pos, (0, start, 0), (B, chunk_size, pos_dim))
-        tau_Q_c = jax.lax.dynamic_slice(tau_Q, (0, start, 0), (B, chunk_size, 1))
-        tau_K_c = jax.lax.dynamic_slice(tau_K, (0, start, 0), (B, chunk_size, 1))
-        tau_V_c = jax.lax.dynamic_slice(tau_V, (0, start, 0), (B, chunk_size, 1))
-        ci_qk_c = jax.lax.dynamic_slice(cand_idx_qk, (0, start, 0), (B, chunk_size, n_cand_qk))
-        m_qk_c = jax.lax.dynamic_slice(mask_qk, (0, start, 0), (B, chunk_size, n_cand_qk))
-        ci_v_c = jax.lax.dynamic_slice(cand_idx_v, (0, start, 0), (B, chunk_size, n_cand_v))
-        m_v_c = jax.lax.dynamic_slice(mask_v, (0, start, 0), (B, chunk_size, n_cand_v))
-
-        Q_c, K_c, V_c, chunk_pl = _attn_chunk_ckpt(
-            x_c, qk_pos_c, v_pos_c, tau_Q_c, tau_K_c, tau_V_c,
-            ci_qk_c, m_qk_c, ci_v_c, m_v_c, chunk_rngs[i],
-            max_k_qk, max_k_v, router_dropout, deterministic)
-        Q_parts.append(Q_c)
-        K_parts.append(K_c)
-        V_parts.append(V_c)
-        total_pos_loss = total_pos_loss + chunk_pl
-
-    Q = jnp.concatenate(Q_parts, axis=1)[:, :S, :]
-    K = jnp.concatenate(K_parts, axis=1)[:, :S, :]
-    V = jnp.concatenate(V_parts, axis=1)[:, :S, :]
-    pos_loss = total_pos_loss / n_chunks
-
-    # --- Self-attention (full sequence) ---
+    # Self-attention (full sequence)
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
     K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -575,11 +417,10 @@ def _attn_pipeline_mapped_chunked(
     scale = jnp.sqrt(jnp.float32(d_head))
     attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
     causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-    attn_scores = jnp.where(causal, attn_scores,
-                            jnp.finfo(attn_scores.dtype).min)
+    attn_scores = jnp.where(causal, attn_scores, jnp.finfo(attn_scores.dtype).min)
     attn_w = jax.nn.softmax(attn_scores, axis=-1)
 
-    rng_attn, rng_out = jax.random.split(rng_final)
+    rng, rng_attn, rng_out = jax.random.split(rng, 3)
     attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_attn)
 
     out = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
@@ -587,104 +428,92 @@ def _attn_pipeline_mapped_chunked(
     out = out @ expand_O_kernel
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    return out, pos_loss
+    return out, pl_qk + pl_v
 
 
-def _know_pipeline_mapped_chunked(
-    x, know_pos, tau,
-    know_neurons, npos_know,
-    cell_map_know, pos_min_know, pos_range_know,
-    rng,
-    # static:
-    n_cells_per_side, max_k_know,
-    router_dropout, dropout_rate, deterministic,
-    chunk_size,
-):
-    """Know pipeline: cell lookup (full seq) + chunked gather/score/gate/emit.
+def _know_dense_chunked(x, router_params, pool_params, block_data, rng,
+                        n_qk, n_v, n_cells_per_side,
+                        max_k_know,
+                        router_dropout, dropout_rate, deterministic,
+                        chunk_size):
+    """Cell-dense knowledge: cell lookup full seq + chunked gather/score/gate/emit.
 
-    Cell lookup over full sequence (small int tensors).
-    Gather+score+gate+emit via Python for loop + jax.checkpoint per chunk
-    (scan would stack intermediate tensors -> OOM).
+    Python for loop + jax.checkpoint per chunk to avoid scan stacking OOM.
+    Neurons gathered from original pool_params (latest, gradient flows).
     """
     B, S, D = x.shape
+    know_neurons = pool_params['know_neurons']
+
+    # Query pos + tau (full sequence, small tensors)
+    know_pos = (x @ router_params['proj_pos_know']['kernel']
+                + router_params['proj_pos_know']['bias'])
+    tau = (x @ router_params['tau_know']['kernel']
+           + router_params['tau_know']['bias'])
+
+    # Cell lookup (full sequence — index tensors are small)
+    ci, vm = get_cell_block_indices(
+        know_pos, block_data['know_idx'], block_data['know_valid'],
+        block_data['pos_min_know'], block_data['pos_range_know'],
+        n_cells_per_side)
+    ci = jax.lax.stop_gradient(ci)
+    n_cand = ci.shape[-1]
     pos_dim = know_pos.shape[-1]
 
-    # Cell lookup (full sequence, small tensors)
-    cand_idx, valid_mask = cell_lookup(
-        know_pos, cell_map_know, pos_min_know, pos_range_know,
-        n_cells_per_side)
-    cand_idx = jax.lax.stop_gradient(cand_idx)
-    n_cand = cand_idx.shape[-1]
-
-    # Pad
+    # Pad sequence
     pad_S = ((S + chunk_size - 1) // chunk_size) * chunk_size
     if pad_S > S:
         x = jnp.pad(x, ((0, 0), (0, pad_S - S), (0, 0)))
         know_pos = jnp.pad(know_pos, ((0, 0), (0, pad_S - S), (0, 0)))
         tau = jnp.pad(tau, ((0, 0), (0, pad_S - S), (0, 0)))
-        cand_idx = jnp.pad(cand_idx, ((0, 0), (0, pad_S - S), (0, 0)))
-        valid_mask = jnp.pad(valid_mask, ((0, 0), (0, pad_S - S), (0, 0)))
+        ci = jnp.pad(ci, ((0, 0), (0, pad_S - S), (0, 0)))
+        vm = jnp.pad(vm, ((0, 0), (0, pad_S - S), (0, 0)))
 
     n_chunks = pad_S // chunk_size
+    npos_know = router_params['neuron_pos'][n_qk + n_v:]
     chunk_rngs = jax.random.split(rng, n_chunks)
 
-    def _know_chunk(x_c, pos_c, tau_c, ci, vm, rng_c,
+    def _know_chunk(x_c, pos_c, tau_c, ci_c, vm_c, rng_c,
                     max_k_know, router_dropout, dropout_rate, deterministic):
-        """Process one know chunk. Checkpointed per call."""
-        cand_neurons = know_neurons[ci]
-
+        cand = know_neurons[ci_c]  # [B, cs, n_cand, D]
         rng_c, rng_drop = jax.random.split(rng_c)
         x_drop = safe_dropout(x_c, router_dropout, deterministic, rng_drop)
         scores = jnp.where(
-            vm, jnp.einsum('bsd,bsnd->bsn', x_drop, cand_neurons), -1e9)
-
+            vm_c, jnp.einsum('bsd,bsnd->bsn', x_drop, cand), -1e9)
         gate = threshold_gate(scores, tau_c, max_k_know)
-
-        activations = jnp.einsum('bsd,bsnd->bsn', x_c, cand_neurons)
-        gated = activations * gate * vm
-        chunk_out = jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)
+        act = jnp.einsum('bsd,bsnd->bsn', x_c, cand)
+        chunk_out = jnp.einsum('bsn,bsnd->bsd', act * gate * vm_c, cand)
         rng_c, rng_out = jax.random.split(rng_c)
-        chunk_out = safe_dropout(
-            chunk_out, dropout_rate, deterministic, rng_out)
-
-        cand_npos = npos_know[ci]
-        pos_dist = jnp.sum(
-            (pos_c[:, :, None, :] - cand_npos) ** 2, axis=-1)
-        chunk_pl = (jax.lax.stop_gradient(gate) * pos_dist * vm
-                    ).sum() / (vm.sum() + 1e-8)
-
-        return chunk_out, chunk_pl
+        chunk_out = safe_dropout(chunk_out, dropout_rate, deterministic, rng_out)
+        # pos_loss
+        cand_pos = npos_know[ci_c]
+        pd = jnp.sum((pos_c[:, :, None, :] - cand_pos) ** 2, axis=-1)
+        pl = (jax.lax.stop_gradient(gate) * pd * vm_c).sum() / (vm_c.sum() + 1e-8)
+        return chunk_out, pl
 
     _know_chunk_ckpt = jax.checkpoint(
         _know_chunk, static_argnums=(6, 7, 8, 9))
 
-    # Python for loop -- no scan stacking
     out_parts = []
-    total_pos_loss = jnp.float32(0.0)
-
+    total_pl = jnp.float32(0.0)
     for i in range(n_chunks):
-        start = i * chunk_size
-        x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
-        pos_c = jax.lax.dynamic_slice(
-            know_pos, (0, start, 0), (B, chunk_size, pos_dim))
-        tau_c = jax.lax.dynamic_slice(tau, (0, start, 0), (B, chunk_size, 1))
-        ci = jax.lax.dynamic_slice(
-            cand_idx, (0, start, 0), (B, chunk_size, n_cand))
-        vm = jax.lax.dynamic_slice(
-            valid_mask, (0, start, 0), (B, chunk_size, n_cand))
-
-        chunk_out, chunk_pl = _know_chunk_ckpt(
-            x_c, pos_c, tau_c, ci, vm, chunk_rngs[i],
+        s = i * chunk_size
+        x_c = jax.lax.dynamic_slice(x, (0, s, 0), (B, chunk_size, D))
+        pos_c = jax.lax.dynamic_slice(know_pos, (0, s, 0), (B, chunk_size, pos_dim))
+        tau_c = jax.lax.dynamic_slice(tau, (0, s, 0), (B, chunk_size, 1))
+        ci_c = jax.lax.dynamic_slice(ci, (0, s, 0), (B, chunk_size, n_cand))
+        vm_c = jax.lax.dynamic_slice(vm, (0, s, 0), (B, chunk_size, n_cand))
+        co, pl = _know_chunk_ckpt(
+            x_c, pos_c, tau_c, ci_c, vm_c, chunk_rngs[i],
             max_k_know, router_dropout, dropout_rate, deterministic)
-        out_parts.append(chunk_out)
-        total_pos_loss = total_pos_loss + chunk_pl
+        out_parts.append(co)
+        total_pl = total_pl + pl
 
     out = jnp.concatenate(out_parts, axis=1)[:, :S, :]
-    return out, total_pos_loss / n_chunks
+    return out, total_pl / n_chunks
 
 
 # ================================================================
-# 11. Flax modules (init path only -- scan uses pure functions)
+# 10. Flax modules (init path only)
 # ================================================================
 
 class AttentionCircuit(nn.Module):
@@ -698,20 +527,18 @@ class AttentionCircuit(nn.Module):
 
     def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
         rng = self.make_rng('dropout')
-        rng, rng_router, rng_drop, rng_out = jax.random.split(rng, 4)
+        rng, rng_r, rng_d, rng_o = jax.random.split(rng, 4)
+        g_Q, g_K, g_V, ci_qk, ci_v, aux = router.get_attention_gates(
+            x, neuron_pool, deterministic, rng_r)
 
-        (gate_Q, gate_K, gate_V, cand_qk, cand_v,
-         mask_qk, mask_v, aux) = router.get_attention_gates(
-            x, neuron_pool, deterministic, rng_router)
-
-        def _se(x, neurons, gate, ci, m):
+        def _se(x, neurons, g, ci):
             cn = neurons[ci]
             act = jnp.einsum('bsd,bsnd->bsn', x, cn)
-            return jnp.einsum('bsn,bsnd->bsd', act * gate * m, cn)
+            return jnp.einsum('bsn,bsnd->bsd', act * g, cn)
 
-        Q = _se(x, neuron_pool.qk_neurons, gate_Q, cand_qk, mask_qk)
-        K = _se(x, neuron_pool.qk_neurons, gate_K, cand_qk, mask_qk)
-        V = _se(x, neuron_pool.v_neurons, gate_V, cand_v, mask_v)
+        Q = _se(x, neuron_pool.qk_neurons, g_Q, ci_qk)
+        K = _se(x, neuron_pool.qk_neurons, g_K, ci_qk)
+        V = _se(x, neuron_pool.v_neurons, g_V, ci_v)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -724,12 +551,11 @@ class AttentionCircuit(nn.Module):
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
         attn_w = jax.nn.softmax(scores, axis=-1)
-        attn_w = safe_dropout(attn_w, self.dropout_rate, deterministic, rng_drop)
-
+        attn_w = safe_dropout(attn_w, self.dropout_rate, deterministic, rng_d)
         out = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
         out = self.expand_O(out)
-        out = safe_dropout(out, self.dropout_rate, deterministic, rng_out)
+        out = safe_dropout(out, self.dropout_rate, deterministic, rng_o)
         return out, aux
 
 
@@ -739,14 +565,12 @@ class KnowledgeCircuit(nn.Module):
 
     def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
         rng = self.make_rng('dropout')
-        rng, rng_router = jax.random.split(rng)
-
-        gate, cand_idx, valid_mask, aux = router.get_knowledge_gates(
-            x, neuron_pool, deterministic, rng_router)
-
-        cn = neuron_pool.know_neurons[cand_idx]
+        rng, rng_r = jax.random.split(rng)
+        gate, ci, aux = router.get_knowledge_gates(
+            x, neuron_pool, deterministic, rng_r)
+        cn = neuron_pool.know_neurons[ci]
         act = jnp.einsum('bsd,bsnd->bsn', x, cn)
-        out = jnp.einsum('bsn,bsnd->bsd', act * gate * valid_mask, cn)
+        out = jnp.einsum('bsn,bsnd->bsd', act * gate, cn)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
@@ -767,23 +591,23 @@ class DAWNBlock(nn.Module):
 
     def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
         normed = self.norm1(x)
-        attn_out, attn_aux = self.attn(
+        attn_out, a_aux = self.attn(
             normed, neuron_pool, router, attention_mask, deterministic)
         x = x + attn_out
         normed = self.norm2(x)
-        know_out, know_aux = self.knowledge(
+        know_out, k_aux = self.knowledge(
             normed, neuron_pool, router, attention_mask, deterministic)
         x = x + know_out
-        return x, attn_aux + know_aux
+        return x, a_aux + k_aux
 
 
 # ================================================================
-# 12. DAWN Model
+# 11. DAWN Model
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-Spatial v3: Rank-1 Neuron + Map-Based Routing."""
-    __version__ = "spatial-r1-v3.0.0"
+    """DAWN-Spatial v3.1: Rank-1 Neuron + Cell-Dense Routing."""
+    __version__ = "spatial-r1-v3.1.0"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -805,46 +629,36 @@ class DAWN(nn.Module):
     max_k_v: int = 262
     max_k_know: int = 1536
     router_dropout: float = 0.1
-    chunk_size: int = 16
+    chunk_size: int = 64
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by "
                 f"n_heads ({self.n_heads})")
-
         self.token_emb = nn.Embed(
-            self.vocab_size, self.d_model,
-            embedding_init=scaled_normal(0.02))
+            self.vocab_size, self.d_model, embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(
-            self.max_seq_len, self.d_model,
-            embedding_init=scaled_normal(0.02))
-
+            self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
             d_model=self.d_model)
-
         self.router = Router(
             d_model=self.d_model, pos_dim=self.pos_dim,
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
             max_k_qk=self.max_k_qk, max_k_v=self.max_k_v,
-            max_k_know=self.max_k_know,
-            router_dropout=self.router_dropout)
-
+            max_k_know=self.max_k_know, router_dropout=self.router_dropout)
         self.layers = [
-            DAWNBlock(
-                d_model=self.d_model, n_heads=self.n_heads,
-                dropout_rate=self.dropout_rate, name=f'block_{i}')
-            for i in range(self.n_layers)
-        ]
+            DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
+                      dropout_rate=self.dropout_rate, name=f'block_{i}')
+            for i in range(self.n_layers)]
         self.norm = nn.LayerNorm()
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
-                 deterministic=False, cell_maps=None):
+                 deterministic=False, block_data=None):
         B, S = input_ids.shape
         if S > self.max_seq_len:
-            raise ValueError(
-                f"Sequence length {S} exceeds max_seq_len {self.max_seq_len}")
+            raise ValueError(f"Sequence length {S} exceeds max_seq_len")
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = self.token_emb(input_ids) + self.pos_emb(positions)
@@ -854,9 +668,8 @@ class DAWN(nn.Module):
         if self.is_initializing():
             total_aux = jnp.float32(0.0)
             for layer in self.layers:
-                x, aux = layer(
-                    x, self.neuron_pool, self.router,
-                    attention_mask, deterministic)
+                x, aux = layer(x, self.neuron_pool, self.router,
+                               attention_mask, deterministic)
                 total_aux = total_aux + aux
         else:
             all_params = self.variables['params']
@@ -871,66 +684,34 @@ class DAWN(nn.Module):
             base_rng = self.make_rng('dropout')
             layer_rngs = jax.random.split(base_rng, self.n_layers)
 
-            # Pre-slice neuron_pos (static indices, outside scan)
-            neuron_pos = router_params['neuron_pos']
-            npos_qk = neuron_pos[:self.n_qk]
-            npos_v = neuron_pos[self.n_qk:self.n_qk + self.n_v]
-            npos_know = neuron_pos[self.n_qk + self.n_v:]
-
             def scan_body(carry, xs):
                 x = carry
                 bp = xs['params']
                 rng = xs['rng']
                 rng, rng_attn, rng_know = jax.random.split(rng, 3)
 
-                # --- Attention ---
+                # --- Attention (full sequence, cell-dense) ---
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
-
-                qk_pos = (normed @ router_params['proj_pos_qk']['kernel']
-                          + router_params['proj_pos_qk']['bias'])
-                v_pos = (normed @ router_params['proj_pos_v']['kernel']
-                         + router_params['proj_pos_v']['bias'])
-                tau_all = (normed @ router_params['tau_attn']['kernel']
-                           + router_params['tau_attn']['bias'])
-
-                attn_out, attn_aux = _attn_pipeline_mapped_chunked(
-                    normed, qk_pos, v_pos,
-                    tau_all[:, :, 0:1], tau_all[:, :, 1:2], tau_all[:, :, 2:3],
-                    pool_params['qk_neurons'], pool_params['v_neurons'],
-                    npos_qk, npos_v,
-                    cell_maps['qk'], cell_maps['v'],
-                    cell_maps['pos_min_qk'], cell_maps['pos_range_qk'],
-                    cell_maps['pos_min_v'], cell_maps['pos_range_v'],
+                attn_out, attn_aux = _attn_dense(
+                    normed, router_params, pool_params, block_data,
                     bp['attn']['expand_O']['kernel'], rng_attn,
-                    # static
-                    self.n_cells_per_side, self.max_k_qk, self.max_k_v,
+                    self.n_qk, self.n_v, self.n_cells_per_side,
+                    self.max_k_qk, self.max_k_v,
                     self.n_heads, self.d_model,
-                    self.router_dropout, self.dropout_rate,
-                    deterministic, self.chunk_size)
-
+                    self.router_dropout, self.dropout_rate, deterministic)
                 x = x + attn_out
 
-                # --- Knowledge ---
+                # --- Knowledge (chunked, cell-dense) ---
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
-
-                know_pos = (normed @ router_params['proj_pos_know']['kernel']
-                            + router_params['proj_pos_know']['bias'])
-                tau_know = (normed @ router_params['tau_know']['kernel']
-                            + router_params['tau_know']['bias'])
-
-                know_out, know_aux = _know_pipeline_mapped_chunked(
-                    normed, know_pos, tau_know,
-                    pool_params['know_neurons'], npos_know,
-                    cell_maps['know'],
-                    cell_maps['pos_min_know'], cell_maps['pos_range_know'],
+                know_out, know_aux = _know_dense_chunked(
+                    normed, router_params, pool_params, block_data,
                     rng_know,
-                    # static
-                    self.n_cells_per_side, self.max_k_know,
-                    self.router_dropout, self.dropout_rate,
-                    deterministic, self.chunk_size)
-
+                    self.n_qk, self.n_v, self.n_cells_per_side,
+                    self.max_k_know,
+                    self.router_dropout, self.dropout_rate, deterministic,
+                    self.chunk_size)
                 x = x + know_out
                 return x, attn_aux + know_aux
 
@@ -960,8 +741,7 @@ class DAWN(nn.Module):
                 loss = (tl * vmask).sum() / (vmask.sum() + 1e-8)
                 preds = jnp.argmax(logits, axis=-1)
                 correct = jnp.sum((preds == labs) & vmask)
-                valid_count = jnp.sum(vmask)
-                return loss, correct, valid_count
+                return loss, correct, jnp.sum(vmask)
 
             loss, correct, valid_count = compute_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
@@ -969,14 +749,9 @@ class DAWN(nn.Module):
             result['correct'] = correct
             result['valid_count'] = valid_count
         else:
-            logits = self.token_emb.attend(x)
-            result['logits'] = logits
+            result['logits'] = self.token_emb.attend(x)
 
         return result
-
-    # ------------------------------------------------------------------
-    # Auxiliary losses
-    # ------------------------------------------------------------------
 
     def diversity_loss(self):
         def _pool_div(neurons, max_sample=4096):
@@ -988,17 +763,12 @@ class DAWN(nn.Module):
             sim = n @ n.T
             mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
             return jnp.abs(sim * mask).sum() / mask.sum()
-
         return (_pool_div(self.neuron_pool.qk_neurons) +
                 _pool_div(self.neuron_pool.v_neurons) +
                 _pool_div(self.neuron_pool.know_neurons)) / 3
 
     def get_auxiliary_losses(self):
         return {'neuron_diversity': self.diversity_loss()}
-
-    # ------------------------------------------------------------------
-    # Config / info
-    # ------------------------------------------------------------------
 
     def get_config(self):
         return {
@@ -1012,19 +782,15 @@ class DAWN(nn.Module):
             'pos_dim': self.pos_dim,
             'n_cells_per_side': self.n_cells_per_side,
             'map_rebuild_interval': self.map_rebuild_interval,
-            'pos_loss_weight': self.pos_loss_weight,
             'chunk_size': self.chunk_size,
         }
 
     def get_model_info(self):
         return [
-            f"DAWN v{self.__version__}: Rank-1 + Map-Based Routing (JAX)",
+            f"DAWN v{self.__version__}: Rank-1 + Cell-Dense Routing (JAX)",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, "
             f"n_heads={self.n_heads}",
-            f"  [Neuron Pool]",
             f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
-            f"  [Map Routing]",
             f"  grid={self.n_cells_per_side}x{self.n_cells_per_side}, "
             f"chunk_size={self.chunk_size}",
-            f"  rebuild_interval={self.map_rebuild_interval}",
         ]

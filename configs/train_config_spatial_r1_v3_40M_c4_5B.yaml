@@ -1,6 +1,5 @@
-# DAWN Spatial-R1 v3 -- Map-Based Routing, 40M Scale, 5B tokens
-# Cell map lookup replaces distance brute-force routing.
-# No candidates_multiplier -- cell size determines candidate count.
+# DAWN Spatial-R1 v3.1 -- Cell-Dense Routing, 40M Scale, 5B tokens
+# Index-only cell map. No neuron copies. No distance computation.
 
 seed: 1
 
@@ -12,7 +11,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.0.0"
+  model_version: "spatial-r1-v3.1.0"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -23,7 +22,7 @@ model:
   pos_dim: 2
   n_cells_per_side: 32
   map_rebuild_interval: 100
-  chunk_size: 16
+  chunk_size: 64
 
   n_qk: 3140
   n_v: 5240
