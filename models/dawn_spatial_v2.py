@@ -2,6 +2,13 @@
 DAWN-Spatial v2: Rank-1 Neuron Architecture with 2D Positional Routing (JAX/Flax)
 
 Changelog:
+  spatial-r1-v2.0.6 (2026-03-31):
+    - Fix scan output stacking OOM: use carry accumulation with
+      dynamic_update_slice instead of scan output stacking.
+      Scan returns None output, all results accumulated in carry buffer.
+    - Remove jax.checkpoint from _know_pipeline_chunked (outer scan_body
+      level checkpoint sufficient)
+
   spatial-r1-v2.0.5 (2026-03-31):
     - Know pipeline fully chunked over sequence axis to fix gather OOM
       ([B,S,n_cand,D] too large). distance->topk->gather->score->gate->
@@ -157,8 +164,8 @@ def threshold_gate(scores, tau, max_k=None):
 def sense_emit_sparse(x, neurons, gates, cand_idx):
     """Sparse rank-1 sense + emit (candidates only).
 
-    Checkpoint is handled at the higher level (_router_and_attn / _know_pipeline_chunked),
-    so no @jax.checkpoint here to avoid redundant recompute.
+    Checkpoint is handled at the higher level (_router_and_attn).
+    _know_pipeline_chunked uses carry accumulation so no checkpoint needed.
 
     x:        [B, S, D]
     neurons:  [N, D]        -- full rank-1 neuron pool
@@ -605,7 +612,7 @@ _router_and_attn = jax.checkpoint(
 )
 
 
-def _know_pipeline_chunked_raw(
+def _know_pipeline_chunked(
     # --- dynamic (tensors) ---
     x,                     # 0  [B, S, D]
     router_params,         # 1
@@ -622,9 +629,11 @@ def _know_pipeline_chunked_raw(
 ):
     """Know pipeline fully chunked over sequence axis.
 
-    Each chunk: distance -> top_k -> gather -> score -> gate -> sense_emit.
-    Peak tensor per chunk: [B, chunk_size, n_cand, D] instead of [B, S, n_cand, D].
-    Wrapped by jax.checkpoint with static_argnums for args 5-10.
+    Uses carry accumulation (dynamic_update_slice) instead of scan output
+    stacking, so intermediate tensors (cand_neurons gather) are freed after
+    each chunk. No jax.checkpoint here -- outer scan_body handles that.
+
+    Peak memory per chunk: [B, chunk_size, n_cand, D].
     """
     B, S, D = x.shape
     know_neurons = pool_params['know_neurons']   # [N_know, D]
@@ -643,27 +652,33 @@ def _know_pipeline_chunked_raw(
         know_pos = jnp.pad(know_pos, ((0, 0), (0, pad_S - S), (0, 0)))
         tau = jnp.pad(tau, ((0, 0), (0, pad_S - S), (0, 0)))
 
-    # Reshape to [B, n_chunks, chunk_size, ...]
     n_chunks = pad_S // chunk_size
-    x_chunks = x.reshape(B, n_chunks, chunk_size, D)
-    pos_chunks = know_pos.reshape(B, n_chunks, chunk_size, -1)
-    tau_chunks = tau.reshape(B, n_chunks, chunk_size, 1)
+    pos_dim = know_pos.shape[-1]
+
+    # Output buffer and pos_loss accumulator as carry
+    out_buf = jnp.zeros((B, pad_S, D))
+    total_pos_loss = jnp.float32(0.0)
 
     # Per-chunk rngs
     chunk_rngs = jax.random.split(rng, n_chunks)
 
-    def process_chunk(carry, inputs):
-        """Full Know pipeline for one sequence chunk."""
-        x_c = inputs['x']       # [B, chunk_size, D]
-        pos_c = inputs['pos']   # [B, chunk_size, 2]
-        tau_c = inputs['tau']   # [B, chunk_size, 1]
-        rng_c = inputs['rng']
+    def process_chunk(carry, chunk_idx):
+        """Full Know pipeline for one sequence chunk, writing to carry buffer."""
+        out_buf, total_pos_loss = carry
+        start = chunk_idx * chunk_size
+
+        # Extract current chunk via dynamic_slice (static shapes)
+        x_c = jax.lax.dynamic_slice(x, (0, start, 0), (B, chunk_size, D))
+        pos_c = jax.lax.dynamic_slice(
+            know_pos, (0, start, 0), (B, chunk_size, pos_dim))
+        tau_c = jax.lax.dynamic_slice(tau, (0, start, 0), (B, chunk_size, 1))
+        rng_c = chunk_rngs[chunk_idx]
 
         # 1. Distance -> candidate selection
         dist = jnp.sum(
             (pos_c[:, :, None, :] - npos_know[None, None, :, :]) ** 2,
             axis=-1)  # [B, chunk_size, N_know]
-        _, cand_idx = jax.lax.top_k(-dist, n_cand)  # [B, chunk_size, n_cand]
+        _, cand_idx = jax.lax.top_k(-dist, n_cand)
         cand_idx = jax.lax.stop_gradient(cand_idx)
 
         # 2. Gather candidate neurons
@@ -677,13 +692,14 @@ def _know_pipeline_chunked_raw(
         # 4. Gate
         gate = threshold_gate(scores, tau_c, max_k_know)
 
-        # 5. Sense-emit (inline, no separate function needed)
+        # 5. Sense-emit (inline)
         activations = jnp.einsum('bsd,bsnd->bsn', x_c, cand_neurons)
         gated = activations * gate
-        out = jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)
+        chunk_out = jnp.einsum('bsn,bsnd->bsd', gated, cand_neurons)
 
         rng_c, rng_out = jax.random.split(rng_c)
-        out = safe_dropout(out, dropout_rate, deterministic, rng_out)
+        chunk_out = safe_dropout(
+            chunk_out, dropout_rate, deterministic, rng_out)
 
         # 6. pos_loss (recompute distance on candidates for gradient flow)
         cand_npos = npos_know[cand_idx]  # [B, chunk_size, n_cand, 2]
@@ -692,28 +708,20 @@ def _know_pipeline_chunked_raw(
             axis=-1)  # [B, chunk_size, n_cand]
         chunk_pos_loss = (jax.lax.stop_gradient(gate) * pos_dist).mean()
 
-        return carry, (out, chunk_pos_loss)
+        # Accumulate into carry (no scan output stacking)
+        out_buf = jax.lax.dynamic_update_slice(
+            out_buf, chunk_out, (0, start, 0))
+        total_pos_loss = total_pos_loss + chunk_pos_loss
 
-    inputs = {
-        'x': jnp.moveaxis(x_chunks, 1, 0),      # [n_chunks, B, cs, D]
-        'pos': jnp.moveaxis(pos_chunks, 1, 0),   # [n_chunks, B, cs, 2]
-        'tau': jnp.moveaxis(tau_chunks, 1, 0),    # [n_chunks, B, cs, 1]
-        'rng': chunk_rngs,                         # [n_chunks, 2]
-    }
+        return (out_buf, total_pos_loss), None  # no output!
 
-    _, (all_out, all_pos_loss) = jax.lax.scan(process_chunk, None, inputs)
+    (out_buf, total_pos_loss), _ = jax.lax.scan(
+        process_chunk,
+        (out_buf, total_pos_loss),
+        jnp.arange(n_chunks))
 
-    # [n_chunks, B, chunk_size, D] -> [B, S, D]
-    all_out = jnp.moveaxis(all_out, 0, 1).reshape(B, -1, D)[:, :S, :]
-    pos_loss = all_pos_loss.mean()
-
-    return all_out, pos_loss
-
-
-_know_pipeline_chunked = jax.checkpoint(
-    _know_pipeline_chunked_raw,
-    static_argnums=(5, 6, 7, 8, 9, 10)
-)
+    # Remove padding, average pos_loss
+    return out_buf[:, :S, :], total_pos_loss / n_chunks
 
 
 # ================================================================
@@ -819,7 +827,7 @@ class DAWN(nn.Module):
     Uses jax.lax.scan for O(1) XLA compile, jax.checkpoint for memory.
     Weight tying: lm_head reuses token_emb via nn.Embed.attend().
     """
-    __version__ = "spatial-r1-v2.0.5"
+    __version__ = "spatial-r1-v2.0.6"
 
     vocab_size: int = 30000
     d_model: int = 384
