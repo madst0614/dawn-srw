@@ -587,7 +587,7 @@ def _know_pipeline_chunked(
 # ================================================================
 
 class AttentionCircuit(nn.Module):
-    """Rank-1 sparse attention: Q/K/V via sense_emit_sparse + causal self-attention."""
+    """Rank-1 sparse attention: Q/K/V via inline sense_emit + causal self-attention."""
     d_model: int
     n_heads: int
     dropout_rate: float = 0.1
@@ -603,9 +603,15 @@ class AttentionCircuit(nn.Module):
         gate_Q, gate_K, gate_V, cand_qk, cand_v, aux = \
             router.get_attention_gates(x, neuron_pool, deterministic, rng_router)
 
-        Q = sense_emit_sparse(x, neuron_pool.qk_neurons, gate_Q, cand_qk)
-        K = sense_emit_sparse(x, neuron_pool.qk_neurons, gate_K, cand_qk)
-        V = sense_emit_sparse(x, neuron_pool.v_neurons, gate_V, cand_v)
+        # Inline sense_emit_sparse (function was removed in v2.0.6)
+        def _sense_emit(x, neurons, gates, cand_idx):
+            cn = neurons[cand_idx]
+            act = jnp.einsum('bsd,bsnd->bsn', x, cn)
+            return jnp.einsum('bsn,bsnd->bsd', act * gates, cn)
+
+        Q = _sense_emit(x, neuron_pool.qk_neurons, gate_Q, cand_qk)
+        K = _sense_emit(x, neuron_pool.qk_neurons, gate_K, cand_qk)
+        V = _sense_emit(x, neuron_pool.v_neurons, gate_V, cand_v)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -628,7 +634,7 @@ class AttentionCircuit(nn.Module):
 
 
 class KnowledgeCircuit(nn.Module):
-    """Rank-1 sparse knowledge: FFN-equivalent via sense_emit_sparse on know_neurons."""
+    """Rank-1 sparse knowledge: FFN-equivalent via inline sense_emit."""
     d_model: int
     dropout_rate: float = 0.1
 
@@ -638,7 +644,12 @@ class KnowledgeCircuit(nn.Module):
 
         gate, cand_idx, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_router)
-        out = sense_emit_sparse(x, neuron_pool.know_neurons, gate, cand_idx)
+
+        # Inline sense_emit_sparse
+        cn = neuron_pool.know_neurons[cand_idx]
+        act = jnp.einsum('bsd,bsnd->bsn', x, cn)
+        out = jnp.einsum('bsn,bsnd->bsd', act * gate, cn)
+
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
@@ -970,7 +981,7 @@ class DAWN(nn.Module):
             f"  router_dropout={self.router_dropout}",
             f"",
             f"  [Memory Optimization]",
-            f"  jax.checkpoint: sense_emit_sparse (rank-1 intermediate recompute)",
+            f"  Chunked pipelines: carry accumulation + dynamic_update_slice",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
             f"  jax.lax.scan layer loop (O(1) XLA compile)",
         ]
