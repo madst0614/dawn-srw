@@ -12,7 +12,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v2.0.4"
+  model_version: "spatial-r1-v2.0.5"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -22,7 +22,8 @@ model:
 
   # 2D spatial routing
   pos_dim: 2
-  candidates_multiplier: 3
+  candidates_multiplier: 2
+  know_chunk_size: 16
 
   # Balanced neuron pools (ratio 1:1.5:5)
   n_qk: 3140
