@@ -2,6 +2,12 @@
 DAWN-Spatial v2: Rank-1 Neuron Architecture with 2D Positional Routing (JAX/Flax)
 
 Changelog:
+  spatial-r1-v2.0.2 (2026-03-31):
+    - Wrap routing+sense_emit in single jax.checkpoint (_router_and_attn,
+      _router_and_know) to eliminate backward OOM from intermediate tensors
+    - Remove redundant @jax.checkpoint from sense_emit_sparse (now inside
+      higher-level checkpoint)
+
   spatial-r1-v2.0.1 (2026-03-31):
     - CRITICAL: Know distance OOM fix (chunked sequence processing)
     - pos_loss distance reuse (take_along_axis / chunked return)
@@ -132,11 +138,11 @@ def threshold_gate(scores, tau, max_k=None):
 # 5. Rank-1 Sense-Emit: sparse (candidate-only) version
 # ================================================================
 
-@jax.checkpoint
 def sense_emit_sparse(x, neurons, gates, cand_idx):
-    """Sparse rank-1 sense + emit with gradient checkpoint.
+    """Sparse rank-1 sense + emit (candidates only).
 
-    Only operates on candidate neurons (not the full pool).
+    Checkpoint is handled at the higher level (_router_and_attn / _router_and_know),
+    so no @jax.checkpoint here to avoid redundant recompute.
 
     x:        [B, S, D]
     neurons:  [N, D]        -- full rank-1 neuron pool
@@ -526,6 +532,73 @@ def _know_forward(x, pool_params, gate_know, cand_idx_know,
 
 
 # ================================================================
+# 8b. Checkpointed routing + forward (eliminates backward OOM)
+# ================================================================
+
+@jax.checkpoint
+def _router_and_attn(x, router_params, pool_params,
+                     expand_O_kernel,
+                     n_qk, n_v, pos_dim,
+                     max_k_qk, max_k_v,
+                     candidates_multiplier,
+                     n_heads, d_model,
+                     router_dropout, dropout_rate,
+                     deterministic, rng):
+    """Checkpointed: routing (distance->candidate->scoring->gating) + attention.
+
+    All intermediate tensors (distance, gather, gates, QKV) are recomputed
+    during backward. Only x (input) and (attn_out, aux) are saved.
+    """
+    rng, rng_ar, rng_a = jax.random.split(rng, 3)
+
+    gate_Q, gate_K, gate_V, cand_idx_qk, cand_idx_v, aux = \
+        _router_attn_gates(
+            x, router_params, pool_params,
+            n_qk, n_v, pos_dim,
+            max_k_qk, max_k_v,
+            candidates_multiplier,
+            router_dropout, deterministic, rng_ar)
+
+    attn_out = _attn_forward(
+        x, pool_params, gate_Q, gate_K, gate_V,
+        cand_idx_qk, cand_idx_v,
+        expand_O_kernel,
+        n_heads, d_model,
+        dropout_rate, deterministic, rng_a)
+
+    return attn_out, aux
+
+
+@jax.checkpoint
+def _router_and_know(x, router_params, pool_params,
+                     n_qk, n_v, n_know,
+                     max_k_know,
+                     candidates_multiplier,
+                     router_dropout, dropout_rate,
+                     deterministic, rng):
+    """Checkpointed: routing + knowledge forward.
+
+    All intermediate tensors are recomputed during backward.
+    Only x (input) and (know_out, aux) are saved.
+    """
+    rng, rng_kr, rng_k = jax.random.split(rng, 3)
+
+    gate_know, cand_idx_know, aux = \
+        _router_know_gates(
+            x, router_params, pool_params,
+            n_qk, n_v, n_know,
+            max_k_know,
+            candidates_multiplier,
+            router_dropout, deterministic, rng_kr)
+
+    know_out = _know_forward(
+        x, pool_params, gate_know, cand_idx_know,
+        dropout_rate, deterministic, rng_k)
+
+    return know_out, aux
+
+
+# ================================================================
 # 9. Flax modules (used during init; scan uses pure functions above)
 # ================================================================
 
@@ -628,7 +701,7 @@ class DAWN(nn.Module):
     Uses jax.lax.scan for O(1) XLA compile, jax.checkpoint for memory.
     Weight tying: lm_head reuses token_emb via nn.Embed.attend().
     """
-    __version__ = "spatial-r1-v2.0.1"
+    __version__ = "spatial-r1-v2.0.2"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -734,44 +807,35 @@ class DAWN(nn.Module):
                 x = carry
                 bp = xs['params']
                 rng = xs['rng']
-                rng, rng_ar, rng_kr, rng_a, rng_k = \
-                    jax.random.split(rng, 5)
+                rng, rng_attn, rng_know = jax.random.split(rng, 3)
 
-                # --- Attention sub-block ---
+                # --- Attention sub-block (fully checkpointed) ---
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
 
-                gate_Q, gate_K, gate_V, cand_qk, cand_v, attn_aux = \
-                    _router_attn_gates(
-                        normed, router_params, pool_params,
-                        self.n_qk, self.n_v, self.pos_dim,
-                        self.max_k_qk, self.max_k_v,
-                        self.candidates_multiplier,
-                        self.router_dropout, deterministic, rng_ar)
-
-                attn_out = _attn_forward(
-                    normed, pool_params, gate_Q, gate_K, gate_V,
-                    cand_qk, cand_v,
+                attn_out, attn_aux = _router_and_attn(
+                    normed, router_params, pool_params,
                     bp['attn']['expand_O']['kernel'],
+                    self.n_qk, self.n_v, self.pos_dim,
+                    self.max_k_qk, self.max_k_v,
+                    self.candidates_multiplier,
                     self.n_heads, self.d_model,
-                    self.dropout_rate, deterministic, rng_a)
+                    self.router_dropout, self.dropout_rate,
+                    deterministic, rng_attn)
 
                 x = x + attn_out
 
-                # --- Knowledge sub-block ---
+                # --- Knowledge sub-block (fully checkpointed) ---
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
 
-                gate_know, cand_know, know_aux = _router_know_gates(
+                know_out, know_aux = _router_and_know(
                     normed, router_params, pool_params,
                     self.n_qk, self.n_v, self.n_know,
                     self.max_k_know,
                     self.candidates_multiplier,
-                    self.router_dropout, deterministic, rng_kr)
-
-                know_out = _know_forward(
-                    normed, pool_params, gate_know, cand_know,
-                    self.dropout_rate, deterministic, rng_k)
+                    self.router_dropout, self.dropout_rate,
+                    deterministic, rng_know)
 
                 x = x + know_out
                 return x, attn_aux + know_aux
