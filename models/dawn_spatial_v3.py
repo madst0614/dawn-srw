@@ -98,7 +98,10 @@ def threshold_gate(scores, tau, max_k=None):
     exp_gate = jnp.exp(gate) - 1.0
 
     if max_k is not None:
-        topk_vals, _ = jax.lax.top_k(exp_gate, max_k)
+        # Clamp max_k to available candidates (safety for cell-map routing)
+        n_cand = scores.shape[-1]
+        effective_k = min(max_k, n_cand)
+        topk_vals, _ = jax.lax.top_k(exp_gate, effective_k)
         threshold = topk_vals[:, :, -1:]
         exp_gate = jnp.where(exp_gate >= threshold, exp_gate, 0.0)
 
@@ -150,13 +153,15 @@ def build_cell_map(neuron_pos_np, n_cells_per_side, max_per_cell):
     return cell_map, cell_counts, pos_min.astype(np.float32), pos_range.astype(np.float32)
 
 
-def build_all_cell_maps(params, n_qk, n_v, n_cells_per_side):
+def build_all_cell_maps(params, n_qk, n_v, n_cells_per_side,
+                        max_k_qk=157, max_k_v=262, max_k_know=1536):
     """Build cell maps for all three pools. Called outside JIT.
 
     Args:
         params: model params dict (has 'router'/'neuron_pos')
         n_qk, n_v: pool sizes
         n_cells_per_side: grid resolution
+        max_k_qk, max_k_v, max_k_know: per-circuit max_k (for sizing)
 
     Returns:
         dict of JAX arrays (fixed shapes, no recompilation on rebuild)
@@ -167,10 +172,11 @@ def build_all_cell_maps(params, n_qk, n_v, n_cells_per_side):
     pos_know = neuron_pos[n_qk + n_v:]
 
     n_cells = n_cells_per_side ** 2
-    # max_per_cell: ~4x average, with reasonable minimums
-    mpc_qk = max(n_qk // n_cells * 4, 16)
-    mpc_v = max(n_v // n_cells * 4, 24)
-    mpc_know = max(len(pos_know) // n_cells * 3, 64)
+    # max_per_cell must ensure 9*max_per_cell >= max_k for each pool
+    # ceil(max_k / 9) + 2 for safety margin
+    mpc_qk = max(max_k_qk // 9 + 2, n_qk // n_cells * 4, 20)
+    mpc_v = max(max_k_v // 9 + 2, n_v // n_cells * 4, 32)
+    mpc_know = max(max_k_know // 9 + 2, len(pos_know) // n_cells * 3, 176)
 
     cm_qk, _, min_qk, range_qk = build_cell_map(pos_qk, n_cells_per_side, mpc_qk)
     cm_v, _, min_v, range_v = build_cell_map(pos_v, n_cells_per_side, mpc_v)

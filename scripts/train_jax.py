@@ -1151,7 +1151,10 @@ def main():
         n_cells_side = cfg['model'].get('n_cells_per_side', 32)
         v3_cell_maps = build_all_cell_maps(
             params_single,
-            cfg['model']['n_qk'], cfg['model']['n_v'], n_cells_side)
+            cfg['model']['n_qk'], cfg['model']['n_v'], n_cells_side,
+            cfg['model'].get('max_k_qk', 157),
+            cfg['model'].get('max_k_v', 262),
+            cfg['model'].get('max_k_know', 1536))
 
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile: real train_step (forward + backward)
@@ -1343,7 +1346,10 @@ def main():
                 v3_cell_maps = build_all_cell_maps(
                     params_single,
                     cfg['model']['n_qk'], cfg['model']['n_v'],
-                    cfg['model'].get('n_cells_per_side', 32))
+                    cfg['model'].get('n_cells_per_side', 32),
+                    cfg['model'].get('max_k_qk', 157),
+                    cfg['model'].get('max_k_v', 262),
+                    cfg['model'].get('max_k_know', 1536))
 
             # Extract metrics (take first device, already aggregated via pmean/psum)
             m_total = float(metrics['total_loss'][0])
