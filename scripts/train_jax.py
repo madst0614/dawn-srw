@@ -1553,12 +1553,25 @@ def main():
                     remaining_steps = steps_per_epoch - epoch_steps
                     eta = s_per_it * remaining_steps
 
+                    # Tau bias logging (v3.8.1+)
+                    tau_str = ""
+                    try:
+                        p_0 = jax.tree.map(lambda x: x[0], params)
+                        tk_b = p_0['router']['tau_know']['bias']
+                        ta_b = p_0['router']['tau_attn']['bias']
+                        tau_str = (
+                            f" | tau_k={float(tk_b[0]):.2f}"
+                            f" tau_a={float(ta_b[0]):.2f}/{float(ta_b[1]):.2f}/{float(ta_b[2]):.2f}")
+                    except Exception:
+                        pass
+
                     msg = (
                         f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
                         f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
                         f"orth={avg_orth:.2e} div={avg_div:.2e} | "
                         f"acc={avg_acc:.4f} lr={current_lr:.2e} "
                         f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
+                        f"{tau_str}"
                     )
                     log_message(msg)
 

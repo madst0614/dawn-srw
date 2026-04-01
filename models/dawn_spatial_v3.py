@@ -271,6 +271,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * n_qk +
         ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * n_v
     )
+    # tau_reg: prevent tau_offset from going too positive (too few active)
+    tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
+    aux = aux + tau_reg
     return out, aux
 
 
@@ -296,7 +299,9 @@ def _know_forward(x, pool_params, router_params, rng,
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
     t = 1.0 / know_emb.shape[0]
-    aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * know_emb.shape[0]
+    lb_aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * know_emb.shape[0]
+    tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
+    aux = lb_aux + tau_reg
     return out, aux
 
 
