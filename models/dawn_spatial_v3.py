@@ -5,8 +5,8 @@ Changelog:
   spatial-r1-v3.7.0 (2026-04-01):
     - Bottleneck removed. Each neuron has w[384] direct emit direction.
     - out = sum(gate_i * w_i[384]). Sense + emit, nothing else.
-    - threshold_gate_fast (top_k) for sparse gather emit.
-    - emit_sparse: gather top_k w[384] + weighted sum.
+    - threshold_gate (element-wise, no top_k) + emit_direct (gate @ w)
+    - top_k/scatter removed: gate already [B,S,N], matmul 1.6ms
 
   spatial-r1-v3.5.0 (2026-04-01):
     - Threshold-only gating + bottleneck emit. 4s/step.
@@ -14,10 +14,10 @@ Changelog:
 Architecture:
   NeuronPool          -- emb[N,d_bn] (sense) + w[N,D] (emit direction)
   Router              -- proj + tau. Uses pool emb for routing.
-  threshold_gate_fast -- top_k first, gate on k items (for sparse emit idx)
-  emit_sparse         -- @jax.checkpoint: gather w[topk] + weighted sum
-  _attn_forward       -- fast gate -> sparse emit Q/K/V -> self-attn
-  _know_forward       -- fast gate -> sparse emit
+  threshold_gate -- element-wise threshold, no top_k (v3.5.0)
+  emit_direct    -- @jax.checkpoint: gate @ w (pure matmul)
+  _attn_forward  -- threshold gate -> direct emit Q/K/V -> self-attn
+  _know_forward  -- threshold gate -> direct emit
   DAWN                -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
@@ -61,45 +61,25 @@ def unit_norm_init(scale=1.0):
 
 
 # ================================================================
-# 2. Threshold gate fast (top_k first, gate on k items)
+# 2. Threshold gate (element-wise, no top_k — v3.5.0 style)
 # ================================================================
 
-def threshold_gate_fast(scores, tau, max_k):
-    """top_k on raw scores, then gate on k items only.
-
-    Returns: (gate [B,S,k], topk_idx [B,S,k])
-    """
-    effective_k = min(max_k, scores.shape[-1])
-    topk_scores, topk_idx = jax.lax.top_k(scores, effective_k)
-
-    raw = topk_scores - tau
+def threshold_gate(scores, tau):
+    """Element-wise threshold gating. No sort, no top_k."""
+    raw = scores - tau
     gate = jnp.where(raw > 0, raw, 0.0)
     gate_sum = gate.sum(axis=-1, keepdims=True) + 1e-8
-    return gate / gate_sum, topk_idx
+    return gate / gate_sum
 
 
 # ================================================================
-# 3. Sparse emit — scatter to dense gate, then matmul (no gather)
+# 3. Direct emit: gate[B,S,N] @ w[N,D] (no scatter, no gather)
 # ================================================================
 
 @jax.checkpoint
-def emit_sparse(gate, w, topk_idx):
-    """Scatter gate[B,S,k] to gate_full[B,S,N], then gate_full @ w.
-
-    No [B,S,k,D] gather. Peak: gate_full[B,S,N] = 1.3GB (not 9.4GB).
-    gate:     [B, S, k]
-    w:        [N, D]
-    topk_idx: [B, S, k]
-    """
-    B, S, k = gate.shape
-    N = w.shape[0]
-    gate_full = jnp.zeros((B, S, N), dtype=gate.dtype)
-    gate_full = gate_full.at[
-        jnp.arange(B)[:, None, None],
-        jnp.arange(S)[None, :, None],
-        topk_idx
-    ].set(gate)
-    return gate_full @ w  # [B, S, D]
+def emit_direct(gate, w):
+    """gate[B,S,N] @ w[N,D] -> [B,S,D]. Pure matmul. 1.6ms."""
+    return gate @ w
 
 
 # ================================================================
@@ -162,25 +142,18 @@ class Router(nn.Module):
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
         tau_all = self.tau_attn(x)
-        g_Q, i_Q = threshold_gate_fast(
-            h_Q @ qk_norm.T, tau_all[:, :, 0:1], self.max_k_qk)
-        g_K, i_K = threshold_gate_fast(
-            h_K @ qk_norm.T, tau_all[:, :, 1:2], self.max_k_qk)
-        g_V, i_V = threshold_gate_fast(
-            h_V @ v_norm.T, tau_all[:, :, 2:3], self.max_k_v)
+        g_Q = threshold_gate(h_Q @ qk_norm.T, tau_all[:, :, 0:1])
+        g_K = threshold_gate(h_K @ qk_norm.T, tau_all[:, :, 1:2])
+        g_V = threshold_gate(h_V @ v_norm.T, tau_all[:, :, 2:3])
 
-        # Load balance (softmax on full scores)
-        scores_qk = h_Q @ qk_norm.T
-        scores_v = h_V @ v_norm.T
-        usage_qk = jax.nn.softmax(scores_qk, axis=-1).mean(axis=(0, 1))
-        usage_v = jax.nn.softmax(scores_v, axis=-1).mean(axis=(0, 1))
         t_qk = 1.0 / self.n_qk
         t_v = 1.0 / self.n_v
         aux = (
-            ((usage_qk - t_qk) ** 2).sum() * self.n_qk * 3 +
-            ((usage_v - t_v) ** 2).sum() * self.n_v
+            ((g_Q.mean(axis=(0, 1)) - t_qk) ** 2).sum() * self.n_qk +
+            ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * self.n_qk +
+            ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * self.n_v
         )
-        return g_Q, i_Q, g_K, i_K, g_V, i_V, aux
+        return g_Q, g_K, g_V, aux
 
     def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
         know_norm = neuron_pool.know_emb / (
@@ -192,12 +165,11 @@ class Router(nn.Module):
         scores = h @ know_norm.T
 
         tau = self.tau_know(x)
-        gate, idx = threshold_gate_fast(scores, tau, self.max_k_know)
+        gate = threshold_gate(scores, tau)
 
-        usage = jax.nn.softmax(scores, axis=-1).mean(axis=(0, 1))
         t = 1.0 / self.n_know
-        aux = ((usage - t) ** 2).sum() * self.n_know
-        return gate, idx, aux
+        aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * self.n_know
+        return gate, aux
 
 
 # ================================================================
@@ -224,13 +196,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-    g_Q, i_Q = threshold_gate_fast(h_Q @ qk_norm.T, tau_all[:, :, 0:1], max_k_qk)
-    g_K, i_K = threshold_gate_fast(h_K @ qk_norm.T, tau_all[:, :, 1:2], max_k_qk)
-    g_V, i_V = threshold_gate_fast(h_V @ v_norm.T, tau_all[:, :, 2:3], max_k_v)
+    g_Q = threshold_gate(h_Q @ qk_norm.T, tau_all[:, :, 0:1])
+    g_K = threshold_gate(h_K @ qk_norm.T, tau_all[:, :, 1:2])
+    g_V = threshold_gate(h_V @ v_norm.T, tau_all[:, :, 2:3])
 
-    Q = emit_sparse(g_Q, qk_w, i_Q)
-    K = emit_sparse(g_K, qk_w, i_K)
-    V = emit_sparse(g_V, v_w, i_V)
+    Q = emit_direct(g_Q, qk_w)
+    K = emit_direct(g_K, qk_w)
+    V = emit_direct(g_V, v_w)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -252,16 +224,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     out = out @ expand_O_kernel
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    # Load balance
-    scores_qk = h_Q @ qk_norm.T
-    scores_v = h_V @ v_norm.T
-    usage_qk = jax.nn.softmax(scores_qk, axis=-1).mean(axis=(0, 1))
-    usage_v = jax.nn.softmax(scores_v, axis=-1).mean(axis=(0, 1))
     t_qk = 1.0 / n_qk
     t_v = 1.0 / n_v
     aux = (
-        ((usage_qk - t_qk) ** 2).sum() * n_qk * 3 +
-        ((usage_v - t_v) ** 2).sum() * n_v
+        ((g_Q.mean(axis=(0, 1)) - t_qk) ** 2).sum() * n_qk +
+        ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * n_qk +
+        ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * n_v
     )
     return out, aux
 
@@ -280,16 +248,15 @@ def _know_forward(x, pool_params, router_params, rng,
     scores = h @ know_norm.T
 
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-    gate, topk_idx = threshold_gate_fast(scores, tau, max_k_know)
+    gate = threshold_gate(scores, tau)
 
-    out = emit_sparse(gate, know_w, topk_idx)
+    out = emit_direct(gate, know_w)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    usage = jax.nn.softmax(scores, axis=-1).mean(axis=(0, 1))
     t = 1.0 / know_emb.shape[0]
-    aux = ((usage - t) ** 2).sum() * know_emb.shape[0]
+    aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * know_emb.shape[0]
     return out, aux
 
 
@@ -310,12 +277,12 @@ class AttentionCircuit(nn.Module):
         rng = self.make_rng('dropout')
         rng, rng_r, rng_d, rng_o = jax.random.split(rng, 4)
 
-        g_Q, i_Q, g_K, i_K, g_V, i_V, aux = router.get_attention_gates(
+        g_Q, g_K, g_V, aux = router.get_attention_gates(
             x, neuron_pool, deterministic, rng_r)
 
-        Q = emit_sparse(g_Q, neuron_pool.qk_w, i_Q)
-        K = emit_sparse(g_K, neuron_pool.qk_w, i_K)
-        V = emit_sparse(g_V, neuron_pool.v_w, i_V)
+        Q = emit_direct(g_Q, neuron_pool.qk_w)
+        K = emit_direct(g_K, neuron_pool.qk_w)
+        V = emit_direct(g_V, neuron_pool.v_w)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -344,9 +311,9 @@ class KnowledgeCircuit(nn.Module):
     def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
         rng = self.make_rng('dropout')
         rng, rng_r = jax.random.split(rng)
-        gate, idx, aux = router.get_knowledge_gates(
+        gate, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_r)
-        out = emit_sparse(gate, neuron_pool.know_w, idx)
+        out = emit_direct(gate, neuron_pool.know_w)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
