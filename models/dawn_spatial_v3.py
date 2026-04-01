@@ -2,6 +2,11 @@
 DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
+  spatial-r1-v3.8.2 (2026-04-01):
+    - d_bottleneck 64->128 (routing resolution improvement)
+    - threshold_gate clamp (NaN prevention)
+    - Neuron counts adjusted for param budget
+
   spatial-r1-v3.8.1 (2026-04-01):
     - threshold_gate: v18.5 relative tau (mean + offset*std)
     - Dead neuron gradient flow (1e-8 * exp(raw))
@@ -403,7 +408,7 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """DAWN-Spatial v3.8: Sense-Read-Write."""
-    __version__ = "spatial-r1-v3.8.1"
+    __version__ = "spatial-r1-v3.8.2"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -413,13 +418,13 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
 
-    d_bottleneck: int = 64
-    n_qk: int = 1700
-    n_v: int = 2800
-    n_know: int = 27200
-    max_k_qk: int = 170
-    max_k_v: int = 280
-    max_k_know: int = 1960
+    d_bottleneck: int = 128
+    n_qk: int = 1580
+    n_v: int = 2600
+    n_know: int = 25200
+    max_k_qk: int = 158
+    max_k_v: int = 260
+    max_k_know: int = 1810
     router_dropout: float = 0.1
 
     def setup(self):
