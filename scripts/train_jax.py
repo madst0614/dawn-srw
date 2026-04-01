@@ -395,9 +395,23 @@ def compute_spatial_diversity_loss(params):
         mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
         return jnp.abs(sim * mask).sum() / mask.sum()
 
-    return (_pool_div(pool['qk_neurons']) +
-            _pool_div(pool['v_neurons']) +
-            _pool_div(pool['know_neurons'])) / 3
+    # Support both v2 (qk_neurons) and v3.2 (qk_emb/qk_w) param names
+    def _get_pool_arrays(pool):
+        """Return list of neuron arrays from pool params."""
+        arrays = []
+        for prefix in ('qk', 'v', 'know'):
+            if f'{prefix}_neurons' in pool:
+                arrays.append(pool[f'{prefix}_neurons'])
+            else:
+                # v3.2: emb + w
+                if f'{prefix}_emb' in pool:
+                    arrays.append(pool[f'{prefix}_emb'])
+                if f'{prefix}_w' in pool:
+                    arrays.append(pool[f'{prefix}_w'])
+        return arrays
+
+    pool_arrays = _get_pool_arrays(pool)
+    return sum(_pool_div(a) for a in pool_arrays) / len(pool_arrays)
 
 
 # ============================================================
