@@ -2,6 +2,12 @@
 DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
+  spatial-r1-v3.8.1 (2026-04-01):
+    - threshold_gate: v18.5 relative tau (mean + offset*std)
+    - Dead neuron gradient flow (1e-8 * exp(raw))
+    - Exp scaling + gate_strength (tanh)
+    - tau init: bias=-0.5, kernel=zeros (initially ~70% activation)
+
   spatial-r1-v3.8.0 (2026-04-01):
     - Sense-Read-Write: each neuron has emb[64] + w_read[384] + w_write[384]
     - out = sum(gate_i * (x . read_i) * write_i)
@@ -61,14 +67,30 @@ def unit_norm_init(scale=1.0):
 
 
 # ================================================================
-# 2. Threshold gate (element-wise, no top_k)
+# 2. Threshold gate (v18.5 relative tau + dead neuron gradient + exp)
 # ================================================================
 
-def threshold_gate(scores, tau):
+def threshold_gate(scores, tau_offset):
+    """v18.5 style: relative tau based on scores distribution.
+
+    scores:     [B, S, N]
+    tau_offset: [B, S, 1] — learnable offset (relative to mean/std)
+
+    tau = mean(scores) + tau_offset * std(scores)
+    Dead neurons get tiny gradient via 1e-8 * exp(raw).
+    """
+    s_mean = scores.mean(axis=-1, keepdims=True)
+    s_std = jnp.std(scores, axis=-1, keepdims=True) + 1e-8
+    tau = s_mean + tau_offset * s_std
+
     raw = scores - tau
-    gate = jnp.where(raw > 0, raw, 0.0)
-    gate_sum = gate.sum(axis=-1, keepdims=True) + 1e-8
-    return gate / gate_sum
+    gate = jnp.where(raw > 0, raw, 1e-8 * jnp.exp(raw))
+
+    exp_gate = jnp.exp(gate) - 1.0
+    exp_sum = exp_gate.sum(axis=-1, keepdims=True) + 1e-8
+    gate_strength = jnp.tanh(exp_gate.max(axis=-1, keepdims=True))
+
+    return (exp_gate / exp_sum) * gate_strength
 
 
 # ================================================================
@@ -140,8 +162,12 @@ class Router(nn.Module):
         db = self.d_bottleneck
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_know = nn.Dense(db, name='proj_know')
-        self.tau_attn = nn.Dense(3, name='tau_attn')
-        self.tau_know = nn.Dense(1, name='tau_know')
+        self.tau_attn = nn.Dense(3, name='tau_attn',
+            kernel_init=nn.initializers.zeros,
+            bias_init=lambda k, s, d: jnp.full(s, -0.5))
+        self.tau_know = nn.Dense(1, name='tau_know',
+            kernel_init=nn.initializers.zeros,
+            bias_init=lambda k, s, d: jnp.full(s, -0.5))
 
     def get_attention_gates(self, x, neuron_pool, deterministic, rng):
         qk_norm = neuron_pool.qk_emb / (
@@ -364,7 +390,7 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """DAWN-Spatial v3.8: Sense-Read-Write."""
-    __version__ = "spatial-r1-v3.8.0"
+    __version__ = "spatial-r1-v3.8.1"
 
     vocab_size: int = 30000
     d_model: int = 384
