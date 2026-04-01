@@ -290,8 +290,19 @@ def _know_forward(x, pool_params, router_params, rng,
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
+    scores_know = h @ know_norm.T
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-    gate = threshold_gate(h @ know_norm.T, tau)
+    gate = threshold_gate(scores_know, tau)
+
+    # Gate stats (jax.debug.print — runs every step, no perf impact on TPU)
+    N_know = know_emb.shape[0]
+    active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
+    s_mean = scores_know.mean()
+    s_std = jnp.std(scores_know) + 1e-8
+    tau_actual = s_mean + tau.mean() * s_std
+    jax.debug.print(
+        "[gate] active={a:.0f}/{n} tau={t:.3f} gate_max={m:.4f}",
+        a=active_count, n=N_know, t=tau_actual, m=gate.max())
 
     out = sense_read_write(x, gate, know_read, know_write)
 
