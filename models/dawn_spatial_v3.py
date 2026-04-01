@@ -1,28 +1,19 @@
 """
-DAWN-Spatial v3.2: Rank-1 Neuron Architecture with Full Matmul (JAX/Flax)
+DAWN-Spatial v3.2: Rank-1 Neuron with Sense/Emit Split + Full Matmul (JAX/Flax)
 
 Changelog:
   spatial-r1-v3.2.0 (2026-04-01):
-    - Full matmul routing: x @ neurons.T for scoring, no gather/cell/distance
-    - Matches v17.1 pattern: dense matmul + sparse gate
-    - @jax.checkpoint on sense_emit to manage [B,S,N] intermediate
-    - Removed: neuron_pos, proj_pos, pos_loss, cell_map, chunking, block_data
-    - Load balance aux loss replaces pos_loss
-
-  spatial-r1-v3.1.0 (2026-03-31):
-    - Cell-dense routing with index-only block_data. Still slow.
-
-Key concept:
-  - Every neuron is a single vector v_i [D] (rank-1).
-  - Sense: activations = x @ neurons.T       [B, S, N]
-  - Fire:  gated = activations * gate         [B, S, N] (mostly 0)
-  - Emit:  output = gated @ neurons           [B, S, D]
-  - Gate from threshold_gate(scores, tau, max_k)
+    - Sense/Emit split: each neuron has emb[D] (sense) + w[D] (emit)
+    - Full matmul: x @ emb.T -> gate -> gated @ w. No gather.
+    - Neuron counts halved (21000 know) to maintain param budget
+    - @jax.checkpoint on sense_emit for [B,S,N] intermediate
+    - Load balance aux loss. No pos_loss.
+    - Removed: neuron_pos, cell_map, gather, chunking, all spatial routing
 
 Architecture:
-  NeuronPool        -- shared [N, D] rank-1 vectors
-  Router            -- tau projection only (no pos/emb)
-  _sense_emit_full  -- @jax.checkpoint: x@N.T * gate @ N
+  NeuronPool        -- emb[N,D] + w[N,D] per pool (sense/emit split)
+  Router            -- tau projection only
+  sense_emit_full   -- @jax.checkpoint: x@emb.T * gate @ w
   _attn_forward_full -- full matmul QKV + causal self-attention
   _know_forward_full -- full matmul knowledge
   DAWN              -- embedding + jax.lax.scan + weight-tied lm_head
@@ -89,40 +80,48 @@ def threshold_gate(scores, tau, max_k=None):
 
 
 # ================================================================
-# 3. Sense-Emit: full matmul (checkpointed)
+# 3. Sense-Emit: full matmul with emb/w split (checkpointed)
 # ================================================================
 
 @jax.checkpoint
-def _sense_emit_full(x, neurons, gate):
-    """Full matmul sense-emit. Checkpointed to recompute [B,S,N] in backward.
+def sense_emit_full(x, emb, w, gate):
+    """Sense with emb, emit with w. Checkpointed for [B,S,N] intermediate.
 
-    x:       [B, S, D]
-    neurons: [N, D]     -- shared, no copy
-    gate:    [B, S, N]  -- sparse (mostly 0)
+    x:    [B, S, D]
+    emb:  [N, D]  -- sense vectors
+    w:    [N, D]  -- emit vectors
+    gate: [B, S, N] -- sparse gate
     Returns: [B, S, D]
     """
-    activations = x @ neurons.T     # [B, S, N]  -- sense
-    gated = activations * gate      # [B, S, N]  -- fire (sparse)
-    return gated @ neurons          # [B, S, D]  -- emit
+    activations = x @ emb.T     # [B, S, N]  sense
+    gated = activations * gate  # [B, S, N]  fire (sparse)
+    return gated @ w            # [B, S, D]  emit
 
 
 # ================================================================
-# 4. NeuronPool
+# 4. NeuronPool -- emb + w per pool
 # ================================================================
 
 class NeuronPool(nn.Module):
+    """Each neuron has emb[D] (sense/routing) and w[D] (emit/output)."""
     n_qk: int
     n_v: int
     n_know: int
     d_model: int
 
     def setup(self):
-        self.qk_neurons = self.param(
-            'qk_neurons', unit_norm_init(), (self.n_qk, self.d_model))
-        self.v_neurons = self.param(
-            'v_neurons', unit_norm_init(), (self.n_v, self.d_model))
-        self.know_neurons = self.param(
-            'know_neurons', unit_norm_init(), (self.n_know, self.d_model))
+        self.qk_emb = self.param(
+            'qk_emb', unit_norm_init(), (self.n_qk, self.d_model))
+        self.qk_w = self.param(
+            'qk_w', unit_norm_init(), (self.n_qk, self.d_model))
+        self.v_emb = self.param(
+            'v_emb', unit_norm_init(), (self.n_v, self.d_model))
+        self.v_w = self.param(
+            'v_w', unit_norm_init(), (self.n_v, self.d_model))
+        self.know_emb = self.param(
+            'know_emb', unit_norm_init(), (self.n_know, self.d_model))
+        self.know_w = self.param(
+            'know_w', unit_norm_init(), (self.n_know, self.d_model))
 
 
 # ================================================================
@@ -130,7 +129,7 @@ class NeuronPool(nn.Module):
 # ================================================================
 
 class Router(nn.Module):
-    """Minimal router: only tau projections. Scoring uses direct matmul."""
+    """Minimal router: tau projections only. Scoring uses x @ emb.T."""
     d_model: int
     max_k_qk: int
     max_k_v: int
@@ -142,21 +141,19 @@ class Router(nn.Module):
         self.tau_know = nn.Dense(1, name='tau_know')
 
     def get_attention_gates(self, x, neuron_pool, deterministic, rng):
-        """Full matmul gates for Q, K, V."""
         rng, rng_drop = jax.random.split(rng)
         x_drop = safe_dropout(x, self.router_dropout, deterministic, rng_drop)
 
-        scores_qk = x_drop @ neuron_pool.qk_neurons.T  # [B,S,N_qk]
-        scores_v = x_drop @ neuron_pool.v_neurons.T     # [B,S,N_v]
+        scores_qk = x_drop @ neuron_pool.qk_emb.T
+        scores_v = x_drop @ neuron_pool.v_emb.T
 
         tau_all = self.tau_attn(x)
         g_Q = threshold_gate(scores_qk, tau_all[:, :, 0:1], self.max_k_qk)
         g_K = threshold_gate(scores_qk, tau_all[:, :, 1:2], self.max_k_qk)
         g_V = threshold_gate(scores_v, tau_all[:, :, 2:3], self.max_k_v)
 
-        # Load balance aux
-        t_qk = 1.0 / neuron_pool.qk_neurons.shape[0]
-        t_v = 1.0 / neuron_pool.v_neurons.shape[0]
+        t_qk = 1.0 / neuron_pool.qk_emb.shape[0]
+        t_v = 1.0 / neuron_pool.v_emb.shape[0]
         aux = (
             ((g_Q.mean(axis=(0, 1)) - t_qk) ** 2).sum() * g_Q.shape[-1] +
             ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * g_K.shape[-1] +
@@ -165,15 +162,14 @@ class Router(nn.Module):
         return g_Q, g_K, g_V, aux
 
     def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
-        """Full matmul gates for knowledge."""
         rng, rng_drop = jax.random.split(rng)
         x_drop = safe_dropout(x, self.router_dropout, deterministic, rng_drop)
-        scores = x_drop @ neuron_pool.know_neurons.T  # [B,S,N_know]
+        scores = x_drop @ neuron_pool.know_emb.T
 
         tau = self.tau_know(x)
         gate = threshold_gate(scores, tau, self.max_k_know)
 
-        t = 1.0 / neuron_pool.know_neurons.shape[0]
+        t = 1.0 / neuron_pool.know_emb.shape[0]
         aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * gate.shape[-1]
         return gate, aux
 
@@ -185,29 +181,27 @@ class Router(nn.Module):
 def _attn_forward_full(x, pool_params, router_params, expand_O_kernel, rng,
                        max_k_qk, max_k_v, n_heads, d_model,
                        router_dropout, dropout_rate, deterministic):
-    """Full matmul attention: score -> gate -> sense_emit -> self-attn."""
+    """Full matmul attention with emb/w split."""
     B, S, D = x.shape
-    qk = pool_params['qk_neurons']
-    v = pool_params['v_neurons']
+    qk_emb = pool_params['qk_emb']
+    qk_w = pool_params['qk_w']
+    v_emb = pool_params['v_emb']
+    v_w = pool_params['v_w']
 
-    # Score (full matmul)
     rng, rng_drop = jax.random.split(rng)
     x_drop = safe_dropout(x, router_dropout, deterministic, rng_drop)
-    scores_qk = x_drop @ qk.T   # [B,S,N_qk]
-    scores_v = x_drop @ v.T     # [B,S,N_v]
+    scores_qk = x_drop @ qk_emb.T
+    scores_v = x_drop @ v_emb.T
 
-    # Tau + Gate
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
     g_Q = threshold_gate(scores_qk, tau_all[:, :, 0:1], max_k_qk)
     g_K = threshold_gate(scores_qk, tau_all[:, :, 1:2], max_k_qk)
     g_V = threshold_gate(scores_v, tau_all[:, :, 2:3], max_k_v)
 
-    # Sense-emit (checkpointed, [B,S,N] recomputed in backward)
-    Q = _sense_emit_full(x, qk, g_Q)
-    K = _sense_emit_full(x, qk, g_K)
-    V = _sense_emit_full(x, v, g_V)
+    Q = sense_emit_full(x, qk_emb, qk_w, g_Q)
+    K = sense_emit_full(x, qk_emb, qk_w, g_K)
+    V = sense_emit_full(x, v_emb, v_w, g_V)
 
-    # Self-attention
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
     K = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -228,13 +222,12 @@ def _attn_forward_full(x, pool_params, router_params, expand_O_kernel, rng,
     out = out @ expand_O_kernel
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    # Load balance aux
-    t_qk = 1.0 / qk.shape[0]
-    t_v = 1.0 / v.shape[0]
+    t_qk = 1.0 / qk_emb.shape[0]
+    t_v = 1.0 / v_emb.shape[0]
     aux = (
-        ((g_Q.mean(axis=(0, 1)) - t_qk) ** 2).sum() * g_Q.shape[-1] +
-        ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * g_K.shape[-1] +
-        ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * g_V.shape[-1]
+        ((g_Q.mean(axis=(0, 1)) - t_qk) ** 2).sum() * qk_emb.shape[0] +
+        ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * qk_emb.shape[0] +
+        ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * v_emb.shape[0]
     )
     return out, aux
 
@@ -242,23 +235,24 @@ def _attn_forward_full(x, pool_params, router_params, expand_O_kernel, rng,
 def _know_forward_full(x, pool_params, router_params, rng,
                        max_k_know,
                        router_dropout, dropout_rate, deterministic):
-    """Full matmul knowledge: score -> gate -> sense_emit."""
-    know = pool_params['know_neurons']
+    """Full matmul knowledge with emb/w split."""
+    know_emb = pool_params['know_emb']
+    know_w = pool_params['know_w']
 
     rng, rng_drop = jax.random.split(rng)
     x_drop = safe_dropout(x, router_dropout, deterministic, rng_drop)
-    scores = x_drop @ know.T  # [B,S,N_know]
+    scores = x_drop @ know_emb.T
 
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     gate = threshold_gate(scores, tau, max_k_know)
 
-    out = _sense_emit_full(x, know, gate)
+    out = sense_emit_full(x, know_emb, know_w, gate)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    t = 1.0 / know.shape[0]
-    aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * gate.shape[-1]
+    t = 1.0 / know_emb.shape[0]
+    aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * know_emb.shape[0]
     return out, aux
 
 
@@ -282,9 +276,9 @@ class AttentionCircuit(nn.Module):
         g_Q, g_K, g_V, aux = router.get_attention_gates(
             x, neuron_pool, deterministic, rng_r)
 
-        Q = _sense_emit_full(x, neuron_pool.qk_neurons, g_Q)
-        K = _sense_emit_full(x, neuron_pool.qk_neurons, g_K)
-        V = _sense_emit_full(x, neuron_pool.v_neurons, g_V)
+        Q = sense_emit_full(x, neuron_pool.qk_emb, neuron_pool.qk_w, g_Q)
+        K = sense_emit_full(x, neuron_pool.qk_emb, neuron_pool.qk_w, g_K)
+        V = sense_emit_full(x, neuron_pool.v_emb, neuron_pool.v_w, g_V)
 
         B, S, D = x.shape
         d_head = D // self.n_heads
@@ -315,7 +309,7 @@ class KnowledgeCircuit(nn.Module):
         rng, rng_r = jax.random.split(rng)
         gate, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_r)
-        out = _sense_emit_full(x, neuron_pool.know_neurons, gate)
+        out = sense_emit_full(x, neuron_pool.know_emb, neuron_pool.know_w, gate)
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
@@ -351,7 +345,7 @@ class DAWNBlock(nn.Module):
 # ================================================================
 
 class DAWN(nn.Module):
-    """DAWN-Spatial v3.2: Rank-1 Neuron + Full Matmul (v17.1 pattern)."""
+    """DAWN-Spatial v3.2: Rank-1 Sense/Emit Split + Full Matmul."""
     __version__ = "spatial-r1-v3.2.0"
 
     vocab_size: int = 30000
@@ -362,9 +356,9 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
 
-    n_qk: int = 3140
-    n_v: int = 5240
-    n_know: int = 42000
+    n_qk: int = 1570
+    n_v: int = 2620
+    n_know: int = 21000
     max_k_qk: int = 157
     max_k_v: int = 262
     max_k_know: int = 1536
@@ -486,18 +480,22 @@ class DAWN(nn.Module):
         return result
 
     def diversity_loss(self):
-        def _pool_div(neurons, max_sample=4096):
-            N = neurons.shape[0]
-            if N > max_sample:
-                stride = N // max_sample
-                neurons = neurons[::stride][:max_sample]
-            n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
-            sim = n @ n.T
-            mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
-            return jnp.abs(sim * mask).sum() / mask.sum()
-        return (_pool_div(self.neuron_pool.qk_neurons) +
-                _pool_div(self.neuron_pool.v_neurons) +
-                _pool_div(self.neuron_pool.know_neurons)) / 3
+        def _pool_div(emb, w, max_sample=4096):
+            # Diversity on both emb and w
+            def _div(neurons):
+                N = neurons.shape[0]
+                if N > max_sample:
+                    stride = N // max_sample
+                    neurons = neurons[::stride][:max_sample]
+                n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
+                sim = n @ n.T
+                mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
+                return jnp.abs(sim * mask).sum() / mask.sum()
+            return (_div(emb) + _div(w)) / 2
+
+        return (_pool_div(self.neuron_pool.qk_emb, self.neuron_pool.qk_w) +
+                _pool_div(self.neuron_pool.v_emb, self.neuron_pool.v_w) +
+                _pool_div(self.neuron_pool.know_emb, self.neuron_pool.know_w)) / 3
 
     def get_auxiliary_losses(self):
         return {'neuron_diversity': self.diversity_loss()}
@@ -515,11 +513,10 @@ class DAWN(nn.Module):
 
     def get_model_info(self):
         return [
-            f"DAWN v{self.__version__}: Rank-1 + Full Matmul (JAX)",
+            f"DAWN v{self.__version__}: Rank-1 Sense/Emit Split + Full Matmul",
             f"  d_model={self.d_model}, n_layers={self.n_layers}, "
             f"n_heads={self.n_heads}",
-            f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
+            f"  QK: {self.n_qk} (emb+w), V: {self.n_v}, Know: {self.n_know}",
             f"  max_k: qk={self.max_k_qk}, v={self.max_k_v}, "
             f"know={self.max_k_know}",
-            f"  Pattern: full matmul (v17.1 style), @jax.checkpoint",
         ]

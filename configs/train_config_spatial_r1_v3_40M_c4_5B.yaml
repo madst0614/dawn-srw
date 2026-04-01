@@ -1,5 +1,6 @@
-# DAWN Spatial-R1 v3.2 -- Full Matmul (v17.1 pattern), 40M Scale, 5B tokens
-# Dense matmul scoring + sparse gate. No gather/cell/distance.
+# DAWN Spatial-R1 v3.2 -- Sense/Emit Split + Full Matmul, 40M Scale, 5B tokens
+# Each neuron: emb[D] (sense) + w[D] (emit). Dense matmul, no gather.
+# Neuron counts halved vs v2 to maintain param budget with 2 vectors/neuron.
 
 seed: 1
 
@@ -19,9 +20,9 @@ model:
   dropout: 0.1
   gradient_checkpointing: true
 
-  n_qk: 3140
-  n_v: 5240
-  n_know: 42000
+  n_qk: 1570
+  n_v: 2620
+  n_know: 21000
   max_k_qk: 157
   max_k_v: 262
   max_k_know: 1536
@@ -42,3 +43,12 @@ training:
 use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.2_40M_c4_5B
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.2_40M_c4_5B
+
+# Parameter budget (~32.9M):
+#   qk: 1570 x 384 x 2 (emb+w)  = 1.21M
+#   v:  2620 x 384 x 2           = 2.01M
+#   know: 21000 x 384 x 2        = 16.13M
+#   Router tau:                     ~0.003M
+#   Blocks (LN x2 + O_proj) x12: 1.79M
+#   Embeddings (tok + pos):      11.72M
+#   Total:                       ~32.9M
