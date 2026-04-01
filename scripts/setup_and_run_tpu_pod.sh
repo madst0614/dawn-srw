@@ -13,10 +13,10 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/madst0614/DAWN.git"
+REPO_URL="https://github.com/madst0614/dawn-spatial.git"
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
-WORK_DIR="$HOME/dawn"
+WORK_DIR="$HOME/dawn-spatial"
 
 echo "============================================"
 echo "Host $(hostname) — Setting up TPU Pod training"
@@ -47,9 +47,9 @@ if [ -d "$WORK_DIR/.git" ]; then
 else
     echo "  Fresh clone (branch: $BRANCH)..."
     cd "$HOME"
-    rm -rf dawn
-    git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" dawn
-    cd dawn
+    rm -rf dawn-spatial
+    git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" dawn-spatial
+    cd dawn-spatial
 fi
 
 # 3. Verify JAX sees TPU devices

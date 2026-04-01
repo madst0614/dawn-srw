@@ -65,7 +65,7 @@ gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --project="$PROJECT" \
     --format="value(state)"
 
-REPO_URL="https://github.com/madst0614/DAWN.git"
+REPO_URL="https://github.com/madst0614/dawn-spatial.git"
 
 # Build inline bootstrap: clone/update repo first, then run setup script
 read -r -d '' REMOTE_CMD <<EOFCMD || true
@@ -75,21 +75,21 @@ BRANCH='${BRANCH}'
 CONFIG='${CONFIG}'
 export BRANCH CONFIG
 
-# Bootstrap: ensure ~/dawn exists with the right branch
-if [ -d ~/dawn/.git ]; then
-    cd ~/dawn
+# Bootstrap: ensure ~/dawn-spatial exists with the right branch
+if [ -d ~/dawn-spatial/.git ]; then
+    cd ~/dawn-spatial
     git fetch origin "\$BRANCH" --depth 1
     git checkout "\$BRANCH" --
     git reset --hard "origin/\$BRANCH"
     echo "Repo updated to \$BRANCH"
 else
-    rm -rf ~/dawn
-    git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" ~/dawn
+    rm -rf ~/dawn-spatial
+    git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" ~/dawn-spatial
     echo "Repo cloned (branch: \$BRANCH)"
 fi
 
 # Run the setup+training script (nohup inside will detach training)
-cd ~/dawn
+cd ~/dawn-spatial
 bash scripts/setup_and_run_tpu_pod.sh
 EOFCMD
 
