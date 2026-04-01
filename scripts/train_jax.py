@@ -1261,7 +1261,7 @@ def main():
 
                 # --- Full component breakdown (every op separately) ---
                 from models.dawn_spatial_v3 import (
-                    threshold_gate_fast as tg_fn, emit_bottleneck_sparse)
+                    threshold_gate as tg_fn, emit_dense)
 
                 def _t(fn, n=N_RUNS):
                     r = fn(); jax.block_until_ready(r)
@@ -1281,15 +1281,15 @@ def main():
                 h_k = normed @ pk + pb_
                 sc_k = h_k @ kn.T
                 tau_k = normed @ tkk + tkb
-                gk, ik = tg_fn(sc_k, tau_k, max_k_know)
+                gk = tg_fn(sc_k, tau_k)
 
                 items = []
                 items.append(("K proj(x)",       _t(lambda: normed @ pk + pb_)))
                 items.append(("K h@emb.T",       _t(lambda: h_k @ kn.T)))
                 items.append(("K tau",            _t(lambda: normed @ tkk + tkb)))
-                items.append(("K top_k+gate",     _t(lambda: tg_fn(sc_k, tau_k, max_k_know))))
-                items.append(("K emit_sparse",    _t(lambda: emit_bottleneck_sparse(gk, kwe, kwd, ik))))
-                items.append(("K softmax(lb)",    _t(lambda: jax.nn.softmax(sc_k, axis=-1).mean(axis=(0,1)))))
+                items.append(("K gate",           _t(lambda: tg_fn(sc_k, tau_k))))
+                items.append(("K emit_dense",     _t(lambda: emit_dense(gk, kwe, kwd))))
+                items.append(("K load_bal",       _t(lambda: gk.mean(axis=(0,1)))))
 
                 # === Attention breakdown ===
                 qke = pool_p['qk_emb']
@@ -1309,24 +1309,24 @@ def main():
                 ha = normed @ pak + pab
                 hQ, hK, hV = jnp.split(ha, 3, axis=-1)
                 tau_a = normed @ tak + tab
-                gQ, iQ = tg_fn(hQ @ qkn.T, tau_a[:,:,0:1], max_k_qk)
-                gK, iK = tg_fn(hK @ qkn.T, tau_a[:,:,1:2], max_k_qk)
-                gV, iV = tg_fn(hV @ vn.T, tau_a[:,:,2:3], max_k_v)
-                Qp = emit_bottleneck_sparse(gQ, qkwe, qkwd, iQ)
-                Kp = emit_bottleneck_sparse(gK, qkwe, qkwd, iK)
-                Vp = emit_bottleneck_sparse(gV, vwe, vwd, iV)
+                gQ = tg_fn(hQ @ qkn.T, tau_a[:,:,0:1])
+                gK = tg_fn(hK @ qkn.T, tau_a[:,:,1:2])
+                gV = tg_fn(hV @ vn.T, tau_a[:,:,2:3])
+                Qp = emit_dense(gQ, qkwe, qkwd)
+                Kp = emit_dense(gK, qkwe, qkwd)
+                Vp = emit_dense(gV, vwe, vwd)
 
                 items.append(("A proj(x)",       _t(lambda: normed @ pak + pab)))
                 items.append(("A h@emb.T(QKV)",  _t(lambda: (hQ@qkn.T, hK@qkn.T, hV@vn.T))))
                 items.append(("A tau",            _t(lambda: normed @ tak + tab)))
                 items.append(("A gate Q+K+V",    _t(lambda: (
-                    tg_fn(hQ@qkn.T, tau_a[:,:,0:1], max_k_qk),
-                    tg_fn(hK@qkn.T, tau_a[:,:,1:2], max_k_qk),
-                    tg_fn(hV@vn.T, tau_a[:,:,2:3], max_k_v)))))
+                    tg_fn(hQ@qkn.T, tau_a[:,:,0:1]),
+                    tg_fn(hK@qkn.T, tau_a[:,:,1:2]),
+                    tg_fn(hV@vn.T, tau_a[:,:,2:3])))))
                 items.append(("A emit Q+K+V",    _t(lambda: (
-                    emit_bottleneck_sparse(gQ, qkwe, qkwd, iQ),
-                    emit_bottleneck_sparse(gK, qkwe, qkwd, iK),
-                    emit_bottleneck_sparse(gV, vwe, vwd, iV)))))
+                    emit_dense(gQ, qkwe, qkwd),
+                    emit_dense(gK, qkwe, qkwd),
+                    emit_dense(gV, vwe, vwd)))))
 
                 Qr = Qp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
                 Kr = Kp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
@@ -1342,7 +1342,7 @@ def main():
                     jnp.where(csl, attn_sc, jnp.finfo(attn_sc.dtype).min), axis=-1))))
                 items.append(("A wV+O_proj",     _t(lambda: jnp.einsum(
                     'bhst,bhtd->bhsd', attn_w, Vr).transpose(0,2,1,3).reshape(Bp,Sp,d_model) @ Ok)))
-                items.append(("A softmax(lb)",    _t(lambda: jax.nn.softmax(hQ@qkn.T, axis=-1).mean(axis=(0,1)))))
+                items.append(("A load_bal",       _t(lambda: gQ.mean(axis=(0,1)))))
 
                 # === Print all ===
                 total_items = sum(v for _, v in items)
