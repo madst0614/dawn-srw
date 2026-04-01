@@ -1272,8 +1272,7 @@ def main():
 
                 # === Knowledge breakdown ===
                 ke = pool_p['know_emb']
-                kwe = pool_p['know_w_enc']
-                kwd = pool_p['know_w_dec']
+                kw = pool_p['know_w']
                 kn = ke / (jnp.linalg.norm(ke, axis=-1, keepdims=True) + 1e-8)
                 pk, pb_ = router_p['proj_know']['kernel'], router_p['proj_know']['bias']
                 tkk, tkb = router_p['tau_know']['kernel'], router_p['tau_know']['bias']
