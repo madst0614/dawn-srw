@@ -11,7 +11,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.4.0"
+  model_version: "spatial-r1-v3.4.1"
   d_model: 384
   n_layers: 12
   n_heads: 6
