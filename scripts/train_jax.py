@@ -1261,7 +1261,7 @@ def main():
 
                 # --- Full component breakdown ---
                 from models.dawn_spatial_v3 import (
-                    threshold_gate as tg_fn, emit_bottleneck)
+                    threshold_gate_fast as tg_fn, emit_bottleneck_sparse)
 
                 def _time_fn(fn, n=N_RUNS):
                     """Time a function, return ms."""
@@ -1286,19 +1286,22 @@ def main():
                 h_prof = normed @ pk + pb
                 scores_prof = h_prof @ know_norm.T
                 tau_prof = normed @ tk + tb
-                gate_prof = tg_fn(scores_prof, tau_prof, max_k_know)
+                gate_prof, idx_prof = tg_fn(scores_prof, tau_prof, max_k_know)
 
                 k_route = _time_fn(lambda: (normed @ pk + pb) @ know_norm.T)
                 k_tau = _time_fn(lambda: normed @ tk + tb)
                 k_gate = _time_fn(lambda: tg_fn(scores_prof, tau_prof, max_k_know))
-                k_emit = _time_fn(lambda: emit_bottleneck(gate_prof, know_w_enc, know_w_dec))
+                k_emit = _time_fn(lambda: emit_bottleneck_sparse(
+                    gate_prof, know_w_enc, know_w_dec, idx_prof))
+                k_lb = _time_fn(lambda: jax.nn.softmax(scores_prof, axis=-1).mean(axis=(0,1)))
 
                 print(f"\n  --- Knowledge sub-breakdown (of {know_ms:.1f} ms) ---",
                       flush=True)
-                print(f"    route score:    {k_route:.1f} ms", flush=True)
-                print(f"    tau:            {k_tau:.1f} ms", flush=True)
-                print(f"    threshold_gate: {k_gate:.1f} ms", flush=True)
-                print(f"    emit_bottleneck:{k_emit:.1f} ms", flush=True)
+                print(f"    route score:     {k_route:.1f} ms", flush=True)
+                print(f"    tau:             {k_tau:.1f} ms", flush=True)
+                print(f"    gate_fast(topk): {k_gate:.1f} ms", flush=True)
+                print(f"    emit_sparse:     {k_emit:.1f} ms", flush=True)
+                print(f"    load_balance:    {k_lb:.1f} ms", flush=True)
 
                 # -- Attention sub-breakdown --
                 qk_emb = pool_p['qk_emb']
@@ -1320,12 +1323,12 @@ def main():
                 h_a = normed @ pa_k + pa_b
                 h_Q, h_K, h_V = jnp.split(h_a, 3, axis=-1)
                 tau_a = normed @ ta_k + ta_b
-                g_Q = tg_fn(h_Q @ qk_n.T, tau_a[:,:,0:1], max_k_qk)
-                g_K = tg_fn(h_K @ qk_n.T, tau_a[:,:,1:2], max_k_qk)
-                g_V = tg_fn(h_V @ v_n.T, tau_a[:,:,2:3], max_k_v)
-                Q_p = emit_bottleneck(g_Q, qk_w_enc, qk_w_dec)
-                K_p = emit_bottleneck(g_K, qk_w_enc, qk_w_dec)
-                V_p = emit_bottleneck(g_V, v_w_enc, v_w_dec)
+                g_Q, i_Q = tg_fn(h_Q @ qk_n.T, tau_a[:,:,0:1], max_k_qk)
+                g_K, i_K = tg_fn(h_K @ qk_n.T, tau_a[:,:,1:2], max_k_qk)
+                g_V, i_V = tg_fn(h_V @ v_n.T, tau_a[:,:,2:3], max_k_v)
+                Q_p = emit_bottleneck_sparse(g_Q, qk_w_enc, qk_w_dec, i_Q)
+                K_p = emit_bottleneck_sparse(g_K, qk_w_enc, qk_w_dec, i_K)
+                V_p = emit_bottleneck_sparse(g_V, v_w_enc, v_w_dec, i_V)
 
                 a_route = _time_fn(lambda: jnp.split(normed @ pa_k + pa_b, 3, axis=-1)[0] @ qk_n.T)
                 a_gate_qkv = _time_fn(lambda: (
@@ -1333,9 +1336,9 @@ def main():
                     tg_fn(h_K @ qk_n.T, tau_a[:,:,1:2], max_k_qk),
                     tg_fn(h_V @ v_n.T, tau_a[:,:,2:3], max_k_v)))
                 a_emit_qkv = _time_fn(lambda: (
-                    emit_bottleneck(g_Q, qk_w_enc, qk_w_dec),
-                    emit_bottleneck(g_K, qk_w_enc, qk_w_dec),
-                    emit_bottleneck(g_V, v_w_enc, v_w_dec)))
+                    emit_bottleneck_sparse(g_Q, qk_w_enc, qk_w_dec, i_Q),
+                    emit_bottleneck_sparse(g_K, qk_w_enc, qk_w_dec, i_K),
+                    emit_bottleneck_sparse(g_V, v_w_enc, v_w_dec, i_V)))
 
                 # Self-attention timing
                 Qr = Q_p.reshape(B_prof, S_prof, n_heads, d_head).transpose(0,2,1,3)
