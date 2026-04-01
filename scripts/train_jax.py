@@ -1259,60 +1259,106 @@ def main():
                 print(f"  Est. {n_layers}-layer: {total_ms*n_layers:.0f} ms "
                       f"(actual step includes grad+opt)", flush=True)
 
-                # --- Knowledge sub-breakdown ---
+                # --- Full component breakdown ---
                 from models.dawn_spatial_v3 import (
-                    threshold_gate as tg_fn, emit_bottleneck, safe_dropout)
+                    threshold_gate as tg_fn, emit_bottleneck)
+
+                def _time_fn(fn, n=N_RUNS):
+                    """Time a function, return ms."""
+                    # Warm
+                    r = fn(); jax.block_until_ready(r)
+                    t0 = time.time()
+                    for _ in range(n):
+                        r = fn(); jax.block_until_ready(r)
+                    return (time.time() - t0) / n * 1000
+
+                # -- Knowledge sub-breakdown --
                 know_emb = pool_p['know_emb']
                 know_w_enc = pool_p['know_w_enc']
                 know_w_dec = pool_p['know_w_dec']
                 know_norm = know_emb / (
                     jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
-                proj_k = router_p['proj_know']['kernel']
-                proj_b = router_p['proj_know']['bias']
-                tau_k = router_p['tau_know']['kernel']
-                tau_b = router_p['tau_know']['bias']
+                pk = router_p['proj_know']['kernel']
+                pb = router_p['proj_know']['bias']
+                tk = router_p['tau_know']['kernel']
+                tb = router_p['tau_know']['bias']
 
-                # Warm up sub-ops
-                h_prof = normed @ proj_k + proj_b
+                h_prof = normed @ pk + pb
                 scores_prof = h_prof @ know_norm.T
-                tau_prof = normed @ tau_k + tau_b
+                tau_prof = normed @ tk + tb
                 gate_prof = tg_fn(scores_prof, tau_prof, max_k_know)
-                emit_prof = emit_bottleneck(gate_prof, know_w_enc, know_w_dec)
-                jax.block_until_ready(emit_prof)
 
-                # Measure routing score
-                t0 = time.time()
-                for _ in range(N_RUNS):
-                    h_prof = normed @ proj_k + proj_b
-                    scores_prof = h_prof @ know_norm.T
-                    tau_prof = normed @ tau_k + tau_b
-                    jax.block_until_ready(scores_prof)
-                    jax.block_until_ready(tau_prof)
-                route_ms = (time.time() - t0) / N_RUNS * 1000
+                k_route = _time_fn(lambda: (normed @ pk + pb) @ know_norm.T)
+                k_tau = _time_fn(lambda: normed @ tk + tb)
+                k_gate = _time_fn(lambda: tg_fn(scores_prof, tau_prof, max_k_know))
+                k_emit = _time_fn(lambda: emit_bottleneck(gate_prof, know_w_enc, know_w_dec))
 
-                # Measure threshold_gate
-                t0 = time.time()
-                for _ in range(N_RUNS):
-                    gate_prof = tg_fn(scores_prof, tau_prof, max_k_know)
-                    jax.block_until_ready(gate_prof)
-                gate_ms = (time.time() - t0) / N_RUNS * 1000
+                print(f"\n  --- Knowledge sub-breakdown (of {know_ms:.1f} ms) ---",
+                      flush=True)
+                print(f"    route score:    {k_route:.1f} ms", flush=True)
+                print(f"    tau:            {k_tau:.1f} ms", flush=True)
+                print(f"    threshold_gate: {k_gate:.1f} ms", flush=True)
+                print(f"    emit_bottleneck:{k_emit:.1f} ms", flush=True)
 
-                # Measure emit_bottleneck
-                t0 = time.time()
-                for _ in range(N_RUNS):
-                    emit_prof = emit_bottleneck(gate_prof, know_w_enc, know_w_dec)
-                    jax.block_until_ready(emit_prof)
-                emit_ms = (time.time() - t0) / N_RUNS * 1000
+                # -- Attention sub-breakdown --
+                qk_emb = pool_p['qk_emb']
+                v_emb = pool_p['v_emb']
+                qk_w_enc = pool_p['qk_w_enc']
+                qk_w_dec = pool_p['qk_w_dec']
+                v_w_enc = pool_p['v_w_enc']
+                v_w_dec = pool_p['v_w_dec']
+                qk_n = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
+                v_n = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
+                pa_k = router_p['proj_attn']['kernel']
+                pa_b = router_p['proj_attn']['bias']
+                ta_k = router_p['tau_attn']['kernel']
+                ta_b = router_p['tau_attn']['bias']
+                O_k = block_p['attn']['expand_O']['kernel']
+                d_head = d_model // n_heads
+                B_prof, S_prof = per_device_batch, max_seq_len
 
-                print(f"\n  --- Knowledge sub-breakdown ---", flush=True)
-                print(f"  Route score:    {route_ms:.1f} ms "
-                      f"({route_ms/know_ms*100:.0f}%)", flush=True)
-                print(f"  threshold_gate: {gate_ms:.1f} ms "
-                      f"({gate_ms/know_ms*100:.0f}%)", flush=True)
-                print(f"  emit_bottleneck:{emit_ms:.1f} ms "
-                      f"({emit_ms/know_ms*100:.0f}%)", flush=True)
-                print(f"  Sum: {route_ms+gate_ms+emit_ms:.1f} ms "
-                      f"(know total: {know_ms:.1f} ms)", flush=True)
+                h_a = normed @ pa_k + pa_b
+                h_Q, h_K, h_V = jnp.split(h_a, 3, axis=-1)
+                tau_a = normed @ ta_k + ta_b
+                g_Q = tg_fn(h_Q @ qk_n.T, tau_a[:,:,0:1], max_k_qk)
+                g_K = tg_fn(h_K @ qk_n.T, tau_a[:,:,1:2], max_k_qk)
+                g_V = tg_fn(h_V @ v_n.T, tau_a[:,:,2:3], max_k_v)
+                Q_p = emit_bottleneck(g_Q, qk_w_enc, qk_w_dec)
+                K_p = emit_bottleneck(g_K, qk_w_enc, qk_w_dec)
+                V_p = emit_bottleneck(g_V, v_w_enc, v_w_dec)
+
+                a_route = _time_fn(lambda: jnp.split(normed @ pa_k + pa_b, 3, axis=-1)[0] @ qk_n.T)
+                a_gate_qkv = _time_fn(lambda: (
+                    tg_fn(h_Q @ qk_n.T, tau_a[:,:,0:1], max_k_qk),
+                    tg_fn(h_K @ qk_n.T, tau_a[:,:,1:2], max_k_qk),
+                    tg_fn(h_V @ v_n.T, tau_a[:,:,2:3], max_k_v)))
+                a_emit_qkv = _time_fn(lambda: (
+                    emit_bottleneck(g_Q, qk_w_enc, qk_w_dec),
+                    emit_bottleneck(g_K, qk_w_enc, qk_w_dec),
+                    emit_bottleneck(g_V, v_w_enc, v_w_dec)))
+
+                # Self-attention timing
+                Qr = Q_p.reshape(B_prof, S_prof, n_heads, d_head).transpose(0,2,1,3)
+                Kr = K_p.reshape(B_prof, S_prof, n_heads, d_head).transpose(0,2,1,3)
+                Vr = V_p.reshape(B_prof, S_prof, n_heads, d_head).transpose(0,2,1,3)
+                scale = jnp.sqrt(jnp.float32(d_head))
+                causal = jnp.tril(jnp.ones((S_prof, S_prof), dtype=jnp.bool_))
+
+                def _self_attn():
+                    sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+                    sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+                    w = jax.nn.softmax(sc, axis=-1)
+                    o = jnp.einsum('bhst,bhtd->bhsd', w, Vr)
+                    return o.transpose(0,2,1,3).reshape(B_prof, S_prof, d_model) @ O_k
+
+                a_selfattn = _time_fn(_self_attn)
+
+                print(f"\n  --- Attention sub-breakdown (of {attn_ms:.1f} ms) ---",
+                      flush=True)
+                print(f"    route score:    {a_route:.1f} ms", flush=True)
+                print(f"    gate Q+K+V:     {a_gate_qkv:.1f} ms", flush=True)
+                print(f"    emit Q+K+V:     {a_emit_qkv:.1f} ms", flush=True)
+                print(f"    self-attention:  {a_selfattn:.1f} ms", flush=True)
             except Exception as e:
                 print(f"  Breakdown skipped: {e}", flush=True)
 
