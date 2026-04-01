@@ -360,13 +360,13 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
 
-    d_bottleneck: int = 64    # routing emb dim
-    n_qk: int = 1570
-    n_v: int = 2620
-    n_know: int = 21000
-    max_k_qk: int = 157
-    max_k_v: int = 262
-    max_k_know: int = 1536
+    d_bottleneck: int = 64
+    n_qk: int = 2500
+    n_v: int = 4000
+    n_know: int = 52500
+    max_k_qk: int = 250
+    max_k_v: int = 400
+    max_k_know: int = 3780
     router_dropout: float = 0.1
 
     def setup(self):
