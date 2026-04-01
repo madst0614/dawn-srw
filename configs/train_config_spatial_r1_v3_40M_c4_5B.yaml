@@ -1,5 +1,6 @@
-# DAWN Spatial-R1 v3.3 -- Low-dim Routing + Sparse Gather, 40M Scale, 5B tokens
-# d_space=64 routing scores 21K neurons cheaply, then top_k gather for sense_emit.
+# DAWN Spatial-R1 v3.4 -- Low-dim Sense + Full-dim Emit, 40M Scale, 5B tokens
+# emb[d_sense=64] for routing/sense, w[d_model=384] for emit.
+# sense = gate @ w (emit only). No gather.
 
 seed: 1
 
@@ -11,7 +12,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.3.0"
+  model_version: "spatial-r1-v3.4.0"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -19,7 +20,7 @@ model:
   dropout: 0.1
   gradient_checkpointing: true
 
-  d_space: 64
+  d_sense: 64
   n_qk: 1570
   n_v: 2620
   n_know: 21000
@@ -41,15 +42,14 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.3_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.3_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.4_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.4_40M_c4_5B
 
-# Parameter budget (~34.8M):
-#   QK:   1570 x 384 x 2 (emb+w) = 1.21M
-#   V:    2620 x 384 x 2          = 2.01M
-#   Know: 21000 x 384 x 2         = 16.13M
-#   Router emb: 25190 x 64        = 1.61M
-#   Router proj + tau:               ~0.10M
-#   Blocks (LN x2 + O_proj) x12:  1.79M
-#   Embeddings (tok + pos):       11.92M
-#   Total:                        ~34.8M
+# Parameter budget:
+#   QK:   1570 x (64+384)   = 0.70M
+#   V:    2620 x (64+384)   = 1.17M
+#   Know: 21000 x (64+384)  = 9.41M
+#   Router proj + tau:         ~0.10M
+#   Blocks (LN x2 + O) x12: 1.79M
+#   Embeddings:             11.92M
+#   Total:                  ~25.1M

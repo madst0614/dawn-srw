@@ -119,7 +119,7 @@ def build_model_from_config(cfg):
             n_layers=mcfg.get('n_layers', 12),
             n_heads=mcfg.get('n_heads', 6),
             max_seq_len=mcfg.get('max_seq_len', 512),
-            d_space=mcfg.get('d_space', 64),
+            d_sense=mcfg.get('d_sense', mcfg.get('d_space', 64)),
             n_qk=mcfg.get('n_qk', 1570),
             n_v=mcfg.get('n_v', 2620),
             n_know=mcfg.get('n_know', 21000),
