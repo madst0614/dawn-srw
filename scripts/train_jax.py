@@ -570,28 +570,20 @@ def shard_params_to_mesh(params, param_shardings):
         params, param_shardings)
 
 
-def shard_to_mesh(data, sharding, mesh, global_batch_size):
+def shard_to_mesh(data, sharding, global_shape):
     """Multi-host: place each host's local data on its local devices.
 
-    Splits per_host_batch across local devices that are on the 'data' axis.
-    Replicates to local devices on the 'model' axis.
+    data: [per_host_batch, ...] — this host's data shard
+    sharding: NamedSharding — determines how to split across local devices
+    global_shape: tuple — shape of the full global array
     """
-    local_devs = mesh.local_devices
+    local_devs = sharding.mesh.local_devices
     n_local = len(local_devs)
-    global_shape = (global_batch_size,) + data.shape[1:]
-
-    # Determine how many local devices are on data vs model axis
-    mesh_model = mesh.shape['model'] if 'model' in mesh.axis_names else 1
-    n_data_local = n_local // mesh_model  # local devices on data axis
-    per_device = data.shape[0] // n_data_local
-
-    local_arrays = []
-    for i, d in enumerate(local_devs):
-        # Which data shard this device gets
-        data_idx = i // mesh_model  # data position among local devices
-        local_arrays.append(
-            jax.device_put(data[data_idx * per_device:(data_idx + 1) * per_device], d))
-
+    per_device = data.shape[0] // n_local
+    local_arrays = [
+        jax.device_put(data[i * per_device:(i + 1) * per_device], d)
+        for i, d in enumerate(local_devs)
+    ]
     return jax.make_array_from_single_device_arrays(
         global_shape, sharding, local_arrays)
 
@@ -634,12 +626,10 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             break
 
         if data_sharding_spec is not None:
-            input_ids = shard_to_mesh(
-                input_ids, data_sharding_spec, data_sharding_spec.mesh,
-                input_ids.shape[0] * jax.process_count())
-            attention_mask = shard_to_mesh(
-                attention_mask, data_sharding_spec, data_sharding_spec.mesh,
-                attention_mask.shape[0] * jax.process_count())
+            gb = input_ids.shape[0] * jax.process_count()
+            gs = (gb, input_ids.shape[1])
+            input_ids = shard_to_mesh(input_ids, data_sharding_spec, gs)
+            attention_mask = shard_to_mesh(attention_mask, data_sharding_spec, gs)
 
         ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
 
@@ -1204,9 +1194,37 @@ def main():
     data_sharding = NamedSharding(mesh, P('data', None))
     per_device_batch = batch_size // total_devices
 
+    # Auto n_chunks: target ~2GB per chunk (bf16)
+    def auto_n_chunks(N, target_gb=2.0):
+        full_gb = per_device_batch * max_seq_len * N * 2 / 1e9  # bf16
+        nc = max(1, int(np.ceil(full_gb / target_gb)))
+        while N % nc != 0 and nc < N:
+            nc += 1
+        return min(nc, N)
+
+    target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
+    n_know = cfg['model'].get('n_know', 25200)
+    n_qk = cfg['model'].get('n_qk', 1580)
+    n_v = cfg['model'].get('n_v', 2600)
+    # N_local = N / mesh_model (each chip's share)
+    nk_local = n_know // mesh_model
+    nqk_local = n_qk // mesh_model
+    nv_local = n_v // mesh_model
+
+    n_chunks_know = cfg['training'].get('n_chunks_know',
+                                         auto_n_chunks(nk_local, target_chunk_gb))
+    n_chunks_qk = cfg['training'].get('n_chunks_qk',
+                                       auto_n_chunks(nqk_local, target_chunk_gb))
+    n_chunks_v = cfg['training'].get('n_chunks_v',
+                                      auto_n_chunks(nv_local, target_chunk_gb))
+
     if is_host0:
         print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
+        print(f"  Chunks: know={n_chunks_know} (cs={nk_local // max(n_chunks_know,1)}), "
+              f"qk={n_chunks_qk}, v={n_chunks_v}")
+        chunk_mem = per_device_batch * max_seq_len * (nk_local // max(n_chunks_know,1)) * 2 / 1e9
+        print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
     param_shardings = get_param_shardings(params, mesh)
@@ -1227,12 +1245,13 @@ def main():
         print(f"\n=== OOM check: real train_step (forward+backward) "
               f"per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
     try:
+        global_shape = (batch_size, max_seq_len)
         dummy_ids = shard_to_mesh(
             jnp.zeros((per_host_batch, max_seq_len), dtype=jnp.int32),
-            data_sharding, mesh, batch_size)
+            data_sharding, global_shape)
         dummy_mask = shard_to_mesh(
             jnp.ones((per_host_batch, max_seq_len), dtype=jnp.int32),
-            data_sharding, mesh, batch_size)
+            data_sharding, global_shape)
         rng, dummy_step_rng = jax.random.split(rng)
 
         # First call: JIT compilation (slow)
@@ -1562,8 +1581,11 @@ def main():
 
             # Shard data and run train step
             rng, step_rng = jax.random.split(rng)
-            input_ids = shard_to_mesh(input_ids, data_sharding, mesh, batch_size)
-            attention_mask = shard_to_mesh(attention_mask, data_sharding, mesh, batch_size)
+            step_rng = jax.random.fold_in(step_rng, host_id)  # per-host dropout
+            input_ids = shard_to_mesh(
+                input_ids, data_sharding, (batch_size, max_seq_len))
+            attention_mask = shard_to_mesh(
+                attention_mask, data_sharding, (batch_size, max_seq_len))
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
