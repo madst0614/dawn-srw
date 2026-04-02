@@ -431,7 +431,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     """Create a jit-compiled training step. Mesh SPMD handles parallelism."""
 
     @jax.jit
-    def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
+    def train_step(params, opt_state, input_ids, attention_mask, dropout_key, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
@@ -456,7 +456,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 total_loss = ce_loss
             elif is_spatial:
                 orth_loss = jnp.float32(0.0)
-                div_loss = compute_spatial_diversity_loss(params)
+                div_loss = jax.lax.cond(
+                    step % 100 == 0,
+                    lambda p: compute_spatial_diversity_loss(p),
+                    lambda p: jnp.float32(0.0),
+                    params)
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
                               + pos_loss_weight * aux_loss
@@ -1267,7 +1271,7 @@ def main():
     _sharded_fns = None
     if mesh_model > 1:
         from models.dawn_spatial_v3 import make_sharded_srw, make_sharded_srw_paired
-        max_chunk = cfg['training'].get('max_chunk_size', 8192)
+        max_chunk = cfg['training'].get('max_chunk_size', 50000)
         _sharded_single = make_sharded_srw(mesh, max_chunk_size=max_chunk)
         _sharded_paired = make_sharded_srw_paired(mesh, max_chunk_size=max_chunk)
         _sharded_fns = (_sharded_single, _sharded_paired)
@@ -1300,7 +1304,7 @@ def main():
         # First call: JIT compilation (slow)
         jit_start = time.time()
         _dp, _do, dummy_metrics = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng)
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng, jnp.int32(0))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         if is_host0:
@@ -1310,7 +1314,7 @@ def main():
         rng, dummy_step_rng2 = jax.random.split(rng)
         step_start = time.time()
         _dp2, _do2, dummy_metrics2 = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2)
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2, jnp.int32(1))
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -1790,7 +1794,8 @@ def main():
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, step_rng)
+                input_ids, attention_mask, step_rng,
+                jnp.int32(global_step))
 
             # Extract metrics (scalars from jit, no [0] indexing)
             def _m(v):

@@ -181,8 +181,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             sc = h_bf @ ec.T
             raw = sc - tau_bf
             gc = jnp.where(raw > 0, raw,
-                            (1e-4 * jax.nn.softplus(
-                                raw.astype(jnp.float32))).astype(jnp.bfloat16))
+                            1e-4 * jax.nn.softplus(raw))
             gc = jnp.clip(gc, 0.0, 10.0)
             eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
             ef = eg.astype(jnp.float32)
@@ -282,8 +281,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             sc = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = sc - tau_bf  # [B,S,2,cs]
             gc = jnp.where(raw > 0, raw,
-                            (1e-4 * jax.nn.softplus(
-                                raw.astype(jnp.float32))).astype(jnp.bfloat16))
+                            1e-4 * jax.nn.softplus(raw))
             gc = jnp.clip(gc, 0.0, 10.0)
             eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)  # [B,S,2,cs]
             ef = eg.astype(jnp.float32)
@@ -359,7 +357,7 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
         sc = h_bf @ ec.T
         raw = sc - tau_bf
         gc = jnp.where(raw > 0, raw,
-                        (1e-4*jax.nn.softplus(raw.astype(jnp.float32))).astype(jnp.bfloat16))
+                        1e-4 * jax.nn.softplus(raw))
         gc = jnp.clip(gc, 0.0, 10.0)
         eg = (jnp.exp(gc.astype(jnp.float32))-1.0).astype(jnp.bfloat16)
         ef = eg.astype(jnp.float32)
