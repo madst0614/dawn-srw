@@ -571,19 +571,14 @@ def shard_params_to_mesh(params, param_shardings):
 
 
 def shard_to_mesh(data, sharding, global_shape):
-    """Multi-host: place each host's local data on its local devices.
-
-    data: [per_host_batch, ...] — this host's data shard
-    sharding: NamedSharding — determines how to split across local devices
-    global_shape: tuple — shape of the full global array
-    """
+    """Multi-host: place each host's local data on its local devices."""
     local_devs = sharding.mesh.local_devices
     n_local = len(local_devs)
     per_device = data.shape[0] // n_local
-    local_arrays = [
-        jax.device_put(data[i * per_device:(i + 1) * per_device], d)
-        for i, d in enumerate(local_devs)
-    ]
+    local_arrays = []
+    for i, d in enumerate(local_devs):
+        shard = jnp.array(data[i * per_device:(i + 1) * per_device])
+        local_arrays.append(jax.device_put(shard, d))
     return jax.make_array_from_single_device_arrays(
         global_shape, sharding, local_arrays)
 
