@@ -159,19 +159,17 @@ def make_sharded_srw(mesh, max_chunk_size=4096):
         local_exp_sum = ef.sum(axis=-1, keepdims=True)
         local_exp_max = ef.max(axis=-1, keepdims=True)
         global_exp_sum = jax.lax.psum(local_exp_sum, 'model') + 1e-4
-        # pmax not differentiable — wrap in stop_gradient (gate_strength is scaling only)
-        global_exp_max = jax.lax.stop_gradient(
-            jax.lax.pmax(local_exp_max, 'model'))
+        # gate_strength: stop_gradient local tanh(max) — no pmax needed
+        # tanh saturates, so local ≈ global. No gradient through scaling.
+        gate_strength = jax.lax.stop_gradient(
+            jnp.tanh(local_exp_max)).astype(jnp.bfloat16)
 
         ratio = eg / global_exp_sum.astype(jnp.bfloat16)
-        gate_strength = jnp.tanh(global_exp_max).astype(jnp.bfloat16)
         gate = ratio * gate_strength
 
         active = (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
         active = jax.lax.psum(active, 'model')
-        gmax = global_exp_max
-
-        return gate, active / N_total, gmax
+        return gate, active / N_total, local_exp_max
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),     # x [B,S,D]
