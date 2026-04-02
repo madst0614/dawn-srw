@@ -110,22 +110,30 @@ def threshold_gate(scores, tau_offset):
 
 @jax.checkpoint
 def _gate_and_read(x, h, emb_norm, tau_offset, w_read):
-    """Score → gate → read → gated_read. One checkpoint boundary.
-    Returns gated_read [B,S,N] only (intermediates freed).
+    """Score → gate → read → gated_read. bf16 for [B,S,N] intermediates.
+    threshold_gate internals (mean/std) stay f32 for numerical stability.
     """
-    scores = h @ emb_norm.T                                          # [B,S,N]
-    gate = threshold_gate(scores, tau_offset)                         # [B,S,N]
-    x_read = x @ w_read.T                                            # [B,S,N]
-    gated_read = gate * x_read                                        # [B,S,N]
+    x = x.astype(jnp.bfloat16)
+    h = h.astype(jnp.bfloat16)
+    emb_norm = emb_norm.astype(jnp.bfloat16)
+    w_read = w_read.astype(jnp.bfloat16)
+
+    scores = h @ emb_norm.T                                          # bf16 [B,S,N]
+    gate = threshold_gate(scores.astype(jnp.float32), tau_offset)    # f32 gate
+    gate = gate.astype(jnp.bfloat16)                                  # bf16
+    x_read = x @ w_read.T                                            # bf16 [B,S,N]
+    gated_read = gate * x_read                                        # bf16 [B,S,N]
     active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
-    gate_max_val = gate.max(axis=-1).mean()
-    # gate needed for aux loss — return it too (small relative to [B,S,N])
-    return gated_read, gate, active_count, gate_max_val
+    gate_max_val = gate.max(axis=-1).astype(jnp.float32).mean()
+    return gated_read, gate.astype(jnp.float32), active_count, gate_max_val
 
 
 @jax.checkpoint
 def _write(gated_read, w_write):
-    """gated_read @ write → [B,S,D]. Separate checkpoint."""
+    """gated_read @ write → [B,S,D]. bf16 matmul, f32 output."""
+    w_write = w_write.astype(jnp.bfloat16)
+    out = gated_read @ w_write                                        # bf16 [B,S,D]
+    return out.astype(jnp.float32)                                    # f32 output
     return gated_read @ w_write                                       # [B,S,D]
 
 
