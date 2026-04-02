@@ -112,26 +112,92 @@ def threshold_gate(scores, tau_offset):
 #    saving [B,S,N] intermediates
 # ================================================================
 
-@partial(jax.checkpoint,
-         policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
-def _know_core(x, h, emb_norm, tau_offset, w_read, w_write):
-    """Fused gate + sense_read_write. bf16 matmul, f32 gate internals.
+def _know_core(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks=1):
+    """Gate + sense_read_write. bf16.
 
-    No N-axis chunking (mesh_model handles N-axis sharding).
-    checkpoint policy avoids saving [B,S,N] intermediates.
+    n_chunks=1: fused (for mesh_model>1 where N is already sharded)
+    n_chunks>1: N-axis chunked scan (for data-only parallel, mesh_model=1)
     """
-    scores = h.astype(jnp.bfloat16) @ emb_norm.astype(jnp.bfloat16).T
-    gate = threshold_gate(scores, tau_offset)
+    B, S, D = x.shape
+    N = emb_norm.shape[0]
 
+    if n_chunks <= 1:
+        # --- Fused path (mesh_model>1: N already sharded across chips) ---
+        scores = h.astype(jnp.bfloat16) @ emb_norm.astype(jnp.bfloat16).T
+        gate = threshold_gate(scores, tau_offset)
+        gate_bf = gate.astype(jnp.bfloat16)
+        x_bf = x.astype(jnp.bfloat16)
+        x_read = x_bf @ w_read.astype(jnp.bfloat16).T
+        out = (gate_bf * x_read) @ w_write.astype(jnp.bfloat16)
+        active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
+        gate_max_val = gate.max(axis=-1).mean()
+        return out.astype(jnp.float32), active_count, gate_max_val
+
+    # --- Chunked path (data-only parallel: N not sharded, chunk locally) ---
+    cs = N // n_chunks
+
+    h_bf = h.astype(jnp.bfloat16)
     x_bf = x.astype(jnp.bfloat16)
-    gate_bf = gate.astype(jnp.bfloat16)
-    x_read = x_bf @ w_read.astype(jnp.bfloat16).T
-    gated_read = gate_bf * x_read
-    out = gated_read @ w_write.astype(jnp.bfloat16)
+    emb_c = emb_norm.astype(jnp.bfloat16).reshape(n_chunks, cs, -1)
+    read_c = w_read.astype(jnp.bfloat16).reshape(n_chunks, cs, -1)
+    write_c = w_write.astype(jnp.bfloat16).reshape(n_chunks, cs, -1)
 
-    active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
-    gate_max_val = gate.max(axis=-1).mean()
+    z1 = jnp.zeros((B, S, 1))
 
+    # Pass 0: scores stats → tau
+    def p0(carry, ec):
+        ss, sq = carry
+        sc = h_bf @ ec.T
+        sf = sc.astype(jnp.float32)
+        return (ss + sf.sum(axis=-1, keepdims=True),
+                sq + (sf ** 2).sum(axis=-1, keepdims=True)), None
+
+    (s_sum, sq_sum), _ = jax.lax.scan(p0, (z1, z1), emb_c)
+    s_mean = s_sum / N
+    s_std = jnp.sqrt(sq_sum / N - s_mean ** 2) + 1e-8
+    tau = s_mean + tau_offset * s_std
+    tau_bf = tau.astype(jnp.bfloat16)
+
+    # Pass 1: gate stats
+    def p1(carry, ec):
+        es, em, ac = carry
+        sc = h_bf @ ec.T
+        raw = sc - tau_bf
+        gc = jnp.where(raw > 0, raw,
+                        (1e-4 * jax.nn.softplus(raw.astype(jnp.float32))
+                         ).astype(jnp.bfloat16))
+        gc = jnp.clip(gc, 0.0, 10.0)
+        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+        ef = eg.astype(jnp.float32)
+        return (es + ef.sum(axis=-1, keepdims=True),
+                jnp.maximum(em, ef.max(axis=-1, keepdims=True)),
+                ac + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
+
+    (t_es, t_em, t_ac), _ = jax.lax.scan(
+        p1, (z1, jnp.full((B, S, 1), -1e9), z1), emb_c)
+    gs = jnp.tanh(t_em).astype(jnp.bfloat16)
+    inv_es = (1.0 / (t_es + 1e-4)).astype(jnp.bfloat16)
+
+    # Pass 2: normalized gate × srw
+    def p2(acc, data):
+        ec, rc, wc = data
+        sc = h_bf @ ec.T
+        raw = sc - tau_bf
+        gc = jnp.where(raw > 0, raw,
+                        (1e-4 * jax.nn.softplus(raw.astype(jnp.float32))
+                         ).astype(jnp.bfloat16))
+        gc = jnp.clip(gc, 0.0, 10.0)
+        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+        ng = eg * inv_es * gs
+        xr = x_bf @ rc.T
+        return acc + (ng * xr) @ wc, None
+
+    out, _ = jax.lax.scan(
+        p2, jnp.zeros((B, S, D), dtype=jnp.bfloat16),
+        (emb_c, read_c, write_c))
+
+    active_count = (t_ac / N).mean()
+    gate_max_val = t_em.mean()
     return out.astype(jnp.float32), active_count, gate_max_val
 
 
@@ -316,7 +382,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
 def _know_forward(x, pool_params, router_params, rng,
                   max_k_know,
-                  router_dropout, dropout_rate, deterministic):
+                  router_dropout, dropout_rate, deterministic,
+                  n_chunks_know=1):
     know_emb = pool_params['know_emb']
     know_read = pool_params['know_read']
     know_write = pool_params['know_write']
@@ -329,9 +396,8 @@ def _know_forward(x, pool_params, router_params, rng,
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
     # N-axis chunked core: 3-pass (stats, gate_stats, srw)
-    n_chunks = 4  # TODO: make configurable
     out, active_count, gate_max_val = _know_core(
-        x, h, know_norm, tau, know_read, know_write, n_chunks)
+        x, h, know_norm, tau, know_read, know_write, n_chunks_know)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -453,6 +519,7 @@ class DAWN(nn.Module):
     max_k_v: int = 260
     max_k_know: int = 1810
     router_dropout: float = 0.1
+    n_chunks_know: int = 1    # 1=fused (mesh_model>1), >1=chunked (data-only)
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -531,7 +598,8 @@ class DAWN(nn.Module):
                 know_out, know_aux, know_active, know_gmax = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.max_k_know,
-                    self.router_dropout, self.dropout_rate, deterministic)
+                    self.router_dropout, self.dropout_rate, deterministic,
+                    self.n_chunks_know)
                 x = x + know_out
                 return x, (attn_aux + know_aux, know_active, know_gmax)
 

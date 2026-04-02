@@ -131,6 +131,7 @@ def build_model_from_config(cfg):
             dropout_rate=mcfg.get('dropout', 0.1),
             router_dropout=mcfg.get('router_dropout', 0.1),
             gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
         )
     elif version.startswith('spatial-r1-v2'):
         model = DAWN_SpatialV2(
