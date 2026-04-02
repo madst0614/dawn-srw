@@ -26,10 +26,9 @@ Architecture:
   NeuronPool        -- emb[N,d_bn] + w_read[N,D] + w_write[N,D]
   Router            -- proj + tau. Uses pool emb for routing.
   threshold_gate    -- element-wise threshold, no top_k
-  _gate_and_read  -- @jax.checkpoint: score+gate+read → gated_read[B,S,N]
-  _write          -- @jax.checkpoint: gated_read @ write → [B,S,D]
-  _attn_forward   -- two-stage checkpoint QKV -> self-attn
-  _know_forward   -- two-stage checkpoint
+  _know_core/_attn_core -- checkpoint(dots_saveable): bf16 gate+read+write fused
+  _attn_forward   -- _attn_core per Q/K/V -> self-attn
+  _know_forward   -- _know_core
   DAWN              -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
@@ -103,37 +102,45 @@ def threshold_gate(scores, tau_offset):
 
 
 # ================================================================
-# 3. Two-stage checkpointed sense-read-write
-#    Stage 1: gate + read → gated_read [B,S,N] (max 2 [B,S,N] alive)
-#    Stage 2: gated_read @ write → [B,S,D] (1 [B,S,N] alive)
+# 3. Core compute: gate + sense_read_write in one checkpoint
+#    bf16 matmul, f32 threshold_gate, checkpoint policy avoids
+#    saving [B,S,N] intermediates
 # ================================================================
 
-@jax.checkpoint
-def _gate_and_read(x, h, emb_norm, tau_offset, w_read):
-    """Score → gate → read → gated_read. bf16 for [B,S,N] intermediates.
-    threshold_gate internals (mean/std) stay f32 for numerical stability.
+@partial(jax.checkpoint,
+         policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+def _know_core(x, h, emb_norm, tau_offset, w_read, w_write):
+    """Routing + gate + sense_read_write fused. bf16 matmul, f32 gate.
+
+    checkpoint policy: saves only dot products with no batch dims
+    (i.e. small tensors), recomputes [B,S,N] intermediates.
     """
-    x = x.astype(jnp.bfloat16)
-    h = h.astype(jnp.bfloat16)
-    emb_norm = emb_norm.astype(jnp.bfloat16)
-    w_read = w_read.astype(jnp.bfloat16)
+    scores = h.astype(jnp.bfloat16) @ emb_norm.astype(jnp.bfloat16).T  # bf16 [B,S,N]
+    gate = threshold_gate(scores.astype(jnp.float32), tau_offset)        # f32 [B,S,N]
 
-    scores = h @ emb_norm.T                                          # bf16 [B,S,N]
-    gate = threshold_gate(scores.astype(jnp.float32), tau_offset)    # f32 gate
-    gate = gate.astype(jnp.bfloat16)                                  # bf16
-    x_read = x @ w_read.T                                            # bf16 [B,S,N]
-    gated_read = gate * x_read                                        # bf16 [B,S,N]
-    active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
-    gate_max_val = gate.max(axis=-1).astype(jnp.float32).mean()
-    return gated_read, gate.astype(jnp.float32), active_count, gate_max_val
+    gate_bf = gate.astype(jnp.bfloat16)
+    x_bf = x.astype(jnp.bfloat16)
+    x_read = x_bf @ w_read.astype(jnp.bfloat16).T                       # bf16 [B,S,N]
+    gated_read = gate_bf * x_read                                        # bf16 [B,S,N]
+    out = gated_read @ w_write.astype(jnp.bfloat16)                     # bf16 [B,S,D]
+
+    return out.astype(jnp.float32), gate
 
 
-@jax.checkpoint
-def _write(gated_read, w_write):
-    """gated_read @ write → [B,S,D]. bf16 matmul, f32 output."""
-    w_write = w_write.astype(jnp.bfloat16)
-    out = gated_read @ w_write                                        # bf16 [B,S,D]
-    return out.astype(jnp.float32)                                    # f32 output
+@partial(jax.checkpoint,
+         policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable)
+def _attn_core(x, h, emb_norm, tau_offset, w_read, w_write):
+    """Same as _know_core but for one Q/K/V head."""
+    scores = h.astype(jnp.bfloat16) @ emb_norm.astype(jnp.bfloat16).T
+    gate = threshold_gate(scores.astype(jnp.float32), tau_offset)
+
+    gate_bf = gate.astype(jnp.bfloat16)
+    x_bf = x.astype(jnp.bfloat16)
+    x_read = x_bf @ w_read.astype(jnp.bfloat16).T
+    gated_read = gate_bf * x_read
+    out = gated_read @ w_write.astype(jnp.bfloat16)
+
+    return out.astype(jnp.float32), gate
     return gated_read @ w_write                                       # [B,S,D]
 
 
@@ -261,13 +268,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-    # Two-stage checkpoint for each of Q, K, V
-    gr_Q, g_Q, _, _ = _gate_and_read(x, h_Q, qk_norm, tau_all[:, :, 0:1], qk_read)
-    Q = _write(gr_Q, qk_write)
-    gr_K, g_K, _, _ = _gate_and_read(x, h_K, qk_norm, tau_all[:, :, 1:2], qk_read)
-    K = _write(gr_K, qk_write)
-    gr_V, g_V, _, _ = _gate_and_read(x, h_V, v_norm, tau_all[:, :, 2:3], v_read)
-    V = _write(gr_V, v_write)
+    # Core compute for Q, K, V (bf16 matmul, f32 gate)
+    Q, g_Q = _attn_core(x, h_Q, qk_norm, tau_all[:, :, 0:1], qk_read, qk_write)
+    K, g_K = _attn_core(x, h_K, qk_norm, tau_all[:, :, 1:2], qk_read, qk_write)
+    V, g_V = _attn_core(x, h_V, v_norm, tau_all[:, :, 2:3], v_read, v_write)
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -316,10 +320,12 @@ def _know_forward(x, pool_params, router_params, rng,
     know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
-    # Two-stage checkpoint: gate+read then write
-    gated_read, gate, active_count, gate_max_val = _gate_and_read(
-        x, h, know_norm, tau, know_read)
-    out = _write(gated_read, know_write)
+    # Core compute: gate + sense_read_write (bf16 matmul, f32 gate)
+    out, gate = _know_core(x, h, know_norm, tau, know_read, know_write)
+
+    # Gate stats (from f32 gate, outside checkpoint)
+    active_count = (gate > 1e-6).sum(axis=-1).astype(jnp.float32).mean()
+    gate_max_val = gate.max(axis=-1).mean()
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
