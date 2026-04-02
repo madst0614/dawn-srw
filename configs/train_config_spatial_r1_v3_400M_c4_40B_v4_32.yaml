@@ -29,11 +29,11 @@ model:
 
 training:
   batch_size: 1024
-  mesh_model: 1
-  mesh_data: 16
-  n_chunks_know: 8
-  n_chunks_qk: 2
-  n_chunks_v: 4
+  mesh_model: 4
+  mesh_data: 4
+  n_chunks_know: 4
+  n_chunks_qk: 1
+  n_chunks_v: 1
   gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.0003

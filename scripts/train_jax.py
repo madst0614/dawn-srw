@@ -427,7 +427,7 @@ def compute_spatial_diversity_loss(params):
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       is_baseline=False, is_spatial=False,
-                      pos_loss_weight=0.0):
+                      pos_loss_weight=0.0, sharded_fns=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism."""
 
     @jax.jit
@@ -435,6 +435,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
+            extra_kw = {}
+            if sharded_fns is not None:
+                extra_kw['sharded_fns'] = sharded_fns
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -442,6 +445,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 attention_mask=attention_mask,
                 deterministic=False,
                 rngs={'dropout': dropout_key},
+                **extra_kw,
             )
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
@@ -1235,11 +1239,19 @@ def main():
     params = shard_params_to_mesh(params, param_shardings)
     opt_state = optimizer.init(params)  # reinit with sharded params
 
+    # Create shard_map functions if mesh_model > 1
+    _sharded_fns = None
+    if mesh_model > 1:
+        from models.dawn_spatial_v3 import make_sharded_srw
+        _sharded_fns = make_sharded_srw(mesh, n_chunks_know)
+        if is_host0:
+            print(f"  shard_map enabled (mesh_model={mesh_model})")
+
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
-        pos_loss_weight=pos_loss_weight)
+        pos_loss_weight=pos_loss_weight, sharded_fns=_sharded_fns)
     eval_step_fn = create_eval_step(model)
 
     # ----------------------------------------------------------
