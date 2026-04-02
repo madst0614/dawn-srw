@@ -1663,6 +1663,11 @@ def main():
                 print(f"  Breakdown failed: {e}", flush=True)
                 traceback.print_exc()
 
+        # Clear XLA compilation cache and free profiling memory
+        import gc
+        gc.collect()
+        jax.clear_caches()
+
         if is_host0:
             # Estimate total training time
             total_steps = len(train_loader) * num_epochs
