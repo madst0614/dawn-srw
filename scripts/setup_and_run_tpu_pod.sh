@@ -13,7 +13,12 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+GH_TOKEN="${GH_TOKEN:-}"
+if [ -n "$GH_TOKEN" ]; then
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/dawn-spatial.git"
+else
+    REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+fi
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
 WORK_DIR="$HOME/dawn-spatial"

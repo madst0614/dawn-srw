@@ -23,6 +23,7 @@ ZONE="us-central2-b"
 PROJECT="dawn-486218"
 BRANCH="main"
 CONFIG="configs/train_config_v17_1_tpu_400M_c4_5B_v4_64.yaml"
+GH_TOKEN=""
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -32,14 +33,16 @@ while [[ $# -gt 0 ]]; do
         --project)  PROJECT="$2";  shift 2 ;;
         --branch)   BRANCH="$2";   shift 2 ;;
         --config)   CONFIG="$2";   shift 2 ;;
+        --token)    GH_TOKEN="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN]"
             echo ""
             echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
             echo "  --zone     GCP zone            (default: $ZONE)"
             echo "  --project  GCP project          (default: $PROJECT)"
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
+            echo "  --token    GitHub access token   (for private repos)"
             exit 0
             ;;
         *)
@@ -65,7 +68,11 @@ gcloud compute tpus tpu-vm describe "$TPU_NAME" \
     --project="$PROJECT" \
     --format="value(state)"
 
-REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+if [ -n "$GH_TOKEN" ]; then
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/dawn-spatial.git"
+else
+    REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+fi
 
 # Build inline bootstrap: clone/update repo first, then run setup script
 read -r -d '' REMOTE_CMD <<EOFCMD || true
@@ -73,7 +80,8 @@ set -e
 REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 CONFIG='${CONFIG}'
-export BRANCH CONFIG
+GH_TOKEN='${GH_TOKEN}'
+export BRANCH CONFIG GH_TOKEN
 
 # Bootstrap: ensure ~/dawn-spatial exists with the right branch
 if [ -d ~/dawn-spatial/.git ]; then
