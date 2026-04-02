@@ -567,6 +567,26 @@ def shard_params_to_mesh(params, param_shardings):
         params, param_shardings)
 
 
+def shard_to_mesh(data, sharding, mesh, global_batch_size):
+    """Multi-host: place each host's local data on its local devices.
+
+    data: [per_host_batch, ...] numpy/jax array (host-local)
+    sharding: NamedSharding with P('data', None)
+    mesh: Mesh
+    global_batch_size: total batch size across all hosts
+    """
+    local_devs = mesh.local_devices
+    n_local = len(local_devs)
+    per_device = data.shape[0] // n_local
+    local_arrays = [
+        jax.device_put(data[i * per_device:(i + 1) * per_device], d)
+        for i, d in enumerate(local_devs)
+    ]
+    global_shape = (global_batch_size,) + data.shape[1:]
+    return jax.make_array_from_single_device_arrays(
+        global_shape, sharding, local_arrays)
+
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -605,8 +625,12 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             break
 
         if data_sharding_spec is not None:
-            input_ids = jax.device_put(input_ids, data_sharding_spec)
-            attention_mask = jax.device_put(attention_mask, data_sharding_spec)
+            input_ids = shard_to_mesh(
+                input_ids, data_sharding_spec, data_sharding_spec.mesh,
+                input_ids.shape[0] * jax.process_count())
+            attention_mask = shard_to_mesh(
+                attention_mask, data_sharding_spec, data_sharding_spec.mesh,
+                attention_mask.shape[0] * jax.process_count())
 
         ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
 
@@ -1194,12 +1218,12 @@ def main():
         print(f"\n=== OOM check: real train_step (forward+backward) "
               f"per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
     try:
-        dummy_ids = jax.device_put(
+        dummy_ids = shard_to_mesh(
             jnp.zeros((per_host_batch, max_seq_len), dtype=jnp.int32),
-            data_sharding)
-        dummy_mask = jax.device_put(
+            data_sharding, mesh, batch_size)
+        dummy_mask = shard_to_mesh(
             jnp.ones((per_host_batch, max_seq_len), dtype=jnp.int32),
-            data_sharding)
+            data_sharding, mesh, batch_size)
         rng, dummy_step_rng = jax.random.split(rng)
 
         # First call: JIT compilation (slow)
@@ -1529,8 +1553,8 @@ def main():
 
             # Shard data and run train step
             rng, step_rng = jax.random.split(rng)
-            input_ids = jax.device_put(input_ids, data_sharding)
-            attention_mask = jax.device_put(attention_mask, data_sharding)
+            input_ids = shard_to_mesh(input_ids, data_sharding, mesh, batch_size)
+            attention_mask = shard_to_mesh(attention_mask, data_sharding, mesh, batch_size)
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
