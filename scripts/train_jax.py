@@ -573,25 +573,25 @@ def shard_params_to_mesh(params, param_shardings):
 def shard_to_mesh(data, sharding, mesh, global_batch_size):
     """Multi-host: place each host's local data on its local devices.
 
-    data: [per_host_batch, ...] numpy/jax array (host-local)
-    sharding: NamedSharding with P('data', None)
-    mesh: Mesh
-    global_batch_size: total batch size across all hosts
-
-    For mesh (data=4, model=4) on 4 hosts:
-      Each host has 4 local devices on the model axis.
-      All 4 local devices get the SAME data shard (replicated on model axis).
-      data axis splits across hosts (1 data shard per host).
+    Splits per_host_batch across local devices that are on the 'data' axis.
+    Replicates to local devices on the 'model' axis.
     """
     local_devs = mesh.local_devices
+    n_local = len(local_devs)
     global_shape = (global_batch_size,) + data.shape[1:]
 
-    # Each local device gets the full per_host_batch
-    # (data is sharded across hosts/data-axis, replicated across model-axis)
-    local_arrays = [
-        jax.device_put(data, d)
-        for d in local_devs
-    ]
+    # Determine how many local devices are on data vs model axis
+    mesh_model = mesh.shape['model'] if 'model' in mesh.axis_names else 1
+    n_data_local = n_local // mesh_model  # local devices on data axis
+    per_device = data.shape[0] // n_data_local
+
+    local_arrays = []
+    for i, d in enumerate(local_devs):
+        # Which data shard this device gets
+        data_idx = i // mesh_model  # data position among local devices
+        local_arrays.append(
+            jax.device_put(data[data_idx * per_device:(data_idx + 1) * per_device], d))
+
     return jax.make_array_from_single_device_arrays(
         global_shape, sharding, local_arrays)
 
