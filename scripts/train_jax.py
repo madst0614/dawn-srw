@@ -1690,41 +1690,16 @@ def main():
                     )
                     log_message(msg)
 
-                    # Detailed stats line (tau + grad_norm + param_norm)
+                    # Detailed stats (gate stats from metrics, no param access)
                     try:
-                        p_0 = jax.tree.map(lambda x: x[0], params)
-                        pool = p_0.get('neuron_pool', {})
-                        rtr = p_0.get('router', {})
-
-                        # Tau bias
-                        tk_b = rtr.get('tau_know', {}).get('bias', None)
-                        ta_b = rtr.get('tau_attn', {}).get('bias', None)
-                        tau_s = ""
-                        if tk_b is not None and ta_b is not None:
-                            tau_s = (f"tau: know={float(tk_b[0]):.2f} "
-                                     f"attn=[{float(ta_b[0]):.2f},{float(ta_b[1]):.2f},{float(ta_b[2]):.2f}]")
-
-                        # Param norms
-                        pn_parts = []
-                        for name in ['know_emb', 'know_read', 'know_write',
-                                     'know_w', 'know_w_enc']:
-                            if name in pool:
-                                v = jnp.linalg.norm(pool[name], axis=-1).mean()
-                                pn_parts.append(f"{name}={float(v):.3f}")
-                        pn_s = " ".join(pn_parts)
-
-                        # Gate stats
                         k_act = _m(metrics['know_active'])
                         k_gmax = _m(metrics['know_gate_max'])
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         gate_s = (f"gate: active={k_act:.0f}/{n_know_cfg}"
                                   f"({k_act/n_know_cfg*100:.0f}%) "
                                   f"max={k_gmax:.4f}")
-
                         log_message(
-                            f"      {tau_s} | grad_norm={m_grad:.3f}")
-                        log_message(
-                            f"      {gate_s} | {pn_s}")
+                            f"      grad_norm={m_grad:.3f} | {gate_s}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
