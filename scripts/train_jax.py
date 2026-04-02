@@ -484,6 +484,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
 
+        # Tau bias (read inside jit — safe, no cross-device issue)
+        tau_know_b = params.get('router', {}).get('tau_know', {}).get(
+            'bias', jnp.zeros(1))
+        tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
+            'bias', jnp.zeros(3))
+
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -495,6 +501,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_norm': grad_norm,
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_gate_max': result.get('know_gate_max', jnp.float32(0.0)),
+            'tau_know_bias': tau_know_b[0],
+            'tau_attn_bias_0': tau_attn_b[0],
+            'tau_attn_bias_1': tau_attn_b[1],
+            'tau_attn_bias_2': tau_attn_b[2],
         }
 
         return new_params, new_opt_state, metrics
@@ -502,13 +512,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     return train_step
 
 
-def create_eval_step(model):
+def create_eval_step(model, sharded_fns=None):
     """Create a jit-compiled evaluation step."""
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
         eval_rng = jax.random.PRNGKey(0)
+        extra_kw = {}
+        if sharded_fns is not None:
+            extra_kw['sharded_fns'] = sharded_fns
         result = model.apply(
             {'params': params},
             input_ids,
@@ -516,6 +529,7 @@ def create_eval_step(model):
             attention_mask=attention_mask,
             deterministic=True,
             rngs={'dropout': eval_rng},
+            **extra_kw,
         )
         return result['loss'], result['correct'], result['valid_count']
 
@@ -1263,7 +1277,7 @@ def main():
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
         pos_loss_weight=pos_loss_weight, sharded_fns=_sharded_fns)
-    eval_step_fn = create_eval_step(model)
+    eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
 
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
@@ -1545,11 +1559,11 @@ def main():
         if preemption_requested[0]:
             return  # avoid double-save
         preemption_requested[0] = True
-        if is_host0:
-            print(f"\n!!! SIGTERM received — saving emergency checkpoint (step={global_step}) !!!", flush=True)
-            try:
-                params_single = jax.device_get(params)
-                opt_state_single = jax.device_get(opt_state)
+        print(f"\n!!! SIGTERM received (host {host_id}) — saving emergency checkpoint (step={global_step}) !!!", flush=True)
+        try:
+            params_single = jax.device_get(params)
+            opt_state_single = jax.device_get(opt_state)
+            if is_host0:
                 epath = _ckpt_path(f"emergency_step{global_step}.flax")
                 save_checkpoint(
                     epath, params_single, opt_state_single,
@@ -1560,8 +1574,8 @@ def main():
                     training_config=training_config,
                 )
                 print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
-            except Exception as e:
-                print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
+        except Exception as e:
+            print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
@@ -1690,16 +1704,26 @@ def main():
                     )
                     log_message(msg)
 
-                    # Detailed stats (gate stats from metrics, no param access)
+                    # Detailed stats (all from metrics, no params access)
                     try:
+                        tk_b = _m(metrics['tau_know_bias'])
+                        ta_b = [_m(metrics['tau_attn_bias_0']),
+                                _m(metrics['tau_attn_bias_1']),
+                                _m(metrics['tau_attn_bias_2'])]
+                        tau_s = (f"tau: know={tk_b:.2f} "
+                                 f"attn=[{ta_b[0]:.2f},{ta_b[1]:.2f},{ta_b[2]:.2f}]")
+
                         k_act = _m(metrics['know_active'])
                         k_gmax = _m(metrics['know_gate_max'])
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         gate_s = (f"gate: active={k_act:.0f}/{n_know_cfg}"
                                   f"({k_act/n_know_cfg*100:.0f}%) "
                                   f"max={k_gmax:.4f}")
+
                         log_message(
-                            f"      grad_norm={m_grad:.3f} | {gate_s}")
+                            f"      {tau_s} | grad_norm={m_grad:.3f}")
+                        log_message(
+                            f"      {gate_s}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
@@ -1766,10 +1790,12 @@ def main():
                         'timestamp': datetime.now().isoformat(),
                     })
 
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        params_single = jax.device_get(params)
-                        opt_state_single = jax.device_get(opt_state)
+                # Best model save (device_get on ALL hosts)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    params_single = jax.device_get(params)
+                    opt_state_single = jax.device_get(opt_state)
+                    if is_host0:
                         save_checkpoint(
                             _ckpt_path("best_model.flax"),
                             params_single, opt_state_single,
@@ -1779,22 +1805,24 @@ def main():
                             steps_per_epoch=steps_per_epoch,
                             training_config=training_config,
                         )
-                        del params_single, opt_state_single
                         log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
+                    del params_single, opt_state_single
 
-            # ---- Mid-epoch checkpoint (host 0 only) ----
-            if global_step % ckpt_interval == 0 and global_step > 0 and is_host0:
+            # ---- Mid-epoch checkpoint ----
+            if global_step % ckpt_interval == 0 and global_step > 0:
+                # device_get on ALL hosts (may be collective for sharded params)
                 params_single = jax.device_get(params)
                 opt_state_single = jax.device_get(opt_state)
-                save_checkpoint(
-                    _ckpt_path(f"checkpoint_step{global_step}.flax"),
-                    params_single, opt_state_single,
-                    epoch, global_step, best_val_loss,
-                    cfg['model'],
-                    step_in_epoch=epoch_step_counter,
-                    steps_per_epoch=steps_per_epoch,
-                    training_config=training_config,
-                )
+                if is_host0:
+                    save_checkpoint(
+                        _ckpt_path(f"checkpoint_step{global_step}.flax"),
+                        params_single, opt_state_single,
+                        epoch, global_step, best_val_loss,
+                        cfg['model'],
+                        step_in_epoch=epoch_step_counter,
+                        steps_per_epoch=steps_per_epoch,
+                        training_config=training_config,
+                    )
                 del params_single, opt_state_single
                 cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
 
@@ -1840,10 +1868,11 @@ def main():
                 'timestamp': datetime.now().isoformat(),
             })
 
-            # Save epoch checkpoint (host 0 only)
-            params_single = jax.device_get(params)
-            opt_state_single = jax.device_get(opt_state)
+        # Save epoch checkpoint (device_get on ALL hosts)
+        params_single = jax.device_get(params)
+        opt_state_single = jax.device_get(opt_state)
 
+        if is_host0:
             save_checkpoint(
                 _ckpt_path(f"checkpoint_epoch{epoch}.flax"),
                 params_single, opt_state_single,
