@@ -29,7 +29,8 @@ model:
 
 training:
   batch_size: 1024
-  mesh_model: 4     # N-axis model parallel (4 = N/4 per chip)
+  mesh_model: 4
+  mesh_data: 4
   gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.0003
