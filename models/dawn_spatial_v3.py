@@ -113,31 +113,54 @@ def threshold_gate(scores, tau_offset):
 # ================================================================
 
 def make_sharded_srw(mesh, max_chunk_size=4096):
-    """Create shard_map'd gate + sense_read_write functions.
+    """Create fused shard_map'd gate+srw. Gate never materialized full.
 
-    max_chunk_size: max N elements per chunk (auto-determines n_chunks).
-    Returns (compute_gate, srw).
+    2-pass chunked inside shard_map:
+      Pass 1: scores stats -> tau (psum for cross-chip mean/std)
+      Pass 2: gate+srw fused per chunk (gate computed and consumed per chunk)
+
+    Returns fused_gate_srw function (single call does gate+srw+psum).
     """
 
     @partial(shard_map, mesh=mesh,
-             in_specs=(P('data', None, None),    # h [B,S,d_bn]
+             in_specs=(P('data', None, None),    # x [B,S,D]
+                       P('data', None, None),    # h [B,S,d_bn]
                        P('model', None),          # emb_norm [N_local, d_bn]
-                       P('data', None, None)),    # tau_offset [B,S,1]
-             out_specs=(P('data', None, 'model'), # gate [B,S,N_local]
-                        P('data', None, None),    # active_count [B,S,1]
-                        P('data', None, None)),   # gate_max [B,S,1]
+                       P('data', None, None),    # tau_offset [B,S,1]
+                       P('model', None),          # read [N_local, D]
+                       P('model', None)),         # write [N_local, D]
+             out_specs=(P('data', None, None),   # out [B,S,D]
+                        P('data', None, None),   # active [B,S,1]
+                        P('data', None, None)),  # gate_max [B,S,1]
              check_rep=False)
-    def compute_gate(h, emb_local, tau_offset):
-        """Per-device gate computation with cross-chip normalization via psum."""
-        scores = h.astype(jnp.bfloat16) @ emb_local.astype(jnp.bfloat16).T
+    def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local):
+        N_local = emb_local.shape[0]
+        nc = max(1, N_local // max_chunk_size)
+        while N_local % nc != 0 and nc < N_local:
+            nc += 1
+        cs = N_local // nc
 
-        # Global mean/std via psum (tiny: [B,S,1])
-        sf = scores.astype(jnp.float32)
-        local_sum = sf.sum(axis=-1, keepdims=True)
-        local_sq = (sf ** 2).sum(axis=-1, keepdims=True)
+        B, S, D = x.shape
+        h_bf = h.astype(jnp.bfloat16)
+        x_bf = x.astype(jnp.bfloat16)
+        emb_bf = emb_local.astype(jnp.bfloat16)
+        read_bf = read_local.astype(jnp.bfloat16)
+        write_bf = write_local.astype(jnp.bfloat16)
+        z1 = jnp.zeros((B, S, 1))
+
+        # --- Pass 1: scores stats -> tau ---
+        def stats_body(i, carry):
+            s_sum, sq_sum = carry
+            s = i * cs
+            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+            sc = h_bf @ ec.T
+            sf = sc.astype(jnp.float32)
+            return (s_sum + sf.sum(axis=-1, keepdims=True),
+                    sq_sum + (sf ** 2).sum(axis=-1, keepdims=True))
+
+        local_sum, local_sq = jax.lax.fori_loop(0, nc, stats_body, (z1, z1))
         global_sum = jax.lax.psum(local_sum, 'model')
         global_sq = jax.lax.psum(local_sq, 'model')
-        N_local = emb_local.shape[0]
         model_size = jax.lax.psum(jnp.int32(1), 'model')
         N_total = N_local * model_size
 
@@ -146,73 +169,49 @@ def make_sharded_srw(mesh, max_chunk_size=4096):
         tau = s_mean + tau_offset * s_std
         tau_bf = tau.astype(jnp.bfloat16)
 
-        # Gate (local)
-        raw = scores - tau_bf
-        gc = jnp.where(raw > 0, raw,
-                        (1e-4 * jax.nn.softplus(
-                            raw.astype(jnp.float32))).astype(jnp.bfloat16))
-        gc = jnp.clip(gc, 0.0, 10.0)
-        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+        # --- Pass 2: gate + srw fused (chunked) ---
+        def gate_srw_body(i, carry):
+            out, exp_sum, exp_max, active = carry
 
-        # Global normalization via psum
-        ef = eg.astype(jnp.float32)
-        local_exp_sum = ef.sum(axis=-1, keepdims=True)
-        local_exp_max = ef.max(axis=-1, keepdims=True)
-        global_exp_sum = jax.lax.psum(local_exp_sum, 'model') + 1e-4
-        # gate_strength: stop_gradient local tanh(max) — no pmax needed
-        # tanh saturates, so local ≈ global. No gradient through scaling.
-        gate_strength = jax.lax.stop_gradient(
-            jnp.tanh(local_exp_max)).astype(jnp.bfloat16)
-
-        ratio = eg / global_exp_sum.astype(jnp.bfloat16)
-        gate = ratio * gate_strength
-
-        active = (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-        active = jax.lax.psum(active, 'model')
-        return gate, active / N_total, local_exp_max
-
-    @partial(shard_map, mesh=mesh,
-             in_specs=(P('data', None, None),     # x [B,S,D]
-                       P('data', None, 'model'),  # gate [B,S,N_local]
-                       P('model', None),           # read [N_local, D]
-                       P('model', None)),          # write [N_local, D]
-             out_specs=P('data', None, None),      # out [B,S,D]
-             check_rep=False)
-    def srw(x, gate_local, read_local, write_local):
-        """Per-device sense_read_write with fori_loop chunking + psum."""
-        N_local = read_local.shape[0]
-        # Auto n_chunks: ensure chunk_size <= max_chunk_size
-        nc = max(1, N_local // max_chunk_size)
-        while N_local % nc != 0 and nc < N_local:
-            nc += 1
-        cs = N_local // nc
-
-        x_bf = x.astype(jnp.bfloat16)
-        gate_bf = gate_local.astype(jnp.bfloat16)
-        read_bf = read_local.astype(jnp.bfloat16)
-        write_bf = write_local.astype(jnp.bfloat16)
-
-        def body(i, acc):
             @jax.checkpoint
             def _chunk(i_val):
                 s = i_val * cs
-                g = jax.lax.dynamic_slice_in_dim(gate_bf, s, cs, axis=-1)
-                rd = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
-                wr = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-                xr = x_bf @ rd.T
-                return ((g * xr) @ wr).astype(jnp.float32)
-            return acc + _chunk(i)
+                ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+                rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
+                wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+                sc = h_bf @ ec.T
+                raw = sc - tau_bf
+                gc = jnp.where(raw > 0, raw,
+                                (1e-4 * jax.nn.softplus(
+                                    raw.astype(jnp.float32))).astype(jnp.bfloat16))
+                gc = jnp.clip(gc, 0.0, 10.0)
+                eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
+                ef = eg.astype(jnp.float32)
+                xr = x_bf @ rc.T
+                c_out = ((eg * xr) @ wc).astype(jnp.float32)
+                return (c_out, ef.sum(axis=-1, keepdims=True),
+                        ef.max(axis=-1, keepdims=True),
+                        (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32))
 
-        # f32 accumulator for gradient precision across chunks
-        out_local = jax.lax.fori_loop(
-            0, nc, body,
-            jnp.zeros(x.shape, dtype=jnp.float32))
+            co, ces, cem, cac = _chunk(i)
+            return (out + co, exp_sum + ces,
+                    jnp.maximum(exp_max, cem), active + cac)
 
-        # all-reduce: partial sums → global sum
-        # all-reduce partial sums across model axis
-        return jax.lax.psum(out_local, 'model')
+        raw_out, total_es, total_em, total_ac = jax.lax.fori_loop(
+            0, nc, gate_srw_body,
+            (jnp.zeros((B, S, D), dtype=jnp.float32),
+             z1, jnp.full((B, S, 1), -1e9), z1))
 
-    return compute_gate, srw
+        global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-4
+        gate_strength = jax.lax.stop_gradient(jnp.tanh(total_em))
+        out = raw_out / global_exp_sum * gate_strength
+        out = jax.lax.psum(out, 'model')
+
+        active = jax.lax.psum(total_ac, 'model')
+        return out.astype(jnp.float32), active / N_total, total_em
+
+    return fused_gate_srw
+
 
 
 def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
@@ -408,13 +407,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
     if sharded_fns is not None:
-        gate_fn, srw_fn = sharded_fns
-        g_Q, _, _ = gate_fn(h_Q, qk_norm, tau_all[:, :, 0:1])
-        Q = srw_fn(x, g_Q, qk_read, qk_write)
-        g_K, _, _ = gate_fn(h_K, qk_norm, tau_all[:, :, 1:2])
-        K = srw_fn(x, g_K, qk_read, qk_write)
-        g_V, _, _ = gate_fn(h_V, v_norm, tau_all[:, :, 2:3])
-        V = srw_fn(x, g_V, v_read, v_write)
+        fused_fn = sharded_fns
+        Q, _, _ = fused_fn(x, h_Q, qk_norm, tau_all[:, :, 0:1], qk_read, qk_write)
+        K, _, _ = fused_fn(x, h_K, qk_norm, tau_all[:, :, 1:2], qk_read, qk_write)
+        V, _, _ = fused_fn(x, h_V, v_norm, tau_all[:, :, 2:3], v_read, v_write)
     else:
         Q, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                 qk_read, qk_write, n_chunks_qk)
@@ -465,9 +461,9 @@ def _know_forward(x, pool_params, router_params, rng,
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
     if sharded_fns is not None:
-        gate_fn, srw_fn = sharded_fns
-        gate, active_count, gate_max_val = gate_fn(h, know_norm, tau)
-        out = srw_fn(x, gate, know_read, know_write)
+        fused_fn = sharded_fns
+        out, active_count, gate_max_val = fused_fn(
+            x, h, know_norm, tau, know_read, know_write)
     else:
         out, active_count, gate_max_val = _srw_chunked(
             x, h, know_norm, tau, know_read, know_write, n_chunks_know)
