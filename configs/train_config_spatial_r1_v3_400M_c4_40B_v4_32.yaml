@@ -1,14 +1,13 @@
 # DAWN Spatial-R1 v3.8.2 Training Config - v4-32 Pod
 # Sense-Read-Write, d_bottleneck=256
-# ~234M params (gate [64,512,50000] = 6.4GB fits 32GB HBM)
-# batch_size=1024 (64 per device on v4-32: 4 hosts x 4 chips)
+# Global batch: 1024 = 16 chips x 64 per_device_batch
 
 seed: 1
 
 data:
-  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
   bin_val: gs://dawn-tpu-data-c4/c4_val.bin
-  max_train_tokens: 20000000000
+  max_train_tokens: 40000000000
   max_val_tokens: 10000000
   local_cache_dir: /tmp/data
 
@@ -19,12 +18,9 @@ model:
   n_heads: 16
   d_bottleneck: 256
 
-  n_know: 50000
-  n_qk: 3200
-  n_v: 5200
-  max_k_know: 3600
-  max_k_qk: 320
-  max_k_v: 520
+  n_know: 100000
+  n_qk: 6300
+  n_v: 10400
 
   max_seq_len: 512
   dropout: 0.1
@@ -38,25 +34,11 @@ training:
   lr: 0.0003
   weight_decay: 0.1
   warmup_ratio: 0.08
+  orthogonality_weight: 0.01
   diversity_weight: 0.1
   load_balance_weight: 0.0001
   checkpoint_interval: 200
   val_interval: 200
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.8_234M_c4_20B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.8_234M_c4_20B
-
-# Parameter budget (~234M):
-#   Know: 50000 x (256+1280+1280) = 140.8M
-#   QK:   3200 x 2816 = 9.0M
-#   V:    5200 x 2816 = 14.6M
-#   Router: ~0.8M
-#   Blocks (LN x2 + O) x18: 29.6M
-#   Embeddings: 39.1M
-#   Total: ~234M
-#
-# Memory per device (batch=64):
-#   gate [64,512,50000] = 6.4GB
-#   x@read.T [64,512,50000] = 6.4GB
-#   @jax.checkpoint -> peak ~6.4GB + params ~6GB = ~12GB
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.8_400M_c4_40B
