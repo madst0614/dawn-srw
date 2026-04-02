@@ -149,18 +149,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
 
-        # --- Pass 1: scores stats -> tau (no checkpoint: carry is [B,S,1]*2) ---
-        def stats_step(carry, i):
-            s_sum, sq_sum = carry
-            s = i * cs
-            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-            sc = h_bf @ ec.T  # bf16 [B,S,cs]
-            # Reduce in bf16, accumulate in f32 — no [B,S,cs] f32 copy
-            return (s_sum + sc.sum(axis=-1, keepdims=True).astype(jnp.float32),
-                    sq_sum + (sc ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
+        # --- Pass 1: stats from first chunk only (1.5-pass approximation) ---
+        ec0 = jax.lax.dynamic_slice_in_dim(emb_bf, 0, cs, axis=0)
+        sc0 = h_bf @ ec0.T  # [B,S,cs] bf16
+        local_sum = sc0.sum(axis=-1, keepdims=True).astype(jnp.float32) * nc
+        local_sq = (sc0 ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32) * nc
 
-        (local_sum, local_sq), _ = jax.lax.scan(
-            stats_step, (z1, z1), jnp.arange(nc))
         global_sum = jax.lax.psum(local_sum, 'model')
         global_sq = jax.lax.psum(local_sq, 'model')
         N_total = N_local * _model_axis_size
@@ -247,18 +241,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         write_bf = write_local.astype(jnp.bfloat16)
         z1_r = jnp.zeros((B, S, 2, 1))  # per-route accumulators
 
-        # --- Pass 1: scores stats per route (no checkpoint: carry is [B,S,2,1]*2) ---
-        def stats_step(carry, i):
-            s_sum, sq_sum = carry  # [B,S,2,1]
-            s = i * cs
-            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)  # [cs, d_bn]
-            # einsum: [B,S,2,d_bn] x [cs,d_bn]^T -> [B,S,2,cs]
-            sc = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
-            return (s_sum + sc.sum(axis=-1, keepdims=True).astype(jnp.float32),
-                    sq_sum + (sc ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
+        # --- Pass 1: stats from first chunk only (1.5-pass approximation) ---
+        ec0 = jax.lax.dynamic_slice_in_dim(emb_bf, 0, cs, axis=0)  # [cs, d_bn]
+        sc0 = jnp.einsum('bsrd,nd->bsrn', h_bf, ec0)  # [B,S,2,cs]
+        local_sum = sc0.sum(axis=-1, keepdims=True).astype(jnp.float32) * nc
+        local_sq = (sc0 ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32) * nc
 
-        (local_sum, local_sq), _ = jax.lax.scan(
-            stats_step, (z1_r, z1_r), jnp.arange(nc))
         global_sum = jax.lax.psum(local_sum, 'model')  # [B,S,2,1]
         global_sq = jax.lax.psum(local_sq, 'model')
         N_total = N_local * _model_axis_size
@@ -333,15 +321,11 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
 
     z1 = jnp.zeros((B, S, 1))
 
-    def stats_step(carry, i):
-        ss, sq = carry
-        s = i * cs
-        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-        sc = h_bf @ ec.T  # bf16
-        return (ss + sc.sum(axis=-1, keepdims=True).astype(jnp.float32),
-                sq + (sc**2).sum(axis=-1, keepdims=True).astype(jnp.float32)), None
-
-    (s_sum, sq_sum), _ = jax.lax.scan(stats_step, (z1, z1), jnp.arange(n_chunks))
+    # --- Stats from first chunk only (1.5-pass approximation) ---
+    ec0 = jax.lax.dynamic_slice_in_dim(emb_bf, 0, cs, axis=0)
+    sc0 = h_bf @ ec0.T  # [B,S,cs] bf16
+    s_sum = sc0.sum(axis=-1, keepdims=True).astype(jnp.float32) * n_chunks
+    sq_sum = (sc0 ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32) * n_chunks
     s_mean = s_sum / N
     s_std = jnp.sqrt(sq_sum / N - s_mean**2) + 1e-8
     tau = s_mean + tau_offset * s_std
