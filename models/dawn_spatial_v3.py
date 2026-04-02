@@ -154,12 +154,13 @@ def make_sharded_srw(mesh, max_chunk_size=4096):
         gc = jnp.clip(gc, 0.0, 10.0)
         eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
 
-        # Global normalization via psum/pmax
+        # Global normalization via psum
         ef = eg.astype(jnp.float32)
         local_exp_sum = ef.sum(axis=-1, keepdims=True)
         local_exp_max = ef.max(axis=-1, keepdims=True)
         global_exp_sum = jax.lax.psum(local_exp_sum, 'model') + 1e-4
-        global_exp_max = jax.lax.pmax(local_exp_max, 'model')
+        # pmax has no grad — use local max with stop_gradient for gate_strength
+        global_exp_max = jax.lax.stop_gradient(local_exp_max)
 
         ratio = eg / global_exp_sum.astype(jnp.bfloat16)
         gate_strength = jnp.tanh(global_exp_max).astype(jnp.bfloat16)
