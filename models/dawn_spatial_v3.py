@@ -375,16 +375,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     out = out @ expand_O_kernel
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    t_qk = 1.0 / n_qk
-    t_v = 1.0 / n_v
-    aux = (
-        ((g_Q.mean(axis=(0, 1)) - t_qk) ** 2).sum() * n_qk +
-        ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * n_qk +
-        ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * n_v
-    )
-    # tau_reg: prevent tau_offset from going too positive (too few active)
+    # Load balance: use tau_reg only (no full gate available from chunked)
     tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
-    aux = aux + tau_reg
+    aux = tau_reg
     return out, aux
 
 
