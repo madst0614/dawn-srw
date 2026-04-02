@@ -1267,7 +1267,7 @@ def main():
     _sharded_fns = None
     if mesh_model > 1:
         from models.dawn_spatial_v3 import make_sharded_srw, make_sharded_srw_paired
-        max_chunk = cfg['training'].get('max_chunk_size', 25000)
+        max_chunk = cfg['training'].get('max_chunk_size', 12500)
         _sharded_single = make_sharded_srw(mesh, max_chunk_size=max_chunk)
         _sharded_paired = make_sharded_srw_paired(mesh, max_chunk_size=max_chunk)
         _sharded_fns = (_sharded_single, _sharded_paired)
