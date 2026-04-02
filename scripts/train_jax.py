@@ -1038,7 +1038,7 @@ def main():
 
     if is_host0:
         print(f"\n{'='*60}")
-        print(f"DAWN Training (Multi-Host Multi-Device) — {model_version}")
+        print(f"DAWN Training (Multi-Host Multi-Device) — {cfg['model'].get('model_version', 'unknown')}")
         print(f"{'='*60}")
         print(f"JAX version: {jax.__version__}")
         print(f"Hosts: {n_hosts}, Host ID: {host_id}")
