@@ -1718,8 +1718,9 @@ def main():
                         k_act = _m(metrics['know_active'])
                         k_gmax = _m(metrics['know_gate_max'])
                         n_know_cfg = cfg['model'].get('n_know', 27200)
-                        gate_s = (f"gate: active={k_act:.0f}/{n_know_cfg}"
-                                  f"({k_act/n_know_cfg*100:.0f}%) "
+                        k_act_count = k_act * n_know_cfg
+                        gate_s = (f"gate: active={k_act_count:.0f}/{n_know_cfg}"
+                                  f"({k_act*100:.1f}%) "
                                   f"max={k_gmax:.4f}")
 
                         log_message(
