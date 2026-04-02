@@ -13,10 +13,15 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/madst0614/DAWN.git"
+GH_TOKEN="${GH_TOKEN:-}"
+if [ -n "$GH_TOKEN" ]; then
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/madst0614/dawn-spatial.git"
+else
+    REPO_URL="https://github.com/madst0614/dawn-spatial.git"
+fi
 BRANCH="${BRANCH:?ERROR: BRANCH env var not set}"
 CONFIG="${CONFIG:?ERROR: CONFIG env var not set}"
-WORK_DIR="$HOME/dawn"
+WORK_DIR="$HOME/dawn-spatial"
 
 echo "============================================"
 echo "Host $(hostname) — Setting up TPU Pod training"
@@ -47,9 +52,9 @@ if [ -d "$WORK_DIR/.git" ]; then
 else
     echo "  Fresh clone (branch: $BRANCH)..."
     cd "$HOME"
-    rm -rf dawn
-    git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" dawn
-    cd dawn
+    rm -rf dawn-spatial
+    git clone -b "$BRANCH" --single-branch --depth 1 "$REPO_URL" dawn-spatial
+    cd dawn-spatial
 fi
 
 # 3. Verify JAX sees TPU devices
@@ -78,7 +83,7 @@ tmux kill-session -t train 2>/dev/null || true
 
 # Start new tmux session running training, tee to ~/train.log
 tmux new-session -d -s train \
-    "python scripts/train_jax.py --config '$CONFIG' 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "python3 scripts/train_jax.py --config '$CONFIG' 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"

@@ -1,0 +1,71 @@
+# DAWN Spatial-R1 v2 Training Config -- Fair Comparison with Baseline 40M
+# 2D positional routing: distance-based candidate selection + sparse sense_emit
+# Balanced neuron pools (ratio 1 : 1.5 : 5)
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "spatial-r1-v2.0.6"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+
+  # 2D spatial routing
+  pos_dim: 2
+  candidates_multiplier: 2
+  know_chunk_size: 16
+
+  # Balanced neuron pools (ratio 1:1.5:5)
+  n_qk: 3140
+  n_v: 5240
+  n_know: 42000
+
+  # Compute-matched top_k
+  max_k_qk: 157
+  max_k_v: 262
+  max_k_know: 1536
+
+  router_dropout: 0.1
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  diversity_weight: 0.1
+  load_balance_weight: 0.00002
+  pos_loss_weight: 0.01
+  checkpoint_interval: 500
+  val_interval: 500
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v2_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v2_40M_c4_5B
+
+# Parameter budget (~32.9M, baseline matched):
+#   qk_neurons:   3,140 x 384  =  1.21M
+#   v_neurons:    5,240 x 384  =  2.01M
+#   know_neurons: 42,000 x 384 = 16.13M
+#   neuron_pos:   50,380 x 2   =  0.0001M
+#   Router (pos_proj + tau):      ~0.01M
+#   Blocks (LN x 2 + O_proj) x 12: 1.79M
+#   Embeddings (tok + pos):      11.72M
+#   Total:                       ~32.9M
+#
+# FLOPs/layer (baseline matched):
+#   QKV: 384 x (4 x 157 + 2 x 262) = 442,368
+#   Know: 2 x 1536 x 384 = 1,179,648
+#   O: 384 x 384 = 147,456
+#   Total: 1,769,472 ~ Baseline

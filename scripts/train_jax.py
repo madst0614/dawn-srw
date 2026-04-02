@@ -34,11 +34,15 @@ import time
 import random
 import argparse
 import yaml
+import numpy as np
 from datetime import datetime
 from functools import partial
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
 from models.model_v17_1_jax import DAWN
 from models.dawn_spatial import DAWN as DAWN_Spatial
+from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
+from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -109,6 +113,50 @@ def build_model_from_config(cfg):
             k_cluster_qk=mcfg.get('k_cluster_qk', 8),
             k_cluster_v=mcfg.get('k_cluster_v', 8),
             k_cluster_know=mcfg.get('k_cluster_know', 8),
+        )
+    elif version.startswith('spatial-r1-v3'):
+        model = DAWN_SpatialV3(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_bottleneck=mcfg.get('d_bottleneck', 128),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            max_k_qk=mcfg.get('max_k_qk', 158),
+            max_k_v=mcfg.get('max_k_v', 260),
+            max_k_know=mcfg.get('max_k_know', 1810),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version.startswith('spatial-r1-v2'):
+        model = DAWN_SpatialV2(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            pos_dim=mcfg.get('pos_dim', 2),
+            grid_size=mcfg.get('grid_size', 64),
+            candidates_multiplier=mcfg.get('candidates_multiplier', 2),
+            grid_rebuild_interval=mcfg.get('grid_rebuild_interval', 100),
+            pos_loss_weight=mcfg.get('pos_loss_weight', 0.01),
+            know_chunk_size=mcfg.get('know_chunk_size', 16),
+            n_qk=mcfg.get('n_qk', 3140),
+            n_v=mcfg.get('n_v', 5240),
+            n_know=mcfg.get('n_know', 42000),
+            max_k_qk=mcfg.get('max_k_qk', 157),
+            max_k_v=mcfg.get('max_k_v', 262),
+            max_k_know=mcfg.get('max_k_know', 1536),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
         )
     else:
         model = DAWN(
@@ -339,18 +387,37 @@ def compute_spatial_diversity_loss(params):
 
     Penalizes high cosine similarity between neurons in each pool.
     Replaces orthogonality + knowledge diversity for spatial-r1.
+    For large pools (>4096), uses deterministic strided sampling to avoid O(N^2).
     """
     pool = params['neuron_pool']
 
-    def _pool_div(neurons):
+    def _pool_div(neurons, max_sample=4096):
+        N = neurons.shape[0]
+        if N > max_sample:
+            stride = N // max_sample
+            neurons = neurons[::stride][:max_sample]
         n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
         sim = jnp.matmul(n, n.T)
         mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
         return jnp.abs(sim * mask).sum() / mask.sum()
 
-    return (_pool_div(pool['qk_neurons']) +
-            _pool_div(pool['v_neurons']) +
-            _pool_div(pool['know_neurons'])) / 3
+    # Support both v2 (qk_neurons) and v3.2 (qk_emb/qk_w) param names
+    def _get_pool_arrays(pool):
+        """Return list of neuron arrays from pool params."""
+        arrays = []
+        for prefix in ('qk', 'v', 'know'):
+            if f'{prefix}_neurons' in pool:
+                arrays.append(pool[f'{prefix}_neurons'])
+            else:
+                # v3.2: emb + w
+                if f'{prefix}_emb' in pool:
+                    arrays.append(pool[f'{prefix}_emb'])
+                if f'{prefix}_w' in pool:
+                    arrays.append(pool[f'{prefix}_w'])
+        return arrays
+
+    pool_arrays = _get_pool_arrays(pool)
+    return sum(_pool_div(a) for a in pool_arrays) / len(pool_arrays)
 
 
 # ============================================================
@@ -359,19 +426,18 @@ def compute_spatial_diversity_loss(params):
 
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
-                      n_devices=1, is_baseline=False, is_spatial=False):
-    """Create a compiled training step function.
+                      is_baseline=False, is_spatial=False,
+                      pos_loss_weight=0.0, sharded_fns=None):
+    """Create a jit-compiled training step. Mesh SPMD handles parallelism."""
 
-    Uses jax.pmap for multi-device data parallelism.
-    When n_devices=1, pmap degenerates to single-device execution.
-    """
-
-    @partial(jax.pmap, axis_name='dp')
+    @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key):
-        # Labels for CLM: input_ids shifted, padding masked
         labels = jnp.where(attention_mask == 1, input_ids, -100)
 
         def loss_fn(params):
+            extra_kw = {}
+            if sharded_fns is not None:
+                extra_kw['sharded_fns'] = sharded_fns
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -379,6 +445,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 attention_mask=attention_mask,
                 deterministic=False,
                 rngs={'dropout': dropout_key},
+                **extra_kw,
             )
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
@@ -388,11 +455,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 div_loss = jnp.float32(0.0)
                 total_loss = ce_loss
             elif is_spatial:
-                # Spatial-r1: no orthogonality (rank-1 vectors), diversity only
                 orth_loss = jnp.float32(0.0)
                 div_loss = compute_spatial_diversity_loss(params)
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
+                              + pos_loss_weight * aux_loss
                               + div_weight * div_loss)
             else:
                 orth_loss = compute_orthogonality_loss(
@@ -408,21 +475,36 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         (total_loss, (ce_loss, aux_loss, orth_loss, div_loss, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-        # All-reduce gradients across devices
-        grads = jax.lax.pmean(grads, axis_name='dp')
+        # XLA SPMD handles gradient all-reduce automatically
+        # (loss computed on sharded data → gradients consistent across shards)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
-        # Aggregate metrics across devices
+        grad_norm = jnp.sqrt(
+            sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
+
+        # Tau bias (read inside jit — safe, no cross-device issue)
+        tau_know_b = params.get('router', {}).get('tau_know', {}).get(
+            'bias', jnp.zeros(1))
+        tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
+            'bias', jnp.zeros(3))
+
         metrics = {
-            'total_loss': jax.lax.pmean(total_loss, axis_name='dp'),
-            'ce_loss': jax.lax.pmean(ce_loss, axis_name='dp'),
-            'aux_loss': jax.lax.pmean(aux_loss, axis_name='dp'),
-            'orth_loss': jax.lax.pmean(orth_loss, axis_name='dp'),
-            'div_loss': jax.lax.pmean(div_loss, axis_name='dp'),
-            'correct': jax.lax.psum(result['correct'], axis_name='dp'),
-            'valid_count': jax.lax.psum(result['valid_count'], axis_name='dp'),
+            'total_loss': total_loss,
+            'ce_loss': ce_loss,
+            'aux_loss': aux_loss,
+            'orth_loss': orth_loss,
+            'div_loss': div_loss,
+            'correct': result['correct'],
+            'valid_count': result['valid_count'],
+            'grad_norm': grad_norm,
+            'know_active': result.get('know_active', jnp.float32(0.0)),
+            'know_gate_max': result.get('know_gate_max', jnp.float32(0.0)),
+            'tau_know_bias': tau_know_b[0],
+            'tau_attn_bias_0': tau_attn_b[0],
+            'tau_attn_bias_1': tau_attn_b[1],
+            'tau_attn_bias_2': tau_attn_b[2],
         }
 
         return new_params, new_opt_state, metrics
@@ -430,19 +512,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     return train_step
 
 
-def create_eval_step(model, n_devices=1):
-    """Create a compiled evaluation step function.
+def create_eval_step(model, sharded_fns=None):
+    """Create a jit-compiled evaluation step."""
 
-    Note: dropout RNG is required because the lax.scan forward path always
-    calls make_rng('dropout') (safe_dropout neutralizes it via deterministic flag).
-    """
-
-    @partial(jax.pmap, axis_name='dp')
+    @jax.jit
     def eval_step(params, input_ids, attention_mask):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
-        # deterministic=True -> dropout masks are all-ones, but RNG key is still
-        # needed for tracing (safe_dropout always generates a mask).
-        eval_rng = jax.random.PRNGKey(0)  # fixed key -- never used for real randomness
+        eval_rng = jax.random.PRNGKey(0)
+        extra_kw = {}
+        if sharded_fns is not None:
+            extra_kw['sharded_fns'] = sharded_fns
         result = model.apply(
             {'params': params},
             input_ids,
@@ -450,38 +529,103 @@ def create_eval_step(model, n_devices=1):
             attention_mask=attention_mask,
             deterministic=True,
             rngs={'dropout': eval_rng},
+            **extra_kw,
         )
-        ce_loss = result['loss']
-        correct = result['correct']
-        valid_count = result['valid_count']
-
-        return (
-            jax.lax.pmean(ce_loss, axis_name='dp'),
-            jax.lax.psum(correct, axis_name='dp'),
-            jax.lax.psum(valid_count, axis_name='dp'),
-        )
+        return result['loss'], result['correct'], result['valid_count']
 
     return eval_step
 
 
 # ============================================================
-# Multi-device helpers
+# Mesh-based sharding (model parallel + data parallel)
 # ============================================================
 
-def replicate(pytree, devices=None):
-    """Replicate a pytree across devices."""
-    if devices is None:
-        devices = jax.devices()
-    return jax.device_put_replicated(pytree, devices)
+def create_mesh(mesh_data, mesh_model):
+    """Create 2D Mesh for data + model parallelism."""
+    devices = jax.devices()
+    n_devices = len(devices)
+    assert n_devices == mesh_data * mesh_model, (
+        f"mesh_data({mesh_data}) * mesh_model({mesh_model}) = "
+        f"{mesh_data * mesh_model} != {n_devices} devices")
+    device_array = np.array(devices).reshape(mesh_data, mesh_model)
+    return Mesh(device_array, ('data', 'model'))
 
 
-def unreplicate(pytree):
-    """Extract first replica from a replicated pytree."""
-    return jax.tree.map(lambda x: x[0], pytree)
+def get_param_shardings(params, mesh):
+    """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated."""
+    replicated = NamedSharding(mesh, P())  # no sharding
+    n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
+    n_sharded_3d = NamedSharding(mesh, P('model', None, None))
 
+    def _get_sharding(path, value):
+        path_str = '/'.join(str(p) for p in path)
+        # NeuronPool params: shard N axis (first dim) on 'model'
+        if 'neuron_pool' in path_str:
+            if value.ndim == 2:
+                return n_sharded       # [N, d_bn] or [N, D]
+            elif value.ndim == 3:
+                return n_sharded_3d    # [N, D, R] for v17.1
+            else:
+                return replicated
+        return replicated
+
+    flat_params = jax.tree.leaves_with_path(params)
+    shardings = {}
+    for path, leaf in flat_params:
+        key_path = tuple(
+            p.key if hasattr(p, 'key') else str(p) for p in path)
+        shardings[key_path] = _get_sharding(path, leaf)
+
+    # Build matching pytree of shardings
+    return jax.tree.map_with_path(
+        lambda path, x: _get_sharding(path, x), params)
+
+
+def shard_params_to_mesh(params, param_shardings):
+    """Place params on mesh according to shardings."""
+    return jax.tree.map(
+        lambda p, s: jax.device_put(p, s),
+        params, param_shardings)
+
+
+def shard_to_mesh(data, sharding, global_shape):
+    """Multi-host: create global array from host-local data.
+
+    Uses make_array_from_callback which correctly maps mesh indices
+    to data slices, regardless of how devices map to hosts.
+
+    data: [per_host_batch, ...] — this host's data portion
+    sharding: NamedSharding
+    global_shape: (global_batch, ...)
+    """
+    n_hosts = jax.process_count()
+    host_id = jax.process_index()
+    per_host = data.shape[0]
+
+    def data_callback(index):
+        # index is a tuple of slices for each dimension
+        # The batch slice tells us which global rows this device needs
+        batch_slice = index[0]
+        start = batch_slice.start or 0
+        stop = batch_slice.stop or global_shape[0]
+        # Map global indices to this host's local data
+        local_start = start - host_id * per_host
+        local_stop = stop - host_id * per_host
+        # If this slice belongs to our host, return it; else zeros (shouldn't happen)
+        if 0 <= local_start < per_host:
+            return np.array(data[local_start:local_stop])
+        else:
+            return np.zeros((stop - start,) + data.shape[1:], dtype=data.dtype)
+
+    return jax.make_array_from_callback(global_shape, sharding, data_callback)
+
+
+# ============================================================
+# Helpers
+# ============================================================
 
 def shard_batch(batch, n_devices):
-    """Reshape a batch for pmap: (B, ...) -> (n_devices, B//n_devices, ...).
+    """Reshape a batch for legacy compatibility: (B, ...) -> (n_devices, B//n_devices, ...).
 
     If the batch is already sharded (leading dim == n_devices), return as-is.
     """
@@ -496,7 +640,8 @@ def shard_batch(batch, n_devices):
 # Evaluation loop
 # ============================================================
 
-def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200, verbose=True):
+def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
+             verbose=True, data_sharding_spec=None):
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
@@ -512,16 +657,17 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200, verbo
         if batch_idx >= max_batches:
             break
 
-        # Ensure sharded for pmap
-        input_ids = shard_batch(input_ids, n_devices)
-        attention_mask = shard_batch(attention_mask, n_devices)
+        if data_sharding_spec is not None:
+            gb = input_ids.shape[0] * jax.process_count()
+            gs = (gb, input_ids.shape[1])
+            input_ids = shard_to_mesh(input_ids, data_sharding_spec, gs)
+            attention_mask = shard_to_mesh(attention_mask, data_sharding_spec, gs)
 
         ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
 
-        # Extract from first device (already aggregated via pmean/psum)
-        n_valid = int(valid_count[0])
-        total_loss += float(ce_loss[0]) * n_valid
-        total_correct += int(correct[0])
+        n_valid = int(valid_count)
+        total_loss += float(ce_loss) * n_valid
+        total_correct += int(correct)
         total_valid += n_valid
 
     eval_elapsed = time.time() - eval_start
@@ -873,6 +1019,12 @@ def main():
     n_local_devices = jax.local_device_count()
     local_devices = jax.local_devices()
 
+    # ALL hosts print device info (for multi-host debugging)
+    print(f"[Host {host_id}/{n_hosts}] "
+          f"local_devices={n_local_devices} total_devices={jax.device_count()} "
+          f"backend={jax.default_backend()} "
+          f"devices={[str(d) for d in local_devices]}", flush=True)
+
     per_host_batch = batch_size // n_hosts
     per_device_batch = per_host_batch // n_local_devices
 
@@ -886,7 +1038,7 @@ def main():
 
     if is_host0:
         print(f"\n{'='*60}")
-        print(f"DAWN v17.1-JAX Training (Multi-Host Multi-Device)")
+        print(f"DAWN Training (Multi-Host Multi-Device) — {cfg['model'].get('model_version', 'unknown')}")
         print(f"{'='*60}")
         print(f"JAX version: {jax.__version__}")
         print(f"Hosts: {n_hosts}, Host ID: {host_id}")
@@ -914,7 +1066,7 @@ def main():
         cfg['data'],
         max_length=max_seq_len,
         batch_size=batch_size,
-        n_devices=n_local_devices,
+        n_devices=1,  # flat (per_host_batch, seq_len) — shard_to_mesh handles splitting
         n_hosts=n_hosts,
         host_id=host_id,
     )
@@ -1053,44 +1205,100 @@ def main():
             print(f"  Warning: Failed to save config.json: {e}")
 
     # ----------------------------------------------------------
-    # Replicate params/opt_state across local devices
-    # ----------------------------------------------------------
-    params = replicate(params, local_devices)
-    opt_state = replicate(opt_state, local_devices)
-
-    # ----------------------------------------------------------
-    # Create pmap-compiled step functions
+    # Create Mesh + shard params
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
     model_version = cfg['model'].get('model_version', '17.1')
     is_baseline = model_version == 'baseline'
-    is_spatial = model_version == 'spatial-r1'
+    is_spatial = (model_version == 'spatial-r1'
+                  or model_version.startswith('spatial-r1-v2')
+                  or model_version.startswith('spatial-r1-v3'))
+    pos_loss_weight = cfg['training'].get('pos_loss_weight', 0.0)
+
+    mesh_model = cfg['training'].get('mesh_model', 1)
+    mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
+    total_devices = jax.device_count()
+    if mesh_data == 0:
+        mesh_data = total_devices // mesh_model
+
+    mesh = create_mesh(mesh_data, mesh_model)
+    data_sharding = NamedSharding(mesh, P('data', None))
+    per_device_batch = batch_size // total_devices
+
+    # Auto n_chunks: target ~2GB per chunk (bf16)
+    def auto_n_chunks(N, target_gb=2.0):
+        full_gb = per_device_batch * max_seq_len * N * 2 / 1e9  # bf16
+        nc = max(1, int(np.ceil(full_gb / target_gb)))
+        while N % nc != 0 and nc < N:
+            nc += 1
+        return min(nc, N)
+
+    target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
+    n_know = cfg['model'].get('n_know', 25200)
+    n_qk = cfg['model'].get('n_qk', 1580)
+    n_v = cfg['model'].get('n_v', 2600)
+    # N_local = N / mesh_model (each chip's share)
+    nk_local = n_know // mesh_model
+    nqk_local = n_qk // mesh_model
+    nv_local = n_v // mesh_model
+
+    n_chunks_know = cfg['training'].get('n_chunks_know',
+                                         auto_n_chunks(nk_local, target_chunk_gb))
+    n_chunks_qk = cfg['training'].get('n_chunks_qk',
+                                       auto_n_chunks(nqk_local, target_chunk_gb))
+    n_chunks_v = cfg['training'].get('n_chunks_v',
+                                      auto_n_chunks(nv_local, target_chunk_gb))
+
+    if is_host0:
+        print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
+              f"{total_devices} devices, per_device_batch={per_device_batch} ===")
+        print(f"  Chunks: know={n_chunks_know} (cs={nk_local // max(n_chunks_know,1)}), "
+              f"qk={n_chunks_qk}, v={n_chunks_v}")
+        chunk_mem = per_device_batch * max_seq_len * (nk_local // max(n_chunks_know,1)) * 2 / 1e9
+        print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
+
+    # Shard params: neuron_pool N-axis on 'model', rest replicated
+    param_shardings = get_param_shardings(params, mesh)
+    params = shard_params_to_mesh(params, param_shardings)
+    opt_state = optimizer.init(params)  # reinit with sharded params
+
+    # Create shard_map functions if mesh_model > 1
+    _sharded_fns = None
+    if mesh_model > 1:
+        from models.dawn_spatial_v3 import make_sharded_srw
+        max_chunk = cfg['training'].get('max_chunk_size', 8192)
+        _sharded_fns = make_sharded_srw(mesh, max_chunk_size=max_chunk)
+        if is_host0:
+            print(f"  shard_map enabled (mesh_model={mesh_model})")
+
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
-        n_devices=n_local_devices, is_baseline=is_baseline,
-        is_spatial=is_spatial)
-    eval_step_fn = create_eval_step(model, n_devices=n_local_devices)
+        is_baseline=is_baseline, is_spatial=is_spatial,
+        pos_loss_weight=pos_loss_weight, sharded_fns=_sharded_fns)
+    eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
 
     # ----------------------------------------------------------
-    # OOM check + JIT pre-compile: real train_step (forward + backward)
-    # All hosts must participate (pmap requires it)
+    # OOM check + JIT pre-compile
     # ----------------------------------------------------------
     if is_host0:
         print(f"\n=== OOM check: real train_step (forward+backward) "
               f"per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
     try:
-        dummy_ids = jnp.zeros((n_local_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
-        dummy_mask = jnp.ones((n_local_devices, per_device_batch, max_seq_len), dtype=jnp.int32)
+        global_shape = (batch_size, max_seq_len)
+        dummy_ids = shard_to_mesh(
+            jnp.zeros((per_host_batch, max_seq_len), dtype=jnp.int32),
+            data_sharding, global_shape)
+        dummy_mask = shard_to_mesh(
+            jnp.ones((per_host_batch, max_seq_len), dtype=jnp.int32),
+            data_sharding, global_shape)
         rng, dummy_step_rng = jax.random.split(rng)
-        dummy_dropout_keys = jax.random.split(dummy_step_rng, n_local_devices)
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
-        _dummy_params, _dummy_opt, dummy_metrics = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys,
-        )
+        _dp, _do, dummy_metrics = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng)
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         if is_host0:
@@ -1098,15 +1306,13 @@ def main():
 
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
-        dummy_dropout_keys2 = jax.random.split(dummy_step_rng2, n_local_devices)
         step_start = time.time()
-        _dummy_params2, _dummy_opt2, dummy_metrics2 = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_dropout_keys2,
-        )
+        _dp2, _do2, dummy_metrics2 = train_step_fn(
+            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2)
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
-            print(f"  train_step OK -- loss={float(dummy_metrics['total_loss'][0]):.4f}", flush=True)
+            print(f"  train_step OK -- loss={float(dummy_metrics['total_loss']):.4f}", flush=True)
             print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
 
             # Show memory usage after JIT compilation
@@ -1120,6 +1326,180 @@ def main():
             except Exception:
                 pass
 
+            # === Inline step-time breakdown (printed to stdout) ===
+            try:
+                print(f"\n  === Step-time breakdown (single device, 1 layer) ===",
+                      flush=True)
+                # Use single-device params for profiling
+                p_single = jax.device_get(params)
+                pool_p = p_single['neuron_pool']
+                router_p = p_single['router']
+                block_p = p_single['block_0']
+                dummy_x = jnp.zeros((per_device_batch, max_seq_len,
+                                     cfg['model']['d_model']))
+                prof_rng = jax.random.PRNGKey(42)
+                d_model = cfg['model']['d_model']
+                n_heads = cfg['model']['n_heads']
+                max_k_qk = cfg['model'].get('max_k_qk', 157)
+                max_k_v = cfg['model'].get('max_k_v', 262)
+                max_k_know = cfg['model'].get('max_k_know', 1536)
+                n_qk = cfg['model'].get('n_qk', 1570)
+                n_v = cfg['model'].get('n_v', 2620)
+                rd = cfg['model'].get('router_dropout', 0.1)
+                dd = cfg['model'].get('dropout', 0.1)
+
+                from models.dawn_spatial_v3 import (
+                    _layer_norm, _attn_forward, _know_forward)
+
+                normed = _layer_norm(dummy_x,
+                                     block_p['norm1']['scale'],
+                                     block_p['norm1']['bias'])
+                # Warm up
+                _a, _ = _attn_forward(
+                    normed, pool_p, router_p,
+                    block_p['attn']['expand_O']['kernel'], prof_rng,
+                    n_qk, n_v, max_k_qk, max_k_v,
+                    n_heads, d_model, rd, dd, True)
+                jax.block_until_ready(_a)
+                _k, _ = _know_forward(
+                    normed, pool_p, router_p, prof_rng,
+                    max_k_know, rd, dd, True)
+                jax.block_until_ready(_k)
+
+                # Measure attention
+                N_RUNS = 5
+                t0 = time.time()
+                for _ in range(N_RUNS):
+                    _a, _ = _attn_forward(
+                        normed, pool_p, router_p,
+                        block_p['attn']['expand_O']['kernel'], prof_rng,
+                        n_qk, n_v, max_k_qk, max_k_v,
+                        n_heads, d_model, rd, dd, True)
+                    jax.block_until_ready(_a)
+                attn_ms = (time.time() - t0) / N_RUNS * 1000
+
+                # Measure knowledge
+                t0 = time.time()
+                for _ in range(N_RUNS):
+                    _k, _ = _know_forward(
+                        normed, pool_p, router_p, prof_rng,
+                        max_k_know, rd, dd, True)
+                    jax.block_until_ready(_k)
+                know_ms = (time.time() - t0) / N_RUNS * 1000
+
+                total_ms = attn_ms + know_ms
+                n_layers = cfg['model']['n_layers']
+                print(f"  Attention:  {attn_ms:.1f} ms/layer "
+                      f"({attn_ms/total_ms*100:.0f}%)", flush=True)
+                print(f"  Knowledge:  {know_ms:.1f} ms/layer "
+                      f"({know_ms/total_ms*100:.0f}%)", flush=True)
+                print(f"  Layer total: {total_ms:.1f} ms", flush=True)
+                print(f"  Est. {n_layers}-layer: {total_ms*n_layers:.0f} ms "
+                      f"(actual step includes grad+opt)", flush=True)
+
+                # --- Full component breakdown (every op separately) ---
+                from models.dawn_spatial_v3 import (
+                    threshold_gate as tg_fn, sense_read_write)
+
+                def _t(fn, n=N_RUNS):
+                    r = fn(); jax.block_until_ready(r)
+                    t0 = time.time()
+                    for _ in range(n):
+                        r = fn(); jax.block_until_ready(r)
+                    return (time.time() - t0) / n * 1000
+
+                # === Knowledge breakdown ===
+                ke = pool_p['know_emb']
+                k_read = pool_p['know_read']
+                k_write = pool_p['know_write']
+                kn = ke / (jnp.linalg.norm(ke, axis=-1, keepdims=True) + 1e-8)
+                pk, pb_ = router_p['proj_know']['kernel'], router_p['proj_know']['bias']
+                tkk, tkb = router_p['tau_know']['kernel'], router_p['tau_know']['bias']
+
+                h_k = normed @ pk + pb_
+                sc_k = h_k @ kn.T
+                tau_k = normed @ tkk + tkb
+                gk = tg_fn(sc_k, tau_k)
+
+                items = []
+                items.append(("K proj(x)",       _t(lambda: normed @ pk + pb_)))
+                items.append(("K h@emb.T",       _t(lambda: h_k @ kn.T)))
+                items.append(("K tau",            _t(lambda: normed @ tkk + tkb)))
+                items.append(("K gate",           _t(lambda: tg_fn(sc_k, tau_k))))
+                items.append(("K srw",             _t(lambda: sense_read_write(normed, gk, k_read, k_write))))
+                items.append(("K load_bal",       _t(lambda: gk.mean(axis=(0,1)))))
+
+                # === Attention breakdown ===
+                qke = pool_p['qk_emb']
+                ve = pool_p['v_emb']
+                qk_rd = pool_p['qk_read']
+                qk_wr = pool_p['qk_write']
+                v_rd = pool_p['v_read']
+                v_wr = pool_p['v_write']
+                qkn = qke / (jnp.linalg.norm(qke, axis=-1, keepdims=True) + 1e-8)
+                vn = ve / (jnp.linalg.norm(ve, axis=-1, keepdims=True) + 1e-8)
+                pak, pab = router_p['proj_attn']['kernel'], router_p['proj_attn']['bias']
+                tak, tab = router_p['tau_attn']['kernel'], router_p['tau_attn']['bias']
+                Ok = block_p['attn']['expand_O']['kernel']
+                Bp, Sp = per_device_batch, max_seq_len
+                dh = d_model // n_heads
+
+                ha = normed @ pak + pab
+                hQ, hK, hV = jnp.split(ha, 3, axis=-1)
+                tau_a = normed @ tak + tab
+                gQ = tg_fn(hQ @ qkn.T, tau_a[:,:,0:1])
+                gK = tg_fn(hK @ qkn.T, tau_a[:,:,1:2])
+                gV = tg_fn(hV @ vn.T, tau_a[:,:,2:3])
+                Qp = sense_read_write(normed, gQ, qk_rd, qk_wr)
+                Kp = sense_read_write(normed, gK, qk_rd, qk_wr)
+                Vp = sense_read_write(normed, gV, v_rd, v_wr)
+
+                items.append(("A proj(x)",       _t(lambda: normed @ pak + pab)))
+                items.append(("A h@emb.T(QKV)",  _t(lambda: (hQ@qkn.T, hK@qkn.T, hV@vn.T))))
+                items.append(("A tau",            _t(lambda: normed @ tak + tab)))
+                items.append(("A gate Q+K+V",    _t(lambda: (
+                    tg_fn(hQ@qkn.T, tau_a[:,:,0:1]),
+                    tg_fn(hK@qkn.T, tau_a[:,:,1:2]),
+                    tg_fn(hV@vn.T, tau_a[:,:,2:3])))))
+                items.append(("A emit Q+K+V",    _t(lambda: (
+                    sense_read_write(normed, gQ, qk_rd, qk_wr),
+                    sense_read_write(normed, gK, qk_rd, qk_wr),
+                    sense_read_write(normed, gV, v_rd, v_wr)))))
+
+                Qr = Qp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
+                Kr = Kp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
+                Vr = Vp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
+                sc = jnp.sqrt(jnp.float32(dh))
+                csl = jnp.tril(jnp.ones((Sp,Sp), dtype=jnp.bool_))
+
+                items.append(("A QK scores",     _t(lambda: jnp.einsum('bhsd,bhtd->bhst', Qr, Kr)/sc)))
+                attn_sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr)/sc
+                attn_sc = jnp.where(csl, attn_sc, jnp.finfo(attn_sc.dtype).min)
+                attn_w = jax.nn.softmax(attn_sc, axis=-1)
+                items.append(("A softmax+mask",  _t(lambda: jax.nn.softmax(
+                    jnp.where(csl, attn_sc, jnp.finfo(attn_sc.dtype).min), axis=-1))))
+                items.append(("A wV+O_proj",     _t(lambda: jnp.einsum(
+                    'bhst,bhtd->bhsd', attn_w, Vr).transpose(0,2,1,3).reshape(Bp,Sp,d_model) @ Ok)))
+                items.append(("A load_bal",       _t(lambda: gQ.mean(axis=(0,1)))))
+
+                # === Print all ===
+                total_items = sum(v for _, v in items)
+                print(f"\n  === Full op breakdown (1 layer, {total_items:.0f} ms total) ===",
+                      flush=True)
+                for name, ms in items:
+                    pct = ms / total_items * 100 if total_items > 0 else 0
+                    bar = '#' * int(pct / 2)
+                    print(f"    {name:20s} {ms:7.1f} ms  {pct:4.0f}%  {bar}",
+                          flush=True)
+
+                know_sum = sum(v for n, v in items if n.startswith('K '))
+                attn_sum = sum(v for n, v in items if n.startswith('A '))
+                print(f"    {'---':20s} {'---':>7s}", flush=True)
+                print(f"    {'Knowledge total':20s} {know_sum:7.1f} ms", flush=True)
+                print(f"    {'Attention total':20s} {attn_sum:7.1f} ms", flush=True)
+            except Exception as e:
+                print(f"  Breakdown skipped: {e}", flush=True)
+
             # Estimate total training time
             total_steps = len(train_loader) * num_epochs
             remaining_steps = total_steps - global_step
@@ -1127,8 +1507,8 @@ def main():
             est_hours = est_seconds / 3600
             print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
 
-        del _dummy_params, _dummy_opt, dummy_metrics, dummy_ids, dummy_mask, dummy_dropout_keys
-        del _dummy_params2, _dummy_opt2, dummy_metrics2, dummy_dropout_keys2
+        del _dp, _do, dummy_metrics, dummy_ids, dummy_mask
+        del _dp2, _do2, dummy_metrics2
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
     except Exception as e:
@@ -1149,8 +1529,8 @@ def main():
         # Set up loggers (local append + periodic GCS sync)
         _setup_loggers(training_log_file, jsonl_log_file)
 
-        n_params = count_parameters(unreplicate(params))
-        log_message(f"DAWN v17.1-JAX Training Log (Multi-Host) - {timestamp}")
+        n_params = count_parameters(jax.device_get(params))
+        log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
         log_message(f"Config: {config_path}")
         log_message(f"Parameters: {n_params:,}")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
@@ -1179,11 +1559,11 @@ def main():
         if preemption_requested[0]:
             return  # avoid double-save
         preemption_requested[0] = True
-        if is_host0:
-            print(f"\n!!! SIGTERM received — saving emergency checkpoint (step={global_step}) !!!", flush=True)
-            try:
-                params_single = unreplicate(params)
-                opt_state_single = unreplicate(opt_state)
+        print(f"\n!!! SIGTERM received (host {host_id}) — saving emergency checkpoint (step={global_step}) !!!", flush=True)
+        try:
+            params_single = jax.device_get(params)
+            opt_state_single = jax.device_get(opt_state)
+            if is_host0:
                 epath = _ckpt_path(f"emergency_step{global_step}.flax")
                 save_checkpoint(
                     epath, params_single, opt_state_single,
@@ -1194,8 +1574,8 @@ def main():
                     training_config=training_config,
                 )
                 print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
-            except Exception as e:
-                print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
+        except Exception as e:
+            print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
@@ -1240,27 +1620,28 @@ def main():
                     print("Preemption requested — exiting training loop.", flush=True)
                 break
 
-            # Ensure sharded for pmap (local devices only)
-            input_ids = shard_batch(input_ids, n_local_devices)
-            attention_mask = shard_batch(attention_mask, n_local_devices)
-
-            # Different dropout key per local device per step
+            # Shard data and run train step
             rng, step_rng = jax.random.split(rng)
-            dropout_keys = jax.random.split(step_rng, n_local_devices)
+            step_rng = jax.random.fold_in(step_rng, host_id)  # per-host dropout
+            input_ids = shard_to_mesh(
+                input_ids, data_sharding, (batch_size, max_seq_len))
+            attention_mask = shard_to_mesh(
+                attention_mask, data_sharding, (batch_size, max_seq_len))
 
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
-                input_ids, attention_mask, dropout_keys,
-            )
+                input_ids, attention_mask, step_rng)
 
-            # Extract metrics (take first device, already aggregated via pmean/psum)
-            m_total = float(metrics['total_loss'][0])
-            m_ce = float(metrics['ce_loss'][0])
-            m_aux = float(metrics['aux_loss'][0])
-            m_orth = float(metrics['orth_loss'][0])
-            m_div = float(metrics['div_loss'][0])
-            m_correct = int(metrics['correct'][0])
-            m_valid = int(metrics['valid_count'][0])
+            # Extract metrics (scalars from jit, no [0] indexing)
+            def _m(v):
+                return float(v)
+            m_total = _m(metrics['total_loss'])
+            m_ce = _m(metrics['ce_loss'])
+            m_aux = _m(metrics['aux_loss'])
+            m_orth = _m(metrics['orth_loss'])
+            m_div = _m(metrics['div_loss'])
+            m_correct = int(_m(metrics['correct']))
+            m_valid = int(_m(metrics['valid_count']))
 
             # NaN/INF detection
             if check_nan_inf({
@@ -1311,6 +1692,9 @@ def main():
                     remaining_steps = steps_per_epoch - epoch_steps
                     eta = s_per_it * remaining_steps
 
+                    # Grad norm
+                    m_grad = _m(metrics['grad_norm'])
+
                     msg = (
                         f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
                         f"loss={avg_loss:.4f} ce={avg_ce:.4f} aux={avg_aux:.4f} "
@@ -1319,6 +1703,29 @@ def main():
                         f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
                     )
                     log_message(msg)
+
+                    # Detailed stats (all from metrics, no params access)
+                    try:
+                        tk_b = _m(metrics['tau_know_bias'])
+                        ta_b = [_m(metrics['tau_attn_bias_0']),
+                                _m(metrics['tau_attn_bias_1']),
+                                _m(metrics['tau_attn_bias_2'])]
+                        tau_s = (f"tau: know={tk_b:.2f} "
+                                 f"attn=[{ta_b[0]:.2f},{ta_b[1]:.2f},{ta_b[2]:.2f}]")
+
+                        k_act = _m(metrics['know_active'])
+                        k_gmax = _m(metrics['know_gate_max'])
+                        n_know_cfg = cfg['model'].get('n_know', 27200)
+                        gate_s = (f"gate: active={k_act:.0f}/{n_know_cfg}"
+                                  f"({k_act/n_know_cfg*100:.0f}%) "
+                                  f"max={k_gmax:.4f}")
+
+                        log_message(
+                            f"      {tau_s} | grad_norm={m_grad:.3f}")
+                        log_message(
+                            f"      {gate_s}")
+                    except Exception:
+                        log_message(f"      grad_norm={m_grad:.3f}")
 
                     # JSONL structured log
                     log_jsonl({
@@ -1369,8 +1776,9 @@ def main():
                 if is_host0:
                     log_message(f"\n  Mid-epoch validation at step {global_step}...")
                 val_loader.reset()
-                val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
-                                             n_local_devices, verbose=is_host0)
+                val_loss, val_acc = evaluate(
+                    eval_step_fn, params, val_loader, n_local_devices,
+                    verbose=is_host0, data_sharding_spec=data_sharding)
                 if is_host0:
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
                     log_jsonl({
@@ -1382,10 +1790,12 @@ def main():
                         'timestamp': datetime.now().isoformat(),
                     })
 
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        params_single = unreplicate(params)
-                        opt_state_single = unreplicate(opt_state)
+                # Best model save (device_get on ALL hosts)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    params_single = jax.device_get(params)
+                    opt_state_single = jax.device_get(opt_state)
+                    if is_host0:
                         save_checkpoint(
                             _ckpt_path("best_model.flax"),
                             params_single, opt_state_single,
@@ -1395,22 +1805,24 @@ def main():
                             steps_per_epoch=steps_per_epoch,
                             training_config=training_config,
                         )
-                        del params_single, opt_state_single
                         log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
+                    del params_single, opt_state_single
 
-            # ---- Mid-epoch checkpoint (host 0 only) ----
-            if global_step % ckpt_interval == 0 and global_step > 0 and is_host0:
-                params_single = unreplicate(params)
-                opt_state_single = unreplicate(opt_state)
-                save_checkpoint(
-                    _ckpt_path(f"checkpoint_step{global_step}.flax"),
-                    params_single, opt_state_single,
-                    epoch, global_step, best_val_loss,
-                    cfg['model'],
-                    step_in_epoch=epoch_step_counter,
-                    steps_per_epoch=steps_per_epoch,
-                    training_config=training_config,
-                )
+            # ---- Mid-epoch checkpoint ----
+            if global_step % ckpt_interval == 0 and global_step > 0:
+                # device_get on ALL hosts (may be collective for sharded params)
+                params_single = jax.device_get(params)
+                opt_state_single = jax.device_get(opt_state)
+                if is_host0:
+                    save_checkpoint(
+                        _ckpt_path(f"checkpoint_step{global_step}.flax"),
+                        params_single, opt_state_single,
+                        epoch, global_step, best_val_loss,
+                        cfg['model'],
+                        step_in_epoch=epoch_step_counter,
+                        steps_per_epoch=steps_per_epoch,
+                        training_config=training_config,
+                    )
                 del params_single, opt_state_single
                 cleanup_old_checkpoints(checkpoint_dir, keep_last=3)
 
@@ -1434,8 +1846,9 @@ def main():
         if is_host0:
             log_message("  Running end-of-epoch validation...")
         val_loader.reset()
-        val_loss, val_acc = evaluate(eval_step_fn, params, val_loader,
-                                     n_local_devices, verbose=is_host0)
+        val_loss, val_acc = evaluate(
+            eval_step_fn, params, val_loader, n_local_devices,
+            verbose=is_host0, data_sharding_spec=data_sharding)
 
         is_best = val_loss < best_val_loss
         if is_best:
@@ -1455,10 +1868,11 @@ def main():
                 'timestamp': datetime.now().isoformat(),
             })
 
-            # Save epoch checkpoint (host 0 only)
-            params_single = unreplicate(params)
-            opt_state_single = unreplicate(opt_state)
+        # Save epoch checkpoint (device_get on ALL hosts)
+        params_single = jax.device_get(params)
+        opt_state_single = jax.device_get(opt_state)
 
+        if is_host0:
             save_checkpoint(
                 _ckpt_path(f"checkpoint_epoch{epoch}.flax"),
                 params_single, opt_state_single,

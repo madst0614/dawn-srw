@@ -1,0 +1,54 @@
+# DAWN Spatial-R1 v3.8.2 -- Sense-Read-Write, d_bottleneck=128, 40M Scale
+# emb[N,128] sense + w_read[N,384] + w_write[N,384]. Relative tau gate.
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "spatial-r1-v3.8.2"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+
+  d_bottleneck: 128
+  n_qk: 1580
+  n_v: 2600
+  n_know: 25200
+  max_k_qk: 158
+  max_k_v: 260
+  max_k_know: 1810
+  router_dropout: 0.1
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  diversity_weight: 0.1
+  load_balance_weight: 0.00002
+  checkpoint_interval: 500
+  val_interval: 500
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.8_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.8_40M_c4_5B
+
+# Parameter budget (~40M):
+#   QK:   1580 x (128+384+384) = 1.42M
+#   V:    2600 x (128+384+384) = 2.33M
+#   Know: 25200 x (128+384+384) = 22.58M
+#   Router proj+tau: ~0.25M
+#   Blocks (LN x2 + O) x12: 1.79M
+#   Embeddings: 11.72M
+#   Total: ~40.1M
