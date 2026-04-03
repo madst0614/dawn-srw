@@ -992,6 +992,254 @@ def analyze_layer_balance(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# R.2: POS Selectivity (rebuttal D.2 methodology)
+# ============================================================
+
+UPOS_TAGS = ['ADJ', 'ADP', 'ADV', 'AUX', 'CCONJ', 'DET', 'INTJ', 'NOUN',
+             'NUM', 'PART', 'PRON', 'PROPN', 'PUNCT', 'SCONJ', 'SYM', 'VERB', 'X']
+
+
+def _load_ud_ewt(max_sentences=5000):
+    """Load UD-EWT dataset. Returns list of {tokens, upos}."""
+    try:
+        import conllu
+    except ImportError:
+        print("  conllu not installed. Falling back to NLTK treebank.")
+        return _load_nltk_fallback(max_sentences)
+
+    import urllib.request
+    url = ("https://raw.githubusercontent.com/UniversalDependencies/"
+           "UD_English-EWT/master/en_ewt-ud-train.conllu")
+    try:
+        print(f"  Downloading UD-EWT from GitHub...")
+        response = urllib.request.urlopen(url, timeout=30)
+        text = response.read().decode('utf-8')
+        sentences = conllu.parse(text)
+    except Exception as e:
+        print(f"  UD-EWT download failed: {e}. Falling back to NLTK.")
+        return _load_nltk_fallback(max_sentences)
+
+    data = []
+    for sent in sentences[:max_sentences]:
+        tokens = [t['form'] for t in sent]
+        upos = [t['upostag'] for t in sent]
+        data.append({'tokens': tokens, 'upos': upos})
+    return data
+
+
+def _load_nltk_fallback(max_sentences=5000):
+    """Fallback: use NLTK treebank with universal tagset."""
+    import nltk
+    nltk.download('treebank', quiet=True)
+    nltk.download('universal_tagset', quiet=True)
+    from nltk.corpus import treebank
+
+    data = []
+    for i, sent in enumerate(treebank.tagged_sents(tagset='universal')):
+        if i >= max_sentences:
+            break
+        tokens = [w for w, _ in sent]
+        # Map NLTK universal tags to UD UPOS
+        tag_map = {'NOUN': 'NOUN', 'VERB': 'VERB', 'ADJ': 'ADJ', 'ADV': 'ADV',
+                    'ADP': 'ADP', 'DET': 'DET', 'PRON': 'PRON', 'NUM': 'NUM',
+                    'CONJ': 'CCONJ', 'PRT': 'PART', '.': 'PUNCT', 'X': 'X'}
+        upos = [tag_map.get(t, 'X') for _, t in sent]
+        data.append({'tokens': tokens, 'upos': upos})
+    return data
+
+
+def analyze_pos_selectivity(params, cfg, output_dir,
+                             max_sentences=5000, batch_size=8):
+    """POS selectivity: same as v17.1 D.2.
+
+    selectivity[neuron, pos] = P(neuron active | POS) / P(neuron active)
+    Specialist: selectivity > 2.0 AND mean_weight > 0.1
+    """
+    print("\n" + "="*60)
+    print("R.2: POS Selectivity")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    from models.dawn_spatial_v3 import analysis_forward
+    import numpy as np
+
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model_cfg = get_model_cfg(cfg)
+    n_know = model_cfg['n_know']
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+
+    # Load UD-EWT
+    dataset = _load_ud_ewt(max_sentences)
+    print(f"  Loaded {len(dataset)} sentences")
+
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Accumulators: per-neuron activation count, per-(neuron,pos) count
+    n_pos = len(UPOS_TAGS)
+    pos_to_idx = {p: i for i, p in enumerate(UPOS_TAGS)}
+
+    # For each pool
+    pools = {
+        'QK': {'size': n_qk, 'gate_key': 'gate_Q'},  # Use Q gate for QK pool
+        'V': {'size': n_v, 'gate_key': 'gate_V'},
+        'Know': {'size': n_know, 'gate_key': 'gate_Know'},
+    }
+    pool_counts = {}
+    pool_pos_counts = {}
+    pos_token_counts = np.zeros(n_pos, dtype=np.float64)
+    total_tokens = 0
+
+    for pool_name, pinfo in pools.items():
+        pool_counts[pool_name] = np.zeros(pinfo['size'], dtype=np.float64)
+        pool_pos_counts[pool_name] = np.zeros((pinfo['size'], n_pos), dtype=np.float64)
+
+    max_seq = model_cfg['max_seq_len']
+
+    print(f"  Processing sentences...")
+    # Process in batches: tokenize sentences, map POS, forward, accumulate
+    batch_tokens = []
+    batch_pos_labels = []
+
+    for si, sent in enumerate(dataset):
+        # Tokenize and map POS to subword tokens
+        text = ' '.join(sent['tokens'])
+        encoding = tokenizer(text, return_offsets_mapping=True,
+                             add_special_tokens=False, truncation=True,
+                             max_length=max_seq)
+        token_ids = encoding['input_ids']
+        offsets = encoding['offset_mapping']
+
+        # Build character-span POS mapping
+        char_pos = {}
+        char_idx = 0
+        for tok, pos in zip(sent['tokens'], sent['upos']):
+            start = text.find(tok, char_idx)
+            if start >= 0:
+                for c in range(start, start + len(tok)):
+                    char_pos[c] = pos
+                char_idx = start + len(tok)
+
+        # Map subword tokens to POS
+        token_pos = []
+        for s, e in offsets:
+            # Find POS for this span
+            mid = (s + e) // 2
+            pos = char_pos.get(mid, 'X')
+            token_pos.append(pos_to_idx.get(pos, pos_to_idx['X']))
+
+        batch_tokens.append(token_ids)
+        batch_pos_labels.append(token_pos)
+
+        # Process when batch full or last sentence
+        if len(batch_tokens) >= batch_size or si == len(dataset) - 1:
+            if not batch_tokens:
+                continue
+
+            # Pad to same length
+            max_len = min(max(len(t) for t in batch_tokens), max_seq)
+            padded = np.zeros((len(batch_tokens), max_len), dtype=np.int32)
+            pos_padded = np.full((len(batch_tokens), max_len), -1, dtype=np.int32)
+            for bi, (tids, plabs) in enumerate(zip(batch_tokens, batch_pos_labels)):
+                l = min(len(tids), max_len)
+                padded[bi, :l] = tids[:l]
+                pos_padded[bi, :l] = plabs[:l]
+
+            # Forward
+            ids_dev = jnp.array(padded, dtype=jnp.int32)
+            _, layer_info = jit_analysis(params, ids_dev)
+
+            # Get gates (average across layers)
+            for pool_name, pinfo in pools.items():
+                # gate: [n_layers, B, S, N]
+                gate = np.array(jax.device_get(layer_info[pinfo['gate_key']]))
+                # Average over layers
+                gate_avg = gate.mean(axis=0)  # [B, S, N]
+                active = (gate_avg > 1e-6).astype(np.float32)  # [B, S, N]
+                weights = gate_avg  # Use actual gate values for mean_weight
+
+                # Accumulate
+                for bi in range(len(batch_tokens)):
+                    for ti in range(min(len(batch_tokens[bi]), max_len)):
+                        pi = pos_padded[bi, ti]
+                        if pi < 0:
+                            continue
+                        # Per-neuron total activation
+                        pool_counts[pool_name] += active[bi, ti]
+                        # Per-(neuron, pos) activation
+                        pool_pos_counts[pool_name][:, pi] += active[bi, ti]
+                        pos_token_counts[pi] += 1
+                        total_tokens += 1
+
+            batch_tokens = []
+            batch_pos_labels = []
+
+        if (si + 1) % 500 == 0:
+            print(f"    [{si+1}/{len(dataset)}] sentences")
+
+    # Compute selectivity
+    results = {}
+    for pool_name, pinfo in pools.items():
+        N = pinfo['size']
+        # P(neuron active)
+        p_neuron = pool_counts[pool_name] / (total_tokens + 1e-8)  # [N]
+
+        selectivity = np.zeros((N, n_pos))
+        for pi in range(n_pos):
+            if pos_token_counts[pi] > 0:
+                # P(neuron active | POS)
+                p_given_pos = pool_pos_counts[pool_name][:, pi] / pos_token_counts[pi]
+                selectivity[:, pi] = p_given_pos / (p_neuron + 1e-8)
+
+        # Mean weight per (neuron, pos) for specialist threshold
+        mean_weight = np.zeros((N, n_pos))
+        for pi in range(n_pos):
+            if pos_token_counts[pi] > 0:
+                mean_weight[:, pi] = pool_pos_counts[pool_name][:, pi] / pos_token_counts[pi]
+
+        # Per-POS top neurons
+        top_per_pos = {}
+        for pi, pos in enumerate(UPOS_TAGS):
+            sel_col = selectivity[:, pi]
+            mw_col = mean_weight[:, pi]
+            # Sort by selectivity
+            order = np.argsort(-sel_col)
+            neurons = []
+            for ni in order[:20]:
+                is_spec = bool(sel_col[ni] > 2.0 and mw_col[ni] > 0.1)
+                neurons.append({
+                    'neuron': int(ni),
+                    'selectivity': float(sel_col[ni]),
+                    'mean_weight': float(mw_col[ni]),
+                    'is_specialist': is_spec,
+                })
+            top_per_pos[pos] = neurons
+
+        n_specialists_total = int(((selectivity > 2.0) &
+                                    (mean_weight > 0.1)).any(axis=1).sum())
+
+        print(f"\n  {pool_name} Pool:")
+        print(f"    Total specialists: {n_specialists_total}")
+        # Show top POS
+        for pos in ['NOUN', 'VERB', 'ADJ', 'ADV', 'DET', 'PROPN']:
+            if top_per_pos[pos]:
+                top1 = top_per_pos[pos][0]
+                n_spec = sum(1 for n in top_per_pos[pos] if n['is_specialist'])
+                print(f"    {pos:6s}: top neuron={top1['neuron']:4d} "
+                      f"sel={top1['selectivity']:.1f}x  ({n_spec} specialists)")
+
+        results[pool_name] = {
+            'n_neurons': N,
+            'n_specialists': n_specialists_total,
+            'top_selective_per_pos': top_per_pos,
+            'total_tokens': total_tokens,
+        }
+
+    _save_json(results, output_dir, 'r2_pos_selectivity', 'results.json')
+    return results
+
+
+# ============================================================
 # R.3: Knowledge Neurons — Contrastive Score (rebuttal D.3)
 # ============================================================
 
@@ -1058,47 +1306,45 @@ def analyze_knowledge_neurons(params, cfg, output_dir,
             if successful_runs >= min_target_count:
                 break
 
-            # Generate one token at a time, check if it's target
-            prompt_dev = jnp.array([prompt_ids], dtype=jnp.int32)
-            logits_pf, cK, cV, cL = jit_prefill(params, prompt_dev)
+            # Generate token by token with greedy decode (matches v17.1)
+            # Build full context each step, get gates at last position
+            context_ids = list(prompt_ids)
+            max_gen_steps = 10
 
-            # Get gate info for the prompt
-            _, layer_info = jit_analysis(params, prompt_dev)
-            # Know gate at last position, averaged over layers
-            # gate_Know: [n_layers, 1, S, n_know]
-            know_gates = jax.device_get(layer_info['gate_Know'])  # [L, 1, S, N]
-
-            # Greedy decode up to 10 tokens
-            last_logits = logits_pf[0, -1, :]
             rng = jax.random.PRNGKey(run)
 
-            for step in range(10):
-                rng, srng = jax.random.split(rng)
-                # Temperature sampling for diversity
-                l = last_logits / 0.9
-                next_tok = int(jax.random.categorical(srng, l))
+            for step in range(max_gen_steps):
+                # Pad to fixed length for JIT stability
+                ctx_len = len(context_ids)
+                if ctx_len >= max_seq:
+                    break
+                padded = context_ids + [0] * (max_seq - ctx_len)
+                ctx_dev = jnp.array([padded], dtype=jnp.int32)
 
-                # Get active neurons at this step (from last position of prompt/context)
-                # Use know gates from the last position
-                last_pos_gates = know_gates[:, 0, -1, :]  # [L, N]
+                # Forward with gate extraction — recompute per step
+                logits, layer_info = jit_analysis(params, ctx_dev)
+                # Know gate at current last position, averaged over layers
+                know_gates = jax.device_get(layer_info['gate_Know'])  # [L, 1, S, N]
+                last_pos_gates = know_gates[:, 0, ctx_len - 1, :]  # [L, N]
                 active_neurons = set(np.where(last_pos_gates.mean(axis=0) > 1e-6)[0])
+
+                # Temperature sampling for diversity across runs
+                rng, srng = jax.random.split(rng)
+                l = logits[0, ctx_len - 1, :] / 0.9
+                next_tok = int(jax.random.categorical(srng, l))
 
                 if next_tok == target_id:
                     successful_runs += 1
                     for n in active_neurons:
                         know_target_counts[n] += 1
                     break
+                elif next_tok in (tokenizer.sep_token_id, tokenizer.pad_token_id, 0):
+                    break
                 else:
                     total_baseline_steps += 1
                     for n in active_neurons:
                         know_baseline_counts[n] += 1
-
-                    # Continue generation
-                    if cL >= model_cfg['max_seq_len'] - 1:
-                        break
-                    tok_dev = jnp.array([next_tok], dtype=jnp.int32)
-                    last_logits, cK, cV, cL = jit_decode(params, tok_dev, cK, cV, cL)
-                    last_logits = last_logits[0]
+                    context_ids.append(next_tok)
 
             if (run + 1) % 50 == 0:
                 print(f"    run {run+1}: {successful_runs}/{min_target_count} hits")
@@ -1358,6 +1604,9 @@ def main():
             analyze_qk_specialization(params, cfg, val_tokens, args.output)
         else:
             print("\n  Skipping R.1 (no --val_data)")
+
+    if only is None or 'r2' in only:
+        analyze_pos_selectivity(params, cfg, args.output)
 
     if only is None or 'r4' in only:
         if val_tokens is not None:
