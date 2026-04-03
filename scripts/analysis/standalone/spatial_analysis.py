@@ -156,25 +156,22 @@ def load_checkpoint_params(ckpt_path, model, cfg):
         {'params': rng, 'dropout': rng}, dummy, deterministic=True)
     target_params = variables['params']
 
-    # Load checkpoint — params only (skip opt_state to avoid shape mismatch)
+    # Load checkpoint — use flax msgpack_restore for proper numpy array handling,
+    # then restore only params (skip opt_state to avoid shape mismatch)
     with _open_file(ckpt_path, 'rb') as f:
         bytes_data = f.read()
 
-    import msgpack
-    raw = msgpack.unpackb(bytes_data, raw=False)
+    raw = serialization.msgpack_restore(bytes_data)
+    raw_params = raw['params']
 
-    # Extract params from raw state dict and restore into target structure
-    raw_params = raw.get('params', raw.get(b'params', {}))
-    ckpt = serialization.from_state_dict({'params': target_params}, {'params': raw_params})
-    ckpt = {
-        'params': ckpt['params'],
-        'step': raw.get('step', raw.get(b'step', 0)),
-        'epoch': raw.get('epoch', raw.get(b'epoch', 0)),
-    }
+    # Restore params into model structure (validates shapes)
+    params = serialization.from_state_dict(target_params, raw_params)
 
-    step = ckpt.get('step', 0)
-    epoch = ckpt.get('epoch', 0)
+    step = int(raw.get('step', 0))
+    epoch = int(raw.get('epoch', 0))
     print(f"  Step: {step}, Epoch: {epoch}")
+
+    ckpt = {'params': params, 'step': step, 'epoch': epoch}
     return ckpt['params'], ckpt
 
 
