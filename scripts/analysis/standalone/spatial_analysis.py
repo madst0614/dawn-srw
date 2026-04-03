@@ -133,16 +133,18 @@ def load_checkpoint_params(ckpt_path, model, cfg):
     if not ckpt_path.endswith('.msgpack') and not ckpt_path.endswith('.ckpt'):
         # It's a directory — find latest checkpoint file
         files = _list_dir(ckpt_path)
-        print(f"  Files in dir: {[os.path.basename(f) for f in files]}")
-        ckpts = sorted([f for f in files
-                        if ('step_' in f or 'checkpoint' in f)
-                        and not any(f.endswith(ext) for ext in
-                                    ('.txt', '.json', '.jsonl', '.log', '.yaml'))])
-        if ckpts:
-            ckpt_path = ckpts[-1]
-            print(f"  Latest checkpoint: {ckpt_path}")
+        flax_files = sorted([f for f in files if f.endswith('.flax')])
+        # Prefer best_model.flax, else latest checkpoint_step*.flax
+        best = [f for f in flax_files if 'best_model' in f]
+        if best:
+            ckpt_path = best[0]
+        elif flax_files:
+            ckpt_path = flax_files[-1]
         else:
-            raise FileNotFoundError(f"No checkpoints in {ckpt_path}\n  Files: {files}")
+            raise FileNotFoundError(
+                f"No .flax checkpoints in {ckpt_path}\n"
+                f"  Files: {[os.path.basename(f) for f in files]}")
+        print(f"  Selected: {ckpt_path}")
 
     print(f"Loading checkpoint: {ckpt_path}")
 
