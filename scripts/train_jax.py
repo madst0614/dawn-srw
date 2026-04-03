@@ -427,7 +427,7 @@ def compute_spatial_diversity_loss(params):
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       is_baseline=False, is_spatial=False,
-                      pos_loss_weight=0.0, sharded_fns=None):
+                      sharded_fns=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism."""
 
     @jax.jit
@@ -459,7 +459,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 div_loss = compute_spatial_diversity_loss(params)
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
-                              + pos_loss_weight * aux_loss
                               + div_weight * div_loss)
             else:
                 orth_loss = compute_orthogonality_loss(
@@ -1214,7 +1213,6 @@ def main():
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
                   or model_version.startswith('spatial-r1-v3'))
-    pos_loss_weight = cfg['training'].get('pos_loss_weight', 0.0)
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
@@ -1278,7 +1276,7 @@ def main():
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
-        pos_loss_weight=pos_loss_weight, sharded_fns=_sharded_fns)
+        sharded_fns=_sharded_fns)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
 
     # ----------------------------------------------------------
