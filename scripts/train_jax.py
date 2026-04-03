@@ -1427,16 +1427,16 @@ def main():
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                QK_out, act, gm = fused_paired(
+                QK_out, act, gm, _lb = fused_paired(
                     x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
                 return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
 
             # 3b) QK non-sharded fallback
             @jax.jit
             def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                Q, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                Q, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                        qk_read, qk_write, n_chunks_qk)
-                K, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                K, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                        qk_read, qk_write, n_chunks_qk)
                 return Q, K
 
@@ -1516,14 +1516,14 @@ def main():
                 Q, K, _, _ = prof_qk_fused(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _ = prof_v_sharded(
+                V, _, _, _ = prof_v_sharded(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             else:
                 Q, K = prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _ = prof_v_chunked(
+                V, _, _, _ = prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             jax.block_until_ready((Q, K, V))
@@ -1531,11 +1531,11 @@ def main():
             h_know, tau_know = prof_know_router(normed, router_p)
             jax.block_until_ready(tau_know)
             if _is_sharded:
-                _kout, _, _ = prof_know_sharded(
+                _kout, _, _, _ = prof_know_sharded(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             else:
-                _kout, _, _ = prof_know_chunked(
+                _kout, _, _, _ = prof_know_chunked(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             jax.block_until_ready(_kout)
