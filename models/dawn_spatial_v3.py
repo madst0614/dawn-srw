@@ -97,7 +97,7 @@ def threshold_gate(scores, tau_offset):
     exp_gate = (jnp.exp(gate.astype(jnp.float32)) - 1.0).astype(scores.dtype)
 
     # sum/max reduce → [B,S,1], then normalize in same dtype
-    exp_sum = exp_gate.sum(axis=-1, keepdims=True) + 1e-4
+    exp_sum = exp_gate.sum(axis=-1, keepdims=True) + 1e-8
     ratio = exp_gate / exp_sum
     gate_strength = jnp.tanh(
         exp_gate.max(axis=-1, keepdims=True).astype(jnp.float32)
@@ -955,7 +955,7 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     gc = jnp.clip(gc, 0.0, 10.0)
     eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
 
-    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-4
+    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_strength = jnp.tanh(
         eg.max(axis=-1, keepdims=True).astype(jnp.float32))
 
@@ -982,7 +982,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gc = jnp.clip(gc, 0.0, 10.0)
     eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
 
-    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-4
+    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_strength = jnp.tanh(
         eg.max(axis=-1, keepdims=True).astype(jnp.float32))
     gate_norm = (eg.astype(jnp.float32) / exp_sum * gate_strength)
@@ -1462,7 +1462,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
         if mult is not None:
             eg = eg * mult[None, None, :]
-        exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-4
+        exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
         gs = jnp.tanh(eg.max(axis=-1, keepdims=True).astype(jnp.float32))
         xr = x @ w_read.T
         out = (eg * xr) @ w_write
