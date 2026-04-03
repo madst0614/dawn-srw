@@ -180,7 +180,7 @@ def load_checkpoint_params(ckpt_path, model, cfg):
 
 def count_params(params):
     """Count total parameters."""
-    return sum(x.size for x in jax.tree.leaves(params))
+    return sum(x.size for x in jax.tree.leaves(params) if hasattr(x, 'size'))
 
 
 # ============================================================
