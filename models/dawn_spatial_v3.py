@@ -214,16 +214,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
 
         active = jax.lax.psum(total_ac, 'model')
 
-        # Load balance loss: Var(gate_mean_per_neuron) * N_total
-        # lb_sum/lb_sq are local sums over N_local neurons
-        # psum('data') to aggregate across data-parallel hosts
+        # Load balance loss on normalized gate: exp_gate / exp_sum
         lb_sum = jax.lax.psum(lb_sum, 'data') / _data_axis_size
         lb_sq = jax.lax.psum(lb_sq, 'data') / _data_axis_size
-        # psum('model') to aggregate across model shards
         global_lb_sum = jax.lax.psum(lb_sum, 'model')
         global_lb_sq = jax.lax.psum(lb_sq, 'model')
-        mean_gate = global_lb_sum / N_total
-        lb_loss = global_lb_sq * N_total - 2.0 * global_lb_sum + 1.0
+        exp_sum_scalar = global_exp_sum.mean() + 1e-8
+        norm_lb_sum = global_lb_sum / exp_sum_scalar
+        norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
+        lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
 
         return out.astype(jnp.float32), active / N_total, total_em, lb_loss
 
@@ -335,12 +334,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         active_mean = active.mean(axis=2)
         gate_max_mean = total_em.mean(axis=2)
 
-        # Load balance loss (same as single version)
+        # Load balance loss on normalized gate
         lb_sum = jax.lax.psum(lb_sum, 'data') / _data_axis_size
         lb_sq = jax.lax.psum(lb_sq, 'data') / _data_axis_size
         global_lb_sum = jax.lax.psum(lb_sum, 'model')
         global_lb_sq = jax.lax.psum(lb_sq, 'model')
-        lb_loss = global_lb_sq * N_total - 2.0 * global_lb_sum + 1.0
+        exp_sum_scalar = global_exp_sum.mean() + 1e-8
+        norm_lb_sum = global_lb_sum / exp_sum_scalar
+        norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
+        lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
 
         return out.astype(jnp.float32), active_mean / N_total, gate_max_mean, lb_loss
 
@@ -414,8 +416,11 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
     gs = jnp.tanh(tem).astype(jnp.bfloat16)
     out = raw_out * inv_es * gs
 
-    # Load balance: Var(gate_mean_per_neuron) * N
-    lb_loss = lb_sq * N - 2.0 * lb_sum + 1.0
+    # Load balance on normalized gate
+    exp_sum_scalar = tes.mean() + 1e-8
+    norm_lb_sum = lb_sum / exp_sum_scalar
+    norm_lb_sq = lb_sq / (exp_sum_scalar ** 2)
+    lb_loss = norm_lb_sq * N - 2.0 * norm_lb_sum + 1.0
 
     return out.astype(jnp.float32), tac / N, tem, lb_loss
 
