@@ -131,14 +131,16 @@ def load_checkpoint_params(ckpt_path, model, cfg):
     """Load checkpoint and return params."""
     # Find latest checkpoint in directory
     if not ckpt_path.endswith('.msgpack') and not ckpt_path.endswith('.ckpt'):
-        # It's a directory — find latest
+        # It's a directory — find latest checkpoint file
         files = _list_dir(ckpt_path)
-        ckpts = sorted([f for f in files if 'step_' in f or 'checkpoint' in f])
+        ckpts = sorted([f for f in files
+                        if ('step_' in f or 'checkpoint' in f)
+                        and not f.endswith('.txt') and not f.endswith('.json')])
         if ckpts:
             ckpt_path = ckpts[-1]
             print(f"  Latest checkpoint: {ckpt_path}")
         else:
-            raise FileNotFoundError(f"No checkpoints in {ckpt_path}")
+            raise FileNotFoundError(f"No checkpoints in {ckpt_path}\n  Files: {files}")
 
     print(f"Loading checkpoint: {ckpt_path}")
 
