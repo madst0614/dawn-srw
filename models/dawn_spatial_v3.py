@@ -223,8 +223,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         global_lb_sum = jax.lax.psum(lb_sum, 'model')
         global_lb_sq = jax.lax.psum(lb_sq, 'model')
         mean_gate = global_lb_sum / N_total
-        target = 1.0 / N_total
-        lb_loss = (global_lb_sq - 2.0 * target * global_lb_sum + N_total * target * target) * N_total
+        lb_loss = global_lb_sq * N_total - 2.0 * global_lb_sum + 1.0
 
         return out.astype(jnp.float32), active / N_total, total_em, lb_loss
 
@@ -341,8 +340,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         lb_sq = jax.lax.psum(lb_sq, 'data') / _data_axis_size
         global_lb_sum = jax.lax.psum(lb_sum, 'model')
         global_lb_sq = jax.lax.psum(lb_sq, 'model')
-        mean_gate = global_lb_sum / N_total
-        lb_loss = (global_lb_sq - N_total * mean_gate ** 2) * N_total
+        lb_loss = global_lb_sq * N_total - 2.0 * global_lb_sum + 1.0
 
         return out.astype(jnp.float32), active_mean / N_total, gate_max_mean, lb_loss
 
@@ -417,8 +415,7 @@ def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
     out = raw_out * inv_es * gs
 
     # Load balance: Var(gate_mean_per_neuron) * N
-    target = 1.0 / N
-    lb_loss = (lb_sq - 2.0 * target * lb_sum + N * target * target) * N
+    lb_loss = lb_sq * N - 2.0 * lb_sum + 1.0
 
     return out.astype(jnp.float32), tac / N, tem, lb_loss
 
