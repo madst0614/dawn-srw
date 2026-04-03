@@ -795,6 +795,8 @@ class DAWN(nn.Module):
             total_aux = jnp.float32(0.0)
             know_actives = jnp.float32(0.0)
             know_gmaxes = jnp.float32(0.0)
+            know_gs_all = jnp.float32(0.0)
+            know_es_all = jnp.float32(0.0)
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -847,7 +849,7 @@ class DAWN(nn.Module):
                 scan_body = jax.checkpoint(scan_body)
 
             xs = {'params': stacked, 'rng': layer_rngs}
-            x, (aux_losses, know_actives, know_gmaxes) = jax.lax.scan(
+            x, (aux_losses, know_actives, know_gmaxes, know_gs_all, know_es_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = aux_losses.sum()
 
@@ -856,6 +858,8 @@ class DAWN(nn.Module):
             'aux_loss': total_aux,
             'know_active': know_actives.mean(),
             'know_gate_max': know_gmaxes.mean(),
+            'know_gs': know_gs_all.mean(),
+            'know_es': know_es_all.mean(),
         }
 
         if labels is not None:

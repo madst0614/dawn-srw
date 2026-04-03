@@ -500,6 +500,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_norm': grad_norm,
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_gate_max': result.get('know_gate_max', jnp.float32(0.0)),
+            'know_gs': result.get('know_gs', jnp.float32(0.0)),
+            'know_es': result.get('know_es', jnp.float32(0.0)),
             'tau_know_bias': tau_know_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
@@ -1425,16 +1427,16 @@ def main():
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                QK_out, act, gm, _lb = fused_paired(
+                QK_out, act, gm, _lb, _gs, _es = fused_paired(
                     x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
                 return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
 
             # 3b) QK non-sharded fallback
             @jax.jit
             def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                Q, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                Q, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                        qk_read, qk_write, n_chunks_qk)
-                K, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                K, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                        qk_read, qk_write, n_chunks_qk)
                 return Q, K
 
@@ -1514,14 +1516,14 @@ def main():
                 Q, K, _, _ = prof_qk_fused(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _ = prof_v_sharded(
+                V, _, _, _, _, _ = prof_v_sharded(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             else:
                 Q, K = prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _ = prof_v_chunked(
+                V, _, _, _, _, _ = prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             jax.block_until_ready((Q, K, V))
@@ -1529,11 +1531,11 @@ def main():
             h_know, tau_know = prof_know_router(normed, router_p)
             jax.block_until_ready(tau_know)
             if _is_sharded:
-                _kout, _, _, _ = prof_know_sharded(
+                _kout, _, _, _, _, _ = prof_know_sharded(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             else:
-                _kout, _, _, _ = prof_know_chunked(
+                _kout, _, _, _, _, _ = prof_know_chunked(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             jax.block_until_ready(_kout)
@@ -1882,11 +1884,14 @@ def main():
 
                         k_act = _m(metrics['know_active'])
                         k_gmax = _m(metrics['know_gate_max'])
+                        k_gs = _m(metrics.get('know_gs', 0.0))
+                        k_es = _m(metrics.get('know_es', 0.0))
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         k_act_count = k_act * n_know_cfg
                         gate_s = (f"gate: active={k_act_count:.0f}/{n_know_cfg}"
                                   f"({k_act*100:.1f}%) "
-                                  f"max={k_gmax:.4f}")
+                                  f"max={k_gmax:.4f} "
+                                  f"| gs={k_gs:.4f} es={k_es:.1f}")
 
                         log_message(
                             f"      {tau_s} | grad_norm={m_grad:.3f}")
