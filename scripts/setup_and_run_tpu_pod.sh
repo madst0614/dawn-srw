@@ -46,8 +46,7 @@ if [ -d "$WORK_DIR/.git" ]; then
     else
         echo "  Switching to branch $BRANCH..."
         git fetch origin "$BRANCH" --depth 1
-        git checkout "$BRANCH" --
-        git reset --hard "origin/$BRANCH"
+        git checkout -B "$BRANCH" FETCH_HEAD
     fi
 else
     echo "  Fresh clone (branch: $BRANCH)..."
@@ -82,8 +81,9 @@ cd "$WORK_DIR"
 tmux kill-session -t train 2>/dev/null || true
 
 # Start new tmux session running training, tee to ~/train.log
+TRAIN_ARGS="${TRAIN_ARGS:-}"
 tmux new-session -d -s train \
-    "python3 scripts/train_jax.py --config '$CONFIG' 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"

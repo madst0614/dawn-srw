@@ -24,6 +24,7 @@ PROJECT="dawn-486218"
 BRANCH="main"
 CONFIG="configs/train_config_v17_1_tpu_400M_c4_5B_v4_64.yaml"
 GH_TOKEN=""
+TRAIN_ARGS=""
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -34,14 +35,16 @@ while [[ $# -gt 0 ]]; do
         --branch)   BRANCH="$2";   shift 2 ;;
         --config)   CONFIG="$2";   shift 2 ;;
         --token)    GH_TOKEN="$2"; shift 2 ;;
+        --from-scratch) TRAIN_ARGS="$TRAIN_ARGS --from-scratch"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch]"
             echo ""
             echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
             echo "  --zone     GCP zone            (default: $ZONE)"
             echo "  --project  GCP project          (default: $PROJECT)"
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
+            echo "  --from-scratch  Start training from scratch (ignore checkpoints)"
             echo "  --token    GitHub access token   (for private repos)"
             exit 0
             ;;
@@ -59,6 +62,9 @@ echo "  Zone:    $ZONE"
 echo "  Project: $PROJECT"
 echo "  Branch:  $BRANCH"
 echo "  Config:  $CONFIG"
+if [ -n "$TRAIN_ARGS" ]; then
+echo "  Args:    $TRAIN_ARGS"
+fi
 echo "============================================"
 
 # Check TPU status
@@ -81,14 +87,14 @@ REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 CONFIG='${CONFIG}'
 GH_TOKEN='${GH_TOKEN}'
-export BRANCH CONFIG GH_TOKEN
+TRAIN_ARGS='${TRAIN_ARGS}'
+export BRANCH CONFIG GH_TOKEN TRAIN_ARGS
 
 # Bootstrap: ensure ~/dawn-spatial exists with the right branch
 if [ -d ~/dawn-spatial/.git ]; then
     cd ~/dawn-spatial
     git fetch origin "\$BRANCH" --depth 1
-    git checkout "\$BRANCH" --
-    git reset --hard "origin/\$BRANCH"
+    git checkout -B "\$BRANCH" FETCH_HEAD
     echo "Repo updated to \$BRANCH"
 else
     rm -rf ~/dawn-spatial

@@ -427,7 +427,7 @@ def compute_spatial_diversity_loss(params):
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       is_baseline=False, is_spatial=False,
-                      pos_loss_weight=0.0, sharded_fns=None):
+                      sharded_fns=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism."""
 
     @jax.jit
@@ -459,7 +459,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 div_loss = compute_spatial_diversity_loss(params)
                 total_loss = (ce_loss
                               + lb_weight * aux_loss
-                              + pos_loss_weight * aux_loss
                               + div_weight * div_loss)
             else:
                 orth_loss = compute_orthogonality_loss(
@@ -501,6 +500,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_norm': grad_norm,
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_gate_max': result.get('know_gate_max', jnp.float32(0.0)),
+            'know_gs': result.get('know_gs', jnp.float32(0.0)),
+            'know_es': result.get('know_es', jnp.float32(0.0)),
+            'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
+            'know_aux': result.get('know_aux', jnp.float32(0.0)),
+            'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
+            'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
+            'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
             'tau_know_bias': tau_know_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
@@ -1214,7 +1220,6 @@ def main():
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
                   or model_version.startswith('spatial-r1-v3'))
-    pos_loss_weight = cfg['training'].get('pos_loss_weight', 0.0)
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
@@ -1266,17 +1271,19 @@ def main():
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        from models.dawn_spatial_v3 import make_sharded_srw
-        max_chunk = cfg['training'].get('max_chunk_size', 8192)
-        _sharded_fns = make_sharded_srw(mesh, max_chunk_size=max_chunk)
+        from models.dawn_spatial_v3 import make_sharded_srw, make_sharded_srw_paired
+        max_chunk = cfg['training'].get('max_chunk_size', 12500)
+        _sharded_single = make_sharded_srw(mesh, max_chunk_size=max_chunk)
+        _sharded_paired = make_sharded_srw_paired(mesh, max_chunk_size=max_chunk)
+        _sharded_fns = (_sharded_single, _sharded_paired)
         if is_host0:
-            print(f"  shard_map enabled (mesh_model={mesh_model})")
+            print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
-        pos_loss_weight=pos_loss_weight, sharded_fns=_sharded_fns)
+        sharded_fns=_sharded_fns)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
 
     # ----------------------------------------------------------
@@ -1301,8 +1308,12 @@ def main():
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng)
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
+        jit_loss = float(dummy_metrics['total_loss'])
         if is_host0:
             print(f"  JIT compile: {jit_time:.1f}s", flush=True)
+
+        # Free first step outputs before second call
+        del _dp, _do, dummy_metrics
 
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
@@ -1312,7 +1323,7 @@ def main():
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
-            print(f"  train_step OK -- loss={float(dummy_metrics['total_loss']):.4f}", flush=True)
+            print(f"  train_step OK -- loss={jit_loss:.4f}", flush=True)
             print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
 
             # Show memory usage after JIT compilation
@@ -1326,180 +1337,343 @@ def main():
             except Exception:
                 pass
 
-            # === Inline step-time breakdown (printed to stdout) ===
-            try:
-                print(f"\n  === Step-time breakdown (single device, 1 layer) ===",
+        # === Step-time breakdown (sharded, 1 layer) ===
+        # NOTE: runs on ALL hosts — shard_map/psum require collective participation.
+        # Only print statements are guarded by is_host0.
+        try:
+            _is_sharded = _sharded_fns is not None
+            if is_host0:
+                print(f"\n  === Step-time breakdown (1 layer, "
+                      f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
-                # Use single-device params for profiling
-                p_single = jax.device_get(params)
-                pool_p = p_single['neuron_pool']
-                router_p = p_single['router']
-                block_p = p_single['block_0']
-                dummy_x = jnp.zeros((per_device_batch, max_seq_len,
-                                     cfg['model']['d_model']))
-                prof_rng = jax.random.PRNGKey(42)
-                d_model = cfg['model']['d_model']
-                n_heads = cfg['model']['n_heads']
-                max_k_qk = cfg['model'].get('max_k_qk', 157)
-                max_k_v = cfg['model'].get('max_k_v', 262)
-                max_k_know = cfg['model'].get('max_k_know', 1536)
-                n_qk = cfg['model'].get('n_qk', 1570)
-                n_v = cfg['model'].get('n_v', 2620)
-                rd = cfg['model'].get('router_dropout', 0.1)
-                dd = cfg['model'].get('dropout', 0.1)
 
-                from models.dawn_spatial_v3 import (
-                    _layer_norm, _attn_forward, _know_forward)
+            from models.dawn_spatial_v3 import (
+                _layer_norm, _attn_forward, _know_forward, _srw_chunked)
 
-                normed = _layer_norm(dummy_x,
-                                     block_p['norm1']['scale'],
-                                     block_p['norm1']['bias'])
-                # Warm up
-                _a, _ = _attn_forward(
-                    normed, pool_p, router_p,
-                    block_p['attn']['expand_O']['kernel'], prof_rng,
-                    n_qk, n_v, max_k_qk, max_k_v,
-                    n_heads, d_model, rd, dd, True)
-                jax.block_until_ready(_a)
-                _k, _ = _know_forward(
-                    normed, pool_p, router_p, prof_rng,
-                    max_k_know, rd, dd, True)
-                jax.block_until_ready(_k)
+            # Use actual sharded params (no device_get)
+            pool_p = params['neuron_pool']
+            router_p = params['router']
+            block_p = params['block_0']
+            d_model = cfg['model']['d_model']
+            n_heads = cfg['model']['n_heads']
+            n_qk_cfg = cfg['model'].get('n_qk', 1580)
+            n_v_cfg = cfg['model'].get('n_v', 2620)
+            max_k_qk = cfg['model'].get('max_k_qk', 157)
+            max_k_v = cfg['model'].get('max_k_v', 262)
+            max_k_know = cfg['model'].get('max_k_know', 1536)
+            rd = cfg['model'].get('router_dropout', 0.1)
+            dd = cfg['model'].get('dropout', 0.1)
+            prof_rng = jax.random.PRNGKey(42)
 
-                # Measure attention
-                N_RUNS = 5
+            # Create properly sharded dummy_x [B, S, D]
+            dummy_x_local = jnp.zeros(
+                (per_host_batch, max_seq_len, d_model), dtype=jnp.float32)
+            x_sharding = NamedSharding(mesh, P('data', None, None))
+            global_x_shape = (batch_size, max_seq_len, d_model)
+            dummy_x = shard_to_mesh(dummy_x_local, x_sharding, global_x_shape)
+
+            N_RUNS = 5
+
+            def _hbm_gb():
+                """Current HBM usage in GB (device 0)."""
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                    if mem:
+                        return mem.get('bytes_in_use', 0) / 1e9
+                except Exception:
+                    pass
+                return 0.0
+
+            def _peak_hbm_gb():
+                """Peak HBM usage in GB (device 0)."""
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                    if mem:
+                        return mem.get('peak_bytes_in_use', 0) / 1e9
+                except Exception:
+                    pass
+                return 0.0
+
+            def _t(fn, n=N_RUNS):
+                """Time a function + measure HBM delta.
+                Returns (ms, delta_gb, peak_gb)."""
+                r = fn(); jax.block_until_ready(jax.tree.leaves(r))
+                del r
+                hbm_before = _hbm_gb()
                 t0 = time.time()
-                for _ in range(N_RUNS):
-                    _a, _ = _attn_forward(
-                        normed, pool_p, router_p,
-                        block_p['attn']['expand_O']['kernel'], prof_rng,
-                        n_qk, n_v, max_k_qk, max_k_v,
-                        n_heads, d_model, rd, dd, True)
-                    jax.block_until_ready(_a)
-                attn_ms = (time.time() - t0) / N_RUNS * 1000
+                for _ in range(n):
+                    r = fn(); jax.block_until_ready(jax.tree.leaves(r))
+                elapsed = (time.time() - t0) / n * 1000
+                hbm_after = _hbm_gb()
+                peak = _peak_hbm_gb()
+                return (elapsed, hbm_after - hbm_before, peak)
 
-                # Measure knowledge
-                t0 = time.time()
-                for _ in range(N_RUNS):
-                    _k, _ = _know_forward(
-                        normed, pool_p, router_p, prof_rng,
-                        max_k_know, rd, dd, True)
-                    jax.block_until_ready(_k)
-                know_ms = (time.time() - t0) / N_RUNS * 1000
+            # --- Jit-compiled component functions for profiling ---
 
-                total_ms = attn_ms + know_ms
-                n_layers = cfg['model']['n_layers']
-                print(f"  Attention:  {attn_ms:.1f} ms/layer "
-                      f"({attn_ms/total_ms*100:.0f}%)", flush=True)
-                print(f"  Knowledge:  {know_ms:.1f} ms/layer "
-                      f"({know_ms/total_ms*100:.0f}%)", flush=True)
-                print(f"  Layer total: {total_ms:.1f} ms", flush=True)
-                print(f"  Est. {n_layers}-layer: {total_ms*n_layers:.0f} ms "
-                      f"(actual step includes grad+opt)", flush=True)
+            # 1) LayerNorm
+            @jax.jit
+            def prof_layernorm(x, scale, bias):
+                return _layer_norm(x, scale, bias)
 
-                # --- Full component breakdown (every op separately) ---
-                from models.dawn_spatial_v3 import (
-                    threshold_gate as tg_fn, sense_read_write)
+            # 2) Attn router: proj + split + tau
+            @jax.jit
+            def prof_attn_router(x, router_p):
+                h_all = (x @ router_p['proj_attn']['kernel']
+                         + router_p['proj_attn']['bias'])
+                h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+                tau_all = (x @ router_p['tau_attn']['kernel']
+                           + router_p['tau_attn']['bias'])
+                return h_Q, h_K, h_V, tau_all
 
-                def _t(fn, n=N_RUNS):
-                    r = fn(); jax.block_until_ready(r)
-                    t0 = time.time()
-                    for _ in range(n):
-                        r = fn(); jax.block_until_ready(r)
-                    return (time.time() - t0) / n * 1000
+            # 3) QK fused shard_map (paired)
+            @jax.jit
+            def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
+                fused_paired = _sharded_fns[1]
+                h_QK = jnp.stack([h_Q, h_K], axis=2)
+                tau_QK = jnp.stack(
+                    [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
+                QK_out, act, gm, _lb, _gs, _es = fused_paired(
+                    x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
+                return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
 
-                # === Knowledge breakdown ===
-                ke = pool_p['know_emb']
-                k_read = pool_p['know_read']
-                k_write = pool_p['know_write']
-                kn = ke / (jnp.linalg.norm(ke, axis=-1, keepdims=True) + 1e-8)
-                pk, pb_ = router_p['proj_know']['kernel'], router_p['proj_know']['bias']
-                tkk, tkb = router_p['tau_know']['kernel'], router_p['tau_know']['bias']
+            # 3b) QK non-sharded fallback
+            @jax.jit
+            def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
+                Q, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                                       qk_read, qk_write, n_chunks_qk)
+                K, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                                       qk_read, qk_write, n_chunks_qk)
+                return Q, K
 
-                h_k = normed @ pk + pb_
-                sc_k = h_k @ kn.T
-                tau_k = normed @ tkk + tkb
-                gk = tg_fn(sc_k, tau_k)
+            # 4) V shard_map (single)
+            @jax.jit
+            def prof_v_sharded(x, h_V, v_norm, tau_v, v_read, v_write):
+                fused_single = _sharded_fns[0]
+                return fused_single(
+                    x, h_V, v_norm, tau_v, v_read, v_write)
 
-                items = []
-                items.append(("K proj(x)",       _t(lambda: normed @ pk + pb_)))
-                items.append(("K h@emb.T",       _t(lambda: h_k @ kn.T)))
-                items.append(("K tau",            _t(lambda: normed @ tkk + tkb)))
-                items.append(("K gate",           _t(lambda: tg_fn(sc_k, tau_k))))
-                items.append(("K srw",             _t(lambda: sense_read_write(normed, gk, k_read, k_write))))
-                items.append(("K load_bal",       _t(lambda: gk.mean(axis=(0,1)))))
+            # 4b) V non-sharded fallback
+            @jax.jit
+            def prof_v_chunked(x, h_V, v_norm, tau_v, v_read, v_write):
+                return _srw_chunked(x, h_V, v_norm, tau_v,
+                                    v_read, v_write, n_chunks_v)
 
-                # === Attention breakdown ===
-                qke = pool_p['qk_emb']
-                ve = pool_p['v_emb']
-                qk_rd = pool_p['qk_read']
-                qk_wr = pool_p['qk_write']
-                v_rd = pool_p['v_read']
-                v_wr = pool_p['v_write']
-                qkn = qke / (jnp.linalg.norm(qke, axis=-1, keepdims=True) + 1e-8)
-                vn = ve / (jnp.linalg.norm(ve, axis=-1, keepdims=True) + 1e-8)
-                pak, pab = router_p['proj_attn']['kernel'], router_p['proj_attn']['bias']
-                tak, tab = router_p['tau_attn']['kernel'], router_p['tau_attn']['bias']
-                Ok = block_p['attn']['expand_O']['kernel']
-                Bp, Sp = per_device_batch, max_seq_len
-                dh = d_model // n_heads
-
-                ha = normed @ pak + pab
-                hQ, hK, hV = jnp.split(ha, 3, axis=-1)
-                tau_a = normed @ tak + tab
-                gQ = tg_fn(hQ @ qkn.T, tau_a[:,:,0:1])
-                gK = tg_fn(hK @ qkn.T, tau_a[:,:,1:2])
-                gV = tg_fn(hV @ vn.T, tau_a[:,:,2:3])
-                Qp = sense_read_write(normed, gQ, qk_rd, qk_wr)
-                Kp = sense_read_write(normed, gK, qk_rd, qk_wr)
-                Vp = sense_read_write(normed, gV, v_rd, v_wr)
-
-                items.append(("A proj(x)",       _t(lambda: normed @ pak + pab)))
-                items.append(("A h@emb.T(QKV)",  _t(lambda: (hQ@qkn.T, hK@qkn.T, hV@vn.T))))
-                items.append(("A tau",            _t(lambda: normed @ tak + tab)))
-                items.append(("A gate Q+K+V",    _t(lambda: (
-                    tg_fn(hQ@qkn.T, tau_a[:,:,0:1]),
-                    tg_fn(hK@qkn.T, tau_a[:,:,1:2]),
-                    tg_fn(hV@vn.T, tau_a[:,:,2:3])))))
-                items.append(("A emit Q+K+V",    _t(lambda: (
-                    sense_read_write(normed, gQ, qk_rd, qk_wr),
-                    sense_read_write(normed, gK, qk_rd, qk_wr),
-                    sense_read_write(normed, gV, v_rd, v_wr)))))
-
-                Qr = Qp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
-                Kr = Kp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
-                Vr = Vp.reshape(Bp,Sp,n_heads,dh).transpose(0,2,1,3)
+            # 5) Self-attention (QK scores + softmax + wV + O_proj)
+            @jax.jit
+            def prof_self_attn(Q, K, V, Ok):
+                B, S, D = Q.shape
+                dh = D // n_heads
+                Qr = Q.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
+                Kr = K.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
+                Vr = V.reshape(B, S, n_heads, dh).transpose(0, 2, 1, 3)
                 sc = jnp.sqrt(jnp.float32(dh))
-                csl = jnp.tril(jnp.ones((Sp,Sp), dtype=jnp.bool_))
+                scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / sc
+                causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+                scores = jnp.where(causal, scores,
+                                   jnp.finfo(scores.dtype).min)
+                attn_w = jax.nn.softmax(scores, axis=-1)
+                out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+                out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
+                return out @ Ok
 
-                items.append(("A QK scores",     _t(lambda: jnp.einsum('bhsd,bhtd->bhst', Qr, Kr)/sc)))
-                attn_sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr)/sc
-                attn_sc = jnp.where(csl, attn_sc, jnp.finfo(attn_sc.dtype).min)
-                attn_w = jax.nn.softmax(attn_sc, axis=-1)
-                items.append(("A softmax+mask",  _t(lambda: jax.nn.softmax(
-                    jnp.where(csl, attn_sc, jnp.finfo(attn_sc.dtype).min), axis=-1))))
-                items.append(("A wV+O_proj",     _t(lambda: jnp.einsum(
-                    'bhst,bhtd->bhsd', attn_w, Vr).transpose(0,2,1,3).reshape(Bp,Sp,d_model) @ Ok)))
-                items.append(("A load_bal",       _t(lambda: gQ.mean(axis=(0,1)))))
+            # 6) Know router
+            @jax.jit
+            def prof_know_router(x, router_p):
+                h = (x @ router_p['proj_know']['kernel']
+                     + router_p['proj_know']['bias'])
+                tau = (x @ router_p['tau_know']['kernel']
+                       + router_p['tau_know']['bias'])
+                return h, tau
 
-                # === Print all ===
-                total_items = sum(v for _, v in items)
-                print(f"\n  === Full op breakdown (1 layer, {total_items:.0f} ms total) ===",
+            # 7) Know shard_map (single)
+            @jax.jit
+            def prof_know_sharded(x, h, know_norm, tau, know_read, know_write):
+                fused_single = _sharded_fns[0]
+                return fused_single(
+                    x, h, know_norm, tau, know_read, know_write)
+
+            # 7b) Know non-sharded fallback
+            @jax.jit
+            def prof_know_chunked(x, h, know_norm, tau, know_read, know_write):
+                return _srw_chunked(x, h, know_norm, tau,
+                                    know_read, know_write, n_chunks_know)
+
+            # --- Prepare intermediate values ---
+            qk_emb = pool_p['qk_emb']
+            v_emb = pool_p['v_emb']
+            know_emb = pool_p['know_emb']
+            qk_norm = qk_emb / (jnp.linalg.norm(
+                qk_emb, axis=-1, keepdims=True) + 1e-8)
+            v_norm = v_emb / (jnp.linalg.norm(
+                v_emb, axis=-1, keepdims=True) + 1e-8)
+            know_norm = know_emb / (jnp.linalg.norm(
+                know_emb, axis=-1, keepdims=True) + 1e-8)
+
+            normed = prof_layernorm(
+                dummy_x, block_p['norm1']['scale'],
+                block_p['norm1']['bias'])
+            jax.block_until_ready(normed)
+
+            h_Q, h_K, h_V, tau_all = prof_attn_router(normed, router_p)
+            jax.block_until_ready(tau_all)
+
+            if _is_sharded:
+                Q, K, _, _ = prof_qk_fused(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write'])
+                V, _, _, _, _, _ = prof_v_sharded(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write'])
+            else:
+                Q, K = prof_qk_chunked(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write'])
+                V, _, _, _, _, _ = prof_v_chunked(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write'])
+            jax.block_until_ready((Q, K, V))
+
+            h_know, tau_know = prof_know_router(normed, router_p)
+            jax.block_until_ready(tau_know)
+            if _is_sharded:
+                _kout, _, _, _, _, _ = prof_know_sharded(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write'])
+            else:
+                _kout, _, _, _, _, _ = prof_know_chunked(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write'])
+            jax.block_until_ready(_kout)
+
+            # --- Timed + memory measurements ---
+            # Each _t() returns (ms, delta_hbm_gb, peak_hbm_gb)
+            hbm_baseline = _hbm_gb()
+            items = []  # [(name, ms, delta_gb, peak_gb)]
+
+            ms, dg, pk = _t(lambda: prof_layernorm(
+                dummy_x, block_p['norm1']['scale'],
+                block_p['norm1']['bias']))
+            items.append(("LayerNorm", ms, dg, pk))
+
+            ms, dg, pk = _t(lambda: prof_attn_router(normed, router_p))
+            items.append(("A router(proj+tau)", ms, dg, pk))
+
+            if _is_sharded:
+                ms, dg, pk = _t(lambda: prof_qk_fused(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write']))
+                items.append(("A QK fused shard", ms, dg, pk))
+                ms, dg, pk = _t(lambda: prof_v_sharded(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write']))
+                items.append(("A V shard", ms, dg, pk))
+            else:
+                ms, dg, pk = _t(lambda: prof_qk_chunked(
+                    normed, h_Q, h_K, qk_norm, tau_all,
+                    pool_p['qk_read'], pool_p['qk_write']))
+                items.append(("A QK chunked(x2)", ms, dg, pk))
+                ms, dg, pk = _t(lambda: prof_v_chunked(
+                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    pool_p['v_read'], pool_p['v_write']))
+                items.append(("A V chunked", ms, dg, pk))
+
+            Ok = block_p['attn']['expand_O']['kernel']
+            ms, dg, pk = _t(lambda: prof_self_attn(Q, K, V, Ok))
+            items.append(("A self-attn(QKV)", ms, dg, pk))
+
+            ms, dg, pk = _t(lambda: prof_layernorm(
+                dummy_x, block_p['norm2']['scale'],
+                block_p['norm2']['bias']))
+            items.append(("LayerNorm (know)", ms, dg, pk))
+
+            ms, dg, pk = _t(lambda: prof_know_router(normed, router_p))
+            items.append(("K router(proj+tau)", ms, dg, pk))
+
+            if _is_sharded:
+                ms, dg, pk = _t(lambda: prof_know_sharded(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write']))
+                items.append(("K know shard", ms, dg, pk))
+            else:
+                ms, dg, pk = _t(lambda: prof_know_chunked(
+                    normed, h_know, know_norm, tau_know,
+                    pool_p['know_read'], pool_p['know_write']))
+                items.append(("K know chunked", ms, dg, pk))
+
+            # --- Print breakdown (time + memory) --- host0 only
+            if is_host0:
+                total_ms = sum(ms for _, ms, _, _ in items)
+                max_peak = max(pk for _, _, _, pk in items)
+                n_layers = cfg['model']['n_layers']
+
+                try:
+                    mem = jax.local_devices()[0].memory_stats()
+                    hbm_limit = mem.get('bytes_limit', 0) / 1e9 if mem else 0
+                except Exception:
+                    hbm_limit = 0
+
+                print(f"\n  === Op breakdown (1 layer fwd, {total_ms:.0f} ms, "
+                      f"peak={max_peak:.2f}G) ===", flush=True)
+                print(f"    {'Op':22s} {'Time':>8s} {'%':>5s}  "
+                      f"{'HBM Δ':>7s}  {'Peak':>7s}  {''}",
                       flush=True)
-                for name, ms in items:
-                    pct = ms / total_items * 100 if total_items > 0 else 0
+                print(f"    {'-'*22} {'-'*8} {'-'*5}  {'-'*7}  {'-'*7}  {'-'*20}",
+                      flush=True)
+                for name, ms_val, dg_val, pk_val in items:
+                    pct = ms_val / total_ms * 100 if total_ms > 0 else 0
                     bar = '#' * int(pct / 2)
-                    print(f"    {name:20s} {ms:7.1f} ms  {pct:4.0f}%  {bar}",
+                    dg_str = f"{dg_val:+.3f}G" if abs(dg_val) > 0.001 else "     -"
+                    print(f"    {name:22s} {ms_val:7.1f}ms {pct:4.0f}%  "
+                          f"{dg_str:>7s}  {pk_val:5.2f}G  {bar}",
                           flush=True)
 
-                know_sum = sum(v for n, v in items if n.startswith('K '))
-                attn_sum = sum(v for n, v in items if n.startswith('A '))
-                print(f"    {'---':20s} {'---':>7s}", flush=True)
-                print(f"    {'Knowledge total':20s} {know_sum:7.1f} ms", flush=True)
-                print(f"    {'Attention total':20s} {attn_sum:7.1f} ms", flush=True)
-            except Exception as e:
-                print(f"  Breakdown skipped: {e}", flush=True)
+                # Group summaries
+                attn_ms = sum(ms for n, ms, _, _ in items if n.startswith('A '))
+                know_ms = sum(ms for n, ms, _, _ in items if n.startswith('K '))
+                norm_ms = sum(ms for n, ms, _, _ in items if n.startswith('LayerNorm'))
+                print(f"    {'-'*22} {'-'*8}", flush=True)
+                print(f"    {'Attention total':22s} {attn_ms:7.1f}ms "
+                      f"{attn_ms/total_ms*100:.0f}%", flush=True)
+                print(f"    {'Knowledge total':22s} {know_ms:7.1f}ms "
+                      f"{know_ms/total_ms*100:.0f}%", flush=True)
+                print(f"    {'LayerNorm total':22s} {norm_ms:7.1f}ms "
+                      f"{norm_ms/total_ms*100:.0f}%", flush=True)
+                print(f"    {'Layer total':22s} {total_ms:7.1f}ms", flush=True)
+                print(f"    Est. {n_layers}-layer fwd: "
+                      f"{total_ms * n_layers:.0f} ms "
+                      f"(actual step incl. grad+opt)", flush=True)
 
+                # Overall HBM summary
+                hbm_now = _hbm_gb()
+                print(f"\n  === HBM Summary (per device) ===", flush=True)
+                print(f"    Baseline (params+opt):  {hbm_baseline:.2f}G",
+                      flush=True)
+                print(f"    After profile:          {hbm_now:.2f}G",
+                      flush=True)
+                print(f"    Peak during profile:    {max_peak:.2f}G",
+                      flush=True)
+                if hbm_limit > 0:
+                    print(f"    Device limit:           {hbm_limit:.2f}G",
+                          flush=True)
+                    print(f"    Headroom:               "
+                          f"{hbm_limit - max_peak:.2f}G "
+                          f"({(hbm_limit - max_peak)/hbm_limit*100:.0f}%)",
+                          flush=True)
+
+            del normed, h_Q, h_K, h_V, tau_all, Q, K, V
+            del h_know, tau_know, _kout, dummy_x
+        except Exception as e:
+            if is_host0:
+                import traceback
+                print(f"  Breakdown failed: {e}", flush=True)
+                traceback.print_exc()
+
+        # Clear XLA compilation cache and free profiling memory
+        import gc
+        gc.collect()
+        jax.clear_caches()
+
+        if is_host0:
             # Estimate total training time
             total_steps = len(train_loader) * num_epochs
             remaining_steps = total_steps - global_step
@@ -1507,7 +1681,7 @@ def main():
             est_hours = est_seconds / 3600
             print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
 
-        del _dp, _do, dummy_metrics, dummy_ids, dummy_mask
+        del dummy_ids, dummy_mask
         del _dp2, _do2, dummy_metrics2
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
@@ -1715,15 +1889,29 @@ def main():
 
                         k_act = _m(metrics['know_active'])
                         k_gmax = _m(metrics['know_gate_max'])
+                        k_gs = _m(metrics.get('know_gs', 0.0))
+                        k_es = _m(metrics.get('know_es', 0.0))
                         n_know_cfg = cfg['model'].get('n_know', 27200)
-                        gate_s = (f"gate: active={k_act:.0f}/{n_know_cfg}"
-                                  f"({k_act/n_know_cfg*100:.0f}%) "
-                                  f"max={k_gmax:.4f}")
+                        k_act_count = k_act * n_know_cfg
+                        gate_s = (f"gate: active={k_act_count:.0f}/{n_know_cfg}"
+                                  f"({k_act*100:.1f}%) "
+                                  f"max={k_gmax:.4f} "
+                                  f"| gs={k_gs:.4f} es={k_es:.1f}")
+
+                        m_attn_aux = _m(metrics.get('attn_aux', 0.0))
+                        m_know_aux = _m(metrics.get('know_aux', 0.0))
+                        k_emb_n = _m(metrics.get('know_emb_norm', 0.0))
+                        k_read_n = _m(metrics.get('know_read_norm', 0.0))
+                        k_write_n = _m(metrics.get('know_write_norm', 0.0))
 
                         log_message(
                             f"      {tau_s} | grad_norm={m_grad:.3f}")
                         log_message(
                             f"      {gate_s}")
+                        log_message(
+                            f"      aux: attn={m_attn_aux:.2f} know={m_know_aux:.2f}"
+                            f" | know_emb={k_emb_n:.3f} know_read={k_read_n:.3f}"
+                            f" know_write={k_write_n:.3f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
