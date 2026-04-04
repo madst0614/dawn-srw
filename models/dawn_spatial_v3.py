@@ -90,6 +90,7 @@ def threshold_gate(scores, tau_offset):
 
     # gate in bf16 ([B,S,N] tensors)
     raw = scores - tau.astype(scores.dtype)
+    raw = raw / (s_std.astype(scores.dtype) + 1e-8)  # σ units: scale-invariant
     gate = jnp.where(raw > 0, raw,
                      (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
 
@@ -147,8 +148,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         cs = N_local // nc
 
         B, S, D = x.shape
-        d_route = emb_local.shape[1]
-        inv_sqrt_dr = jnp.float32(1.0 / jnp.sqrt(jnp.float32(d_route)))
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
         emb_bf = emb_local.astype(jnp.bfloat16)
@@ -162,7 +161,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             s_sum, sq_sum = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-            scores = (h_bf @ ec.T) * inv_sqrt_dr
+            scores = h_bf @ ec.T
             s_sum = s_sum + scores.sum(axis=-1, keepdims=True).astype(jnp.float32)
             sq_sum = sq_sum + (scores.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True)
             return (s_sum, sq_sum), None
@@ -187,8 +186,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            scores = (h_bf @ ec.T) * inv_sqrt_dr
+            scores = h_bf @ ec.T
             raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
+            raw = raw / (s_std + 1e-8)  # σ units: scale-invariant
             gate = jnp.where(raw > 0, raw,
                              1e-6 * jnp.exp(jnp.clip(raw, -10.0, 0.0)))
             gate = jnp.clip(gate, 0.0, 10.0)
@@ -274,8 +274,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         cs = N_local // nc
 
         B, S, D = x.shape
-        d_route = emb_local.shape[1]
-        inv_sqrt_dr = jnp.float32(1.0 / jnp.sqrt(jnp.float32(d_route)))
         # h: [B,S,2,d_route], tau_offset: [B,S,2,1]
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
@@ -290,7 +288,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             s_sum, sq_sum = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-            scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec) * inv_sqrt_dr
+            scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             s_sum = s_sum + scores.sum(axis=-1, keepdims=True).astype(jnp.float32)
             sq_sum = sq_sum + (scores.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True)
             return (s_sum, sq_sum), None
@@ -315,8 +313,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec) * inv_sqrt_dr
+            scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
+            raw = raw / (s_std + 1e-8)  # σ units: scale-invariant
             gate = jnp.where(raw > 0, raw,
                              1e-6 * jnp.exp(jnp.clip(raw, -10.0, 0.0)))
             gate = jnp.clip(gate, 0.0, 10.0)
@@ -376,8 +375,6 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     """
     B, S, D = x.shape
     N = emb_unit.shape[0]
-    d_route = emb_unit.shape[1]
-    inv_sqrt_dr = jnp.float32(1.0 / jnp.sqrt(jnp.float32(d_route)))
     cs = N // n_chunks
 
     h_bf = h.astype(jnp.bfloat16)
@@ -394,7 +391,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         s_sum, sq_sum = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
-        scores = (h_bf @ ec.T) * inv_sqrt_dr
+        scores = h_bf @ ec.T
         s_sum = s_sum + scores.sum(axis=-1, keepdims=True).astype(jnp.float32)
         sq_sum = sq_sum + (scores.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True)
         return (s_sum, sq_sum), None
@@ -413,8 +410,9 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
         wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-        scores = (h_bf @ ec.T) * inv_sqrt_dr
+        scores = h_bf @ ec.T
         raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
+        raw = raw / (s_std + 1e-8)  # σ units: scale-invariant
         gate = jnp.where(raw > 0, raw,
                          1e-6 * jnp.exp(jnp.clip(raw, -10.0, 0.0)))
         gate = jnp.clip(gate, 0.0, 10.0)
@@ -513,17 +511,15 @@ class Router(nn.Module):
             jnp.linalg.norm(neuron_pool.qk_emb, axis=-1, keepdims=True) + 1e-8)
         v_emb_unit = neuron_pool.v_emb / (
             jnp.linalg.norm(neuron_pool.v_emb, axis=-1, keepdims=True) + 1e-8)
-        inv_sqrt_dr = 1.0 / jnp.sqrt(jnp.float32(qk_emb_unit.shape[-1]))
-
         rng, rng_drop = jax.random.split(rng)
         h_all = self.proj_attn(x)
         h_all = safe_dropout(h_all, self.router_dropout, deterministic, rng_drop)
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
         tau_all = self.tau_attn(x)
-        g_Q = threshold_gate(h_Q @ qk_emb_unit.T * inv_sqrt_dr, tau_all[:, :, 0:1])
-        g_K = threshold_gate(h_K @ qk_emb_unit.T * inv_sqrt_dr, tau_all[:, :, 1:2])
-        g_V = threshold_gate(h_V @ v_emb_unit.T * inv_sqrt_dr, tau_all[:, :, 2:3])
+        g_Q = threshold_gate(h_Q @ qk_emb_unit.T, tau_all[:, :, 0:1])
+        g_K = threshold_gate(h_K @ qk_emb_unit.T, tau_all[:, :, 1:2])
+        g_V = threshold_gate(h_V @ v_emb_unit.T, tau_all[:, :, 2:3])
 
         t_qk = 1.0 / self.n_qk
         t_v = 1.0 / self.n_v
@@ -537,14 +533,12 @@ class Router(nn.Module):
     def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
         know_emb_unit = neuron_pool.know_emb / (
             jnp.linalg.norm(neuron_pool.know_emb, axis=-1, keepdims=True) + 1e-8)
-        inv_sqrt_dr = 1.0 / jnp.sqrt(jnp.float32(know_emb_unit.shape[-1]))
-
         rng, rng_drop = jax.random.split(rng)
         h = self.proj_know(x)
         h = safe_dropout(h, self.router_dropout, deterministic, rng_drop)
 
         tau = self.tau_know(x)
-        gate = threshold_gate(h @ know_emb_unit.T * inv_sqrt_dr, tau)
+        gate = threshold_gate(h @ know_emb_unit.T, tau)
 
         t = 1.0 / self.n_know
         aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * self.n_know
