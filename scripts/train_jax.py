@@ -499,14 +499,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
-            'know_norm_gate_max': result.get('know_norm_gate_max', jnp.float32(0.0)),
-            'know_gate_strength': result.get('know_gate_strength', jnp.float32(0.0)),
-            'know_exp_sum': result.get('know_exp_sum', jnp.float32(0.0)),
+            'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
+            'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
+            'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
             'attn_active': result.get('attn_active', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
-            'attn_norm_gate_max': result.get('attn_norm_gate_max', jnp.float32(0.0)),
-            'attn_gate_strength': result.get('attn_gate_strength', jnp.float32(0.0)),
-            'attn_exp_sum': result.get('attn_exp_sum', jnp.float32(0.0)),
+            'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
+            'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
+            'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -1896,15 +1896,15 @@ def main():
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         k_act = _m(metrics['know_active'])
                         k_raw_gmax = _m(metrics['know_raw_gate_max'])
-                        k_norm_gmax = _m(metrics.get('know_norm_gate_max', 0.0))
-                        k_gs = _m(metrics.get('know_gate_strength', 0.0))
-                        k_es = _m(metrics.get('know_exp_sum', 0.0))
+                        k_sstd = _m(metrics.get('know_score_std', 0.0))
+                        k_gsum = _m(metrics.get('know_gate_sum', 0.0))
+                        k_gconc = _m(metrics.get('know_gate_conc', 0.0))
 
                         a_act = _m(metrics.get('attn_active', 0.0))
                         a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
-                        a_norm_gmax = _m(metrics.get('attn_norm_gate_max', 0.0))
-                        a_gs = _m(metrics.get('attn_gate_strength', 0.0))
-                        a_es = _m(metrics.get('attn_exp_sum', 0.0))
+                        a_sstd = _m(metrics.get('attn_score_std', 0.0))
+                        a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
+                        a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
 
                         log_message(
                             f"      {tau_s} | grad_norm={m_grad:.3f}")
@@ -1915,13 +1915,13 @@ def main():
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                             f"({k_act*100:.1f}%) raw_max={k_raw_gmax:.4f}"
-                            f" norm_max={k_norm_gmax:.4f}"
-                            f" | gs={k_gs:.4f} es={k_es:.1f}")
+                            f" conc={k_gconc:.1f}"
+                            f" | s_std={k_sstd:.3f} gsum={k_gsum:.1f}")
                         log_message(
                             f"      attn: active={a_act:.1%}"
                             f" raw_max={a_raw_gmax:.4f}"
-                            f" norm_max={a_norm_gmax:.4f}"
-                            f" | gs={a_gs:.4f} es={a_es:.1f}")
+                            f" conc={a_gconc:.1f}"
+                            f" | s_std={a_sstd:.3f} gsum={a_gsum:.1f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
