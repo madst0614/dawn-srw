@@ -747,7 +747,7 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """DAWN-Spatial v3.8: Sense-Read-Write."""
-    __version__ = "spatial-r1-v3.9.0"
+    __version__ = "spatial-r1-v3.9.1"
 
     vocab_size: int = 30000
     d_model: int = 384
