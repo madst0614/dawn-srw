@@ -41,7 +41,7 @@ training:
   warmup_ratio: 0.08
   orthogonality_weight: 0.01
   diversity_weight: 0.1
-  load_balance_weight: 0.001  # 10x increase, now applied to score LB (v3.9.1)
+  load_balance_weight: 0.1  # score LB is now pure variance (~0.5), target ~1-5% of CE
   checkpoint_interval: 200
   val_interval: 200
 

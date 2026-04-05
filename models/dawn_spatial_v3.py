@@ -8,6 +8,7 @@ Changelog:
     - Naturally adaptive: weak when scores uniform, strong when biased
     - gate LB (ng_sum/ng_sq) removed from pass 2
     - read/write init: scaled_normal(0.02) → orthogonal (better initial diversity)
+    - score_lb: remove ×N (N-invariant variance), attn aux /3, layer .mean()
 
   spatial-r1-v3.9.0 (2026-04-05):
     - Gate: exp(gate)-1 → ReLU (linear gate). No dead neuron gradient.
@@ -196,7 +197,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
         global_ns_sum = jax.lax.psum(ns_sum, 'model')
         global_ns_sq = jax.lax.psum(ns_sq, 'model')
-        score_lb = (global_ns_sq - (global_ns_sum ** 2) / N_total) * N_total
+        score_lb = global_ns_sq / N_total - (global_ns_sum / N_total) ** 2
 
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
         @jax.checkpoint
@@ -317,7 +318,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
         global_ns_sum = jax.lax.psum(ns_sum, 'model')
         global_ns_sq = jax.lax.psum(ns_sq, 'model')
-        score_lb = (global_ns_sq - (global_ns_sum ** 2) / N_total) * N_total
+        score_lb = global_ns_sq / N_total - (global_ns_sum / N_total) ** 2
 
         # --- Pass 2: gate + srw fused ---
         @jax.checkpoint
@@ -404,8 +405,8 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     s_std = jnp.sqrt(sq_sum / N - s_mean**2) + 1e-8
     tau = s_mean + tau_offset * s_std
 
-    # Score LB: variance of per-neuron score mean * N
-    score_lb = (ns_sq - (ns_sum ** 2) / N) * N
+    # Score LB: variance of per-neuron score mean (N-invariant)
+    score_lb = ns_sq / N - (ns_sum / N) ** 2
 
     @jax.checkpoint
     def gate_srw_step(carry, i):
@@ -613,7 +614,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     # Load balance loss from gate distributions + tau regularization
     tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
-    aux = qk_lb + v_lb + tau_reg
+    aux = (qk_lb + v_lb) / 3.0 + tau_reg  # average over Q, K, V routes
     attn_active = (qk_active.mean() + v_active.mean()) / 2
     attn_raw_gmax = jnp.maximum(qk_raw_gmax.mean(), v_raw_gmax.mean())
     attn_score_std = (qk_sstd + v_sstd) / 2
@@ -876,7 +877,7 @@ class DAWN(nn.Module):
                 attn_active_all, attn_raw_gmax_all, attn_sstd_all, attn_gsum_all, attn_gconc_all,
                 k_emb_n_all, k_read_n_all, k_write_n_all) = jax.lax.scan(
                 scan_body, x, xs)
-            total_aux = (attn_auxes + know_auxes).sum()
+            total_aux = (attn_auxes + know_auxes).mean()
 
         x = self.norm(x)
         result = {
