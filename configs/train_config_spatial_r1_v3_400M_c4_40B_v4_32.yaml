@@ -1,5 +1,5 @@
-# DAWN Spatial-R1 v3.8.2 Training Config - v4-32 Pod
-# Sense-Read-Write, d_route=256
+# DAWN Spatial-R1 v3.9.0 Training Config - v4-32 Pod
+# Linear gate (ReLU), no σ-norm, 39M-style LB loss, attn dropout restored
 # Global batch: 1024 = 16 chips x 64 per_device_batch
 
 seed: 1
@@ -12,7 +12,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.8.2"
+  model_version: "spatial-r1-v3.9.0"
   d_model: 1280
   n_layers: 18
   n_heads: 16
@@ -46,4 +46,4 @@ training:
   val_interval: 200
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.8_400M_c4_40B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9_400M_c4_40B
