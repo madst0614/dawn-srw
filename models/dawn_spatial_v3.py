@@ -859,6 +859,9 @@ class DAWN(nn.Module):
             k_emb_n_all = _z
             k_read_n_all = _z
             k_write_n_all = _z
+            attn_smean_all = _z
+            know_smean_all = _z
+            know_out_norm_all = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
