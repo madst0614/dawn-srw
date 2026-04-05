@@ -1,4 +1,4 @@
-# DAWN Spatial-R1 v3.8.2 -- Sense-Read-Write, d_bottleneck=128, 40M Scale
+# DAWN Spatial-R1 v3.8.2 -- Sense-Read-Write, d_route=128, 40M Scale
 # emb[N,128] sense + w_read[N,384] + w_write[N,384]. Relative tau gate.
 
 seed: 1
@@ -19,13 +19,10 @@ model:
   dropout: 0.1
   gradient_checkpointing: true
 
-  d_bottleneck: 128
+  d_route: 128
   n_qk: 1580
   n_v: 2600
   n_know: 25200
-  max_k_qk: 158
-  max_k_v: 260
-  max_k_know: 1810
   router_dropout: 0.1
 
 training:

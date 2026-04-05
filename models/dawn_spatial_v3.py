@@ -2,8 +2,16 @@
 DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
+  spatial-r1-v3.9.0 (2026-04-05):
+    - Gate: exp(gate)-1 → ReLU (linear gate). No dead neuron gradient.
+    - Gate: σ-normalization removed (raw = scores - tau, no /std)
+    - LB loss: 39M-style uniform target MSE per neuron
+    - Attn dropout restored inside checkpoint (rng passed as arg)
+    - New logging: score_std, gate_concentration
+    - Inference APIs updated to match linear gate
+
   spatial-r1-v3.8.2 (2026-04-01):
-    - d_bottleneck 64->128 (routing resolution improvement)
+    - d_route 64->128 (routing resolution improvement)
     - threshold_gate clamp (NaN prevention)
     - Neuron counts adjusted for param budget
 
@@ -79,31 +87,25 @@ def unit_norm_init(scale=1.0):
 # ================================================================
 
 def threshold_gate(scores, tau_offset):
-    """v18.5 style relative tau. All [B,S,N] tensors in bf16.
-    Only mean/std/tau (scalar/[B,S,1]) computed in f32.
+    """Relative tau threshold gate with linear (ReLU) activation.
+    scores: [B,S,N], tau_offset: [B,S,1]
+    Returns normalized gate: [B,S,N]
     """
-    # mean/std in f32 (reduce results are [B,S,1], tiny)
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
     s_std = jnp.sqrt(jnp.mean(jnp.square(scores_f32 - s_mean), axis=-1, keepdims=True)) + 1e-8
     tau = s_mean + tau_offset * s_std
 
-    # gate in bf16 ([B,S,N] tensors)
     raw = scores - tau.astype(scores.dtype)
-    gate = jnp.where(raw > 0, raw,
-                     (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
-
+    gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
-    exp_gate = (jnp.exp(gate.astype(jnp.float32)) - 1.0).astype(scores.dtype)
 
-    # sum/max reduce → [B,S,1], then normalize in same dtype
-    exp_sum = exp_gate.sum(axis=-1, keepdims=True) + 1e-8
-    ratio = exp_gate / exp_sum
+    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_strength = jnp.tanh(
-        exp_gate.max(axis=-1, keepdims=True).astype(jnp.float32)
+        gate.max(axis=-1, keepdims=True).astype(jnp.float32)
     ).astype(scores.dtype)
 
-    return ratio * gate_strength
+    return (gate / gate_sum.astype(scores.dtype)) * gate_strength
 
 
 # ================================================================
@@ -136,7 +138,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                         P('data', None, None),   # gate_max [B,S,1]
                         P(),                     # lb_loss scalar
                         P(),                     # gs_mean scalar
-                        P()),                    # es_mean scalar
+                        P(),                     # es_mean scalar
+                        P()),                    # norm_gate_max scalar
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -153,16 +156,20 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
 
-        # --- Pass 1: stats from first chunk only (checkpointed) ---
+        # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
         @jax.checkpoint
-        def estimate_stats(h, emb, nc_val):
-            ec0 = jax.lax.dynamic_slice_in_dim(emb, 0, cs, axis=0)
-            sc0 = h @ ec0.T
-            s_sum = sc0.sum(axis=-1, keepdims=True).astype(jnp.float32) * nc_val
-            sq_sum = (sc0 ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32) * nc_val
-            return s_sum, sq_sum
+        def stats_step(carry, i):
+            s_sum, sq_sum = carry
+            s = i * cs
+            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+            scores = h_bf @ ec.T
+            s_sum = s_sum + scores.sum(axis=-1, keepdims=True).astype(jnp.float32)
+            sq_sum = sq_sum + (scores.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True)
+            return (s_sum, sq_sum), None
 
-        local_sum, local_sq = estimate_stats(h_bf, emb_bf, nc)
+        z_bs1 = jnp.zeros((B, S, 1))
+        (local_sum, local_sq), _ = jax.lax.scan(
+            stats_step, (z_bs1, z_bs1), jnp.arange(nc))
 
         global_sum = jax.lax.psum(local_sum, 'model')
         global_sq = jax.lax.psum(local_sq, 'model')
@@ -171,64 +178,58 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         s_mean = global_sum / N_total
         s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
         tau = s_mean + tau_offset * s_std
-        tau_bf = tau.astype(jnp.bfloat16)
 
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
-        # lb_sq_sum: accumulate per-chunk LB contribution (scalar)
+        t_uniform = 1.0 / N_total  # uniform target for LB loss
+
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            out, exp_sum, exp_max, active, lb_sum, lb_sq = carry
+            out, total_gate_sum, total_gate_max, total_active, lb_acc = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            sc = h_bf @ ec.T
-            raw = sc - tau_bf
-            gc = jnp.where(raw > 0, raw,
-                            (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
-            gc = jnp.clip(gc, 0.0, 10.0)
-            eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
-            ef = eg.astype(jnp.float32)
+            scores = h_bf @ ec.T
+            raw = scores.astype(jnp.float32) - tau  # f32 (tau already f32)
+            gate = jnp.maximum(raw, 0.0)
+            gate = jnp.clip(gate, 0.0, 10.0)
+            gate_bf = gate.astype(jnp.bfloat16)
             xr = x_bf @ rc.T
-            c_out = ((eg * xr) @ wc).astype(jnp.float32)
-            # LB: per-neuron mean gate for this chunk's neurons [cs]
-            gn = ef.mean(axis=(0, 1))  # [cs] avg gate per neuron
-            lb_sum = lb_sum + gn.sum()
-            lb_sq = lb_sq + (gn ** 2).sum()
-            return (out + c_out, exp_sum + ef.sum(axis=-1, keepdims=True),
-                    jnp.maximum(exp_max, ef.max(axis=-1, keepdims=True)),
-                    active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
-                    lb_sum, lb_sq), None
+            c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
+            # LB: 39M-style uniform target per neuron
+            per_neuron_gate = gate.mean(axis=(0, 1))  # [cs]
+            lb_acc = lb_acc + ((per_neuron_gate - t_uniform) ** 2).sum()
+            return (out + c_out,
+                    total_gate_sum + gate.sum(axis=-1, keepdims=True),
+                    jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
+                    total_active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
+                    lb_acc), None
 
         z_scalar = jnp.float32(0.0)
-        (raw_out, total_es, total_em, total_ac, lb_sum, lb_sq), _ = jax.lax.scan(
+        (raw_out, total_gate_sum, total_gate_max, total_active, lb_acc), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, D), dtype=jnp.float32),
              z1, jnp.full((B, S, 1), -1e9), z1,
-             z_scalar, z_scalar),
+             z_scalar),
             jnp.arange(nc))
 
-        global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-8
-        gate_strength = jnp.tanh(total_em)
-        out = raw_out / global_exp_sum * gate_strength
-        # bf16 before psum: 640MB → 320MB per all-reduce
+        global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
+        gate_strength = jnp.tanh(total_gate_max)
+        out = raw_out / global_gate_sum * gate_strength
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
-        active = jax.lax.psum(total_ac, 'model')
+        active_frac = jax.lax.psum(total_active, 'model') / N_total
 
-        # Load balance loss on normalized gate: exp_gate / exp_sum
-        lb_sum = jax.lax.psum(lb_sum, 'data') / _data_axis_size
-        lb_sq = jax.lax.psum(lb_sq, 'data') / _data_axis_size
-        global_lb_sum = jax.lax.psum(lb_sum, 'model')
-        global_lb_sq = jax.lax.psum(lb_sq, 'model')
-        exp_sum_scalar = global_exp_sum.mean() + 1e-8
-        norm_lb_sum = global_lb_sum / exp_sum_scalar
-        norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
-        lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
+        # LB loss: 39M-style — cross-device sum
+        lb_acc = jax.lax.psum(lb_acc, 'data') / _data_axis_size
+        lb_loss = jax.lax.psum(lb_acc, 'model') * N_total
 
-        gs_mean = jnp.tanh(total_em).mean()
-        es_mean = global_exp_sum.mean()
-        return out.astype(jnp.float32), active / N_total, total_em, lb_loss, gs_mean, es_mean
+        score_std_out = s_std.mean()
+        es_out = global_gate_sum.mean()
+        # gate_concentration: max / mean_active — how peaked the gate is
+        mean_active_gate = global_gate_sum / (jax.lax.psum(total_active, 'model') + 1e-8)
+        gate_conc = (total_gate_max / (mean_active_gate + 1e-8)).mean()
+        return out.astype(jnp.float32), active_frac, total_gate_max, lb_loss, score_std_out, es_out, gate_conc
 
     return fused_gate_srw
 
@@ -257,7 +258,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                         P('data', None, None),       # gate_max [B,S,1]
                         P(),                         # lb_loss scalar
                         P(),                         # gs_mean scalar
-                        P()),                        # es_mean scalar
+                        P(),                         # es_mean scalar
+                        P()),                        # norm_gate_max scalar
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -267,24 +269,28 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         cs = N_local // nc
 
         B, S, D = x.shape
-        # h: [B,S,2,d_bn], tau_offset: [B,S,2,1]
+        # h: [B,S,2,d_route], tau_offset: [B,S,2,1]
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
         emb_bf = emb_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
-        z1_r = jnp.zeros((B, S, 2, 1))  # per-route accumulators
+        z1_r = jnp.zeros((B, S, 2, 1))
 
-        # --- Pass 1: stats from first chunk only (checkpointed) ---
+        # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
         @jax.checkpoint
-        def estimate_stats(h, emb, nc_val):
-            ec0 = jax.lax.dynamic_slice_in_dim(emb, 0, cs, axis=0)
-            sc0 = jnp.einsum('bsrd,nd->bsrn', h, ec0)
-            s_sum = sc0.sum(axis=-1, keepdims=True).astype(jnp.float32) * nc_val
-            sq_sum = (sc0 ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32) * nc_val
-            return s_sum, sq_sum
+        def stats_step(carry, i):
+            s_sum, sq_sum = carry
+            s = i * cs
+            ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+            scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
+            s_sum = s_sum + scores.sum(axis=-1, keepdims=True).astype(jnp.float32)
+            sq_sum = sq_sum + (scores.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True)
+            return (s_sum, sq_sum), None
 
-        local_sum, local_sq = estimate_stats(h_bf, emb_bf, nc)
+        z_bsr1 = jnp.zeros((B, S, 2, 1))
+        (local_sum, local_sq), _ = jax.lax.scan(
+            stats_step, (z_bsr1, z_bsr1), jnp.arange(nc))
 
         global_sum = jax.lax.psum(local_sum, 'model')  # [B,S,2,1]
         global_sq = jax.lax.psum(local_sq, 'model')
@@ -293,146 +299,141 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         s_mean = global_sum / N_total      # [B,S,2,1]
         s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
         tau = s_mean + tau_offset * s_std   # [B,S,2,1]
-        tau_bf = tau.astype(jnp.bfloat16)
 
         # --- Pass 2: gate + srw fused ---
+        t_uniform = 1.0 / N_total
+
         @jax.checkpoint
         def gate_srw_step(carry, i):
-            out, exp_sum, exp_max, active, lb_sum, lb_sq = carry
+            out, total_gate_sum, total_gate_max, total_active, lb_acc = carry
             s = i * cs
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-            sc = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
-            raw = sc - tau_bf
-            gc = jnp.where(raw > 0, raw,
-                            (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
-            gc = jnp.clip(gc, 0.0, 10.0)
-            eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(jnp.bfloat16)
-            ef = eg.astype(jnp.float32)
+            scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
+            raw = scores.astype(jnp.float32) - tau
+            gate = jnp.maximum(raw, 0.0)
+            gate = jnp.clip(gate, 0.0, 10.0)
+            gate_bf = gate.astype(jnp.bfloat16)
             xr = x_bf @ rc.T
-            c_out = jnp.einsum('bsrn,nd->bsrd', eg * xr[:, :, None, :], wc).astype(jnp.float32)
-            # LB: average over route dim → per-neuron mean [cs]
-            gn = ef.mean(axis=(0, 1, 2))  # [cs] avg gate per neuron (across B,S,2)
-            lb_sum = lb_sum + gn.sum()
-            lb_sq = lb_sq + (gn ** 2).sum()
+            c_out = jnp.einsum('bsrn,nd->bsrd', gate_bf * xr[:, :, None, :], wc).astype(jnp.float32)
+            per_neuron_gate = gate.mean(axis=(0, 1, 2))  # [cs]
+            lb_acc = lb_acc + ((per_neuron_gate - t_uniform) ** 2).sum()
             return (out + c_out,
-                    exp_sum + ef.sum(axis=-1, keepdims=True),
-                    jnp.maximum(exp_max, ef.max(axis=-1, keepdims=True)),
-                    active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
-                    lb_sum, lb_sq), None
+                    total_gate_sum + gate.sum(axis=-1, keepdims=True),
+                    jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
+                    total_active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
+                    lb_acc), None
 
         z_scalar = jnp.float32(0.0)
-        (raw_out, total_es, total_em, total_ac, lb_sum, lb_sq), _ = jax.lax.scan(
+        (raw_out, total_gate_sum, total_gate_max, total_active, lb_acc), _ = jax.lax.scan(
             gate_srw_step,
             (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
              z1_r, jnp.full((B, S, 2, 1), -1e9), z1_r,
-             z_scalar, z_scalar),
+             z_scalar),
             jnp.arange(nc))
 
         # Normalize per route independently
-        global_exp_sum = jax.lax.psum(total_es, 'model') + 1e-8
-        gate_strength = jnp.tanh(total_em)
-        out = raw_out / global_exp_sum * gate_strength
+        global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
+        gate_strength = jnp.tanh(total_gate_max)
+        out = raw_out / global_gate_sum * gate_strength
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
-        active = jax.lax.psum(total_ac, 'model')
-        active_mean = active.mean(axis=2)
-        gate_max_mean = total_em.mean(axis=2)
+        active_frac = jax.lax.psum(total_active, 'model') / N_total
+        active_frac_mean = active_frac.mean(axis=2)
+        raw_gate_max_mean = total_gate_max.mean(axis=2)
 
-        # Load balance loss on normalized gate
-        lb_sum = jax.lax.psum(lb_sum, 'data') / _data_axis_size
-        lb_sq = jax.lax.psum(lb_sq, 'data') / _data_axis_size
-        global_lb_sum = jax.lax.psum(lb_sum, 'model')
-        global_lb_sq = jax.lax.psum(lb_sq, 'model')
-        exp_sum_scalar = global_exp_sum.mean() + 1e-8
-        norm_lb_sum = global_lb_sum / exp_sum_scalar
-        norm_lb_sq = global_lb_sq / (exp_sum_scalar ** 2)
-        lb_loss = norm_lb_sq * N_total - 2.0 * norm_lb_sum + 1.0
+        # LB loss: 39M-style — cross-device sum
+        lb_acc = jax.lax.psum(lb_acc, 'data') / _data_axis_size
+        lb_loss = jax.lax.psum(lb_acc, 'model') * N_total
 
-        gs_mean = jnp.tanh(total_em).mean()
-        es_mean = global_exp_sum.mean()
-        return out.astype(jnp.float32), active_mean / N_total, gate_max_mean, lb_loss, gs_mean, es_mean
+        score_std_out = s_std.mean()
+        es_out = global_gate_sum.mean()
+        mean_active_gate = global_gate_sum / (jax.lax.psum(total_active, 'model') + 1e-8)
+        gate_conc = (total_gate_max / (mean_active_gate + 1e-8)).mean()
+        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, lb_loss, score_std_out, es_out, gate_conc
 
     return fused_gate_srw_paired
 
 
-def _srw_chunked(x, h, emb_norm, tau_offset, w_read, w_write, n_chunks):
+def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     """Fallback: non-sharded chunked srw (for mesh_model=1 or 40M scale).
 
-    Uses fori_loop + checkpoint. No shard_map.
+    Uses scan + checkpoint. No shard_map.
     """
     B, S, D = x.shape
-    N = emb_norm.shape[0]
+    N = emb_unit.shape[0]
     cs = N // n_chunks
 
     h_bf = h.astype(jnp.bfloat16)
     x_bf = x.astype(jnp.bfloat16)
-    emb_bf = emb_norm.astype(jnp.bfloat16)
+    emb_bf = emb_unit.astype(jnp.bfloat16)
     read_bf = w_read.astype(jnp.bfloat16)
     write_bf = w_write.astype(jnp.bfloat16)
 
     z1 = jnp.zeros((B, S, 1))
 
-    # --- Stats from first chunk only (checkpointed) ---
+    # --- Exact stats over ALL chunks (scan + checkpoint) ---
     @jax.checkpoint
-    def estimate_stats(h, emb, nc_val):
-        ec0 = jax.lax.dynamic_slice_in_dim(emb, 0, cs, axis=0)
-        sc0 = h @ ec0.T
-        s_sum = sc0.sum(axis=-1, keepdims=True).astype(jnp.float32) * nc_val
-        sq_sum = (sc0 ** 2).sum(axis=-1, keepdims=True).astype(jnp.float32) * nc_val
-        return s_sum, sq_sum
+    def stats_step(carry, i):
+        s_sum, sq_sum = carry
+        s = i * cs
+        ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
+        scores = h_bf @ ec.T
+        s_sum = s_sum + scores.sum(axis=-1, keepdims=True).astype(jnp.float32)
+        sq_sum = sq_sum + (scores.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True)
+        return (s_sum, sq_sum), None
 
-    s_sum, sq_sum = estimate_stats(h_bf, emb_bf, n_chunks)
+    z_bs1 = jnp.zeros((B, S, 1))
+    (s_sum, sq_sum), _ = jax.lax.scan(
+        stats_step, (z_bs1, z_bs1), jnp.arange(n_chunks))
     s_mean = s_sum / N
     s_std = jnp.sqrt(sq_sum / N - s_mean**2) + 1e-8
     tau = s_mean + tau_offset * s_std
-    tau_bf = tau.astype(jnp.bfloat16)
+
+    t_uniform = 1.0 / N
 
     @jax.checkpoint
-    def gsrw_step(carry, i):
-        out, es, em, ac, lbs, lbq = carry
+    def gate_srw_step(carry, i):
+        out, total_gate_sum, total_gate_max, total_active, lb_acc = carry
         s = i * cs
         ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
         rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
         wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
-        sc = h_bf @ ec.T
-        raw = sc - tau_bf
-        gc = jnp.where(raw > 0, raw,
-                        (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(jnp.bfloat16))
-        gc = jnp.clip(gc, 0.0, 10.0)
-        eg = (jnp.exp(gc.astype(jnp.float32))-1.0).astype(jnp.bfloat16)
-        ef = eg.astype(jnp.float32)
+        scores = h_bf @ ec.T
+        raw = scores.astype(jnp.float32) - tau
+        gate = jnp.maximum(raw, 0.0)
+        gate = jnp.clip(gate, 0.0, 10.0)
+        gate_bf = gate.astype(jnp.bfloat16)
         xr = x_bf @ rc.T
-        co = ((eg*xr)@wc).astype(jnp.float32)
-        gn = ef.mean(axis=(0, 1))  # [cs]
-        lbs = lbs + gn.sum()
-        lbq = lbq + (gn ** 2).sum()
-        return (out+co, es+ef.sum(axis=-1,keepdims=True),
-                jnp.maximum(em, ef.max(axis=-1,keepdims=True)),
-                ac+(raw>0).sum(axis=-1,keepdims=True).astype(jnp.float32),
-                lbs, lbq), None
+        c_out = ((gate_bf * xr) @ wc).astype(jnp.float32)
+        per_neuron_gate = gate.mean(axis=(0, 1))  # [cs]
+        lb_acc = lb_acc + ((per_neuron_gate - t_uniform) ** 2).sum()
+        return (out + c_out,
+                total_gate_sum + gate.sum(axis=-1, keepdims=True),
+                jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
+                total_active + (raw > 0).sum(axis=-1, keepdims=True).astype(jnp.float32),
+                lb_acc), None
 
     z_scalar = jnp.float32(0.0)
-    (raw_out, tes, tem, tac, lb_sum, lb_sq), _ = jax.lax.scan(
-        gsrw_step,
-        (jnp.zeros((B,S,D), dtype=jnp.float32), z1, jnp.full((B,S,1),-1e9), z1,
-         z_scalar, z_scalar),
+    (raw_out, total_gate_sum, total_gate_max, total_active, lb_acc), _ = jax.lax.scan(
+        gate_srw_step,
+        (jnp.zeros((B, S, D), dtype=jnp.float32), z1, jnp.full((B, S, 1), -1e9), z1,
+         z_scalar),
         jnp.arange(n_chunks))
 
-    inv_es = (1.0/(tes+1e-8)).astype(jnp.bfloat16)
-    gs = jnp.tanh(tem).astype(jnp.bfloat16)
-    out = raw_out * inv_es * gs
+    inv_gs = (1.0 / (total_gate_sum + 1e-8)).astype(jnp.bfloat16)
+    gate_strength = jnp.tanh(total_gate_max).astype(jnp.bfloat16)
+    out = raw_out * inv_gs * gate_strength
 
-    # Load balance on normalized gate
-    exp_sum_scalar = tes.mean() + 1e-8
-    norm_lb_sum = lb_sum / exp_sum_scalar
-    norm_lb_sq = lb_sq / (exp_sum_scalar ** 2)
-    lb_loss = norm_lb_sq * N - 2.0 * norm_lb_sum + 1.0
+    # LB loss: 39M-style uniform target
+    lb_loss = lb_acc * N
 
-    gs_mean = jnp.tanh(tem).mean()
-    es_mean = tes.mean()
-    return out.astype(jnp.float32), tac / N, tem, lb_loss, gs_mean, es_mean
+    score_std_out = s_std.mean()
+    es_out = total_gate_sum.mean()
+    mean_active_gate = total_gate_sum / (total_active + 1e-8)
+    gate_conc = (total_gate_max / (mean_active_gate + 1e-8)).mean()
+    return out.astype(jnp.float32), total_active / N, total_gate_max, lb_loss, score_std_out, es_out, gate_conc
 
 
 # ================================================================
@@ -444,10 +445,10 @@ class NeuronPool(nn.Module):
     n_v: int
     n_know: int
     d_model: int
-    d_bottleneck: int
+    d_route: int
 
     def setup(self):
-        db = self.d_bottleneck
+        db = self.d_route
         dm = self.d_model
 
         # Sense (routing, low-dim)
@@ -472,17 +473,14 @@ class NeuronPool(nn.Module):
 
 class Router(nn.Module):
     d_model: int
-    d_bottleneck: int
+    d_route: int
     n_qk: int
     n_v: int
     n_know: int
-    max_k_qk: int
-    max_k_v: int
-    max_k_know: int
     router_dropout: float = 0.1
 
     def setup(self):
-        db = self.d_bottleneck
+        db = self.d_route
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_know = nn.Dense(db, name='proj_know')
         self.tau_attn = nn.Dense(3, name='tau_attn',
@@ -493,20 +491,19 @@ class Router(nn.Module):
             bias_init=lambda k, s, d: jnp.full(s, -0.5))
 
     def get_attention_gates(self, x, neuron_pool, deterministic, rng):
-        qk_norm = neuron_pool.qk_emb / (
+        qk_emb_unit = neuron_pool.qk_emb / (
             jnp.linalg.norm(neuron_pool.qk_emb, axis=-1, keepdims=True) + 1e-8)
-        v_norm = neuron_pool.v_emb / (
+        v_emb_unit = neuron_pool.v_emb / (
             jnp.linalg.norm(neuron_pool.v_emb, axis=-1, keepdims=True) + 1e-8)
-
         rng, rng_drop = jax.random.split(rng)
         h_all = self.proj_attn(x)
         h_all = safe_dropout(h_all, self.router_dropout, deterministic, rng_drop)
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
         tau_all = self.tau_attn(x)
-        g_Q = threshold_gate(h_Q @ qk_norm.T, tau_all[:, :, 0:1])
-        g_K = threshold_gate(h_K @ qk_norm.T, tau_all[:, :, 1:2])
-        g_V = threshold_gate(h_V @ v_norm.T, tau_all[:, :, 2:3])
+        g_Q = threshold_gate(h_Q @ qk_emb_unit.T, tau_all[:, :, 0:1])
+        g_K = threshold_gate(h_K @ qk_emb_unit.T, tau_all[:, :, 1:2])
+        g_V = threshold_gate(h_V @ v_emb_unit.T, tau_all[:, :, 2:3])
 
         t_qk = 1.0 / self.n_qk
         t_v = 1.0 / self.n_v
@@ -518,15 +515,14 @@ class Router(nn.Module):
         return g_Q, g_K, g_V, aux
 
     def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
-        know_norm = neuron_pool.know_emb / (
+        know_emb_unit = neuron_pool.know_emb / (
             jnp.linalg.norm(neuron_pool.know_emb, axis=-1, keepdims=True) + 1e-8)
-
         rng, rng_drop = jax.random.split(rng)
         h = self.proj_know(x)
         h = safe_dropout(h, self.router_dropout, deterministic, rng_drop)
 
         tau = self.tau_know(x)
-        gate = threshold_gate(h @ know_norm.T, tau)
+        gate = threshold_gate(h @ know_emb_unit.T, tau)
 
         t = 1.0 / self.n_know
         aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * self.n_know
@@ -539,7 +535,7 @@ class Router(nn.Module):
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
-                  max_k_qk, max_k_v, n_heads, d_model,
+                  n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
                   n_chunks_qk=1, n_chunks_v=1,
                   sharded_fns=None):
@@ -551,8 +547,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_read = pool_params['v_read']
     v_write = pool_params['v_write']
 
-    qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
-    v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
+    qk_emb_unit = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
+    v_emb_unit = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
 
     rng, rng_drop = jax.random.split(rng)
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
@@ -563,22 +559,27 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
-        h_QK = jnp.stack([h_Q, h_K], axis=2)  # [B,S,2,d_bn]
-        tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)  # [B,S,2,1]
-        QK_out, _, _, qk_lb, qk_gs, qk_es = fused_paired(x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
-        Q = QK_out[:, :, 0, :]  # [B,S,D]
-        K = QK_out[:, :, 1, :]  # [B,S,D]
-        V, _, _, v_lb, v_gs, v_es = fused_single(x, h_V, v_norm, tau_all[:, :, 2:3], v_read, v_write)
+        h_QK = jnp.stack([h_Q, h_K], axis=2)
+        tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
+        QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_gconc = fused_paired(
+            x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
+        Q = QK_out[:, :, 0, :]
+        K = QK_out[:, :, 1, :]
+        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_gconc = fused_single(
+            x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
     else:
-        Q, _, _, q_lb, q_gs, q_es = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
-                                qk_read, qk_write, n_chunks_qk)
-        K, _, _, k_lb, k_gs2, k_es2 = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
-                                qk_read, qk_write, n_chunks_qk)
-        V, _, _, v_lb, v_gs, v_es = _srw_chunked(x, h_V, v_norm, tau_all[:, :, 2:3],
-                                v_read, v_write, n_chunks_v)
+        Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_gconc = _srw_chunked(
+            x, h_Q, qk_emb_unit, tau_all[:, :, 0:1], qk_read, qk_write, n_chunks_qk)
+        K, k_active, k_raw_gmax, k_lb, k_sstd, k_es, k_gconc = _srw_chunked(
+            x, h_K, qk_emb_unit, tau_all[:, :, 1:2], qk_read, qk_write, n_chunks_qk)
+        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_gconc = _srw_chunked(
+            x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, n_chunks_v)
         qk_lb = q_lb + k_lb
-        qk_gs = (q_gs + k_gs2) / 2
-        qk_es = (q_es + k_es2) / 2
+        qk_sstd = (q_sstd + k_sstd) / 2
+        qk_es = (q_es + k_es) / 2
+        qk_active = (q_active + k_active) / 2
+        qk_raw_gmax = jnp.maximum(q_raw_gmax, k_raw_gmax)
+        qk_gconc = (q_gconc + k_gconc) / 2
 
     d_head = d_model // n_heads
     Q = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -586,17 +587,19 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     V = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
 
     scale = jnp.sqrt(jnp.float32(d_head))
+    rng, rng_attn_drop = jax.random.split(rng)
 
     @jax.checkpoint
-    def _attn_scores(Q, K, V):
+    def _attn_scores(Q, K, V, rng_drop):
         attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         attn_scores = jnp.where(causal, attn_scores,
                                 jnp.finfo(attn_scores.dtype).min)
         attn_w = jax.nn.softmax(attn_scores, axis=-1)
+        attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
         return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
 
-    out = _attn_scores(Q, K, V)
+    out = _attn_scores(Q, K, V, rng_attn_drop)
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     rng, rng_out = jax.random.split(rng)
@@ -605,13 +608,15 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     # Load balance loss from gate distributions + tau regularization
     tau_reg = jnp.maximum(tau_all, 0.0).mean() * 0.01
     aux = qk_lb + v_lb + tau_reg
-    attn_gs = (qk_gs + v_gs) / 2
-    attn_es = (qk_es + v_es) / 2
-    return out, aux, attn_gs, attn_es
+    attn_active = (qk_active.mean() + v_active.mean()) / 2
+    attn_raw_gmax = jnp.maximum(qk_raw_gmax.mean(), v_raw_gmax.mean())
+    attn_score_std = (qk_sstd + v_sstd) / 2
+    attn_gate_sum = (qk_es + v_es) / 2
+    attn_gate_conc = (qk_gconc + v_gconc) / 2
+    return out, aux, attn_active, attn_raw_gmax, attn_score_std, attn_gate_sum, attn_gate_conc
 
 
 def _know_forward(x, pool_params, router_params, rng,
-                  max_k_know,
                   router_dropout, dropout_rate, deterministic,
                   n_chunks_know=1, sharded_fns=None):
     know_emb = pool_params['know_emb']
@@ -622,27 +627,26 @@ def _know_forward(x, pool_params, router_params, rng,
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
-    know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
+    know_emb_unit = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
-        out, active_count, gate_max_val, lb_loss, gs_mean, es_mean = fused_single(
-            x, h, know_norm, tau, know_read, know_write)
+        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, gate_conc = fused_single(
+            x, h, know_emb_unit, tau, know_read, know_write)
     else:
-        out, active_count, gate_max_val, lb_loss, gs_mean, es_mean = _srw_chunked(
-            x, h, know_norm, tau, know_read, know_write, n_chunks_know)
+        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, gate_conc = _srw_chunked(
+            x, h, know_emb_unit, tau, know_read, know_write, n_chunks_know)
 
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
-    # Load balance loss from gate distribution + tau regularization
     tau_reg = jnp.maximum(tau, 0.0).mean() * 0.01
     aux = lb_loss + tau_reg
     emb_norm_val = jnp.linalg.norm(know_emb, axis=-1).mean()
     read_norm_val = jnp.linalg.norm(know_read, axis=-1).mean()
     write_norm_val = jnp.linalg.norm(know_write, axis=-1).mean()
-    return out, aux, active_count, gate_max_val, gs_mean, es_mean, emb_norm_val, read_norm_val, write_norm_val
+    return out, aux, active_frac, raw_gate_max, score_std, gate_sum, gate_conc, emb_norm_val, read_norm_val, write_norm_val
 
 
 # ================================================================
@@ -738,7 +742,7 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """DAWN-Spatial v3.8: Sense-Read-Write."""
-    __version__ = "spatial-r1-v3.8.2"
+    __version__ = "spatial-r1-v3.9.0"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -748,13 +752,10 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
 
-    d_bottleneck: int = 128
+    d_route: int = 128
     n_qk: int = 1580
     n_v: int = 2600
     n_know: int = 25200
-    max_k_qk: int = 158
-    max_k_v: int = 260
-    max_k_know: int = 1810
     router_dropout: float = 0.1
     n_chunks_know: int = 1    # N-axis chunking for know pool
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
@@ -771,12 +772,11 @@ class DAWN(nn.Module):
             self.max_seq_len, self.d_model, embedding_init=scaled_normal(0.02))
         self.neuron_pool = NeuronPool(
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
-            d_model=self.d_model, d_bottleneck=self.d_bottleneck)
+            d_model=self.d_model, d_route=self.d_route)
         self.router = Router(
-            d_model=self.d_model, d_bottleneck=self.d_bottleneck,
+            d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
-            max_k_qk=self.max_k_qk, max_k_v=self.max_k_v,
-            max_k_know=self.max_k_know, router_dropout=self.router_dropout)
+            router_dropout=self.router_dropout)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
                       dropout_rate=self.dropout_rate, name=f'block_{i}')
@@ -795,13 +795,23 @@ class DAWN(nn.Module):
         x = safe_dropout(x, self.dropout_rate, deterministic, emb_rng)
 
         if self.is_initializing():
-            total_aux = jnp.float32(0.0)
-            attn_auxes = jnp.float32(0.0)
-            know_auxes = jnp.float32(0.0)
-            know_actives = jnp.float32(0.0)
-            know_gmaxes = jnp.float32(0.0)
-            know_gs_all = jnp.float32(0.0)
-            know_es_all = jnp.float32(0.0)
+            _z = jnp.float32(0.0)
+            total_aux = _z
+            attn_auxes = _z
+            know_auxes = _z
+            know_active_all = _z
+            know_raw_gmax_all = _z
+            know_sstd_all = _z
+            know_gsum_all = _z
+            know_gconc_all = _z
+            attn_active_all = _z
+            attn_raw_gmax_all = _z
+            attn_sstd_all = _z
+            attn_gsum_all = _z
+            attn_gconc_all = _z
+            k_emb_n_all = _z
+            k_read_n_all = _z
+            k_write_n_all = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -811,7 +821,7 @@ class DAWN(nn.Module):
             pool_params = all_params['neuron_pool']
             router_params = all_params['router']
 
-            _sharded = sharded_fns  # None for non-sharded, tuple for shard_map
+            _sharded = sharded_fns
 
             block_params_list = [all_params[f'block_{i}']
                                  for i in range(self.n_layers)]
@@ -829,11 +839,10 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
-                attn_out, attn_aux, attn_gs, attn_es = _attn_forward(
+                attn_out, attn_aux, a_active, a_raw_gmax, a_sstd, a_gsum, a_gconc = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
                     self.n_qk, self.n_v,
-                    self.max_k_qk, self.max_k_v,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
                     self.n_chunks_qk, self.n_chunks_v,
@@ -842,20 +851,24 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
-                know_out, know_aux, know_active, know_gmax, know_gs, know_es, k_emb_n, k_read_n, k_write_n = _know_forward(
+                know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum, k_gconc, k_emb_n, k_read_n, k_write_n = _know_forward(
                     normed, pool_params, router_params, rng_know,
-                    self.max_k_know,
                     self.router_dropout, self.dropout_rate, deterministic,
                     self.n_chunks_know, sharded_fns=_sharded)
                 x = x + know_out
-                return x, (attn_aux, know_aux, know_active, know_gmax, know_gs, know_es, k_emb_n, k_read_n, k_write_n)
+                return x, (attn_aux, know_aux,
+                           k_active, k_raw_gmax, k_sstd, k_gsum, k_gconc,
+                           a_active, a_raw_gmax, a_sstd, a_gsum, a_gconc,
+                           k_emb_n, k_read_n, k_write_n)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
 
             xs = {'params': stacked, 'rng': layer_rngs}
-            x, (attn_auxes, know_auxes, know_actives, know_gmaxes,
-                know_gs_all, know_es_all, k_emb_n_all, k_read_n_all, k_write_n_all) = jax.lax.scan(
+            x, (attn_auxes, know_auxes,
+                know_active_all, know_raw_gmax_all, know_sstd_all, know_gsum_all, know_gconc_all,
+                attn_active_all, attn_raw_gmax_all, attn_sstd_all, attn_gsum_all, attn_gconc_all,
+                k_emb_n_all, k_read_n_all, k_write_n_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).sum()
 
@@ -864,10 +877,19 @@ class DAWN(nn.Module):
             'aux_loss': total_aux,
             'attn_aux': attn_auxes.mean(),
             'know_aux': know_auxes.mean(),
-            'know_active': know_actives.mean(),
-            'know_gate_max': know_gmaxes.mean(),
-            'know_gs': know_gs_all.mean(),
-            'know_es': know_es_all.mean(),
+
+            'know_active': know_active_all.mean(),
+            'know_raw_gate_max': know_raw_gmax_all.mean(),
+            'know_score_std': know_sstd_all.mean(),
+            'know_gate_sum': know_gsum_all.mean(),
+            'know_gate_conc': know_gconc_all.mean(),
+
+            'attn_active': attn_active_all.mean(),
+            'attn_raw_gate_max': attn_raw_gmax_all.mean(),
+            'attn_score_std': attn_sstd_all.mean(),
+            'attn_gate_sum': attn_gsum_all.mean(),
+            'attn_gate_conc': attn_gconc_all.mean(),
+
             'know_emb_norm': k_emb_n_all.mean(),
             'know_read_norm': k_read_n_all.mean(),
             'know_write_norm': k_write_n_all.mean(),
@@ -925,19 +947,17 @@ class DAWN(nn.Module):
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
-            'd_bottleneck': self.d_bottleneck,
+            'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_know': self.n_know,
-            'max_k_qk': self.max_k_qk, 'max_k_v': self.max_k_v,
-            'max_k_know': self.max_k_know,
         }
 
     def get_model_info(self):
         return [
             f"DAWN v{self.__version__}: Sense-Read-Write",
-            f"  d_model={self.d_model}, d_bottleneck={self.d_bottleneck}, "
+            f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
-            f"  Per neuron: emb[{self.d_bottleneck}] + read[{self.d_model}] "
+            f"  Per neuron: emb[{self.d_route}] + read[{self.d_model}] "
             f"+ write[{self.d_model}]",
         ]
 
@@ -950,6 +970,7 @@ class DAWN(nn.Module):
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference (S=1 typically).
     No checkpoint, no LB loss, no bf16 casting.
+    Linear gate (ReLU), no σ-normalization.
     """
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
@@ -959,20 +980,16 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     tau = s_mean + tau_offset * s_std
 
     raw = scores - tau.astype(scores.dtype)
-    gc = jnp.where(raw > 0, raw,
-                   (1e-6 * jnp.exp(jnp.clip(
-                       raw.astype(jnp.float32), -10.0, 0.0)
-                   )).astype(scores.dtype))
-    gc = jnp.clip(gc, 0.0, 10.0)
-    eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+    gate = jnp.maximum(raw, 0.0)
+    gate = jnp.clip(gate, 0.0, 10.0)
 
-    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_strength = jnp.tanh(
-        eg.max(axis=-1, keepdims=True).astype(jnp.float32))
+        gate.max(axis=-1, keepdims=True).astype(jnp.float32))
 
     xr = x @ w_read.T
-    raw_out = (eg * xr) @ w_write
-    out = raw_out.astype(jnp.float32) / exp_sum * gate_strength
+    raw_out = (gate * xr) @ w_write
+    out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
     return out.astype(jnp.float32)
 
 
@@ -986,21 +1003,17 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     tau = s_mean + tau_offset * s_std
 
     raw = scores - tau.astype(scores.dtype)
-    gc = jnp.where(raw > 0, raw,
-                   (1e-6 * jnp.exp(jnp.clip(
-                       raw.astype(jnp.float32), -10.0, 0.0)
-                   )).astype(scores.dtype))
-    gc = jnp.clip(gc, 0.0, 10.0)
-    eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+    gate = jnp.maximum(raw, 0.0)
+    gate = jnp.clip(gate, 0.0, 10.0)
 
-    exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_strength = jnp.tanh(
-        eg.max(axis=-1, keepdims=True).astype(jnp.float32))
-    gate_norm = (eg.astype(jnp.float32) / exp_sum * gate_strength)
+        gate.max(axis=-1, keepdims=True).astype(jnp.float32))
+    gate_norm = (gate.astype(jnp.float32) / gate_sum * gate_strength)
 
     xr = x @ w_read.T
-    raw_out = (eg * xr) @ w_write
-    out = raw_out.astype(jnp.float32) / exp_sum * gate_strength
+    raw_out = (gate * xr) @ w_write
+    out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
     return out.astype(jnp.float32), gate_norm
 
 
@@ -1460,24 +1473,22 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if 'know' in suppress_masks else None
 
     def _srw_sup(x, h, emb_n, tau_off, w_read, w_write, mult):
-        """SRW with optional gate suppression."""
+        """SRW with optional gate suppression. Linear gate (ReLU)."""
         scores = h @ emb_n.T
         sf = scores.astype(jnp.float32)
         s_mean = sf.mean(axis=-1, keepdims=True)
         s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
         tau = s_mean + tau_off * s_std
         raw = scores - tau.astype(scores.dtype)
-        gc = jnp.where(raw > 0, raw,
-                       (1e-6 * jnp.exp(jnp.clip(raw.astype(jnp.float32), -10.0, 0.0))).astype(scores.dtype))
-        gc = jnp.clip(gc, 0.0, 10.0)
-        eg = (jnp.exp(gc.astype(jnp.float32)) - 1.0).astype(scores.dtype)
+        gate = jnp.maximum(raw, 0.0)
+        gate = jnp.clip(gate, 0.0, 10.0)
         if mult is not None:
-            eg = eg * mult[None, None, :]
-        exp_sum = eg.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
-        gs = jnp.tanh(eg.max(axis=-1, keepdims=True).astype(jnp.float32))
+            gate = gate * mult[None, None, :]
+        gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+        gs = jnp.tanh(gate.max(axis=-1, keepdims=True).astype(jnp.float32))
         xr = x @ w_read.T
-        out = (eg * xr) @ w_write
-        return (out.astype(jnp.float32) / exp_sum * gs).astype(jnp.float32)
+        out = (gate * xr) @ w_write
+        return (out.astype(jnp.float32) / gate_sum * gs).astype(jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
