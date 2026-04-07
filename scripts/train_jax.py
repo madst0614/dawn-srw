@@ -533,6 +533,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'qk_output_scale': result.get('qk_output_scale', jnp.float32(1.0)),
             'v_output_scale': result.get('v_output_scale', jnp.float32(1.0)),
             'know_output_scale': result.get('know_output_scale', jnp.float32(1.0)),
+            'attn_qk_strength': result.get('attn_qk_strength', jnp.float32(0.5)),
+            'attn_v_strength': result.get('attn_v_strength', jnp.float32(0.5)),
+            'know_strength': result.get('know_strength', jnp.float32(0.5)),
             'tau_know_bias': tau_know_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
@@ -1987,6 +1990,11 @@ def main():
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
                             f" write={k_write_n:.3f}"
                             f" | oscale: qk={qk_os:.3f} v={v_os:.3f} k={k_os:.3f}")
+                        qk_str = _m(metrics.get('attn_qk_strength', 0.5))
+                        v_str = _m(metrics.get('attn_v_strength', 0.5))
+                        k_str = _m(metrics.get('know_strength', 0.5))
+                        log_message(
+                            f"      strength: qk={qk_str:.3f} v={v_str:.3f} know={k_str:.3f}")
                         k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
                         a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
                         a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))
