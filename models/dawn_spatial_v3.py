@@ -205,8 +205,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
 
         global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        gate_strength = jnp.tanh(global_gate_max)
-        out = raw_out / global_gate_sum * gate_strength
+        out = raw_out / global_gate_sum
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active_frac = jax.lax.psum(total_active, 'model') / N_total
@@ -306,8 +305,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         # Normalize per route independently
         global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        gate_strength = jnp.tanh(global_gate_max)
-        out = raw_out / global_gate_sum * gate_strength
+        out = raw_out / global_gate_sum
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active_frac = jax.lax.psum(total_active, 'model') / N_total
@@ -383,8 +381,7 @@ def _srw_chunked(x, h, emb_unit, tau, w_read, w_write, n_chunks):
         jnp.arange(n_chunks))
 
     inv_gs = (1.0 / (total_gate_sum + 1e-8)).astype(jnp.bfloat16)
-    gate_strength = jnp.tanh(total_gate_max).astype(jnp.bfloat16)
-    out = raw_out * inv_gs * gate_strength
+    out = raw_out * inv_gs
 
     # Score LB: CV² of per-neuron score mean
     mean_score = ns_sum / N
@@ -978,14 +975,12 @@ def _srw_inference(x, h, emb_norm, tau, w_read, w_write):
     gate = jnp.clip(gate, 0.0, 10.0)
 
     gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
-    gate_strength = jnp.tanh(
-        gate.max(axis=-1, keepdims=True).astype(jnp.float32))
 
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
-    out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
+    out = raw_out.astype(jnp.float32) / gate_sum
     return out.astype(jnp.float32)
 
 
@@ -997,15 +992,13 @@ def _srw_inference_with_gates(x, h, emb_norm, tau, w_read, w_write):
     gate = jnp.clip(gate, 0.0, 10.0)
 
     gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
-    gate_strength = jnp.tanh(
-        gate.max(axis=-1, keepdims=True).astype(jnp.float32))
-    gate_norm = (gate.astype(jnp.float32) / gate_sum * gate_strength)
+    gate_norm = gate.astype(jnp.float32) / gate_sum
 
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
-    out = raw_out.astype(jnp.float32) / gate_sum * gate_strength
+    out = raw_out.astype(jnp.float32) / gate_sum
     return out.astype(jnp.float32), gate_norm
 
 
@@ -1506,12 +1499,11 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if mult is not None:
             gate = gate * mult[None, None, :]
         gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
-        gs = jnp.tanh(gate.max(axis=-1, keepdims=True).astype(jnp.float32))
         r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
         xr = x @ r_n.T
         out = (gate * xr) @ w_n
-        return (out.astype(jnp.float32) / gate_sum * gs).astype(jnp.float32)
+        return (out.astype(jnp.float32) / gate_sum).astype(jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
