@@ -806,6 +806,8 @@ class DAWN(nn.Module):
             attn_qk_raw_norm_all = _z
             attn_v_raw_norm_all = _z
             know_raw_out_norm_all = _z
+            attn_gain_all = _z
+            know_gain_all = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -852,13 +854,16 @@ class DAWN(nn.Module):
                     know_output_gain=bp.get('know_output_gain', None),
                     n_chunks_know=self.n_chunks_know, sharded_fns=_sharded)
                 x = x + know_out
+                a_gain = bp.get('attn_output_gain', jnp.ones(1))
+                k_gain = bp.get('know_output_gain', jnp.ones(1))
                 return x, (attn_aux, know_aux,
                            k_active, k_raw_gmax, k_gsum, k_gconc,
                            a_qk_active, a_v_active, a_raw_gmax, a_gsum, a_gconc,
                            k_emb_n, k_read_n, k_write_n,
                            k_out_norm, a_out_norm,
                            a_tau_mean, k_tau_mean,
-                           a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm)
+                           a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
+                           a_gain[0], k_gain[0])
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -870,7 +875,8 @@ class DAWN(nn.Module):
                 k_emb_n_all, k_read_n_all, k_write_n_all,
                 know_out_norm_all, attn_out_norm_all,
                 attn_tau_mean_all, know_tau_mean_all,
-                attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all) = jax.lax.scan(
+                attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
+                attn_gain_all, know_gain_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -902,6 +908,8 @@ class DAWN(nn.Module):
             'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
             'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
             'know_raw_out_norm': know_raw_out_norm_all.mean(),
+            'attn_output_gain': attn_gain_all.mean(),
+            'know_output_gain': know_gain_all.mean(),
         }
 
         if labels is not None:

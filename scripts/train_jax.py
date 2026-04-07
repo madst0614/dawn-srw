@@ -536,6 +536,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
             'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
             'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
+            'attn_output_gain': result.get('attn_output_gain', jnp.float32(1.0)),
+            'know_output_gain': result.get('know_output_gain', jnp.float32(1.0)),
         }
 
         return new_params, new_opt_state, metrics
@@ -1982,6 +1984,10 @@ def main():
                             f" gsum={a_gsum:.1f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
+                        a_gain = _m(metrics.get('attn_output_gain', 1.0))
+                        k_gain = _m(metrics.get('know_output_gain', 1.0))
+                        log_message(
+                            f"      gain: attn={a_gain:.4f} know={k_gain:.4f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
