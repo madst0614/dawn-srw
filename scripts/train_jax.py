@@ -530,6 +530,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
+            'qk_output_scale': result.get('qk_output_scale', jnp.float32(1.0)),
+            'v_output_scale': result.get('v_output_scale', jnp.float32(1.0)),
+            'know_output_scale': result.get('know_output_scale', jnp.float32(1.0)),
             'tau_know_bias': tau_know_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
@@ -1976,10 +1979,14 @@ def main():
                         log_message(
                             f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
                             f" know={k_tau_m:.3f} | grad_norm={m_grad:.3f}")
+                        qk_os = _m(metrics.get('qk_output_scale', 1.0))
+                        v_os = _m(metrics.get('v_output_scale', 1.0))
+                        k_os = _m(metrics.get('know_output_scale', 1.0))
                         log_message(
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
-                            f" write={k_write_n:.3f}")
+                            f" write={k_write_n:.3f}"
+                            f" | oscale: qk={qk_os:.3f} v={v_os:.3f} k={k_os:.3f}")
                         k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
                         a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
                         a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))

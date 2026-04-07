@@ -1002,6 +1002,10 @@ class DAWN(nn.Module):
             'know_read_norm': k_read_n_all.mean(),
             'know_write_norm': k_write_n_all.mean(),
 
+            'qk_output_scale': self.neuron_pool.qk_output_scale.squeeze(),
+            'v_output_scale': self.neuron_pool.v_output_scale.squeeze(),
+            'know_output_scale': self.neuron_pool.know_output_scale.squeeze(),
+
             'attn_score_mean': attn_smean_all.mean(),
             'know_score_mean': know_smean_all.mean(),
             'know_out_norm': know_out_norm_all.mean(),
