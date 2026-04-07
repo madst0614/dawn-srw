@@ -538,6 +538,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
             'debug_emb_norm': result.get('debug_emb_norm', jnp.float32(0.0)),
             'debug_o_proj_norm': result.get('debug_o_proj_norm', jnp.float32(0.0)),
+            'debug_q_norm': result.get('debug_q_norm', jnp.float32(0.0)),
+            'debug_k_norm': result.get('debug_k_norm', jnp.float32(0.0)),
+            'debug_v_norm': result.get('debug_v_norm', jnp.float32(0.0)),
+            'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
+            'debug_o_input_norm': result.get('debug_o_input_norm', jnp.float32(0.0)),
+            'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
+            'per_layer_know_out_norm': result.get('per_layer_know_out_norm', jnp.zeros(1)),
         }
 
         return new_params, new_opt_state, metrics
@@ -891,6 +898,8 @@ def main():
                         help='Override batch_size from config (global)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning rate from config')
+    parser.add_argument('--debug', action='store_true',
+                        help='Debug mode: log every step with detailed metrics')
     cli_args = parser.parse_args()
 
     # ----------------------------------------------------------
@@ -909,6 +918,7 @@ def main():
     set_seed(seed)
 
     # Training params (from YAML first, may be overridden by checkpoint config below)
+    debug_mode = cli_args.debug
     tcfg = cfg['training']
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
@@ -1889,7 +1899,7 @@ def main():
 
             # ---- Periodic logging (host 0 only) ----
             _early_debug = global_step in (1, 5, 10, 20, 50)
-            if global_step % LOG_INTERVAL == 0 or _early_debug:
+            if global_step % LOG_INTERVAL == 0 or _early_debug or debug_mode:
                 if is_host0:
                     elapsed = time.time() - win_start_time
                     steps_per_sec = win_count / elapsed if elapsed > 0 else 0
@@ -1982,14 +1992,33 @@ def main():
                             f" gsum={a_gsum:.1f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
-                        if _early_debug:
+                        if _early_debug or debug_mode:
                             d_res = _m(metrics.get('debug_residual_norm', 0.0))
                             d_emb = _m(metrics.get('debug_emb_norm', 0.0))
                             d_oproj = _m(metrics.get('debug_o_proj_norm', 0.0))
+                            d_q = _m(metrics.get('debug_q_norm', 0.0))
+                            d_k = _m(metrics.get('debug_k_norm', 0.0))
+                            d_v = _m(metrics.get('debug_v_norm', 0.0))
+                            d_lm = _m(metrics.get('debug_logit_max', 0.0))
+                            d_oi = _m(metrics.get('debug_o_input_norm', 0.0))
                             log_message(
-                                f"      [DEBUG] residual_norm={d_res:.3f}"
-                                f" emb_norm={d_emb:.3f}"
-                                f" o_proj_norm={d_oproj:.3f}")
+                                f"      [DEBUG] residual={d_res:.3f}"
+                                f" emb={d_emb:.3f} o_proj={d_oproj:.3f}"
+                                f" read={k_read_n:.3f}")
+                            log_message(
+                                f"      [DEBUG] attn_detail:"
+                                f" q={d_q:.3f} k={d_k:.3f} v={d_v:.3f}"
+                                f" logit_max={d_lm:.3f}"
+                                f" o_in={d_oi:.3f} o_out={a_out_n:.3f}")
+                            try:
+                                pl_attn = jax.device_get(metrics['per_layer_attn_out_norm'])
+                                pl_know = jax.device_get(metrics['per_layer_know_out_norm'])
+                                attn_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_attn))
+                                know_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_know))
+                                log_message(f"      [DEBUG] per_layer_attn: [{attn_s}]")
+                                log_message(f"      [DEBUG] per_layer_know: [{know_s}]")
+                            except Exception:
+                                pass
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 

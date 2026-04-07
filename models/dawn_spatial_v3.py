@@ -562,7 +562,15 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
         return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
 
+    # Debug metrics (always computed, cheap scalars)
+    q_norm = jnp.linalg.norm(Q, axis=-1).mean()
+    k_norm = jnp.linalg.norm(K, axis=-1).mean()
+    v_norm = jnp.linalg.norm(V, axis=-1).mean()
+    # Approximate logit max from Q,K norms (exact would require materializing full score matrix)
+    attn_logit_max = (q_norm * k_norm / scale)
+
     out = _attn_scores(Q, K, V, rng_attn_drop)
+    o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     attn_out_norm = jnp.linalg.norm(out, axis=-1).mean()
@@ -576,7 +584,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_gate_sum = (qk_es + v_es) / 2
     attn_gate_conc = (qk_gconc + v_gconc) / 2
     attn_tau_mean = tau_all.mean()
-    return out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax, attn_gate_sum, attn_gate_conc, attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm
+    return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax, attn_gate_sum, attn_gate_conc,
+            attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
+            q_norm, k_norm, v_norm, attn_logit_max, o_input_norm)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -786,6 +796,11 @@ class DAWN(nn.Module):
             attn_qk_raw_norm_all = _z
             attn_v_raw_norm_all = _z
             know_raw_out_norm_all = _z
+            attn_q_norm_all = _z
+            attn_k_norm_all = _z
+            attn_v_norm_dbg_all = _z
+            attn_logit_max_all = _z
+            attn_o_input_norm_all = _z
             _o_proj_norm = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
@@ -814,7 +829,9 @@ class DAWN(nn.Module):
 
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
-                attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax, a_gsum, a_gconc, a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm = _attn_forward(
+                (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax, a_gsum, a_gconc,
+                 a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
+                 a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
                     self.n_qk, self.n_v,
@@ -837,7 +854,8 @@ class DAWN(nn.Module):
                            k_emb_n, k_read_n, k_write_n,
                            k_out_norm, a_out_norm,
                            a_tau_mean, k_tau_mean,
-                           a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm)
+                           a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
+                           a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -849,7 +867,9 @@ class DAWN(nn.Module):
                 k_emb_n_all, k_read_n_all, k_write_n_all,
                 know_out_norm_all, attn_out_norm_all,
                 attn_tau_mean_all, know_tau_mean_all,
-                attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all) = jax.lax.scan(
+                attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
+                attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
+                attn_logit_max_all, attn_o_input_norm_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
             _o_proj_norm = jnp.linalg.norm(stacked['attn']['expand_O']['kernel'], axis=(-2, -1)).mean()
@@ -889,6 +909,14 @@ class DAWN(nn.Module):
             'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
             'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
             'know_raw_out_norm': know_raw_out_norm_all.mean(),
+            # Debug: per-layer arrays + attn detail
+            'per_layer_attn_out_norm': attn_out_norm_all,
+            'per_layer_know_out_norm': know_out_norm_all,
+            'debug_q_norm': attn_q_norm_all.mean(),
+            'debug_k_norm': attn_k_norm_all.mean(),
+            'debug_v_norm': attn_v_norm_dbg_all.mean(),
+            'debug_logit_max': attn_logit_max_all.mean(),
+            'debug_o_input_norm': attn_o_input_norm_all.mean(),
         }
 
         if labels is not None:
