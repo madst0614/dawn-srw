@@ -597,10 +597,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
         QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_gconc, qk_smean = fused_paired(
             x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
+        qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
         Q = QK_out[:, :, 0, :] * qk_scale
         K = QK_out[:, :, 1, :] * qk_scale
         V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_gconc, v_smean = fused_single(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
+        v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         V = V * v_scale
     else:
         Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_gconc, q_smean = _srw_chunked(
@@ -609,6 +611,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             x, h_K, qk_emb_unit, tau_all[:, :, 1:2], qk_read, qk_write, n_chunks_qk)
         V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_gconc, v_smean = _srw_chunked(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, n_chunks_v)
+        qk_raw_norm = (jnp.linalg.norm(Q, axis=-1).mean() + jnp.linalg.norm(K, axis=-1).mean()) / 2
+        v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         Q = Q * qk_scale
         K = K * qk_scale
         V = V * v_scale
