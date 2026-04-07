@@ -589,6 +589,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_all = safe_dropout(h_all, router_dropout, deterministic, rng_drop)
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+    h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+    h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+    h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
@@ -670,6 +673,7 @@ def _know_forward(x, pool_params, router_params, rng,
     rng, rng_drop = jax.random.split(rng)
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
+    h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
 
     know_emb_unit = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
@@ -1092,6 +1096,9 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+    h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+    h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+    h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
     Q = _srw_inference(x, h_Q, qk_norm, tau_all[:, :, 0:1],
@@ -1129,6 +1136,7 @@ def _know_forward_inference(x, pool_params, router_params):
     know_emb = pool_params['know_emb']
     know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+    h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     out = _srw_inference(x, h, know_norm, tau,
                          pool_params['know_read'], pool_params['know_write'])
@@ -1172,6 +1180,9 @@ def prefill(params, model_cfg, input_ids):
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
         h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+        h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+        h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
         tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
         Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
@@ -1305,6 +1316,9 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
             h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+            h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+            h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
             tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
             Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
@@ -1334,6 +1348,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            h_k = h_k / (jnp.linalg.norm(h_k, axis=-1, keepdims=True) + 1e-8)
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
             know_out = _srw_inference(normed, h_k, know_norm, tau_k,
                                      pool_params['know_read'], pool_params['know_write'])
@@ -1477,6 +1492,9 @@ def analysis_forward(params, model_cfg, input_ids):
         normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
         h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+        h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+        h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
         tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
         Q, gate_Q = _srw_inference_with_gates(
@@ -1509,6 +1527,7 @@ def analysis_forward(params, model_cfg, input_ids):
 
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+        h_k = h_k / (jnp.linalg.norm(h_k, axis=-1, keepdims=True) + 1e-8)
         tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
         know_out, gate_Know = _srw_inference_with_gates(
             normed, h_k, know_norm_w, tau_k,
@@ -1587,6 +1606,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
             h_all = normed @ rp['proj_attn']['kernel'] + rp['proj_attn']['bias']
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
+            h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
+            h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
             tau_all = normed @ rp['tau_attn']['kernel'] + rp['tau_attn']['bias']
 
             Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], pp['qk_read'], pp['qk_write'], qk_mult)
@@ -1610,6 +1632,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ rp['proj_know']['kernel'] + rp['proj_know']['bias']
+            h_k = h_k / (jnp.linalg.norm(h_k, axis=-1, keepdims=True) + 1e-8)
             tau_k = normed @ rp['tau_know']['kernel'] + rp['tau_know']['bias']
             x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult) * pp['know_output_scale']
 
