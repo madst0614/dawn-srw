@@ -481,7 +481,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def normalize_pool_params(params):
             pool = params['neuron_pool']
             norm_keys = [
-                'qk_read', 'v_read', 'know_read',
                 'qk_write', 'v_write', 'know_write',
                 'qk_emb', 'v_emb', 'know_emb',
             ]
@@ -1161,7 +1160,7 @@ def main():
             path_str = '/'.join(str(p) for p in path)
             # No WD for unit-norm re-projected params
             if 'neuron_pool' in path_str:
-                for key in ['_emb', '_read', '_write']:
+                for key in ['_emb', '_write']:
                     if key in path_str:
                         return False
             return True
@@ -1979,8 +1978,6 @@ def main():
                             f" gsum={a_gsum:.1f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
-                        _d = cfg['model'].get('d_model', 384)
-                        log_message(f"      scale: √d_model={_d**0.5:.1f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
