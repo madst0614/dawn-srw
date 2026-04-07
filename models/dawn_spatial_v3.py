@@ -170,6 +170,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
             wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
             scores = h_bf @ ec.T
             raw = scores.astype(jnp.float32) - tau
@@ -268,6 +269,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, s, cs, axis=0)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, s, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, s, cs, axis=0)
+            rc = rc / (jnp.linalg.norm(rc, axis=-1, keepdims=True) + 1e-8)
             wc = wc / (jnp.linalg.norm(wc, axis=-1, keepdims=True) + 1e-8)
             scores = jnp.einsum('bsrd,nd->bsrn', h_bf, ec)
             raw = scores.astype(jnp.float32) - tau
@@ -1003,8 +1005,9 @@ def _srw_inference(x, h, emb_norm, tau, w_read, w_write):
 
     gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
 
+    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
-    xr = x @ w_read.T
+    xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
     out = raw_out.astype(jnp.float32) / gate_sum
     return out.astype(jnp.float32)
@@ -1020,8 +1023,9 @@ def _srw_inference_with_gates(x, h, emb_norm, tau, w_read, w_write):
     gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
     gate_norm = gate.astype(jnp.float32) / gate_sum
 
+    r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
-    xr = x @ w_read.T
+    xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
     out = raw_out.astype(jnp.float32) / gate_sum
     return out.astype(jnp.float32), gate_norm
@@ -1524,8 +1528,9 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if mult is not None:
             gate = gate * mult[None, None, :]
         gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+        r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
-        xr = x @ w_read.T
+        xr = x @ r_n.T
         out = (gate * xr) @ w_n
         return (out.astype(jnp.float32) / gate_sum).astype(jnp.float32)
 
