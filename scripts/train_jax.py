@@ -516,14 +516,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
             'know_active': result.get('know_active', jnp.float32(0.0)),
-            'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
-            'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
-            'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
+            'know_active_N': result.get('know_active_N', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
-            'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
-            'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
-            'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
+            'attn_active_N': result.get('attn_active_N', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
@@ -1937,15 +1933,11 @@ def main():
 
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         k_act = _m(metrics['know_active'])
-                        k_raw_gmax = _m(metrics['know_raw_gate_max'])
-                        k_gsum = _m(metrics.get('know_gate_sum', 0.0))
-                        k_gconc = _m(metrics.get('know_gate_conc', 0.0))
+                        k_aN = _m(metrics.get('know_active_N', 0.0))
 
                         a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
                         a_v_act = _m(metrics.get('attn_v_active', 0.0))
-                        a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
-                        a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
-                        a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
+                        a_aN = _m(metrics.get('attn_active_N', 0.0))
                         a_out_n = _m(metrics.get('attn_out_norm', 0.0))
 
                         a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
@@ -1965,16 +1957,12 @@ def main():
 
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
-                            f"({k_act*100:.1f}%) raw_max={k_raw_gmax:.4f}"
-                            f" conc={k_gconc:.1f}"
-                            f" gsum={k_gsum:.1f}"
+                            f"({k_act*100:.1f}%) active_N={k_aN:.0f}"
                             f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         log_message(
                             f"      attn: qk_active={a_qk_act:.1%}"
                             f" v_active={a_v_act:.1%}"
-                            f" raw_max={a_raw_gmax:.4f}"
-                            f" conc={a_gconc:.1f}"
-                            f" gsum={a_gsum:.1f}"
+                            f" active_N={a_aN:.0f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
                         if _early_debug or debug_mode:

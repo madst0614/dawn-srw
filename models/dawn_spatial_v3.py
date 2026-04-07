@@ -1318,11 +1318,6 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
                                pool_params['qk_read'], pool_params['qk_write'])
             V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
                                pool_params['v_read'], pool_params['v_write'])
-            _os = jnp.sqrt(jnp.float32(d_model))
-            Q = Q * _os
-            K = K * _os
-            V = V * _os
-
             d_head = d_model // n_heads
             Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
             Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1343,7 +1338,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
             know_out = _srw_inference(normed, h_k, know_norm, tau_k,
                                      pool_params['know_read'], pool_params['know_write'])
-            x = x + know_out * jnp.sqrt(jnp.float32(x.shape[-1]))
+            x = x + know_out
             return x, None
 
         x, _ = jax.lax.scan(layer_fn, x, stacked)
@@ -1494,10 +1489,6 @@ def analysis_forward(params, model_cfg, input_ids):
         V, gate_V = _srw_inference_with_gates(
             normed, h_V, v_norm, tau_all[:, :, 2:3],
             pool_params['v_read'], pool_params['v_write'])
-        _os = jnp.sqrt(jnp.float32(d_model))
-        Q = Q * _os
-        K = K * _os
-        V = V * _os
 
         d_head = d_model // n_heads
         Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1520,7 +1511,6 @@ def analysis_forward(params, model_cfg, input_ids):
         know_out, gate_Know = _srw_inference_with_gates(
             normed, h_k, know_norm_w, tau_k,
             pool_params['know_read'], pool_params['know_write'])
-        know_out = know_out * jnp.sqrt(jnp.float32(x.shape[-1]))
         know_out_norm = jnp.linalg.norm(know_out, axis=-1).mean()
         x = x + know_out
 
@@ -1555,7 +1545,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if 'know' in suppress_masks else None
 
     def _srw_sup(x, h, emb_n, tau_off, w_read, w_write, mult):
-        """SRW with optional gate suppression. Linear gate (ReLU)."""
+        """SRW with optional gate suppression. active_N normalize."""
+        D = x.shape[-1]
         scores = h @ emb_n.T
         sf = scores.astype(jnp.float32)
         s_mean = sf.mean(axis=-1, keepdims=True)
@@ -1566,13 +1557,13 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         gate = jnp.clip(gate, 0.0, 10.0)
         if mult is not None:
             gate = gate * mult[None, None, :]
-        gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
-        gs = jnp.tanh(gate.max(axis=-1, keepdims=True).astype(jnp.float32))
+        active_N = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
         r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
         xr = x @ r_n.T
-        out = (gate * xr) @ w_n
-        return (out.astype(jnp.float32) / gate_sum * gs).astype(jnp.float32)
+        raw_out = (gate * xr) @ w_n
+        C = jnp.sqrt(jnp.float32(D))
+        return (raw_out / (active_N + 1.0) * C).astype(jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
@@ -1599,10 +1590,6 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], pp['qk_read'], pp['qk_write'], qk_mult)
             K = _srw_sup(normed, h_K, qk_n, tau_all[:,:,1:2], pp['qk_read'], pp['qk_write'], qk_mult)
             V = _srw_sup(normed, h_V, v_n, tau_all[:,:,2:3], pp['v_read'], pp['v_write'], v_mult)
-            _os = jnp.sqrt(jnp.float32(d_model))
-            Q = Q * _os
-            K = K * _os
-            V = V * _os
 
             Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
             Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
@@ -1619,7 +1606,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ rp['proj_know']['kernel'] + rp['proj_know']['bias']
             tau_k = normed @ rp['tau_know']['kernel'] + rp['tau_know']['bias']
-            x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult) * jnp.sqrt(jnp.float32(d_model))
+            x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult)
 
         norm_p = params['norm']
         x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
