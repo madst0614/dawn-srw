@@ -3,9 +3,9 @@ DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
   spatial-r1-v3.9.5 (2026-04-07):
-    - gate_sum normalize → √(active_count) normalize
-    - tanh(gate_max) 제거
-    - √d_model output scale 제거 (gate norm이 scale 역할)
+    - squash normalization: gate_sum normalize + tanh(gate_max) → capsule-style squash, C=√d_model
+    - threshold_gate returns raw gate (no normalization)
+    - √d_model output scale 제거 (squash의 C가 대체)
 
   spatial-r1-v3.9.4 (2026-04-07):
     - learnable output_scale → fixed √d_model (wd-induced shrinkage fix)
@@ -107,7 +107,7 @@ def unit_norm_init(scale=1.0):
 def threshold_gate(scores, tau_offset):
     """Relative tau threshold gate with linear (ReLU) activation.
     scores: [B,S,N], tau_offset: [B,S,1]
-    Returns √(active_count)-normalized gate: [B,S,N]
+    Returns raw gate (no normalization — squash applied after SRW).
     """
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -117,11 +117,7 @@ def threshold_gate(scores, tau_offset):
     raw = scores - tau.astype(scores.dtype)
     gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
-
-    active_count = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-    active_count = jnp.maximum(active_count, 1.0)
-
-    return gate / jnp.sqrt(active_count)
+    return gate
 
 
 # ================================================================
@@ -237,20 +233,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
              jnp.full((B, S, 1), -1e9), z1),
             jnp.arange(nc))
 
-        global_active = jax.lax.psum(total_active, 'model')
-        global_active = jnp.maximum(global_active, 1.0)
-        out = raw_out / jnp.sqrt(global_active)
-        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        # Squash normalization after psum
+        raw_out_global = jax.lax.psum(raw_out.astype(jnp.bfloat16), 'model').astype(jnp.float32)
+        C = jnp.sqrt(jnp.float32(D))
+        norm = jnp.linalg.norm(raw_out_global, axis=-1, keepdims=True) + 1e-8
+        out = raw_out_global * (C / (C + norm))
 
+        global_active = jax.lax.psum(total_active, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        active_frac = global_active / N_total
+        active_frac = jnp.maximum(global_active, 1.0) / N_total
 
         score_std_out = s_std.mean()
         active_count_out = global_active.mean()
-        # gate_concentration: max / mean_active — how peaked the gate is
         gate_conc = (global_gate_max / (global_active + 1e-8)).mean()
         score_mean_out = s_mean.mean()
-        return out.astype(jnp.float32), active_frac, global_gate_max, score_lb, score_std_out, active_count_out, gate_conc, score_mean_out
+        return out, active_frac, global_gate_max, score_lb, score_std_out, active_count_out, gate_conc, score_mean_out
 
     return fused_gate_srw
 
@@ -363,14 +360,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
              jnp.full((B, S, 2, 1), -1e9), z1_r),
             jnp.arange(nc))
 
-        # Normalize per route independently
-        global_active = jax.lax.psum(total_active, 'model')
-        global_active = jnp.maximum(global_active, 1.0)
-        out = raw_out / jnp.sqrt(global_active)
-        out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
+        # Squash normalization per route after psum
+        raw_out_global = jax.lax.psum(raw_out.astype(jnp.bfloat16), 'model').astype(jnp.float32)
+        C = jnp.sqrt(jnp.float32(D))
+        norm = jnp.linalg.norm(raw_out_global, axis=-1, keepdims=True) + 1e-8
+        out = raw_out_global * (C / (C + norm))
 
+        global_active = jax.lax.psum(total_active, 'model')
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
-        active_frac = global_active / N_total
+        active_frac = jnp.maximum(global_active, 1.0) / N_total
         active_frac_mean = active_frac.mean(axis=2)
         raw_gate_max_mean = global_gate_max.mean(axis=2)
 
@@ -378,7 +376,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         active_count_out = global_active.mean()
         gate_conc = (global_gate_max / (global_active + 1e-8)).mean()
         score_mean_out = s_mean.mean()
-        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb, score_std_out, active_count_out, gate_conc, score_mean_out
+        return out, active_frac_mean, raw_gate_max_mean, score_lb, score_std_out, active_count_out, gate_conc, score_mean_out
 
     return fused_gate_srw_paired
 
@@ -453,8 +451,10 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         (jnp.zeros((B, S, D), dtype=jnp.float32), jnp.full((B, S, 1), -1e9), z1),
         jnp.arange(n_chunks))
 
-    total_active = jnp.maximum(total_active, 1.0)
-    out = raw_out / jnp.sqrt(total_active)
+    # Squash normalization
+    C = jnp.sqrt(jnp.float32(D))
+    norm = jnp.linalg.norm(raw_out, axis=-1, keepdims=True) + 1e-8
+    out = raw_out * (C / (C + norm))
 
     score_std_out = s_std.mean()
     active_count_out = total_active.mean()
@@ -1081,8 +1081,9 @@ class DAWN(nn.Module):
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference (S=1 typically).
     No checkpoint, no LB loss, no bf16 casting.
-    Linear gate (ReLU), √(active_count) normalization.
+    Linear gate (ReLU), squash normalization.
     """
+    D = x.shape[-1]
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -1094,19 +1095,19 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
 
-    active_count = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-    active_count = jnp.maximum(active_count, 1.0)
-
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
-    out = raw_out.astype(jnp.float32) / jnp.sqrt(active_count)
-    return out.astype(jnp.float32)
+    raw_out = raw_out.astype(jnp.float32)
+    C = jnp.sqrt(jnp.float32(D))
+    norm = jnp.linalg.norm(raw_out, axis=-1, keepdims=True) + 1e-8
+    return raw_out * (C / (C + norm))
 
 
 def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
-    """Like _srw_inference but also returns normalized gate [B,S,N] for analysis."""
+    """Like _srw_inference but also returns raw gate [B,S,N] for analysis."""
+    D = x.shape[-1]
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -1118,16 +1119,14 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
 
-    active_count = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-    active_count = jnp.maximum(active_count, 1.0)
-    gate_norm = gate.astype(jnp.float32) / jnp.sqrt(active_count)
-
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
-    out = raw_out.astype(jnp.float32) / jnp.sqrt(active_count)
-    return out.astype(jnp.float32), gate_norm
+    raw_out = raw_out.astype(jnp.float32)
+    C = jnp.sqrt(jnp.float32(D))
+    norm = jnp.linalg.norm(raw_out, axis=-1, keepdims=True) + 1e-8
+    return raw_out * (C / (C + norm)), gate.astype(jnp.float32)
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
@@ -1583,7 +1582,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         if 'know' in suppress_masks else None
 
     def _srw_sup(x, h, emb_n, tau_off, w_read, w_write, mult):
-        """SRW with optional gate suppression. Linear gate (ReLU), √(active_count) norm."""
+        """SRW with optional gate suppression. Linear gate (ReLU), squash norm."""
+        D = x.shape[-1]
         scores = h @ emb_n.T
         sf = scores.astype(jnp.float32)
         s_mean = sf.mean(axis=-1, keepdims=True)
@@ -1594,13 +1594,13 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         gate = jnp.clip(gate, 0.0, 10.0)
         if mult is not None:
             gate = gate * mult[None, None, :]
-        active_count = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-        active_count = jnp.maximum(active_count, 1.0)
         r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
         xr = x @ r_n.T
-        out = (gate * xr) @ w_n
-        return (out.astype(jnp.float32) / jnp.sqrt(active_count)).astype(jnp.float32)
+        raw_out = ((gate * xr) @ w_n).astype(jnp.float32)
+        C = jnp.sqrt(jnp.float32(D))
+        norm = jnp.linalg.norm(raw_out, axis=-1, keepdims=True) + 1e-8
+        return raw_out * (C / (C + norm))
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
