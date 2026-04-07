@@ -5,7 +5,7 @@ Changelog:
   spatial-r1-v3.9.5 (2026-04-07):
     - gate_sum normalized SRW: out = (raw_out/gate_sum) * output_scale
       direction norm encodes per-token signal strength naturally
-    - Per-pool learnable output_scale (know/V: √d_model, QK: d_model^¼), WD exempt
+    - Per-pool learnable output_scale (all: √d_model), WD exempt
 
   spatial-r1-v3.9.4 (2026-04-07):
     - learnable output_scale → fixed √d_model (wd-induced shrinkage fix)
@@ -493,16 +493,14 @@ class NeuronPool(nn.Module):
         self.know_write = self.param('know_write', unit_norm_init(), (self.n_know, dm))
 
         # Per-pool output scale (learnable, exempt from weight decay)
-        # know/V: √d_model (residual stream scale matching)
-        # QK: d_model^(1/4) (Q·K dot product has squaring effect)
-        _residual_scale = float(dm ** 0.5)
-        _qk_scale = float(dm ** 0.25)
+        # All pools: √d_model (residual stream scale matching)
+        _scale = float(dm ** 0.5)
         self.qk_output_scale = self.param('qk_output_scale',
-            lambda k, s, d=jnp.float32: jnp.full(s, _qk_scale), (1,))
+            lambda k, s, d=jnp.float32: jnp.full(s, _scale), (1,))
         self.v_output_scale = self.param('v_output_scale',
-            lambda k, s, d=jnp.float32: jnp.full(s, _residual_scale), (1,))
+            lambda k, s, d=jnp.float32: jnp.full(s, _scale), (1,))
         self.know_output_scale = self.param('know_output_scale',
-            lambda k, s, d=jnp.float32: jnp.full(s, _residual_scale), (1,))
+            lambda k, s, d=jnp.float32: jnp.full(s, _scale), (1,))
 
 
 # ================================================================
