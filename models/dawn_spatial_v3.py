@@ -225,7 +225,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         # active_N normalize: out = raw_out / (active_N + 1) * √d_model
         global_active = jax.lax.psum(total_active, 'model')
         C = jnp.sqrt(jnp.float32(D))
-        out = raw_out / (global_active + 1.0) * C
+        out = raw_out / (jnp.sqrt(global_active) + 1.0) * C
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active_frac = global_active / N_total
@@ -345,7 +345,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         # active_N normalize per route
         global_active = jax.lax.psum(total_active, 'model')
         C = jnp.sqrt(jnp.float32(D))
-        out = raw_out / (global_active + 1.0) * C
+        out = raw_out / (jnp.sqrt(global_active) + 1.0) * C
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active_frac = global_active / N_total
@@ -430,7 +430,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
 
     # active_N normalize: out = raw_out / (active_N + 1) * √d_model
     C = jnp.sqrt(jnp.float32(D))
-    out = raw_out / (total_active + 1.0) * C
+    out = raw_out / (jnp.sqrt(total_active) + 1.0) * C
 
     score_std_out = s_std.mean()
     active_N_out = total_active.mean()
@@ -695,7 +695,10 @@ class AttentionCircuit(nn.Module):
             x, neuron_pool, deterministic, rng_r)
 
         def _se(x, g, rd, wr):
-            return (g * (x @ rd.T)) @ wr
+            raw = (g * (x @ rd.T)) @ wr
+            active_N = (g > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
+            C = jnp.sqrt(jnp.float32(x.shape[-1]))
+            return raw / (jnp.sqrt(active_N) + 1.0) * C
 
         Q = _se(x, g_Q, neuron_pool.qk_read, neuron_pool.qk_write)
         K = _se(x, g_K, neuron_pool.qk_read, neuron_pool.qk_write)
@@ -730,7 +733,10 @@ class KnowledgeCircuit(nn.Module):
         rng, rng_r = jax.random.split(rng)
         gate, aux = router.get_knowledge_gates(
             x, neuron_pool, deterministic, rng_r)
-        out = (gate * (x @ neuron_pool.know_read.T)) @ neuron_pool.know_write
+        raw = (gate * (x @ neuron_pool.know_read.T)) @ neuron_pool.know_write
+        active_N = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
+        C = jnp.sqrt(jnp.float32(x.shape[-1]))
+        out = raw / (jnp.sqrt(active_N) + 1.0) * C
         out = safe_dropout(out, self.dropout_rate, deterministic, rng)
         return out, aux
 
@@ -1064,7 +1070,7 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
     C = jnp.sqrt(jnp.float32(D))
-    return (raw_out / (active_N + 1.0) * C).astype(jnp.float32)
+    return (raw_out / (jnp.sqrt(active_N) + 1.0) * C).astype(jnp.float32)
 
 
 def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
@@ -1080,13 +1086,13 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
     active_N = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-    gate_norm = gate.astype(jnp.float32) / (active_N + 1.0)
+    gate_norm = gate.astype(jnp.float32) / (jnp.sqrt(active_N) + 1.0)
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
     xr = x @ r_n.T
     raw_out = (gate * xr) @ w_n
     C = jnp.sqrt(jnp.float32(D))
-    return (raw_out / (active_N + 1.0) * C).astype(jnp.float32), gate_norm
+    return (raw_out / (jnp.sqrt(active_N) + 1.0) * C).astype(jnp.float32), gate_norm
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
@@ -1563,7 +1569,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         xr = x @ r_n.T
         raw_out = (gate * xr) @ w_n
         C = jnp.sqrt(jnp.float32(D))
-        return (raw_out / (active_N + 1.0) * C).astype(jnp.float32)
+        return (raw_out / (jnp.sqrt(active_N) + 1.0) * C).astype(jnp.float32)
 
     def forward_fn(input_ids):
         B, S = input_ids.shape
