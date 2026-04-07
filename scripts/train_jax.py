@@ -502,12 +502,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
             'bias', jnp.zeros(3))
 
-        # Output scale (per-pool learnable)
-        pool_p = params.get('neuron_pool', {})
-        qk_os = pool_p.get('qk_output_scale', jnp.ones(1))[0]
-        v_os = pool_p.get('v_output_scale', jnp.ones(1))[0]
-        know_os = pool_p.get('know_output_scale', jnp.ones(1))[0]
-
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -539,9 +533,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
-            'qk_output_scale': qk_os,
-            'v_output_scale': v_os,
-            'know_output_scale': know_os,
         }
 
         return new_params, new_opt_state, metrics
@@ -1958,9 +1949,10 @@ def main():
                         a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
                         k_tau_m = _m(metrics.get('know_tau_mean', 0.0))
                         k_out_n = _m(metrics.get('know_out_norm', 0.0))
-                        qk_os_v = _m(metrics.get('qk_output_scale', 1.0))
-                        v_os_v = _m(metrics.get('v_output_scale', 1.0))
-                        k_os_v = _m(metrics.get('know_output_scale', 1.0))
+                        _d = cfg['model'].get('d_model', 384)
+                        qk_os_v = (cfg['model'].get('n_qk', 1580) * _d) ** 0.5
+                        v_os_v = (cfg['model'].get('n_v', 2600) * _d) ** 0.5
+                        k_os_v = (cfg['model'].get('n_know', 25200) * _d) ** 0.5
 
                         log_message(
                             f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
