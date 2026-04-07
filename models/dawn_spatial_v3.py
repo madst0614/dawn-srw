@@ -303,7 +303,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         gate_strength = jnp.tanh(global_gate_max)
-        out = raw_out / global_gate_sum * gate_strength
+        sqrt_N = jnp.sqrt(jnp.float32(N_total))
+        out = raw_out / global_gate_sum * gate_strength * sqrt_N
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         active_frac = jax.lax.psum(total_active, 'model') / N_total
