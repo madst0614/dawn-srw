@@ -11,7 +11,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v3.9.2"
+  model_version: "spatial-r1-v3.9.4"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -41,8 +41,8 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.2_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.2_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.4_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.4_40M_c4_5B
 
 # Parameter budget (~40M):
 #   QK:   1580 x (128+384+384) = 1.42M
