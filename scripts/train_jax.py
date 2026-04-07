@@ -504,9 +504,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         # Output scale (per-pool learnable)
         pool_p = params.get('neuron_pool', {})
-        qk_os = pool_p.get('qk_output_scale', jnp.ones(1))[0]
-        v_os = pool_p.get('v_output_scale', jnp.ones(1))[0]
-        know_os = pool_p.get('know_output_scale', jnp.ones(1))[0]
+        qk_os = jnp.exp(pool_p.get('qk_output_scale_log', jnp.zeros(1))[0])
+        v_os = jnp.exp(pool_p.get('v_output_scale_log', jnp.zeros(1))[0])
+        know_os = jnp.exp(pool_p.get('know_output_scale_log', jnp.zeros(1))[0])
 
         metrics = {
             'total_loss': total_loss,
