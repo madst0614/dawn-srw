@@ -477,6 +477,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
+        # Re-project neuron pool vectors to unit norm after optimizer step
+        def normalize_pool_params(params):
+            pool = params['neuron_pool']
+            norm_keys = [
+                'qk_read', 'v_read', 'know_read',
+                'qk_write', 'v_write', 'know_write',
+                'qk_emb', 'v_emb', 'know_emb',
+            ]
+            new_pool = dict(pool)
+            for key in norm_keys:
+                w = new_pool[key]
+                new_pool[key] = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
+            return {**params, 'neuron_pool': new_pool}
+
+        new_params = normalize_pool_params(new_params)
+
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
 
