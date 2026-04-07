@@ -5,7 +5,7 @@ Changelog:
   spatial-r1-v3.9.5 (2026-04-07):
     - gate_sum normalize → √(active_count) normalize
     - tanh(gate_max) 제거
-    - fixed √d_model scale (from v3.9.4)
+    - √d_model output scale 제거 (gate norm이 scale 역할)
 
   spatial-r1-v3.9.4 (2026-04-07):
     - learnable output_scale → fixed √d_model (wd-induced shrinkage fix)
@@ -584,9 +584,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-    qk_scale = jnp.sqrt(jnp.float32(D))
-    v_scale = jnp.sqrt(jnp.float32(D))
-
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
         h_QK = jnp.stack([h_Q, h_K], axis=2)
@@ -594,12 +591,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_gconc, qk_smean = fused_paired(
             x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
-        Q = QK_out[:, :, 0, :] * qk_scale
-        K = QK_out[:, :, 1, :] * qk_scale
+        Q = QK_out[:, :, 0, :]
+        K = QK_out[:, :, 1, :]
         V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_gconc, v_smean = fused_single(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
-        V = V * v_scale
     else:
         Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_gconc, q_smean = _srw_chunked(
             x, h_Q, qk_emb_unit, tau_all[:, :, 0:1], qk_read, qk_write, n_chunks_qk)
@@ -609,9 +605,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, n_chunks_v)
         qk_raw_norm = (jnp.linalg.norm(Q, axis=-1).mean() + jnp.linalg.norm(K, axis=-1).mean()) / 2
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
-        Q = Q * qk_scale
-        K = K * qk_scale
-        V = V * v_scale
         qk_lb = q_lb + k_lb
         qk_sstd = (q_sstd + k_sstd) / 2
         qk_es = (q_es + k_es) / 2
@@ -681,8 +674,6 @@ def _know_forward(x, pool_params, router_params, rng,
     know_emb_unit = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
 
-    know_scale = jnp.sqrt(jnp.float32(x.shape[-1]))
-
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
         out, active_frac, raw_gate_max, lb_loss, score_std, active_count, gate_conc, score_mean = fused_single(
@@ -692,7 +683,6 @@ def _know_forward(x, pool_params, router_params, rng,
             x, h, know_emb_unit, tau, know_read, know_write, n_chunks_know)
 
     know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
-    out = out * know_scale
     know_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -1162,10 +1152,6 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                            pool_params['qk_read'], pool_params['qk_write'])
     V_new = _srw_inference(x, h_V, v_norm, tau_all[:, :, 2:3],
                            pool_params['v_read'], pool_params['v_write'])
-    Q = Q * jnp.sqrt(jnp.float32(d_model))
-    K_new = K_new * jnp.sqrt(jnp.float32(d_model))
-    V_new = V_new * jnp.sqrt(jnp.float32(d_model))
-
     Q = Q.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
     K_new_h = K_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
     V_new_h = V_new.reshape(B, 1, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1194,7 +1180,7 @@ def _know_forward_inference(x, pool_params, router_params):
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     out = _srw_inference(x, h, know_norm, tau,
                          pool_params['know_read'], pool_params['know_write'])
-    return out * jnp.sqrt(jnp.float32(x.shape[-1]))
+    return out
 
 
 def prefill(params, model_cfg, input_ids):
@@ -1242,10 +1228,6 @@ def prefill(params, model_cfg, input_ids):
                                pool_params['qk_read'], pool_params['qk_write'])
         V_val = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
                                pool_params['v_read'], pool_params['v_write'])
-        Q = Q * jnp.sqrt(jnp.float32(d_model))
-        K_val = K_val * jnp.sqrt(jnp.float32(d_model))
-        V_val = V_val * jnp.sqrt(jnp.float32(d_model))
-
         Q_h = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
         K_h = K_val.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
         V_h = V_val.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1375,10 +1357,6 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
                                pool_params['qk_read'], pool_params['qk_write'])
             V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
                                pool_params['v_read'], pool_params['v_write'])
-            Q = Q * jnp.sqrt(jnp.float32(d_model))
-            K = K * jnp.sqrt(jnp.float32(d_model))
-            V = V * jnp.sqrt(jnp.float32(d_model))
-
             d_head = d_model // n_heads
             Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
             Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1399,7 +1377,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
             know_out = _srw_inference(normed, h_k, know_norm, tau_k,
                                      pool_params['know_read'], pool_params['know_write'])
-            x = x + know_out * jnp.sqrt(jnp.float32(x.shape[-1]))
+            x = x + know_out
             return x, None
 
         x, _ = jax.lax.scan(layer_fn, x, stacked)
@@ -1550,10 +1528,6 @@ def analysis_forward(params, model_cfg, input_ids):
         V, gate_V = _srw_inference_with_gates(
             normed, h_V, v_norm, tau_all[:, :, 2:3],
             pool_params['v_read'], pool_params['v_write'])
-        Q = Q * jnp.sqrt(jnp.float32(d_model))
-        K = K * jnp.sqrt(jnp.float32(d_model))
-        V = V * jnp.sqrt(jnp.float32(d_model))
-
         d_head = d_model // n_heads
         Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
         Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -1575,7 +1549,6 @@ def analysis_forward(params, model_cfg, input_ids):
         know_out, gate_Know = _srw_inference_with_gates(
             normed, h_k, know_norm_w, tau_k,
             pool_params['know_read'], pool_params['know_write'])
-        know_out = know_out * jnp.sqrt(jnp.float32(x.shape[-1]))
         know_out_norm = jnp.linalg.norm(know_out, axis=-1).mean()
         x = x + know_out
 
@@ -1654,10 +1627,6 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], pp['qk_read'], pp['qk_write'], qk_mult)
             K = _srw_sup(normed, h_K, qk_n, tau_all[:,:,1:2], pp['qk_read'], pp['qk_write'], qk_mult)
             V = _srw_sup(normed, h_V, v_n, tau_all[:,:,2:3], pp['v_read'], pp['v_write'], v_mult)
-            Q = Q * jnp.sqrt(jnp.float32(d_model))
-            K = K * jnp.sqrt(jnp.float32(d_model))
-            V = V * jnp.sqrt(jnp.float32(d_model))
-
             Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
             Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
             Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
@@ -1673,7 +1642,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
             h_k = normed @ rp['proj_know']['kernel'] + rp['proj_know']['bias']
             tau_k = normed @ rp['tau_know']['kernel'] + rp['tau_know']['bias']
-            x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult) * jnp.sqrt(jnp.float32(d_model))
+            x = x + _srw_sup(normed, h_k, kn_n, tau_k, pp['know_read'], pp['know_write'], know_mult)
 
         norm_p = params['norm']
         x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
