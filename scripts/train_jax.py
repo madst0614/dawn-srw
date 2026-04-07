@@ -1179,6 +1179,9 @@ def main():
                 for key in ['_emb', '_read', '_write']:
                     if key in path_str:
                         return False
+                # No WD for learnable output_scale (like bias)
+                if 'output_scale' in path_str:
+                    return False
             return True
         return jax.tree.map_with_path(_mask, params)
 
