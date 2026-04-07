@@ -779,6 +779,7 @@ class DAWN(nn.Module):
             attn_qk_raw_norm_all = _z
             attn_v_raw_norm_all = _z
             know_raw_out_norm_all = _z
+            _o_proj_norm = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -844,10 +845,18 @@ class DAWN(nn.Module):
                 attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
+            _o_proj_norm = jnp.linalg.norm(stacked['attn']['expand_O']['kernel'], axis=(-2, -1)).mean()
+
+        # Debug: residual norm before final LayerNorm
+        _residual_norm = jnp.linalg.norm(x, axis=-1).mean()
+        _emb_norm = jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean()
 
         x = self.norm(x)
         result = {
             'aux_loss': total_aux,
+            'debug_residual_norm': _residual_norm,
+            'debug_emb_norm': _emb_norm,
+            'debug_o_proj_norm': _o_proj_norm,
             'attn_aux': attn_auxes.mean(),
             'know_aux': know_auxes.mean(),
 

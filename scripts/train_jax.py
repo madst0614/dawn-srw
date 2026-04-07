@@ -535,6 +535,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
             'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
             'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
+            'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
+            'debug_emb_norm': result.get('debug_emb_norm', jnp.float32(0.0)),
+            'debug_o_proj_norm': result.get('debug_o_proj_norm', jnp.float32(0.0)),
         }
 
         return new_params, new_opt_state, metrics
@@ -1885,7 +1888,8 @@ def main():
             epoch_step_counter += 1
 
             # ---- Periodic logging (host 0 only) ----
-            if global_step % LOG_INTERVAL == 0:
+            _early_debug = global_step in (1, 5, 10, 20, 50)
+            if global_step % LOG_INTERVAL == 0 or _early_debug:
                 if is_host0:
                     elapsed = time.time() - win_start_time
                     steps_per_sec = win_count / elapsed if elapsed > 0 else 0
@@ -1978,6 +1982,14 @@ def main():
                             f" gsum={a_gsum:.1f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
+                        if _early_debug:
+                            d_res = _m(metrics.get('debug_residual_norm', 0.0))
+                            d_emb = _m(metrics.get('debug_emb_norm', 0.0))
+                            d_oproj = _m(metrics.get('debug_o_proj_norm', 0.0))
+                            log_message(
+                                f"      [DEBUG] residual_norm={d_res:.3f}"
+                                f" emb_norm={d_emb:.3f}"
+                                f" o_proj_norm={d_oproj:.3f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
