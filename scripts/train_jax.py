@@ -521,12 +521,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
             'know_active': result.get('know_active', jnp.float32(0.0)),
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
-            'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
             'attn_active': result.get('attn_active', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
-            'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
@@ -536,8 +534,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
-            'attn_score_mean': result.get('attn_score_mean', jnp.float32(0.0)),
-            'know_score_mean': result.get('know_score_mean', jnp.float32(0.0)),
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
             'qk_output_scale': qk_os,
             'v_output_scale': v_os,
@@ -1474,16 +1470,16 @@ def main():
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                QK_out, act, gm, _lb, _gs, _es, _ngm, _sm = fused_paired(
+                QK_out, act, gm, _lb, _gs, _gc = fused_paired(
                     x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
                 return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
 
             # 3b) QK non-sharded fallback
             @jax.jit
             def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                Q, _, _, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                Q, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                        qk_read, qk_write, n_chunks_qk)
-                K, _, _, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                K, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                        qk_read, qk_write, n_chunks_qk)
                 return Q, K
 
@@ -1563,14 +1559,14 @@ def main():
                 Q, K, _, _ = prof_qk_fused(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _, _ = prof_v_sharded(
+                V, _, _, _, _, _ = prof_v_sharded(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             else:
                 Q, K = prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _, _ = prof_v_chunked(
+                V, _, _, _, _, _ = prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             jax.block_until_ready((Q, K, V))
@@ -1578,11 +1574,11 @@ def main():
             h_know, tau_know = prof_know_router(normed, router_p)
             jax.block_until_ready(tau_know)
             if _is_sharded:
-                _kout, _, _, _, _, _, _, _ = prof_know_sharded(
+                _kout, _, _, _, _, _ = prof_know_sharded(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             else:
-                _kout, _, _, _, _, _, _, _ = prof_know_chunked(
+                _kout, _, _, _, _, _ = prof_know_chunked(
                     normed, h_know, know_norm, tau_know,
                     pool_p['know_read'], pool_p['know_write'])
             jax.block_until_ready(_kout)
@@ -1938,15 +1934,18 @@ def main():
                         n_know_cfg = cfg['model'].get('n_know', 27200)
                         k_act = _m(metrics['know_active'])
                         k_raw_gmax = _m(metrics['know_raw_gate_max'])
-                        k_sstd = _m(metrics.get('know_score_std', 0.0))
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
 
                         a_act = _m(metrics.get('attn_active', 0.0))
                         a_raw_gmax = _m(metrics.get('attn_raw_gate_max', 0.0))
-                        a_sstd = _m(metrics.get('attn_score_std', 0.0))
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
+
+                        k_out_n = _m(metrics.get('know_out_norm', 0.0))
+                        qk_os_v = _m(metrics.get('qk_output_scale', 1.0))
+                        v_os_v = _m(metrics.get('v_output_scale', 1.0))
+                        k_os_v = _m(metrics.get('know_output_scale', 1.0))
 
                         log_message(
                             f"      {tau_s} | grad_norm={m_grad:.3f}")
@@ -1954,24 +1953,15 @@ def main():
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
                             f" write={k_write_n:.3f}")
-                        k_smean = _m(metrics.get('know_score_mean', 0.0))
-                        a_smean = _m(metrics.get('attn_score_mean', 0.0))
-                        k_out_n = _m(metrics.get('know_out_norm', 0.0))
-                        qk_os_v = _m(metrics.get('qk_output_scale', 1.0))
-                        v_os_v = _m(metrics.get('v_output_scale', 1.0))
-                        k_os_v = _m(metrics.get('know_output_scale', 1.0))
-
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                             f"({k_act*100:.1f}%) raw_max={k_raw_gmax:.4f}"
                             f" conc={k_gconc:.1f}"
-                            f" | s_mean={k_smean:.3f} s_std={k_sstd:.3f}"
                             f" gsum={k_gsum:.1f} out_norm={k_out_n:.3f}")
                         log_message(
                             f"      attn: active={a_act:.1%}"
                             f" raw_max={a_raw_gmax:.4f}"
                             f" conc={a_gconc:.1f}"
-                            f" | s_mean={a_smean:.3f} s_std={a_sstd:.3f}"
                             f" gsum={a_gsum:.1f}")
                         log_message(
                             f"      scale: qk={qk_os_v:.4f} v={v_os_v:.4f}"
