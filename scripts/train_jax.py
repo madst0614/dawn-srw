@@ -1159,10 +1159,14 @@ def main():
     def create_wd_mask(params):
         def _mask(path, _):
             path_str = '/'.join(str(p) for p in path)
+            # No WD for unit-norm re-projected params
             if 'neuron_pool' in path_str:
                 for key in ['_emb', '_read', '_write']:
                     if key in path_str:
                         return False
+            # No WD for per-layer output gain (bias-like)
+            if 'output_gain' in path_str:
+                return False
             return True
         return jax.tree.map_with_path(_mask, params)
 
@@ -1952,10 +1956,6 @@ def main():
                         a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
                         k_tau_m = _m(metrics.get('know_tau_mean', 0.0))
                         k_out_n = _m(metrics.get('know_out_norm', 0.0))
-                        _d = cfg['model'].get('d_model', 384)
-                        qk_os_v = (cfg['model'].get('n_qk', 1580) * _d) ** 0.5
-                        v_os_v = (cfg['model'].get('n_v', 2600) * _d) ** 0.5
-                        k_os_v = (cfg['model'].get('n_know', 25200) * _d) ** 0.5
 
                         log_message(
                             f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
@@ -1982,9 +1982,6 @@ def main():
                             f" gsum={a_gsum:.1f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
-                        log_message(
-                            f"      scale: qk={qk_os_v:.1f} v={v_os_v:.1f}"
-                            f" know={k_os_v:.1f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 
