@@ -1979,6 +1979,8 @@ def main():
                             f" gsum={a_gsum:.1f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
+                        _d = cfg['model'].get('d_model', 384)
+                        log_message(f"      scale: √d_model={_d**0.5:.1f}")
                     except Exception:
                         log_message(f"      grad_norm={m_grad:.3f}")
 

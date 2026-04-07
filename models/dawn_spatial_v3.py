@@ -2,10 +2,15 @@
 DAWN-Spatial v3.8: Sense-Read-Write (JAX/Flax)
 
 Changelog:
+  spatial-r1-v3.9.3 (2026-04-07):
+    - RMSNorm 제거: gate magnitude 정보 보존
+    - learnable output_gain 제거: gradient 집중 폭발 방지
+    - 고정 √d_model scale: SRW output O(1) → O(√D) 보정
+
   spatial-r1-v3.9.2 (2026-04-07):
     - h unit-norm: routing projection output L2 normalized
     - absolute tau: s_mean/s_std removed, tau network output = direct threshold
-    - 2-pass → 1-pass: stats scan removed, LB loss = gate-based CV²
+    - 2-pass → 1-pass: stats scan removed, LB loss = score-based CV²
     - re-projection: train step후 read/write/emb unit norm 재투영
     - weight decay masking for unit-norm params
 
@@ -714,7 +719,7 @@ class DAWNBlock(nn.Module):
 
 class DAWN(nn.Module):
     """DAWN-Spatial v3.8: Sense-Read-Write."""
-    __version__ = "spatial-r1-v3.9.2"
+    __version__ = "spatial-r1-v3.9.3"
 
     vocab_size: int = 30000
     d_model: int = 384
