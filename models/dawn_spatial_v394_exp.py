@@ -7,6 +7,7 @@ Changelog:
     - gate_sum normalize (ratio) + fixed √d_model scale only
     - x·read naturally modulates per-token output magnitude
     - No learnable strength parameters, no gate_strength variable
+    - gate_sum floor=1.0: backward gradient 1/gate_sum² 폭발 방지
 
   spatial-r1-v3.9.1 (2026-04-05):
     - LB loss: gate-based → score-based (pre-ReLU)
@@ -117,7 +118,7 @@ def threshold_gate(scores, tau_offset):
     gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
 
-    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+    gate_sum = jnp.maximum(gate.sum(axis=-1, keepdims=True).astype(jnp.float32), 1.0)
 
     return gate / gate_sum.astype(scores.dtype)
 
@@ -236,7 +237,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
              z1, jnp.full((B, S, 1), -1e9), z1),
             jnp.arange(nc))
 
-        global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
+        global_gate_sum = jnp.maximum(jax.lax.psum(total_gate_sum, 'model'), 1.0)
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         out = raw_out / global_gate_sum
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
@@ -364,7 +365,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
             jnp.arange(nc))
 
         # Normalize per route independently
-        global_gate_sum = jax.lax.psum(total_gate_sum, 'model') + 1e-8
+        global_gate_sum = jnp.maximum(jax.lax.psum(total_gate_sum, 'model'), 1.0)
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         out = raw_out / global_gate_sum
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
@@ -454,7 +455,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
         (jnp.zeros((B, S, D), dtype=jnp.float32), z1, jnp.full((B, S, 1), -1e9), z1),
         jnp.arange(n_chunks))
 
-    inv_gs = (1.0 / (total_gate_sum + 1e-8)).astype(jnp.bfloat16)
+    inv_gs = (1.0 / jnp.maximum(total_gate_sum, 1.0)).astype(jnp.bfloat16)
     out = raw_out * inv_gs
 
     score_std_out = s_std.mean()
@@ -1106,7 +1107,7 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
 
-    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+    gate_sum = jnp.maximum(gate.sum(axis=-1, keepdims=True).astype(jnp.float32), 1.0)
 
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
     w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
@@ -1129,7 +1130,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     gate = jnp.maximum(raw, 0.0)
     gate = jnp.clip(gate, 0.0, 10.0)
 
-    gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+    gate_sum = jnp.maximum(gate.sum(axis=-1, keepdims=True).astype(jnp.float32), 1.0)
     gate_norm = gate.astype(jnp.float32) / gate_sum
 
     r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
@@ -1625,7 +1626,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         gate = jnp.clip(gate, 0.0, 10.0)
         if mult is not None:
             gate = gate * mult[None, None, :]
-        gate_sum = gate.sum(axis=-1, keepdims=True).astype(jnp.float32) + 1e-8
+        gate_sum = jnp.maximum(gate.sum(axis=-1, keepdims=True).astype(jnp.float32), 1.0)
         r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
         w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
         xr = x @ r_n.T
