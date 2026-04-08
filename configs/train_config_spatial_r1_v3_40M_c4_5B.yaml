@@ -41,7 +41,7 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.1_40M_c4_5B/run_vspatial-r1-v3.9.1_20260408_051756_3201
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.1_40M_c4_5B
 log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.1_40M_c4_5B
 
 # Parameter budget (~40M):

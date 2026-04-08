@@ -899,6 +899,8 @@ def main():
                         help='Override learning rate from config')
     parser.add_argument('--debug', action='store_true',
                         help='Debug mode: log every step with detailed metrics')
+    parser.add_argument('--resume-from', type=str, default=None,
+                        help='Resume from specific run folder path (e.g. gs://...../run_v...)')
     cli_args = parser.parse_args()
 
     # ----------------------------------------------------------
@@ -972,18 +974,30 @@ def main():
             ])
 
     # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
-    # All hosts detect the same checkpoint for consistency
+    # --resume-from takes priority: resume from a specific run folder
     if not cli_args.from_scratch:
-        run_folders = _list_run_folders(base_checkpoint_dir)
-        for folder in reversed(run_folders):
+        if cli_args.resume_from:
+            folder = cli_args.resume_from.rstrip('/')
             candidates = _list_files(folder, "*.flax")
             if candidates:
                 resume_path = candidates[-1]
                 checkpoint_dir = folder
                 if jax.process_index() == 0:
-                    print(f"  Auto-resume: found checkpoint in {checkpoint_dir}")
+                    print(f"  Resume from specified folder: {checkpoint_dir}")
                     print(f"  Resuming from: {resume_path}")
-                break
+            else:
+                raise FileNotFoundError(f"No .flax checkpoint found in {folder}")
+        else:
+            run_folders = _list_run_folders(base_checkpoint_dir)
+            for folder in reversed(run_folders):
+                candidates = _list_files(folder, "*.flax")
+                if candidates:
+                    resume_path = candidates[-1]
+                    checkpoint_dir = folder
+                    if jax.process_index() == 0:
+                        print(f"  Auto-resume: found checkpoint in {checkpoint_dir}")
+                        print(f"  Resuming from: {resume_path}")
+                    break
 
     # Create new run folder if not resuming
     if checkpoint_dir is None:
