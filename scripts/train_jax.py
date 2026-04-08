@@ -1489,9 +1489,9 @@ def main():
             # 3b) QK non-sharded fallback
             @jax.jit
             def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                Q, _, _, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                Q, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                        qk_read, qk_write, n_chunks_qk)
-                K, _, _, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                K, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                        qk_read, qk_write, n_chunks_qk)
                 return Q, K
 
