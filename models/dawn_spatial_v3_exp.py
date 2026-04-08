@@ -681,7 +681,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_score_std, attn_gate_sum, attn_gate_conc, attn_score_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
             q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
-            v_strength.mean(),
             v_strength.mean(), v_strength.std(),
             v_strength.min(), v_strength.max(),
             v_logit.mean(), v_logit.std())
@@ -729,7 +728,6 @@ def _know_forward(x, pool_params, router_params, rng,
     return (out, aux, active_frac, raw_gate_max, score_std, gate_sum, gate_conc,
             emb_norm_val, read_norm_val, write_norm_val, score_mean, know_out_norm,
             know_tau_mean, know_raw_out_norm,
-            know_strength.mean(),
             know_strength.mean(), know_strength.std(),
             know_strength.min(), know_strength.max(),
             know_logit.mean(), know_logit.std())
@@ -913,8 +911,6 @@ class DAWN(nn.Module):
             attn_v_norm_dbg_all = _z
             attn_logit_max_all = _z
             attn_o_input_norm_all = _z
-            attn_v_strength_all = _z
-            know_strength_all = _z
             attn_v_str_mean_all = _z
             attn_v_str_std_all = _z
             attn_v_str_min_all = _z
@@ -958,7 +954,6 @@ class DAWN(nn.Module):
                  a_sstd, a_gsum, a_gconc, a_smean,
                  a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
                  a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
-                 a_v_strength,
                  a_v_str_mean, a_v_str_std, a_v_str_min, a_v_str_max, a_v_logit_mean, a_v_logit_std
                 ) = _attn_forward(
                     normed, pool_params, router_params,
@@ -974,7 +969,7 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 (know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum, k_gconc,
                  k_emb_n, k_read_n, k_write_n, k_smean, k_out_norm,
-                 k_tau_mean, k_raw_out_norm, k_strength,
+                 k_tau_mean, k_raw_out_norm,
                  k_str_mean, k_str_std, k_str_min, k_str_max, k_logit_mean, k_logit_std
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
@@ -989,7 +984,6 @@ class DAWN(nn.Module):
                            a_out_norm, a_tau_mean, k_tau_mean,
                            a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
                            a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
-                           a_v_strength, k_strength,
                            a_v_str_mean, a_v_str_std, a_v_str_min, a_v_str_max, a_v_logit_mean, a_v_logit_std,
                            k_str_mean, k_str_std, k_str_min, k_str_max, k_logit_mean, k_logit_std)
 
@@ -1006,7 +1000,6 @@ class DAWN(nn.Module):
                 attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
                 attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
                 attn_logit_max_all, attn_o_input_norm_all,
-                attn_v_strength_all, know_strength_all,
                 attn_v_str_mean_all, attn_v_str_std_all, attn_v_str_min_all, attn_v_str_max_all, attn_v_logit_mean_all, attn_v_logit_std_all,
                 know_str_mean_all, know_str_std_all, know_str_min_all, know_str_max_all, know_logit_mean_all, know_logit_std_all) = jax.lax.scan(
                 scan_body, x, xs)
