@@ -1543,16 +1543,17 @@ def main():
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                QK_out, act, gm, _lb, _ss, _gs, _gc, _sm = fused_paired(
+                results = fused_paired(
                     x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
-                return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act, gm
+                QK_out, act = results[0], results[1]
+                return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act
 
             # 3b) QK non-sharded fallback
             @jax.jit
             def prof_qk_chunked(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
-                Q, _, _, _, _, _, _, _, _ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
+                Q, *_ = _srw_chunked(x, h_Q, qk_norm, tau_all[:, :, 0:1],
                                        qk_read, qk_write, n_chunks_qk)
-                K, _, _, _, _, _, _, _, _ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
+                K, *_ = _srw_chunked(x, h_K, qk_norm, tau_all[:, :, 1:2],
                                        qk_read, qk_write, n_chunks_qk)
                 return Q, K
 
@@ -1630,17 +1631,17 @@ def main():
             jax.block_until_ready(tau_all)
 
             if _is_sharded:
-                Q, K, _, _ = prof_qk_fused(
+                Q, K, *_ = prof_qk_fused(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _, _ = prof_v_sharded(
+                V, *_ = prof_v_sharded(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             else:
                 Q, K = prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
                     pool_p['qk_read'], pool_p['qk_write'])
-                V, _, _, _, _, _, _, _ = prof_v_chunked(
+                V, *_ = prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             jax.block_until_ready((Q, K, V))
