@@ -19,9 +19,9 @@ model:
   n_heads: 16
   d_route: 384
 
-  n_know: 166800
-  n_qk: 10400
-  n_v: 16800
+  n_know: 158800
+  n_qk: 9900
+  n_v: 16100
 
   max_seq_len: 512
   dropout: 0.1
