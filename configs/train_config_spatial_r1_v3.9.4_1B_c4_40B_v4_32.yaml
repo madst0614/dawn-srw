@@ -1,9 +1,7 @@
-# DAWN Spatial-R1 v3.9.4 Training Config - 1B Scale - v4-128 Pod
-# d_route=384 (routing expressiveness vs compute tradeoff)
-# Parameter-matched to baseline 1B: d_model=2048, n_layers=18
-# Global batch: 2048 = 64 chips × 32 per_device_batch
-# Tokens/step: 2048 × 512 = ~1M tokens/step
-# Checkpoint compatible with v4-32 config for seamless migration
+# DAWN Spatial-R1 v3.9.4 Training Config - 1B Scale - v4-32 Pod
+# Same model as v4-128 config, adjusted mesh/batch for 16 chips
+# Global batch: 512 × acc 4 = effective 2048 (matches v4-128)
+# Checkpoint compatible with v4-128 config for seamless migration
 
 seed: 1
 
@@ -31,10 +29,10 @@ model:
   router_dropout: 0.1
 
 training:
-  batch_size: 2048
-  mesh_model: 4
-  mesh_data: 16
-  gradient_accumulation_steps: 1
+  batch_size: 512
+  gradient_accumulation_steps: 4
+  mesh_model: 2
+  mesh_data: 8
   num_epochs: 1
   lr: 0.0003
   weight_decay: 0.1
