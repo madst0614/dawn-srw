@@ -29,8 +29,8 @@ model:
   router_dropout: 0.1
 
 training:
-  batch_size: 512
-  gradient_accumulation_steps: 4
+  batch_size: 256
+  gradient_accumulation_steps: 8
   mesh_model: 4
   mesh_data: 4
   num_epochs: 1
