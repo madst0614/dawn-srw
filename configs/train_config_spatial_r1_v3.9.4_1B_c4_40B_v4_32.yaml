@@ -31,8 +31,8 @@ model:
 training:
   batch_size: 512
   gradient_accumulation_steps: 4
-  mesh_model: 2
-  mesh_data: 8
+  mesh_model: 4
+  mesh_data: 4
   num_epochs: 1
   lr: 0.0002
   weight_decay: 0.1
