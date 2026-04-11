@@ -1,0 +1,46 @@
+# DAWN Spatial-R1 v3.9.8.1 -- Sigmoid gate + pure confidence sum denominator
+# gate = sigmoid(raw/s_std), den = Σ gate (no xr²)
+# learnable per-pool scale (init=√d_model, WD excluded)
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "spatial-r1-v3.9.8.1"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+
+  d_route: 128
+  n_qk: 1580
+  n_v: 2600
+  n_know: 25200
+  router_dropout: 0.1
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  warmup_ratio: 0.06
+  diversity_weight: 0.1
+  load_balance_weight: 0.1
+  n_chunks_know: 1
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  checkpoint_interval: 500
+  val_interval: 500
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v3.9.8.1_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v3.9.8.1_40M_c4_5B
