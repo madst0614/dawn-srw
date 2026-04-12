@@ -218,7 +218,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                         P(),                     # gate_sum scalar
                         P(),                     # active_n_mean scalar
                         P(),                     # score_mean scalar
-                        P('data', None, None)),  # strong [B,S,1]
+                        P('data', None, None),   # strong [B,S,1]
+                        P('data', None, None),   # phi_binary [B,S,1]
+                        P('data', None, None)),  # z_mean_active [B,S,1]
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
@@ -356,7 +358,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                         P(),                         # gate_sum scalar
                         P(),                         # active_n_mean scalar
                         P(),                         # score_mean scalar
-                        P('data', None, None)),      # strong [B,S,1]
+                        P('data', None, None),       # strong [B,S,1]
+                        P('data', None, None),       # phi_binary [B,S,1]
+                        P('data', None, None)),      # z_mean_active [B,S,1]
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local):
         N_local = emb_local.shape[0]
