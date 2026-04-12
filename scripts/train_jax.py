@@ -1426,23 +1426,29 @@ def main():
     )
 
     # WD mask: exclude bias, layernorm, and output_scale params
-    def _wd_mask(params):
-        def _should_decay(path, _):
-            path_str = '/'.join(str(p) for p in path)
-            if 'bias' in path_str:
-                return False
-            if 'scale' in path_str and 'norm' in path_str.lower():
-                return False  # LayerNorm scale
-            if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
-               or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
-                return False  # learnable output_scale
-            return True
-        return jax.tree.map_with_path(_should_decay, params)
+    # Only apply mask if model has learnable scale params (v3.9.7.1+)
+    _has_scale = 'qk_scale' in params.get('neuron_pool', {}) or \
+                 'know_scale' in params.get('neuron_pool', {})
+    _wd_mask_fn = None
+    if _has_scale:
+        def _wd_mask(params):
+            def _should_decay(path, _):
+                path_str = '/'.join(str(p) for p in path)
+                if 'bias' in path_str:
+                    return False
+                if 'scale' in path_str and 'norm' in path_str.lower():
+                    return False  # LayerNorm scale
+                if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+                   or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+                    return False  # learnable output_scale
+                return True
+            return jax.tree.map_with_path(_should_decay, params)
+        _wd_mask_fn = _wd_mask
 
     base_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=schedule, weight_decay=weight_decay, b2=0.95,
-                    mask=_wd_mask),
+                    mask=_wd_mask_fn),
     )
 
     if grad_accum_steps > 1:
