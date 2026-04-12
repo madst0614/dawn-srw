@@ -1455,8 +1455,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     pool_params = params['neuron_pool']
     router_params = params['router']
     norm_params = params['norm']
-    emb_matrix = params['token_emb']['embedding']
-    pos_matrix = params['pos_emb']['embedding']
+    emb_matrix = jnp.asarray(params['token_emb']['embedding'])
+    pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
 
     qk_norm = pool_params['qk_emb'] / (
         jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
