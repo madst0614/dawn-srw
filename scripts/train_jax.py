@@ -1527,7 +1527,8 @@ def main():
     is_baseline = model_version == 'baseline'
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
-                  or model_version.startswith('spatial-r1-v3'))
+                  or model_version.startswith('spatial-r1-v3')
+                  or model_version.startswith('spatial-r1-v4'))
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
