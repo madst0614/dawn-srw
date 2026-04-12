@@ -1346,7 +1346,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     def forward_batch(input_ids):
         B, S = input_ids.shape
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+        x = jnp.take(emb_matrix, input_ids.astype(jnp.int32), axis=0) + jnp.take(pos_matrix, positions.astype(jnp.int32), axis=0)
 
         def layer_fn(x, bp):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
