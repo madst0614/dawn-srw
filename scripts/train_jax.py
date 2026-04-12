@@ -2261,11 +2261,15 @@ def main():
                             k_extra = f" raw_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
-                        k_inhibit = max(k_act - k_strong, 0.0) if k_strong > 0 else 0.0
-                        k_strong_s = f" excite={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%) inhibit={k_inhibit * n_know_cfg:.0f}({k_inhibit*100:.1f}%)" if k_strong > 0 else ""
+                        k_exc = k_strong
+                        k_inh = max(k_act - k_strong, 0.0)
+                        k_exc_n = k_exc * n_know_cfg
+                        k_inh_n = k_inh * n_know_cfg
+                        k_total_n = k_act * n_know_cfg
                         log_message(
-                            f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
-                            f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
+                            f"      know: exc={k_exc_n:.0f}({k_exc*100:.1f}%)"
+                            f" inh={k_inh_n:.0f}({k_inh*100:.1f}%)"
+                            f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
                             f" s_std={k_sstd:.3f}"
                             f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         # attn line
@@ -2276,11 +2280,11 @@ def main():
                             a_extra = f" raw_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
-                        a_inhibit = max(a_strong - 0, 0.0)  # placeholder: attn_strong is excite frac
-                        a_strong_s = f" excite={a_strong*100:.1f}%" if a_strong > 0 else ""
+                        a_exc = a_strong
+                        a_inh = max(a_qk_act - a_strong, 0.0)
                         log_message(
-                            f"      attn: qk_active={a_qk_act:.1%}"
-                            f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"
+                            f"      attn: qk_exc={a_exc*100:.1f}% qk_inh={a_inh*100:.1f}%"
+                            f" v_active={a_v_act:.1%}{a_extra}"
                             f" s_std={a_sstd:.3f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
