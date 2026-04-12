@@ -610,8 +610,8 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
     def get_routing_stats(input_ids):
         """Forward to mid layer, get gate distributions for Q,K,V,Know."""
         B, S = input_ids.shape
-        emb_matrix = jnp.asarray(params['token_emb']['embedding'])
-        pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
+        emb_matrix = params['token_emb']['embedding']
+        pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
@@ -1595,6 +1595,9 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
     n_heads = model_cfg['n_heads']
     n_know = model_cfg['n_know']
 
+    # Convert all params to JAX arrays (needed for JIT tracing)
+    params = jax.tree.map(jnp.asarray, params)
+
     pool_params = params['neuron_pool']
     router_params = params['router']
 
@@ -1622,8 +1625,8 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
     def get_all_layer_gates(input_ids):
         """Forward through all layers, collect know gate stats at each layer."""
         B, S = input_ids.shape
-        emb_matrix = jnp.asarray(params['token_emb']['embedding'])
-        pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
+        emb_matrix = params['token_emb']['embedding']
+        pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
@@ -1734,6 +1737,9 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
     n_know = model_cfg['n_know']
     mid_layer = n_layers // 2
 
+    # Convert all params to JAX arrays
+    params = jax.tree.map(jnp.asarray, params)
+
     pool_params = params['neuron_pool']
     router_params = params['router']
 
@@ -1753,8 +1759,8 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
     def get_neuron_activation(input_ids):
         """Forward to mid layer, return per-neuron activation mask."""
         B, S = input_ids.shape
-        emb_matrix = jnp.asarray(params['token_emb']['embedding'])
-        pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
+        emb_matrix = params['token_emb']['embedding']
+        pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
