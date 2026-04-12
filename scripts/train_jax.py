@@ -2270,17 +2270,30 @@ def main():
                             k_extra = f" gate_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
-                        k_pos = k_strong
-                        k_neg = max(k_act - k_strong, 0.0)
-                        k_pos_n = k_pos * n_know_cfg
-                        k_neg_n = k_neg * n_know_cfg
-                        k_total_n = k_act * n_know_cfg
-                        log_message(
-                            f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
-                            f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
-                            f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
-                            f" s_std={k_sstd:.3f}"
-                            f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+
+                        # v4.0.0+: symmetric gate → show pos/neg split
+                        # v3.9.x: ReLU gate → show active/total + optional strong
+                        _has_pos = bool(metrics.get('know_pos', 0.0)) or model_version.startswith('spatial-r1-v4')
+                        if _has_pos:
+                            k_pos = _m(metrics.get('know_pos', k_strong))
+                            k_neg = max(k_act - k_pos, 0.0)
+                            k_pos_n = k_pos * n_know_cfg
+                            k_neg_n = k_neg * n_know_cfg
+                            k_total_n = k_act * n_know_cfg
+                            log_message(
+                                f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
+                                f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
+                                f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
+                                f" s_std={k_sstd:.3f}"
+                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+                        else:
+                            k_strong_s = f" strong={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%)" if k_strong > 0 else ""
+                            log_message(
+                                f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
+                                f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
+                                f" s_std={k_sstd:.3f}"
+                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+
                         # attn line
                         a_extra = ""
                         if a_gsum > 0:  # v3.9.1+
@@ -2289,16 +2302,27 @@ def main():
                             a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
-                        a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
-                        a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
-                        a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
-                        a_v_neg = max(a_v_act - a_v_pos, 0.0)
-                        log_message(
-                            f"      attn: qk_pos={a_qk_pos*100:.1f}% qk_neg={a_qk_neg*100:.1f}%"
-                            f" v_pos={a_v_pos*100:.1f}% v_neg={a_v_neg*100:.1f}%{a_extra}"
-                            f" s_std={a_sstd:.3f}"
-                            f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
-                            f" out_norm={a_out_n:.3f}")
+
+                        _has_attn_pos = bool(metrics.get('attn_qk_pos', metrics.get('attn_pos', 0.0))) or model_version.startswith('spatial-r1-v4')
+                        if _has_attn_pos:
+                            a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
+                            a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
+                            a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
+                            a_v_neg = max(a_v_act - a_v_pos, 0.0)
+                            log_message(
+                                f"      attn: qk_pos={a_qk_pos*100:.1f}% qk_neg={a_qk_neg*100:.1f}%"
+                                f" v_pos={a_v_pos*100:.1f}% v_neg={a_v_neg*100:.1f}%{a_extra}"
+                                f" s_std={a_sstd:.3f}"
+                                f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
+                                f" out_norm={a_out_n:.3f}")
+                        else:
+                            a_strong_s = f" strong={a_strong*100:.1f}%" if a_strong > 0 else ""
+                            log_message(
+                                f"      attn: qk_active={a_qk_act:.1%}"
+                                f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"
+                                f" s_std={a_sstd:.3f}"
+                                f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
+                                f" out_norm={a_out_n:.3f}")
                         # Strength (v3.9.3)
                         k_str_m = _m(metrics.get('know_strength_mean', 0.0))
                         if k_str_m > 0:
