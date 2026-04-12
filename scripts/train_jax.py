@@ -2012,8 +2012,8 @@ def main():
         preemption_requested[0] = True
         print(f"\n!!! SIGTERM received (host {host_id}) — saving emergency checkpoint (step={global_step}) !!!", flush=True)
         try:
-            params_single = jax.device_get(process_allgather(params))
-            opt_state_single = jax.device_get(process_allgather(opt_state))
+            params_single = _gather_for_save(params)
+            opt_state_single = _gather_for_save(opt_state)
             if is_host0:
                 epath = _ckpt_path(f"emergency_step{global_step}.flax")
                 save_checkpoint(
@@ -2027,6 +2027,12 @@ def main():
                 print(f"!!! Emergency checkpoint saved: {epath} !!!", flush=True)
         except Exception as e:
             print(f"!!! Emergency save FAILED: {e} !!!", flush=True)
+
+    def _gather_for_save(x):
+        """Gather sharded params for checkpoint save. Only needed for baseline FSDP."""
+        if is_baseline:
+            return jax.device_get(process_allgather(x))
+        return jax.device_get(x)
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
@@ -2351,8 +2357,8 @@ def main():
                 # Best model save (device_get on ALL hosts)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
-                    params_single = jax.device_get(process_allgather(params))
-                    opt_state_single = jax.device_get(process_allgather(opt_state))
+                    params_single = _gather_for_save(params)
+                    opt_state_single = _gather_for_save(opt_state)
                     if is_host0:
                         save_checkpoint(
                             _ckpt_path("best_model.flax"),
@@ -2369,8 +2375,8 @@ def main():
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:
                 # device_get on ALL hosts (may be collective for sharded params)
-                params_single = jax.device_get(process_allgather(params))
-                opt_state_single = jax.device_get(process_allgather(opt_state))
+                params_single = _gather_for_save(params)
+                opt_state_single = _gather_for_save(opt_state)
                 if is_host0:
                     save_checkpoint(
                         _ckpt_path(f"checkpoint_step{global_step}.flax"),
@@ -2427,8 +2433,8 @@ def main():
             })
 
         # Save epoch checkpoint (device_get on ALL hosts)
-        params_single = jax.device_get(process_allgather(params))
-        opt_state_single = jax.device_get(process_allgather(opt_state))
+        params_single = _gather_for_save(params)
+        opt_state_single = _gather_for_save(opt_state)
 
         if is_host0:
             save_checkpoint(
