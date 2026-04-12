@@ -613,7 +613,7 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
         emb_matrix = params['token_emb']['embedding']
         pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = emb_matrix[input_ids] + pos_matrix[positions]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
         # Output scales (1.0 for models without learnable scale)
         qk_s, v_s, know_s = get_output_scales(pool_params)
@@ -1625,7 +1625,7 @@ def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20,
         emb_matrix = params['token_emb']['embedding']
         pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = emb_matrix[input_ids] + pos_matrix[positions]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
         all_stats = jnp.zeros((n_layers, N_STATS))
 
@@ -1756,7 +1756,7 @@ def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20
         emb_matrix = params['token_emb']['embedding']
         pos_matrix = params['pos_emb']['embedding']
         positions = jnp.arange(S)[jnp.newaxis, :]
-        x = emb_matrix[input_ids] + pos_matrix[positions]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
         for i in range(mid_layer):
             lp = block_params_list[i]
