@@ -756,12 +756,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_active_n_mean = (qk_anm + v_anm) / 2
     attn_score_mean = (qk_smean + v_smean) / 2
     attn_tau_mean = tau_all.mean()
-    attn_pos = (qk_pos.mean() + v_pos.mean()) / 2
+    attn_qk_pos = qk_pos.mean()
+    attn_v_pos = v_pos.mean()
     return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
             attn_score_std, attn_gate_sum, attn_active_n_mean, attn_score_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
             q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
-            attn_pos)
+            attn_qk_pos, attn_v_pos)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -968,7 +969,8 @@ class DAWN(nn.Module):
             attn_sstd_all = _z
             attn_gsum_all = _z
             attn_active_n_mean_all = _z
-            attn_pos_all = _z
+            attn_qk_pos_all = _z
+            attn_v_pos_all = _z
             k_emb_n_all = _z
             k_read_n_all = _z
             k_write_n_all = _z
@@ -1017,7 +1019,7 @@ class DAWN(nn.Module):
                  a_sstd, a_gsum, a_active_n_mean, a_smean,
                  a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
                  a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
-                 a_pos
+                 a_qk_pos, a_v_pos
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1046,7 +1048,7 @@ class DAWN(nn.Module):
                            a_out_norm, a_tau_mean, k_tau_mean,
                            a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
                            a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
-                           k_pos, a_pos)
+                           k_pos, a_qk_pos, a_v_pos)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -1061,7 +1063,7 @@ class DAWN(nn.Module):
                 attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
                 attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
                 attn_logit_max_all, attn_o_input_norm_all,
-                know_pos_all, attn_pos_all) = jax.lax.scan(
+                know_pos_all, attn_qk_pos_all, attn_v_pos_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1092,7 +1094,8 @@ class DAWN(nn.Module):
             'attn_score_std': attn_sstd_all.mean(),
             'attn_gate_sum': attn_gsum_all.mean(),
             'attn_active_n_mean': attn_active_n_mean_all.mean(),
-            'attn_pos': attn_pos_all.mean(),
+            'attn_qk_pos': attn_qk_pos_all.mean(),
+            'attn_v_pos': attn_v_pos_all.mean(),
 
             'know_emb_norm': k_emb_n_all.mean(),
             'know_read_norm': k_read_n_all.mean(),

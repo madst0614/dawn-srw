@@ -749,6 +749,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
             'attn_strong': result.get('attn_strong', result.get('attn_pos', jnp.float32(0.0))),
+            'attn_qk_pos': result.get('attn_qk_pos', jnp.float32(0.0)),
+            'attn_v_pos': result.get('attn_v_pos', jnp.float32(0.0)),
             'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
             'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
             'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
@@ -2281,11 +2283,13 @@ def main():
                             a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
-                        a_pos = a_strong
-                        a_neg = max(a_qk_act - a_strong, 0.0)
+                        a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
+                        a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
+                        a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
+                        a_v_neg = max(a_v_act - a_v_pos, 0.0)
                         log_message(
-                            f"      attn: qk_pos={a_pos*100:.1f}% qk_neg={a_neg*100:.1f}%"
-                            f" v_active={a_v_act:.1%}{a_extra}"
+                            f"      attn: qk_pos={a_qk_pos*100:.1f}% qk_neg={a_qk_neg*100:.1f}%"
+                            f" v_pos={a_v_pos*100:.1f}% v_neg={a_v_neg*100:.1f}%{a_extra}"
                             f" s_std={a_sstd:.3f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
