@@ -714,6 +714,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_gate_conc': result.get('know_gate_conc', jnp.float32(0.0)),
             'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
+            'know_strong': result.get('know_strong', jnp.float32(0.0)),
             'know_strength_mean': result.get('know_strength_mean', jnp.float32(0.0)),
             'know_strength_std': result.get('know_strength_std', jnp.float32(0.0)),
             'know_strength_min': result.get('know_strength_min', jnp.float32(0.0)),
@@ -728,6 +729,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_gate_conc': result.get('attn_gate_conc', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
+            'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
             'attn_v_strength_mean': result.get('attn_v_strength_mean', jnp.float32(0.0)),
             'attn_v_strength_std': result.get('attn_v_strength_std', jnp.float32(0.0)),
             'attn_v_strength_min': result.get('attn_v_strength_min', jnp.float32(0.0)),
@@ -2204,6 +2206,7 @@ def main():
                         k_gsum = _m(metrics.get('know_gate_sum', 0.0))
                         k_gconc = _m(metrics.get('know_gate_conc', 0.0))
                         k_anm = _m(metrics.get('know_active_n_mean', 0.0))
+                        k_strong = _m(metrics.get('know_strong', 0.0))
 
                         a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
                         a_v_act = _m(metrics.get('attn_v_active', 0.0))
@@ -2213,6 +2216,7 @@ def main():
                         a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
                         a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
                         a_anm = _m(metrics.get('attn_active_n_mean', 0.0))
+                        a_strong = _m(metrics.get('attn_strong', 0.0))
                         a_out_n = _m(metrics.get('attn_out_norm', 0.0))
 
                         a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
@@ -2238,9 +2242,10 @@ def main():
                             k_extra = f" raw_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
+                        k_strong_s = f" strong={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%)" if k_strong > 0 else ""
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
-                            f"({k_act*100:.1f}%){k_extra}"
+                            f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
                             f" s_std={k_sstd:.3f}"
                             f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
                         # attn line
@@ -2251,9 +2256,10 @@ def main():
                             a_extra = f" raw_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
+                        a_strong_s = f" strong={a_strong*100:.1f}%" if a_strong > 0 else ""
                         log_message(
                             f"      attn: qk_active={a_qk_act:.1%}"
-                            f" v_active={a_v_act:.1%}{a_extra}"
+                            f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"
                             f" s_std={a_sstd:.3f}"
                             f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
                             f" out_norm={a_out_n:.3f}")
