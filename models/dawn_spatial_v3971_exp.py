@@ -1411,7 +1411,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     """
     n_seqs = all_tokens.shape[0]
     n_batches = n_seqs // batch_size
-    tokens = all_tokens[:n_batches * batch_size].reshape(n_batches, batch_size, -1)
+    tokens = all_tokens[:n_batches * batch_size].reshape(n_batches, batch_size, -1).astype(jnp.int32)
 
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
