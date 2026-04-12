@@ -1090,6 +1090,19 @@ class DAWN(nn.Module):
 #    Pure functions only. Training code above is untouched.
 # ================================================================
 
+def _squeeze_params(params):
+    """Remove leading singleton dim from all param arrays.
+
+    Device-replicated checkpoints store params with shape (1, ...).
+    Squeeze axis 0 when it is size 1 so indexing and matmul work correctly.
+    """
+    def _sq(x):
+        if hasattr(x, 'ndim') and x.ndim >= 2 and x.shape[0] == 1:
+            return x.squeeze(0)
+        return x
+    return jax.tree.map(_sq, params)
+
+
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference. active_N normalize."""
     D = x.shape[-1]
@@ -1190,6 +1203,8 @@ def prefill(params, model_cfg, input_ids):
 
     Returns: logits [B,S,vocab], cache_K, cache_V [n_layers,B,H,max_seq,d_head], cache_len
     """
+    params = _squeeze_params(params)
+
     B, S = input_ids.shape
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
@@ -1264,6 +1279,8 @@ def prefill(params, model_cfg, input_ids):
 
 def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     """Single token decode with KV cache. Returns logits [B,vocab], updated cache."""
+    params = _squeeze_params(params)
+
     token_id = token_id.reshape(-1, 1)
     B = token_id.shape[0]
     d_model = model_cfg['d_model']
@@ -1318,6 +1335,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     Uses jax.lax.scan over batches, _srw_inference per layer (no chunking).
     Returns: (avg_loss, ppl, accuracy, total_valid) — all jnp scalars.
     """
+    params = _squeeze_params(params)
+
     n_seqs = all_tokens.shape[0]
     n_batches = n_seqs // batch_size
     tokens = all_tokens[:n_batches * batch_size].reshape(n_batches, batch_size, -1).astype(jnp.int32)
@@ -1418,6 +1437,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
 def vectorized_neuron_health(params):
     """All neuron health stats. Returns dict of jnp values (single device_get later)."""
+    params = _squeeze_params(params)
     pool = params['neuron_pool']
     results = {}
     for pool_name, emb_key in [('QK', 'qk_emb'), ('V', 'v_emb'), ('Know', 'know_emb')]:
@@ -1443,6 +1463,7 @@ def vectorized_neuron_health(params):
 
 def vectorized_weight_analysis(params, max_sample=2048):
     """Weight analysis: effective rank + cosine sim. All on device."""
+    params = _squeeze_params(params)
     pool = params['neuron_pool']
     results = {}
     for pool_name, emb_key in [('QK', 'qk_emb'), ('V', 'v_emb'), ('Know', 'know_emb')]:
@@ -1492,6 +1513,8 @@ def analysis_forward(params, model_cfg, input_ids):
             attn_out_norm: [n_layers]
             know_out_norm: [n_layers]
     """
+    params = _squeeze_params(params)
+
     B, S = input_ids.shape
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
@@ -1579,6 +1602,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     True = suppress.
     Returns: forward_fn(input_ids) -> logits [B, S, vocab]
     """
+    params = _squeeze_params(params)
     qk_mult = jnp.where(suppress_masks.get('qk', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
         if 'qk' in suppress_masks else None
     v_mult = jnp.where(suppress_masks.get('v', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \

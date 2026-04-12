@@ -157,6 +157,14 @@ def load_checkpoint_params(ckpt_path, model, cfg):
     raw = serialization.msgpack_restore(bytes_data)
     params = serialization.from_state_dict(target_params, raw['params'])
 
+    # Squeeze leading singleton dim from all params (device-replicated checkpoints
+    # save arrays with shape (1, ...) — squeeze to remove the leading dim).
+    def _squeeze(x):
+        if hasattr(x, 'ndim') and x.ndim >= 2 and x.shape[0] == 1:
+            return x.squeeze(0)
+        return x
+    params = jax.tree.map(_squeeze, params)
+
     step = int(raw.get('step', 0))
     epoch = int(raw.get('epoch', 0))
     print(f"  Step: {step}, Epoch: {epoch}")
