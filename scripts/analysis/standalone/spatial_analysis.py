@@ -1202,10 +1202,11 @@ def analyze_pos_selectivity(params, cfg, output_dir,
             if not batch_tokens:
                 continue
 
-            # Pad to same length
-            max_len = min(max(len(t) for t in batch_tokens), max_seq)
-            padded = np.zeros((len(batch_tokens), max_len), dtype=np.int32)
-            pos_padded = np.full((len(batch_tokens), max_len), -1, dtype=np.int32)
+            # Fixed shape: (batch_size, max_seq) avoids JIT recompilation
+            max_len = max_seq
+            actual_b = len(batch_tokens)
+            padded = np.zeros((batch_size, max_len), dtype=np.int32)
+            pos_padded = np.full((batch_size, max_len), -1, dtype=np.int32)
             for bi, (tids, plabs) in enumerate(zip(batch_tokens, batch_pos_labels)):
                 l = min(len(tids), max_len)
                 padded[bi, :l] = tids[:l]
