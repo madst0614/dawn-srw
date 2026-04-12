@@ -1215,32 +1215,34 @@ def analyze_pos_selectivity(params, cfg, output_dir,
             ids_dev = jnp.array(padded, dtype=jnp.int32)
             _, layer_info = jit_analysis(params, ids_dev)
 
-            # Vectorized accumulation (no Python per-token loop)
+            # Fully vectorized accumulation (no Python loops over tokens or POS)
             valid_mask = pos_padded >= 0  # [B, S]
-            n_valid = int(valid_mask.sum())
-            total_tokens += n_valid
+            total_tokens += int(valid_mask.sum())
 
-            # Count POS tokens (once, not per pool)
-            for pi in range(n_pos):
-                pos_token_counts[pi] += int((pos_padded == pi).sum())
+            # Count POS tokens via bincount
+            valid_pos = pos_padded[valid_mask]  # [n_valid]
+            pos_token_counts += np.bincount(valid_pos, minlength=n_pos).astype(np.float64)
 
             for pool_name, pinfo in pools.items():
-                # gate: [n_layers, B, S, N]
                 gate = np.array(jax.device_get(layer_info[pinfo['gate_key']]))
                 gate_avg = gate.mean(axis=0)  # [B, S, N]
                 active = (gate_avg > 0.01).astype(np.float32)  # [B, S, N]
+                N = pinfo['size']
 
-                # Zero out padding positions
+                # Zero out padding
                 active_masked = active * valid_mask[:, :, np.newaxis]  # [B, S, N]
 
-                # Per-neuron total activation
+                # Per-neuron total activation: sum over (B, S)
                 pool_counts[pool_name] += active_masked.sum(axis=(0, 1))  # [N]
 
-                # Per-(neuron, pos) activation
-                for pi in range(n_pos):
-                    pmask = (pos_padded == pi)  # [B, S]
-                    if pmask.any():
-                        pool_pos_counts[pool_name][:, pi] += (active * pmask[:, :, np.newaxis]).sum(axis=(0, 1))
+                # Per-(neuron, pos): scatter-add via one-hot matmul
+                # pos_onehot: [B*S, n_pos], active_flat: [B*S, N]
+                safe_pos = np.where(valid_mask, pos_padded, 0).ravel()  # [B*S]
+                pos_onehot = np.zeros((safe_pos.shape[0], n_pos), dtype=np.float32)
+                pos_onehot[np.arange(safe_pos.shape[0]), safe_pos] = valid_mask.ravel().astype(np.float32)
+                active_flat = active.reshape(-1, N)  # [B*S, N]
+                # pool_pos_counts[:, pi] += sum of active[t] for tokens where pos=pi
+                pool_pos_counts[pool_name] += (active_flat.T @ pos_onehot)  # [N, n_pos]
 
             n_batches_done += 1
             batch_tokens = []
