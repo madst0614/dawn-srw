@@ -1585,7 +1585,20 @@ def main():
     # Shard params: neuron_pool N-axis on 'model', rest replicated
     param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
     params = shard_params_to_mesh(params, param_shardings)
-    opt_state = optimizer.init(params)  # reinit with sharded params
+
+    # opt_state: shard to match params (preserve checkpoint state on resume)
+    _fresh_opt = optimizer.init(params)  # sharded opt_state template
+    if resume_path and _file_exists(resume_path):
+        # Shard restored opt_state using fresh_opt's sharding as template
+        opt_state_shardings = jax.tree.map(lambda x: x.sharding, _fresh_opt)
+        opt_state = jax.tree.map(
+            lambda x, s: jax.device_put(x, s),
+            opt_state, opt_state_shardings)
+        if is_host0:
+            print("  Optimizer state restored and sharded to mesh")
+    else:
+        opt_state = _fresh_opt
+    del _fresh_opt
 
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
