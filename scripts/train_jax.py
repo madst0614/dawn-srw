@@ -1590,10 +1590,10 @@ def main():
     if _is_resuming:
         _opt_template = optimizer.init(params)
         def _restore_leaf(restored_val, template_val):
-            # Ensure restored value matches template's dtype and shape,
-            # then place on same devices as template
-            restored_val = jnp.asarray(restored_val, dtype=template_val.dtype).reshape(template_val.shape)
-            return jax.device_put(restored_val, template_val.sharding)
+            # template_val is already correctly sharded across all devices.
+            # Create a zero with the same sharding, then add restored value.
+            # This forces the result to inherit template's sharding.
+            return jnp.zeros_like(template_val) + jnp.asarray(restored_val, dtype=template_val.dtype).reshape(template_val.shape)
         opt_state = jax.tree.map(_restore_leaf, opt_state, _opt_template)
         del _opt_template
         if is_host0:
