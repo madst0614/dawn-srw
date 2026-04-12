@@ -54,6 +54,7 @@ from models.dawn_spatial_v3971_exp import DAWN as DAWN_SpatialV3971Exp
 from models.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
 from models.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
 from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
+from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -124,6 +125,24 @@ def build_model_from_config(cfg):
             k_cluster_qk=mcfg.get('k_cluster_qk', 8),
             k_cluster_v=mcfg.get('k_cluster_v', 8),
             k_cluster_know=mcfg.get('k_cluster_know', 8),
+        )
+    elif version == 'spatial-r1-v4.0.0':
+        model = DAWN_SpatialV400Exp(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            d_route=mcfg.get('d_route', mcfg.get('d_bottleneck', 128)),
+            n_qk=mcfg.get('n_qk', 1580),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            router_dropout=mcfg.get('router_dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
+            n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
     elif version == 'spatial-r1-v3.9.9':
         model = DAWN_SpatialV399Exp(
@@ -1560,7 +1579,7 @@ def main():
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw', 'make_sharded_srw_paired'])
         make_sharded_srw, make_sharded_srw_paired = _v3.make_sharded_srw, _v3.make_sharded_srw_paired
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -1642,7 +1661,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -2242,7 +2261,8 @@ def main():
                             k_extra = f" raw_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
-                        k_strong_s = f" strong={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%)" if k_strong > 0 else ""
+                        k_inhibit = max(k_act - k_strong, 0.0) if k_strong > 0 else 0.0
+                        k_strong_s = f" excite={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%) inhibit={k_inhibit * n_know_cfg:.0f}({k_inhibit*100:.1f}%)" if k_strong > 0 else ""
                         log_message(
                             f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
                             f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
@@ -2256,7 +2276,8 @@ def main():
                             a_extra = f" raw_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
-                        a_strong_s = f" strong={a_strong*100:.1f}%" if a_strong > 0 else ""
+                        a_inhibit = max(a_strong - 0, 0.0)  # placeholder: attn_strong is excite frac
+                        a_strong_s = f" excite={a_strong*100:.1f}%" if a_strong > 0 else ""
                         log_message(
                             f"      attn: qk_active={a_qk_act:.1%}"
                             f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"
