@@ -308,16 +308,17 @@ def analyze_validation(params, cfg, val_tokens, output_dir, batch_size=32, max_b
     tokens_dev = jnp.array(tokens, dtype=jnp.int32)
     model_cfg = get_model_cfg(cfg)
 
-    # JIT compile + run
-    eval_fn = jax.jit(lambda p, t: vectorized_eval(p, model_cfg, t, batch_size))
+    # Convert params to JAX arrays for JIT closure capture
+    params_jax = jax.tree.map(jnp.asarray, params)
+
+    # JIT compile + run — params as closure (not arg) to avoid trace issues
+    @jax.jit
+    def eval_fn(t):
+        return vectorized_eval(params_jax, model_cfg, t, batch_size)
 
     print(f"  JIT compiling...")
-    # Debug: check embedding shape
-    emb_shape = jax.tree.map(lambda x: x.shape, params['token_emb'])
-    pos_shape = jax.tree.map(lambda x: x.shape, params['pos_emb'])
-    print(f"  DEBUG emb_shape={emb_shape}, pos_shape={pos_shape}")
     t0 = time.time()
-    avg_loss, ppl, acc, total_valid = eval_fn(params, tokens_dev)
+    avg_loss, ppl, acc, total_valid = eval_fn(tokens_dev)
     jax.block_until_ready(avg_loss)
     elapsed = time.time() - t0
 
