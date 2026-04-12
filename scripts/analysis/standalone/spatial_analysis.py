@@ -43,6 +43,20 @@ import jax
 import jax.numpy as jnp
 import flax.serialization as serialization
 import yaml
+import importlib
+
+
+# ============================================================
+# Dynamic model import
+# ============================================================
+
+_MODEL_MODULE = None
+
+def get_model_module(model_file="models.dawn_spatial_v3"):
+    global _MODEL_MODULE
+    if _MODEL_MODULE is None:
+        _MODEL_MODULE = importlib.import_module(model_file)
+    return _MODEL_MODULE
 
 
 # ============================================================
@@ -83,10 +97,16 @@ def _list_dir(path):
 # Model + checkpoint loading
 # ============================================================
 
-def build_model(cfg):
-    from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
+def build_model(cfg, model_file="models.dawn_spatial_v3"):
+    mod = get_model_module(model_file)
     mcfg = cfg['model']
-    return DAWN_SpatialV3(
+    # Check if model has gate_norm_mode attribute
+    import inspect
+    init_params = inspect.signature(mod.DAWN).parameters
+    extra_kw = {}
+    if 'gate_norm_mode' in init_params and 'gate_norm_mode' in mcfg:
+        extra_kw['gate_norm_mode'] = mcfg['gate_norm_mode']
+    return mod.DAWN(
         vocab_size=mcfg.get('vocab_size', 30522),
         d_model=mcfg.get('d_model', 384),
         n_layers=mcfg.get('n_layers', 12),
@@ -102,6 +122,7 @@ def build_model(cfg):
         n_chunks_know=cfg.get('training', {}).get('n_chunks_know', 1),
         n_chunks_qk=cfg.get('training', {}).get('n_chunks_qk', 1),
         n_chunks_v=cfg.get('training', {}).get('n_chunks_v', 1),
+        **extra_kw,
     )
 
 
@@ -260,7 +281,9 @@ def analyze_validation(params, cfg, val_tokens, output_dir, batch_size=32, max_b
     print("D2: Validation Performance")
     print("="*60)
 
-    from models.dawn_spatial_v3 import vectorized_eval
+    _mod = get_model_module()
+
+    vectorized_eval = _mod.vectorized_eval
 
     max_seq = cfg['model'].get('max_seq_len', 512)
     n_seqs = len(val_tokens) // max_seq
@@ -349,7 +372,9 @@ def analyze_neuron_health(params, cfg, output_dir):
     print("D3: Neuron Health")
     print("="*60)
 
-    from models.dawn_spatial_v3 import vectorized_neuron_health
+    _mod = get_model_module()
+
+    vectorized_neuron_health = _mod.vectorized_neuron_health
 
     raw = jax.device_get(jax.jit(vectorized_neuron_health)(params))
 
@@ -396,7 +421,9 @@ def analyze_generation(params, cfg, output_dir, prompt="The meaning of life is",
     print("="*60)
 
     from transformers import AutoTokenizer
-    from models.dawn_spatial_v3 import prefill, decode_step
+    _mod = get_model_module()
+    prefill = _mod.prefill
+    decode_step = _mod.decode_step
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model_cfg = get_model_cfg(cfg)
@@ -497,7 +524,9 @@ def analyze_weights(params, cfg, output_dir):
     print("D5: Weight Analysis")
     print("="*60)
 
-    from models.dawn_spatial_v3 import vectorized_weight_analysis
+    _mod = get_model_module()
+
+    vectorized_weight_analysis = _mod.vectorized_weight_analysis
 
     raw = jax.device_get(jax.jit(vectorized_weight_analysis)(params))
     results = {}
@@ -536,8 +565,10 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
     print("D6: Routing Analysis")
     print("="*60)
 
-    from models.dawn_spatial_v3 import (
-        _layer_norm, _srw_inference_with_gates)
+    _mod = get_model_module()
+    _layer_norm = _mod._layer_norm
+    _srw_inference_with_gates = _mod._srw_inference_with_gates
+    _srw_inference = _mod._srw_inference
 
     model_cfg = get_model_cfg(cfg)
     max_seq = model_cfg['max_seq_len']
@@ -584,7 +615,6 @@ def analyze_routing(params, cfg, val_tokens, output_dir, n_batches=50, batch_siz
             h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
             tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-            from models.dawn_spatial_v3 import _srw_inference
             Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
                                pool_params['qk_read'], pool_params['qk_write'])
             K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2],
@@ -709,7 +739,9 @@ def analyze_generation_samples(params, cfg, output_dir,
     print("="*60)
 
     from transformers import AutoTokenizer
-    from models.dawn_spatial_v3 import prefill, decode_step
+    _mod = get_model_module()
+    prefill = _mod.prefill
+    decode_step = _mod.decode_step
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model_cfg = get_model_cfg(cfg)
@@ -804,7 +836,9 @@ def analyze_qk_specialization(params, cfg, val_tokens, output_dir,
     print("R.1: Q/K Specialization")
     print("="*60)
 
-    from models.dawn_spatial_v3 import analysis_forward
+    _mod = get_model_module()
+
+    analysis_forward = _mod.analysis_forward
     import numpy as np
 
     model_cfg = get_model_cfg(cfg)
@@ -921,7 +955,9 @@ def analyze_layer_balance(params, cfg, val_tokens, output_dir,
     print("R.4: Layer-wise Balance")
     print("="*60)
 
-    from models.dawn_spatial_v3 import analysis_forward
+    _mod = get_model_module()
+
+    analysis_forward = _mod.analysis_forward
     import numpy as np
 
     model_cfg = get_model_cfg(cfg)
@@ -1057,7 +1093,8 @@ def analyze_pos_selectivity(params, cfg, output_dir,
     print("="*60)
 
     from transformers import AutoTokenizer
-    from models.dawn_spatial_v3 import analysis_forward
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
     import numpy as np
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -1264,7 +1301,10 @@ def analyze_knowledge_neurons(params, cfg, output_dir,
     print("="*60)
 
     from transformers import AutoTokenizer
-    from models.dawn_spatial_v3 import prefill, decode_step, analysis_forward
+    _mod = get_model_module()
+    prefill = _mod.prefill
+    decode_step = _mod.decode_step
+    analysis_forward = _mod.analysis_forward
     import numpy as np
     from collections import Counter
 
@@ -1397,7 +1437,8 @@ def analyze_suppression(params, cfg, output_dir, knowledge_results=None,
     print("="*60)
 
     from transformers import AutoTokenizer
-    from models.dawn_spatial_v3 import build_suppressed_forward
+    _mod = get_model_module()
+    build_suppressed_forward = _mod.build_suppressed_forward
     import numpy as np
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -1429,7 +1470,8 @@ def analyze_suppression(params, cfg, output_dir, knowledge_results=None,
     # Baseline probabilities
     @jax.jit
     def get_logits(params, ids):
-        from models.dawn_spatial_v3 import prefill
+        _mod = get_model_module()
+        prefill = _mod.prefill
         logits, _, _, _ = prefill(params, model_cfg, ids)
         return logits
 
@@ -1521,6 +1563,278 @@ def analyze_suppression(params, cfg, output_dir, knowledge_results=None,
 
 
 # ============================================================
+# D8: Gate Distribution Analysis
+# ============================================================
+
+def analyze_gate_distribution(params, cfg, val_tokens, output_dir, n_batches=20, batch_size=8):
+    """D8: Gate value distribution across tokens — histogram, effective_N, per-layer stats."""
+    print("\n" + "="*60)
+    print("D8: Gate Distribution Analysis")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm = _mod._layer_norm
+    _srw_inference_with_gates = _mod._srw_inference_with_gates
+    _srw_inference = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    n_know = model_cfg['n_know']
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    qk_norm = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_norm = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_norm = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+
+    # Prepare val data
+    n_tokens = val_tokens.shape[0]
+    n_seqs = n_tokens // max_seq
+    val_reshaped = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    @jax.jit
+    def get_all_layer_gates(input_ids):
+        """Forward through all layers, collect know gate at each layer."""
+        B, S = input_ids.shape
+        emb_matrix = params['token_emb']['embedding']
+        pos_matrix = params['pos_emb']['embedding']
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids] + pos_matrix[positions]
+
+        layer_gates = []
+        for i in range(n_layers):
+            lp = block_params_list[i]
+            # Attention forward
+            normed = _layer_norm(x, lp['norm1']['scale'], lp['norm1']['bias'])
+            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+            Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1],
+                               pool_params['qk_read'], pool_params['qk_write'])
+            K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2],
+                               pool_params['qk_read'], pool_params['qk_write'])
+            V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3],
+                               pool_params['v_read'], pool_params['v_write'])
+
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+            attn_w = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ lp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            # Knowledge forward — get gate
+            normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
+            h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            know_out, gate_know = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
+                                                            pool_params['know_read'], pool_params['know_write'])
+            x = x + know_out
+
+            # Gate stats for this layer
+            abs_gate = jnp.abs(gate_know)
+            gate_sum = abs_gate.sum(axis=-1)
+            gate_sq_sum = (abs_gate ** 2).sum(axis=-1)
+            eff_n = gate_sum ** 2 / (gate_sq_sum + 1e-8)
+            layer_gates.append({
+                'gate_mean': gate_know.mean(),
+                'gate_std': gate_know.std(),
+                'gate_max': gate_know.max(),
+                'gate_min': gate_know.min(),
+                'eff_n_mean': eff_n.mean(),
+                'frac_above_0p5': (abs_gate > 0.5).astype(jnp.float32).mean(),
+                'frac_above_0p1': (abs_gate > 0.1).astype(jnp.float32).mean(),
+                'frac_above_0p01': (abs_gate > 0.01).astype(jnp.float32).mean(),
+                'frac_neg': (gate_know < -0.5).astype(jnp.float32).mean(),
+            })
+
+        return layer_gates
+
+    print(f"  Running {actual_batches} batches (batch_size={batch_size})...")
+    all_results = []
+    for b in range(actual_batches):
+        batch = jnp.array(val_reshaped[b * batch_size:(b + 1) * batch_size])
+        layer_gates = get_all_layer_gates(batch)
+        all_results.append(jax.device_get(layer_gates))
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # Aggregate across batches
+    results = {}
+    for layer_idx in range(n_layers):
+        layer_data = {}
+        for key in all_results[0][layer_idx]:
+            vals = [r[layer_idx][key] for r in all_results]
+            layer_data[key] = float(np.mean(vals))
+        results[f'layer_{layer_idx}'] = layer_data
+
+    # Print summary
+    print(f"\n  Know Pool (N={n_know}):")
+    print(f"  {'Layer':<7} | {'gate_mean':>10} | {'gate_std':>10} | {'eff_N':>8} | {'>0.5%':>7} | {'>0.1%':>7} | {'neg%':>6}")
+    print(f"  {'-------':<7}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*7}-+-{'-'*7}-+-{'-'*6}")
+    for i in range(n_layers):
+        d = results[f'layer_{i}']
+        print(f"  {i:<7} | {d['gate_mean']:>10.4f} | {d['gate_std']:>10.4f} | {d['eff_n_mean']:>8.1f}"
+              f" | {d['frac_above_0p5']*100:>6.1f}% | {d['frac_above_0p1']*100:>6.1f}% | {d['frac_neg']*100:>5.1f}%")
+
+    _save_json(results, output_dir, 'gate_distribution', 'results.json')
+    return results
+
+
+# ============================================================
+# D10: Neuron Utilization Pattern
+# ============================================================
+
+def analyze_neuron_utilization(params, cfg, val_tokens, output_dir, n_batches=20, batch_size=8):
+    """D10: Per-neuron activation frequency — universal, specialist, dead neurons."""
+    print("\n" + "="*60)
+    print("D10: Neuron Utilization Pattern")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm = _mod._layer_norm
+    _srw_inference_with_gates = _mod._srw_inference_with_gates
+    _srw_inference = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    n_know = model_cfg['n_know']
+    mid_layer = n_layers // 2
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+
+    qk_norm = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_norm = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_norm = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+
+    n_tokens = val_tokens.shape[0]
+    n_seqs = n_tokens // max_seq
+    val_reshaped = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    @jax.jit
+    def get_neuron_activation(input_ids):
+        """Forward to mid layer, return per-neuron activation mask."""
+        B, S = input_ids.shape
+        emb_matrix = params['token_emb']['embedding']
+        pos_matrix = params['pos_emb']['embedding']
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids] + pos_matrix[positions]
+
+        for i in range(mid_layer):
+            lp = block_params_list[i]
+            normed = _layer_norm(x, lp['norm1']['scale'], lp['norm1']['bias'])
+            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+            Q = _srw_inference(normed, h_Q, qk_norm, tau_all[:, :, 0:1], pool_params['qk_read'], pool_params['qk_write'])
+            K = _srw_inference(normed, h_K, qk_norm, tau_all[:, :, 1:2], pool_params['qk_read'], pool_params['qk_write'])
+            V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], pool_params['v_read'], pool_params['v_write'])
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            scores = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
+            attn_w = jax.nn.softmax(scores, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', attn_w, Vr)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ lp['attn']['expand_O']['kernel']
+            x = x + attn_out
+            normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
+            h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            know_out = _srw_inference(normed, h_k, know_norm, tau_k, pool_params['know_read'], pool_params['know_write'])
+            x = x + know_out
+
+        # At mid layer, get know gate
+        lp = block_params_list[mid_layer]
+        normed = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
+        h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+        tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+        _, gate_know = _srw_inference_with_gates(normed, h_k, know_norm, tau_k,
+                                                  pool_params['know_read'], pool_params['know_write'])
+        # Per-neuron: fraction of tokens where |gate| > 0.1
+        active_mask = (jnp.abs(gate_know) > 0.1).astype(jnp.float32)  # [B,S,N]
+        neuron_freq = active_mask.mean(axis=(0, 1))  # [N]
+        return neuron_freq
+
+    print(f"  Running {actual_batches} batches (batch_size={batch_size})...")
+    all_freqs = []
+    for b in range(actual_batches):
+        batch = jnp.array(val_reshaped[b * batch_size:(b + 1) * batch_size])
+        freq = get_neuron_activation(batch)
+        all_freqs.append(jax.device_get(freq))
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    avg_freq = np.mean(all_freqs, axis=0)  # [N]
+
+    universal = int((avg_freq > 0.9).sum())
+    frequent = int(((avg_freq > 0.5) & (avg_freq <= 0.9)).sum())
+    moderate = int(((avg_freq > 0.1) & (avg_freq <= 0.5)).sum())
+    specialist = int(((avg_freq > 0.01) & (avg_freq <= 0.1)).sum())
+    rare = int((avg_freq <= 0.01).sum())
+
+    print(f"\n  Know Pool (N={n_know}, layer {mid_layer}):")
+    print(f"    Universal (>90%):   {universal:>6} neurons")
+    print(f"    Frequent (50-90%):  {frequent:>6} neurons")
+    print(f"    Moderate (10-50%):  {moderate:>6} neurons")
+    print(f"    Specialist (1-10%): {specialist:>6} neurons")
+    print(f"    Rare (<1%):         {rare:>6} neurons")
+
+    # Top 10 most active
+    top_idx = np.argsort(avg_freq)[::-1][:10]
+    print(f"\n    Top 10 most active neurons:")
+    for idx in top_idx:
+        print(f"      neuron {idx}: {avg_freq[idx]*100:.1f}% tokens")
+
+    results = {
+        'n_know': n_know,
+        'layer': mid_layer,
+        'universal': universal,
+        'frequent': frequent,
+        'moderate': moderate,
+        'specialist': specialist,
+        'rare': rare,
+        'top_10': [{'neuron_id': int(idx), 'freq_pct': float(avg_freq[idx] * 100)} for idx in top_idx],
+        'freq_mean': float(avg_freq.mean()),
+        'freq_std': float(avg_freq.std()),
+    }
+    _save_json(results, output_dir, 'neuron_utilization', 'results.json')
+    return results
+
+
+# ============================================================
+# D11: Layer-wise Gate Pattern (merged into D8)
+# ============================================================
+# D11 is included in D8's per-layer analysis above.
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1532,16 +1846,22 @@ def main():
     parser.add_argument("--output", default="results/spatial_analysis")
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--only", default=None, help="Comma-separated: info,val,health,generate,weights,routing,samples")
+    parser.add_argument("--only", default=None,
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--model_file", default="models.dawn_spatial_v3",
+                        help="Model module path (e.g. models.dawn_spatial_v3981_exp)")
     args = parser.parse_args()
+
+    # Initialize dynamic model module
+    get_model_module(args.model_file)
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    model = build_model(cfg)
+    model = build_model(cfg, args.model_file)
     params, ckpt_info = load_checkpoint_params(args.checkpoint, model, cfg)
 
     only = set(args.only.split(',')) if args.only else None
@@ -1556,7 +1876,7 @@ def main():
     # Load val tokens once (shared by D2 and D6)
     val_tokens = None
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
-    if val_path and (only is None or any(k in (only or set()) for k in ['val', 'routing'])):
+    if val_path and (only is None or any(k in (only or set()) for k in ['val', 'routing', 'gate_dist', 'utilization'])):
         val_tokens = load_val_tokens(val_path)
 
     if only is None or 'val' in only:
@@ -1588,6 +1908,19 @@ def main():
         analyze_generation_samples(params, cfg, args.output,
                                    max_new_tokens=args.max_new_tokens,
                                    temperature=args.temperature)
+
+    # --- D8/D10: Gate distribution and neuron utilization ---
+    if only is None or 'gate_dist' in only:
+        if val_tokens is not None:
+            analyze_gate_distribution(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping gate_dist (no --val_data)")
+
+    if only is None or 'utilization' in only:
+        if val_tokens is not None:
+            analyze_neuron_utilization(params, cfg, val_tokens, args.output)
+        else:
+            print("\n  Skipping utilization (no --val_data)")
 
     # --- Rebuttal analyses (D.1-D.5 methodology) ---
     # Load val tokens for rebuttal analyses if not already loaded
