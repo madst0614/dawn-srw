@@ -3912,6 +3912,7 @@ def main():
     params, ckpt_info = load_checkpoint_params(args.checkpoint, model, cfg)
 
     only = set(args.only.split(',')) if args.only else None
+    print(f"  ONLY={only}")
     os.makedirs(args.output, exist_ok=True)
 
     # Save checkpoint info
@@ -3920,6 +3921,7 @@ def main():
     if only is None or 'info' in only:
         analyze_model_info(params, cfg, args.output)
 
+    print(f"  BEFORE VAL CHECK")
     # Load val tokens once (shared by D2 and D6)
     val_tokens = None
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
