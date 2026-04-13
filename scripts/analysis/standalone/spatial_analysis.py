@@ -4180,6 +4180,255 @@ def analyze_interventions(params, cfg, val_tokens, output_dir,
     return results
 
 
+
+# ============================================================
+# P12: Composition Decomposition
+# ============================================================
+
+def analyze_composition(params, cfg, val_tokens, output_dir,
+                         n_batches=10, batch_size=4):
+    """P12: Decompose know_out into correction/neutral/transform contributions."""
+    print("\n" + "="*60)
+    print("P12: Composition Decomposition")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+    emb_matrix = params_jax['token_emb']['embedding']
+    pos_matrix = params_jax['pos_emb']['embedding']
+
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    r_normed = pool_p['know_read'] / (jnp.linalg.norm(pool_p['know_read'], axis=-1, keepdims=True) + 1e-8)
+    w_normed = pool_p['know_write'] / (jnp.linalg.norm(pool_p['know_write'], axis=-1, keepdims=True) + 1e-8)
+
+    # Alignment masks as JAX arrays for broadcasting
+    read_np = np.array(pool_p['know_read'])
+    write_np = np.array(pool_p['know_write'])
+    rn_np = read_np / (np.linalg.norm(read_np, axis=-1, keepdims=True) + 1e-8)
+    wn_np = write_np / (np.linalg.norm(write_np, axis=-1, keepdims=True) + 1e-8)
+    alignment = (rn_np * wn_np).sum(axis=-1)
+
+    corr_mask = jnp.array((alignment < -0.5).astype(np.float32))   # [N]
+    neut_mask = jnp.array(((alignment >= -0.5) & (alignment <= 0.1)).astype(np.float32))
+    trans_mask = jnp.array((alignment > 0.1).astype(np.float32))
+    n_corr = int((alignment < -0.5).sum())
+    n_neut = int(((alignment >= -0.5) & (alignment <= 0.1)).sum())
+    n_trans = int((alignment > 0.1).sum())
+    print(f"  Groups: correction={n_corr}, neutral={n_neut}, transform={n_trans}")
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    # Per-layer accumulators
+    layer_acc = {li: {
+        'corr_mag': 0.0, 'neut_mag': 0.0, 'trans_mag': 0.0,
+        'cos_cn': 0.0, 'cos_ct': 0.0, 'cos_nt': 0.0,
+        'cos_attn_corr': 0.0, 'cos_attn_neut': 0.0, 'cos_attn_trans': 0.0,
+        'corr_proj': 0.0, 'neut_proj': 0.0, 'trans_proj': 0.0,
+    } for li in range(n_layers)}
+
+    # Part D: logits decomposition samples
+    logits_samples = []
+
+    print(f"  Running {actual_batches} batches (bs={batch_size})...")
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        B, S = batch.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[batch.astype(jnp.int32)] + pos_matrix[positions]
+
+        for li in range(n_layers):
+            bp = block_params_list[li]
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+            Q = _srw_inference_fn(normed1, h_Q, qk_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * pool_p.get('qk_scale', 1.0)
+            K = _srw_inference_fn(normed1, h_K, qk_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * pool_p.get('qk_scale', 1.0)
+            V = _srw_inference_fn(normed1, h_V, v_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * pool_p.get('v_scale', 1.0)
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            # Know: direct gate computation + group decomposition
+            normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
+            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
+
+            scores_k = h_k @ know_emb_n.T  # [B, S, N]
+            sf = scores_k.astype(jnp.float32)
+            s_mean = sf.mean(axis=-1, keepdims=True)
+            s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+            tau = s_mean + tau_k * s_std
+            z = (sf - tau) / s_std
+            gate = jnp.where(z > 0, z * 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476)), 0.0)
+
+            # xr and group-separated raw outputs
+            xr = normed2 @ r_normed.T  # [B, S, N]
+            gate_xr = gate * xr  # [B, S, N] — raw contribution per neuron (before den)
+
+            raw_corr = (gate_xr * corr_mask[None, None, :]) @ w_normed  # [B, S, D]
+            raw_neut = (gate_xr * neut_mask[None, None, :]) @ w_normed
+            raw_trans = (gate_xr * trans_mask[None, None, :]) @ w_normed
+            raw_total = raw_corr + raw_neut + raw_trans
+
+            # Magnitudes
+            cm = jnp.linalg.norm(raw_corr, axis=-1).mean()
+            nm = jnp.linalg.norm(raw_neut, axis=-1).mean()
+            tm = jnp.linalg.norm(raw_trans, axis=-1).mean()
+            total_m = cm + nm + tm + 1e-8
+
+            # Direction relationships
+            def _cos_mean(a, b):
+                return ((a * b).sum(axis=-1) / (jnp.linalg.norm(a, axis=-1) * jnp.linalg.norm(b, axis=-1) + 1e-8)).mean()
+
+            # Contribution to know_out direction
+            raw_dir = raw_total / (jnp.linalg.norm(raw_total, axis=-1, keepdims=True) + 1e-8)
+            cp = (raw_corr * raw_dir).sum(axis=-1).mean()
+            np_ = (raw_neut * raw_dir).sum(axis=-1).mean()
+            tp = (raw_trans * raw_dir).sum(axis=-1).mean()
+
+            d = layer_acc[li]
+            vals = jax.device_get({
+                'cm': cm/total_m, 'nm': nm/total_m, 'tm': tm/total_m,
+                'cos_cn': _cos_mean(raw_corr, raw_neut),
+                'cos_ct': _cos_mean(raw_corr, raw_trans),
+                'cos_nt': _cos_mean(raw_neut, raw_trans),
+                'cos_ac': _cos_mean(attn_out, raw_corr),
+                'cos_an': _cos_mean(attn_out, raw_neut),
+                'cos_at': _cos_mean(attn_out, raw_trans),
+                'cp': cp, 'np': np_, 'tp': tp,
+            })
+            d['corr_mag'] += float(vals['cm'])
+            d['neut_mag'] += float(vals['nm'])
+            d['trans_mag'] += float(vals['tm'])
+            d['cos_cn'] += float(vals['cos_cn'])
+            d['cos_ct'] += float(vals['cos_ct'])
+            d['cos_nt'] += float(vals['cos_nt'])
+            d['cos_attn_corr'] += float(vals['cos_ac'])
+            d['cos_attn_neut'] += float(vals['cos_an'])
+            d['cos_attn_trans'] += float(vals['cos_at'])
+            d['corr_proj'] += float(vals['cp'])
+            d['neut_proj'] += float(vals['np'])
+            d['trans_proj'] += float(vals['tp'])
+
+            # Actual know_out for residual update
+            den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
+            know_out = raw_total / den * pool_p.get('know_scale', 1.0)
+            x = x + know_out
+
+            # Part D: logits decomposition at last layer, first batch only
+            if li == n_layers - 1 and b == 0 and len(logits_samples) < 10:
+                norm_p = params_jax['norm']
+                x_final = _layer_norm_fn(x, norm_p['scale'], norm_p['bias'])
+                # Group logit contributions (through LN approximation: use raw_out directly)
+                k_scale = pool_p.get('know_scale', 1.0)
+                corr_logits = (raw_corr / den * k_scale) @ emb_matrix.T  # [B, S, V]
+                neut_logits = (raw_neut / den * k_scale) @ emb_matrix.T
+                trans_logits = (raw_trans / den * k_scale) @ emb_matrix.T
+
+                for si in range(0, min(S, 100), 10):
+                    cl = np.array(jax.device_get(corr_logits[0, si]))
+                    nl = np.array(jax.device_get(neut_logits[0, si]))
+                    tl = np.array(jax.device_get(trans_logits[0, si]))
+                    tok_id = int(batch[0, si])
+                    c_top = np.argsort(-cl)[:5]
+                    n_top = np.argsort(-nl)[:5]
+                    t_top = np.argsort(-tl)[:5]
+                    logits_samples.append({
+                        'token': tokenizer.decode([tok_id]),
+                        'position': si,
+                        'correction_pushes': [(tokenizer.decode([int(i)]), float(cl[i])) for i in c_top],
+                        'neutral_pushes': [(tokenizer.decode([int(i)]), float(nl[i])) for i in n_top],
+                        'transform_pushes': [(tokenizer.decode([int(i)]), float(tl[i])) for i in t_top],
+                    })
+
+        if (b + 1) % 3 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # Average
+    for li in range(n_layers):
+        for k in layer_acc[li]:
+            layer_acc[li][k] /= actual_batches
+
+    mid = n_layers // 2
+
+    # === Print Part A ===
+    print(f"\n  === Part A: Group Output Decomposition (layer {mid}) ===")
+    d = layer_acc[mid]
+    print(f"  Magnitude ratio (raw output):")
+    print(f"    correction: {d['corr_mag']*100:.1f}%  neutral: {d['neut_mag']*100:.1f}%  transform: {d['trans_mag']*100:.1f}%")
+    print(f"  Direction relationships:")
+    print(f"    cos(corr, neut):  {d['cos_cn']:.4f}")
+    print(f"    cos(corr, trans): {d['cos_ct']:.4f}")
+    print(f"    cos(neut, trans): {d['cos_nt']:.4f}")
+
+    # === Print Part B ===
+    print(f"\n  === Part B: Layer-wise Composition ===")
+    print(f"  {'Layer':>5} | {'corr%':>7} | {'neut%':>7} | {'trans%':>7} | {'cos(c,n)':>8} | {'cos(c,t)':>8}")
+    print(f"  {'-'*5}-+-{'-'*7}-+-{'-'*7}-+-{'-'*7}-+-{'-'*8}-+-{'-'*8}")
+    for li in range(n_layers):
+        d = layer_acc[li]
+        print(f"  {li:>5} | {d['corr_mag']*100:>6.1f}% | {d['neut_mag']*100:>6.1f}% | {d['trans_mag']*100:>6.1f}% | {d['cos_cn']:>8.4f} | {d['cos_ct']:>8.4f}")
+
+    # === Print Part C ===
+    print(f"\n  === Part C: Attn-Group Relationships ===")
+    print(f"  {'Layer':>5} | {'cos(a,corr)':>11} | {'cos(a,neut)':>11} | {'cos(a,trans)':>12}")
+    print(f"  {'-'*5}-+-{'-'*11}-+-{'-'*11}-+-{'-'*12}")
+    for li in range(n_layers):
+        d = layer_acc[li]
+        print(f"  {li:>5} | {d['cos_attn_corr']:>11.4f} | {d['cos_attn_neut']:>11.4f} | {d['cos_attn_trans']:>12.4f}")
+
+    # === Print Part D ===
+    if logits_samples:
+        print(f"\n  === Part D: Logits Decomposition ({len(logits_samples)} samples) ===")
+        for s in logits_samples[:5]:
+            print(f"  Token: \"{s['token']}\" at pos {s['position']}")
+            c_str = ', '.join(f"{t}({v:+.2f})" for t, v in s['correction_pushes'][:3])
+            n_str = ', '.join(f"{t}({v:+.2f})" for t, v in s['neutral_pushes'][:3])
+            t_str = ', '.join(f"{t}({v:+.2f})" for t, v in s['transform_pushes'][:3])
+            print(f"    correction: {c_str}")
+            print(f"    neutral:    {n_str}")
+            print(f"    transform:  {t_str}")
+
+    results = {
+        'n_layers': n_layers,
+        'groups': {'correction': n_corr, 'neutral': n_neut, 'transform': n_trans},
+        'per_layer': {f'layer_{li}': layer_acc[li] for li in range(n_layers)},
+        'logits_samples': logits_samples[:10],
+    }
+    _save_json(results, output_dir, 'p12_composition', 'results.json')
+    return results
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -4193,7 +4442,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -4232,7 +4481,7 @@ def main():
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
-                     'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene']
+                     'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene', 'compose']
     print(f"  DEBUG: val_path={val_path}, only={only}, check={any(k in (only or set()) for k in _val_analyses)}")
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         print(f"  Loading val tokens from {val_path}...")
@@ -4397,6 +4646,13 @@ def main():
                                  n_batches=_nb or 50, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping intervene (no --val_data)")
+
+    if only is None or 'compose' in only:
+        if val_tokens is not None:
+            analyze_composition(params, cfg, val_tokens, args.output,
+                               n_batches=_nb or 10, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping compose (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
