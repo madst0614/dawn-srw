@@ -3876,6 +3876,262 @@ def analyze_operation_space(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# P11: Causal Intervention Experiments
+# ============================================================
+
+def _layer_ablated_forward(params_jax, model_cfg, input_ids, ablate_layers, ablate_type='know'):
+    """Forward with know/attn zeroed at specific layers. Returns logits [B, S, vocab]."""
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    B, S = input_ids.shape
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+
+    pool_params = params_jax['neuron_pool']
+    router_params = params_jax['router']
+    emb_matrix = params_jax['token_emb']['embedding']
+    pos_matrix = params_jax['pos_emb']['embedding']
+    know_emb_n = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    positions = jnp.arange(S)[jnp.newaxis, :]
+    x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+
+    for li in range(n_layers):
+        bp = params_jax[f'block_{li}']
+        normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+        h_all = normed1 @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed1 @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+        Q = _srw_inference_fn(normed1, h_Q, qk_n, tau_all[:,:,0:1], pool_params['qk_read'], pool_params['qk_write']) * pool_params.get('qk_scale', 1.0)
+        K = _srw_inference_fn(normed1, h_K, qk_n, tau_all[:,:,1:2], pool_params['qk_read'], pool_params['qk_write']) * pool_params.get('qk_scale', 1.0)
+        V = _srw_inference_fn(normed1, h_V, v_n, tau_all[:,:,2:3], pool_params['v_read'], pool_params['v_write']) * pool_params.get('v_scale', 1.0)
+
+        d_head = d_model // n_heads
+        Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        scale = jnp.sqrt(jnp.float32(d_head))
+        sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+        aw = jax.nn.softmax(sc, axis=-1)
+        ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+        attn_out = ao @ bp['attn']['expand_O']['kernel']
+
+        if ablate_type == 'attn' and li in ablate_layers:
+            attn_out = jnp.zeros_like(attn_out)
+        x = x + attn_out
+
+        normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+        h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+        tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+        know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
+                                     pool_params['know_read'], pool_params['know_write']) * pool_params.get('know_scale', 1.0)
+
+        if ablate_type == 'know' and li in ablate_layers:
+            know_out = jnp.zeros_like(know_out)
+        x = x + know_out
+
+    norm_p = params_jax['norm']
+    x = _layer_norm_fn(x, norm_p['scale'], norm_p['bias'])
+    logits = x @ emb_matrix.T
+    return logits
+
+
+def _ce_loss_from_logits(logits, input_ids):
+    """CE loss from logits [B, S, V] and input_ids [B, S]."""
+    shift_logits = logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:].astype(jnp.int32)
+    log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+    safe = jnp.where(shift_labels > 0, shift_labels, 0)
+    tl = -jnp.take_along_axis(log_probs, safe[..., jnp.newaxis], axis=-1).squeeze(-1)
+    valid = shift_labels > 0
+    return (tl * valid).sum() / (valid.sum() + 1e-8)
+
+
+def analyze_interventions(params, cfg, val_tokens, output_dir,
+                           n_batches=50, batch_size=4):
+    """P11: Causal intervention experiments — ablation, dosage, role isolation."""
+    print("\n" + "="*60)
+    print("P11: Causal Intervention Experiments")
+    print("="*60)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    _mod = get_model_module()
+    build_suppressed_forward = _mod.build_suppressed_forward
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+
+    # Alignment groups
+    pool = params['neuron_pool']
+    r_v = np.array(pool['know_read'])
+    w_v = np.array(pool['know_write'])
+    rn = r_v / (np.linalg.norm(r_v, axis=-1, keepdims=True) + 1e-8)
+    wn = w_v / (np.linalg.norm(w_v, axis=-1, keepdims=True) + 1e-8)
+    alignment = (rn * wn).sum(axis=-1)
+    corr_idx = np.where(alignment < -0.5)[0]
+    trans_idx = np.where(alignment > 0.1)[0]
+    neut_idx = np.where((alignment >= -0.5) & (alignment <= 0.1))[0]
+    print(f"  Groups: correction={len(corr_idx)}, neutral={len(neut_idx)}, transform={len(trans_idx)}")
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+
+    def _eval_loss_suppressed(suppress_mask):
+        """Eval loss with suppress_mask [n_know] bool. No JIT."""
+        fwd_fn = build_suppressed_forward(params, model_cfg, {'know': suppress_mask})
+        total_loss, total_valid = 0.0, 0
+        for b in range(actual_batches):
+            batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+            logits = fwd_fn(batch)
+            loss = float(_ce_loss_from_logits(logits, batch))
+            total_loss += loss
+            total_valid += 1
+        return total_loss / max(total_valid, 1)
+
+    def _eval_loss_layer_ablated(ablate_layers, ablate_type='know'):
+        """Eval loss with layer-selective ablation."""
+        total_loss, total_valid = 0.0, 0
+        for b in range(actual_batches):
+            batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+            logits = _layer_ablated_forward(params_jax, model_cfg, batch, ablate_layers, ablate_type)
+            loss = float(_ce_loss_from_logits(logits, batch))
+            total_loss += loss
+            total_valid += 1
+        return total_loss / max(total_valid, 1)
+
+    # === Baseline ===
+    print(f"\n  Computing baseline ({actual_batches} batches, bs={batch_size})...")
+    baseline = _eval_loss_layer_ablated(set())  # no ablation
+    print(f"  Baseline val loss: {baseline:.4f}")
+
+    results = {'baseline': baseline, 'n_batches': actual_batches, 'batch_size': batch_size}
+
+    # === Exp 1: Role Ablation ===
+    print(f"\n  === Exp 1: Role Ablation ===")
+    rng = np.random.RandomState(42)
+
+    exp1_conditions = [
+        ('correction', corr_idx),
+        ('transform', trans_idx),
+        ('neutral', neut_idx),
+    ]
+    # Random controls (3 runs averaged)
+    for name, idx in [('random_corr', corr_idx), ('random_trans', trans_idx)]:
+        n = len(idx)
+        losses = []
+        for seed in range(3):
+            r_idx = rng.choice(n_know, n, replace=False)
+            mask = np.zeros(n_know, dtype=bool)
+            mask[r_idx] = True
+            losses.append(_eval_loss_suppressed(mask))
+        exp1_conditions.append((f'random({n})', np.array([], dtype=int)))  # placeholder
+        exp1_conditions[-1] = (f'random({n})', losses)
+
+    print(f"  {'Condition':>17} | {'n_suppress':>11} | {'val_loss':>9} | {'Δloss':>9} | {'Δ/neuron':>9}")
+    print(f"  {'-'*17}-+-{'-'*11}-+-{'-'*9}-+-{'-'*9}-+-{'-'*9}")
+    exp1_results = {}
+    for name, idx_or_losses in exp1_conditions:
+        if isinstance(idx_or_losses, list):
+            # random control (averaged)
+            loss = float(np.mean(idx_or_losses))
+            n_s = int(name.split('(')[1].rstrip(')'))
+        else:
+            mask = np.zeros(n_know, dtype=bool)
+            mask[idx_or_losses] = True
+            n_s = int(mask.sum())
+            print(f"    Computing {name} ({n_s} neurons)...", flush=True)
+            loss = _eval_loss_suppressed(mask)
+        delta = loss - baseline
+        per_n = delta / max(n_s, 1)
+        print(f"  {name:>17} | {n_s:>11,} | {loss:>9.4f} | {delta:>+9.4f} | {per_n:>9.6f}")
+        exp1_results[name] = {'n_suppress': n_s, 'loss': loss, 'delta': delta, 'per_neuron': per_n}
+    results['exp1'] = exp1_results
+
+    # === Exp 2: Layer-selective Know Ablation ===
+    print(f"\n  === Exp 2: Layer-selective Know Ablation ===")
+    mid = n_layers // 2
+    layer_conditions = [
+        ('ablate L0 know', {0}, 'know'),
+        (f'ablate L{mid-1}-{mid+1} know', set(range(mid-1, mid+2)), 'know'),
+        (f'ablate L{n_layers-1} know', {n_layers - 1}, 'know'),
+        ('ablate ALL know', set(range(n_layers)), 'know'),
+        ('ablate L0 attn', {0}, 'attn'),
+    ]
+    print(f"  {'Condition':>22} | {'val_loss':>9} | {'Δloss':>9}")
+    print(f"  {'-'*22}-+-{'-'*9}-+-{'-'*9}")
+    print(f"  {'no ablation':>22} | {baseline:>9.4f} | {'—':>9}")
+    exp2_results = {}
+    for name, layers, atype in layer_conditions:
+        print(f"    Computing {name}...", flush=True)
+        loss = _eval_loss_layer_ablated(layers, atype)
+        delta = loss - baseline
+        print(f"  {name:>22} | {loss:>9.4f} | {delta:>+9.4f}")
+        exp2_results[name] = {'loss': loss, 'delta': delta, 'layers': list(layers), 'type': atype}
+    results['exp2'] = exp2_results
+
+    # === Exp 3: Correction Dosage Curve ===
+    print(f"\n  === Exp 3: Correction Dosage Curve ===")
+    # Sort correction neurons by alignment (most anti-aligned first)
+    sorted_corr = corr_idx[np.argsort(alignment[corr_idx])]
+    dosages = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+
+    print(f"  {'Dosage':>8} | {'n_suppress':>11} | {'val_loss':>9} | {'Δloss':>9}")
+    print(f"  {'-'*8}-+-{'-'*11}-+-{'-'*9}-+-{'-'*9}")
+    exp3_results = []
+    for d in dosages:
+        n_s = int(len(sorted_corr) * d)
+        if n_s == 0:
+            loss = baseline
+        else:
+            mask = np.zeros(n_know, dtype=bool)
+            mask[sorted_corr[:n_s]] = True
+            print(f"    Computing dosage {d*100:.0f}% ({n_s} neurons)...", flush=True)
+            loss = _eval_loss_suppressed(mask)
+        delta = loss - baseline
+        print(f"  {d*100:>7.0f}% | {n_s:>11,} | {loss:>9.4f} | {delta:>+9.4f}")
+        exp3_results.append({'dosage': d, 'n_suppress': n_s, 'loss': loss, 'delta': delta})
+    results['exp3'] = exp3_results
+
+    # === Exp 4: Role Isolation ===
+    print(f"\n  === Exp 4: Role Isolation ===")
+    exp4_conditions = [
+        ('suppress transform', trans_idx),
+        ('suppress correction', corr_idx),
+        ('suppress corr+trans', np.concatenate([corr_idx, trans_idx])),
+    ]
+    print(f"  {'Condition':>22} | {'val_loss':>9} | {'Δloss':>9}")
+    print(f"  {'-'*22}-+-{'-'*9}-+-{'-'*9}")
+    print(f"  {'no suppression':>22} | {baseline:>9.4f} | {'—':>9}")
+    exp4_results = {}
+    for name, idx in exp4_conditions:
+        mask = np.zeros(n_know, dtype=bool)
+        mask[idx] = True
+        print(f"    Computing {name} ({int(mask.sum())} neurons)...", flush=True)
+        loss = _eval_loss_suppressed(mask)
+        delta = loss - baseline
+        print(f"  {name:>22} | {loss:>9.4f} | {delta:>+9.4f}")
+        exp4_results[name] = {'n_suppress': int(mask.sum()), 'loss': loss, 'delta': delta}
+    results['exp4'] = exp4_results
+
+    _save_json(results, output_dir, 'p11_interventions', 'results.json')
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -3888,7 +4144,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -3927,7 +4183,7 @@ def main():
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
-                     'neuron_cluster', 'cross_ref', 'deep', 'op_space']
+                     'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene']
     print(f"  DEBUG: val_path={val_path}, only={only}, check={any(k in (only or set()) for k in _val_analyses)}")
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         print(f"  Loading val tokens from {val_path}...")
@@ -4085,6 +4341,13 @@ def main():
                                    n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping op_space (no --val_data)")
+
+    if only is None or 'intervene' in only:
+        if val_tokens is not None:
+            analyze_interventions(params, cfg, val_tokens, args.output,
+                                 n_batches=_nb or 50, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping intervene (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
