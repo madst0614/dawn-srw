@@ -3036,7 +3036,8 @@ def main():
     val_tokens = None
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
-                     'act_context', 'layer_role', 'gate_mech', 'comp_expr']
+                     'act_context', 'layer_role', 'gate_mech', 'comp_expr',
+                     'neuron_cluster']
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         val_tokens = load_val_tokens(val_path)
 
