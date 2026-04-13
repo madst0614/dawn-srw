@@ -3926,6 +3926,7 @@ def main():
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
                      'neuron_cluster', 'cross_ref', 'deep', 'op_space']
+    print(f"  DEBUG: val_path={val_path}, only={only}, check={any(k in (only or set()) for k in _val_analyses)}")
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         print(f"  Loading val tokens from {val_path}...")
         val_tokens = load_val_tokens(val_path)
