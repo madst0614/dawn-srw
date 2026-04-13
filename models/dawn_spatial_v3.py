@@ -1606,6 +1606,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     Returns: forward_fn(input_ids) -> logits [B, S, vocab]
     """
     params = _squeeze_params(params)
+    params = jax.tree.map(jnp.asarray, params)
     qk_mult = jnp.where(suppress_masks.get('qk', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
         if 'qk' in suppress_masks else None
     v_mult = jnp.where(suppress_masks.get('v', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
