@@ -1352,6 +1352,7 @@ def analyze_knowledge_neurons(params, cfg, output_dir,
 
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
 
     jit_prefill = jax.jit(lambda p, ids: prefill(p, model_cfg, ids))
     jit_decode = jax.jit(lambda p, tok, cK, cV, cL: decode_step(p, model_cfg, tok, cK, cV, cL))
