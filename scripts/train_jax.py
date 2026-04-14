@@ -1631,16 +1631,19 @@ def main():
     _sharded_fns = None
     if mesh_model > 1:
         _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_rw_v402'}.get(model_version, 'models.dawn_spatial_v3')
-        _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw', 'make_sharded_srw_paired'])
-        make_sharded_srw, make_sharded_srw_paired = _v3.make_sharded_srw, _v3.make_sharded_srw_paired
+        _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
+        make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
         _gnm = cfg['model'].get('gate_norm_mode', 'sqrt_active')
         _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
         if model_version.startswith('spatial-r1-v3.9.5'):
             _srw_kwargs['gate_norm_mode'] = _gnm
         _sharded_single = make_sharded_srw(**_srw_kwargs)
-        _sharded_paired = make_sharded_srw_paired(**_srw_kwargs)
-        _sharded_fns = (_sharded_single, _sharded_paired)
+        if hasattr(_v3, 'make_sharded_srw_paired'):
+            _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
+            _sharded_fns = (_sharded_single, _sharded_paired)
+        else:
+            _sharded_fns = _sharded_single  # v4.0.2: no paired (Q/K split)
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
 
@@ -2510,6 +2513,34 @@ def main():
                         )
                         log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
                     del params_single, opt_state_single
+
+                # Dead neuron diagnosis (rw-v4.0.2)
+                if model_version.startswith('rw-v') and is_host0:
+                    try:
+                        from models.dawn_rw_v402 import diagnose_dead_neurons as _diag_dead
+                        _diag_cfg = {
+                            'd_model': cfg['model']['d_model'],
+                            'n_layers': cfg['model']['n_layers'],
+                            'n_heads': cfg['model']['n_heads'],
+                            'max_seq_len': cfg['model']['max_seq_len'],
+                            'n_q': cfg['model'].get('n_q', 790),
+                            'n_k': cfg['model'].get('n_k', 790),
+                            'n_v': cfg['model'].get('n_v', 2600),
+                            'n_know': cfg['model'].get('n_know', 25200),
+                        }
+                        _params_cpu = _gather_for_save(params)
+                        _dead = jax.device_get(_diag_dead(
+                            _params_cpu, _diag_cfg,
+                            jnp.ones((128, cfg['model']['max_seq_len']), dtype=jnp.int32),
+                            n_batches=4, batch_size=32))
+                        for _pn in ('Q', 'K', 'V', 'Know'):
+                            _ps = _dead[_pn]
+                            log_message(
+                                f"      [DEAD] {_pn}: dead={int(_ps['n_dead'])}({float(_ps['dead_frac'])*100:.1f}%)"
+                                f" rare(<1%)={int(_ps['n_rare'])}({float(_ps['rare_frac'])*100:.1f}%)")
+                        del _params_cpu, _dead
+                    except Exception as e:
+                        log_message(f"      [DEAD] diagnosis failed: {e}")
 
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:

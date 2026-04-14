@@ -1525,6 +1525,147 @@ def vectorized_weight_analysis(params, max_sample=2048):
     return results
 
 
+def diagnose_dead_neurons(params, model_cfg, sample_tokens, n_batches=4, batch_size=32):
+    """Diagnose dead/rare neurons by running actual forward passes.
+
+    Returns per-pool stats: ever_active, activation_freq, mean_gate, max_gate.
+    Uses jax.lax.scan over batches and layers for efficiency.
+    """
+    params = _squeeze_params(params)
+    n_seqs = sample_tokens.shape[0]
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    tokens = sample_tokens[:actual_batches * batch_size].reshape(
+        actual_batches, batch_size, -1).astype(jnp.int32)
+
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    n_q = model_cfg['n_q']
+    n_k = model_cfg['n_k']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    S = sample_tokens.shape[1]
+
+    pool_params = params['neuron_pool']
+    router_params = params['router']
+    emb_matrix = params['token_emb']['embedding']
+    pos_matrix = params['pos_emb']['embedding']
+
+    q_ru = pool_params['q_read'] / (jnp.linalg.norm(pool_params['q_read'], axis=-1, keepdims=True) + 1e-8)
+    k_ru = pool_params['k_read'] / (jnp.linalg.norm(pool_params['k_read'], axis=-1, keepdims=True) + 1e-8)
+    v_ru = pool_params['v_read'] / (jnp.linalg.norm(pool_params['v_read'], axis=-1, keepdims=True) + 1e-8)
+    kn_ru = pool_params['know_read'] / (jnp.linalg.norm(pool_params['know_read'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
+    stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    def _srw_gate_stats(x, route_unit, tau_offset, w_read, w_write):
+        """SRW forward + gate stats. Returns (out, active_count[N], gate_sum[N], gate_max[N])."""
+        scores = x @ route_unit.T
+        sf = scores.astype(jnp.float32)
+        s_mean = sf.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_offset * s_std
+        raw = scores - tau.astype(scores.dtype)
+        z = raw.astype(jnp.float32) / s_std
+        gate = jnp.where(z > 0, z * 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476)), 0.0)
+        # SRW output
+        r_n = w_read / (jnp.linalg.norm(w_read, axis=-1, keepdims=True) + 1e-8)
+        w_n = w_write / (jnp.linalg.norm(w_write, axis=-1, keepdims=True) + 1e-8)
+        xr = x @ r_n.T
+        raw_out = (gate.astype(scores.dtype) * xr) @ w_n
+        den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
+        out = raw_out.astype(jnp.float32) / den
+        # Gate stats
+        active = (gate > 0.0).astype(jnp.float32)
+        return out, active.sum(axis=(0, 1)), (gate * active).sum(axis=(0, 1)), gate.max(axis=(0, 1))
+
+    def forward_batch(input_ids):
+        B, _S = input_ids.shape
+        positions = jnp.arange(_S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids] + pos_matrix[positions]
+
+        def layer_fn(carry, bp):
+            (x, qc, qgs, qgm, kc, kgs, kgm,
+             vc, vgs, vgm, knc, kngs, kngm) = carry
+            normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            tq = normed @ router_params['tau_q']['kernel'] + router_params['tau_q']['bias']
+            tk = normed @ router_params['tau_k']['kernel'] + router_params['tau_k']['bias']
+            tv = normed @ router_params['tau_v']['kernel'] + router_params['tau_v']['bias']
+
+            Q, _qc, _qgs, _qgm = _srw_gate_stats(normed, q_ru, tq, pool_params['q_read'], pool_params['q_write'])
+            K, _kc, _kgs, _kgm = _srw_gate_stats(normed, k_ru, tk, pool_params['k_read'], pool_params['k_write'])
+            V, _vc, _vgs, _vgm = _srw_gate_stats(normed, v_ru, tv, pool_params['v_read'], pool_params['v_write'])
+            Q, K, V = Q * pool_params['q_scale'], K * pool_params['k_scale'], V * pool_params['v_scale']
+
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, _S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, _S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, _S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((_S, _S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0, 2, 1, 3).reshape(B, _S, d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            normed2 = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            tkn = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            kn_out, _knc, _kngs, _kngm = _srw_gate_stats(normed2, kn_ru, tkn, pool_params['know_read'], pool_params['know_write'])
+            x = x + kn_out * pool_params['know_scale']
+
+            return (x, qc + _qc, qgs + _qgs, jnp.maximum(qgm, _qgm),
+                    kc + _kc, kgs + _kgs, jnp.maximum(kgm, _kgm),
+                    vc + _vc, vgs + _vgs, jnp.maximum(vgm, _vgm),
+                    knc + _knc, kngs + _kngs, jnp.maximum(kngm, _kngm)), None
+
+        init = (x,
+                jnp.zeros(n_q), jnp.zeros(n_q), jnp.zeros(n_q),
+                jnp.zeros(n_k), jnp.zeros(n_k), jnp.zeros(n_k),
+                jnp.zeros(n_v), jnp.zeros(n_v), jnp.zeros(n_v),
+                jnp.zeros(n_know), jnp.zeros(n_know), jnp.zeros(n_know))
+        (_, qc, qgs, qgm, kc, kgs, kgm, vc, vgs, vgm, knc, kngs, kngm), _ = jax.lax.scan(
+            layer_fn, init, stacked)
+        return qc, qgs, qgm, kc, kgs, kgm, vc, vgs, vgm, knc, kngs, kngm
+
+    def scan_batches(carry, batch):
+        (qc, qgs, qgm, kc, kgs, kgm, vc, vgs, vgm, knc, kngs, kngm) = carry
+        r = forward_batch(batch)
+        return (qc + r[0], qgs + r[1], jnp.maximum(qgm, r[2]),
+                kc + r[3], kgs + r[4], jnp.maximum(kgm, r[5]),
+                vc + r[6], vgs + r[7], jnp.maximum(vgm, r[8]),
+                knc + r[9], kngs + r[10], jnp.maximum(kngm, r[11])), None
+
+    init = tuple(jnp.zeros(n) for n in [n_q]*3 + [n_k]*3 + [n_v]*3 + [n_know]*3)
+    (qc, qgs, qgm, kc, kgs, kgm, vc, vgs, vgm, knc, kngs, kngm), _ = jax.lax.scan(
+        scan_batches, init, tokens)
+
+    total_tokens = actual_batches * batch_size * S * n_layers
+
+    def _pool_stats(count, gsum, gmax, N):
+        freq = count / total_tokens
+        mean_gate = gsum / jnp.maximum(count, 1.0)
+        dead = (count == 0)
+        rare = freq < 0.01
+        return {
+            'ever_active': ~dead, 'activation_freq': freq,
+            'mean_gate_when_active': mean_gate, 'max_gate': gmax,
+            'n_dead': dead.sum(), 'dead_frac': dead.sum() / N,
+            'n_rare': rare.sum(), 'rare_frac': rare.sum() / N,
+        }
+
+    return {
+        'Q': _pool_stats(qc, qgs, qgm, n_q),
+        'K': _pool_stats(kc, kgs, kgm, n_k),
+        'V': _pool_stats(vc, vgs, vgm, n_v),
+        'Know': _pool_stats(knc, kngs, kngm, n_know),
+        'total_tokens_seen': total_tokens,
+        'config': {'n_batches': actual_batches, 'batch_size': batch_size, 'n_layers': n_layers},
+    }
+
+
 def analysis_forward(params, model_cfg, input_ids, mode='full'):
     """Forward returning per-layer gate distributions + output norms.
 
