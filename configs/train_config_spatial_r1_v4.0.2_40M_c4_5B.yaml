@@ -22,10 +22,10 @@ model:
   dropout: 0.1
   gradient_checkpointing: true
 
-  n_q: 790
-  n_k: 790
-  n_v: 2600
-  n_know: 25200
+  n_q: 928
+  n_k: 928
+  n_v: 3056
+  n_know: 29620
 
 training:
   batch_size: 128
