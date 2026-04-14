@@ -1532,6 +1532,7 @@ def diagnose_dead_neurons(params, model_cfg, sample_tokens, n_batches=4, batch_s
     Uses jax.lax.scan over batches and layers for efficiency.
     """
     params = _squeeze_params(params)
+    params = jax.tree.map(jnp.asarray, params)
     n_seqs = sample_tokens.shape[0]
     actual_batches = min(n_batches, n_seqs // batch_size)
     tokens = sample_tokens[:actual_batches * batch_size].reshape(
