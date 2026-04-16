@@ -5309,6 +5309,119 @@ def analyze_gate_confidence_intensity(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §7.2.3 Write Direction Coverage
+# ============================================================
+
+def analyze_write_coverage(params, cfg, output_dir):
+    """§7.2.3: SVD effective rank, pairwise cos sim, covering radius per pool."""
+    print("\n" + "="*60)
+    print("§7.2.3: Write Direction Coverage")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    d_model = model_cfg['d_model']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+
+    pools = {
+        'qk':   ('qk_write', n_qk),
+        'v':    ('v_write',  n_v),
+        'know': ('know_write', n_know),
+    }
+
+    results = {}
+    for pool_name, (w_key, n_pool) in pools.items():
+        print(f"\n  Pool: {pool_name} (N={n_pool}, d={d_model})")
+        W = np.array(jax.device_get(pool_p[w_key]))  # [N, d]
+        W_n = W / (np.linalg.norm(W, axis=-1, keepdims=True) + 1e-8)
+
+        # SVD effective rank
+        print(f"    Computing SVD...")
+        if n_pool <= 5000:
+            _, S_vals, _ = np.linalg.svd(W_n, full_matrices=False)
+        else:
+            # subsample for SVD if too large
+            rng = np.random.RandomState(42)
+            idx = rng.choice(n_pool, 5000, replace=False)
+            _, S_vals, _ = np.linalg.svd(W_n[idx], full_matrices=False)
+
+        S2 = S_vals ** 2
+        S2_norm = S2 / (S2.sum() + 1e-12)
+        eff_rank = float(np.exp(-np.sum(S2_norm * np.log(S2_norm + 1e-12))))
+        print(f"    SVD effective rank: {eff_rank:.1f} / {min(n_pool, d_model)}")
+
+        # Pairwise cosine similarity
+        print(f"    Computing pairwise cos sim...")
+        subsample_size = min(n_pool, 5000)
+        rng = np.random.RandomState(42)
+        if n_pool > subsample_size:
+            idx = rng.choice(n_pool, subsample_size, replace=False)
+            W_sub = W_n[idx]
+        else:
+            W_sub = W_n
+
+        # chunked matmul for memory
+        chunk = 1000
+        cos_vals = []
+        for i in range(0, len(W_sub), chunk):
+            sim_chunk = W_sub[i:i+chunk] @ W_sub.T  # [chunk, subsample_size]
+            # off-diagonal만
+            for ci in range(sim_chunk.shape[0]):
+                global_i = i + ci
+                row = sim_chunk[ci]
+                row[global_i] = np.nan  # 자기 자신 제외
+                cos_vals.append(row[~np.isnan(row)])
+
+        cos_flat = np.concatenate(cos_vals)
+        cos_hist, cos_edges = np.histogram(cos_flat, bins=100, range=(-1.0, 1.0))
+
+        # Covering radius: random unit vectors에 대한 nearest write max cos
+        print(f"    Computing covering radius...")
+        n_probes = 10000
+        probes = rng.randn(n_probes, d_model).astype(np.float32)
+        probes /= (np.linalg.norm(probes, axis=-1, keepdims=True) + 1e-8)
+
+        max_cos_per_probe = np.zeros(n_probes, dtype=np.float32)
+        for i in range(0, n_probes, chunk):
+            sim = probes[i:i+chunk] @ W_sub.T  # [chunk, subsample]
+            max_cos_per_probe[i:i+chunk] = sim.max(axis=-1)
+
+        cover_hist, cover_edges = np.histogram(max_cos_per_probe, bins=50, range=(0.0, 1.0))
+
+        pool_result = {
+            'n_pool': n_pool,
+            'svd_eff_rank': eff_rank,
+            'svd_top10': S_vals[:10].tolist(),
+            'pairwise_cos': {
+                'mean': float(cos_flat.mean()),
+                'std': float(cos_flat.std()),
+                'p5': float(np.percentile(cos_flat, 5)),
+                'p95': float(np.percentile(cos_flat, 95)),
+                'histogram': cos_hist.tolist(),
+                'edges': cos_edges.tolist(),
+            },
+            'covering': {
+                'mean_max_cos': float(max_cos_per_probe.mean()),
+                'min_max_cos': float(max_cos_per_probe.min()),
+                'p5_max_cos': float(np.percentile(max_cos_per_probe, 5)),
+                'histogram': cover_hist.tolist(),
+                'edges': cover_edges.tolist(),
+            },
+        }
+        results[pool_name] = pool_result
+        print(f"    pairwise cos mean={pool_result['pairwise_cos']['mean']:.4f}, "
+              f"covering mean_max_cos={pool_result['covering']['mean_max_cos']:.4f}")
+
+    _save_json(results, output_dir, 'write_cov', 'write_coverage.json')
+    print("  Done: write_cov")
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -5321,7 +5434,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -5579,6 +5692,9 @@ def main():
                                               n_batches=_nb or 20, batch_size=min(_abs, 8))
         else:
             print("\n  Skipping gate_ci (no --val_data)")
+
+    if _should_run('write_cov'):
+        analyze_write_coverage(params, cfg, args.output)
 
     print(f"\nDone. Results in {args.output}/")
 
