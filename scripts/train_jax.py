@@ -55,6 +55,8 @@ from models.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
 from models.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
 from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
 from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
+from models.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
+from models.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -144,8 +146,9 @@ def build_model_from_config(cfg):
             n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
             n_chunks_v=cfg['training'].get('n_chunks_v', 1),
         )
-    elif version == 'spatial-r1-v3.9.9':
-        model = DAWN_SpatialV399Exp(
+    elif version in ('spatial-r1-v3.9.9', 'spatial-r1-v4.0.1'):
+        _cls = DAWN_SpatialV401Exp if version == 'spatial-r1-v4.0.1' else DAWN_SpatialV399Exp
+        model = _cls(
             vocab_size=mcfg.get('vocab_size', 30522),
             d_model=mcfg.get('d_model', 384),
             n_layers=mcfg.get('n_layers', 12),
@@ -161,6 +164,24 @@ def build_model_from_config(cfg):
             n_chunks_know=cfg['training'].get('n_chunks_know', 1),
             n_chunks_qk=cfg['training'].get('n_chunks_qk', 1),
             n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+        )
+    elif version == 'rw-v4.0.2':
+        model = DAWN_RW_V402(
+            vocab_size=mcfg.get('vocab_size', 30522),
+            d_model=mcfg.get('d_model', 384),
+            n_layers=mcfg.get('n_layers', 12),
+            n_heads=mcfg.get('n_heads', 6),
+            max_seq_len=mcfg.get('max_seq_len', 512),
+            n_q=mcfg.get('n_q', 790),
+            n_k=mcfg.get('n_k', 790),
+            n_v=mcfg.get('n_v', 2600),
+            n_know=mcfg.get('n_know', 25200),
+            dropout_rate=mcfg.get('dropout', 0.1),
+            gradient_checkpointing=mcfg.get('gradient_checkpointing', False),
+            n_chunks_q=cfg['training'].get('n_chunks_q', 1),
+            n_chunks_k=cfg['training'].get('n_chunks_k', 1),
+            n_chunks_v=cfg['training'].get('n_chunks_v', 1),
+            n_chunks_know=cfg['training'].get('n_chunks_know', 1),
         )
     elif version == 'spatial-r1-v3.9.8.1':
         model = DAWN_SpatialV3981Exp(
@@ -447,8 +468,18 @@ def _file_exists(path):
 
 
 def _list_files(directory, pattern="*.flax"):
-    """List files in a directory (local or GCS)."""
+    """List files in a directory (local or GCS), sorted by step number."""
+    import re
     dir_str = str(directory)
+
+    def _sort_key(path):
+        """Extract step number for numeric sort. best_model sorts last."""
+        name = path.rsplit('/', 1)[-1] if '/' in path else path
+        if 'best_model' in name:
+            return float('inf')
+        m = re.search(r'(\d+)', name)
+        return int(m.group(1)) if m else 0
+
     if _is_gcs(dir_str):
         try:
             import gcsfs
@@ -456,7 +487,7 @@ def _list_files(directory, pattern="*.flax"):
             if not dir_str.endswith("/"):
                 dir_str += "/"
             files = fs.glob(dir_str + pattern)
-            return sorted(["gs://" + f for f in files])
+            return sorted(["gs://" + f for f in files], key=_sort_key)
         except ImportError:
             pass
         try:
@@ -464,10 +495,10 @@ def _list_files(directory, pattern="*.flax"):
             if not dir_str.endswith("/"):
                 dir_str += "/"
             files = tf.io.gfile.glob(dir_str + pattern)
-            return sorted(files)
+            return sorted(files, key=_sort_key)
         except ImportError:
             return []
-    return sorted(str(f) for f in Path(dir_str).glob(pattern))
+    return sorted((str(f) for f in Path(dir_str).glob(pattern)), key=_sort_key)
 
 
 def _makedirs(path):
@@ -613,15 +644,25 @@ def compute_spatial_diversity_loss(params):
     def _get_pool_arrays(pool):
         """Return list of neuron arrays from pool params."""
         arrays = []
+        # v4.0.2 (rw): separate q/k pools, read/write only
+        for prefix in ('q', 'k', 'v', 'know'):
+            if f'{prefix}_read' in pool:
+                arrays.append(pool[f'{prefix}_read'])
+                arrays.append(pool[f'{prefix}_write'])
+        if arrays:
+            return arrays
+        # v3/v4.0.1: shared qk pool
         for prefix in ('qk', 'v', 'know'):
             if f'{prefix}_neurons' in pool:
                 arrays.append(pool[f'{prefix}_neurons'])
             else:
-                # v3.2: emb + w
                 if f'{prefix}_emb' in pool:
                     arrays.append(pool[f'{prefix}_emb'])
                 if f'{prefix}_w' in pool:
                     arrays.append(pool[f'{prefix}_w'])
+                if f'{prefix}_read' in pool:
+                    arrays.append(pool[f'{prefix}_read'])
+                    arrays.append(pool[f'{prefix}_write'])
         return arrays
 
     pool_arrays = _get_pool_arrays(pool)
@@ -779,6 +820,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'debug_v_norm': result.get('debug_v_norm', jnp.float32(0.0)),
             'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
             'debug_o_input_norm': result.get('debug_o_input_norm', jnp.float32(0.0)),
+            'know_phi_binary': result.get('know_phi_binary', jnp.float32(0.0)),
+            'know_z_mean_active': result.get('know_z_mean_active', jnp.float32(0.0)),
+            'attn_qk_phi_binary': result.get('attn_qk_phi_binary', jnp.float32(0.0)),
+            'attn_v_phi_binary': result.get('attn_v_phi_binary', jnp.float32(0.0)),
+            'attn_qk_z_mean_active': result.get('attn_qk_z_mean_active', jnp.float32(0.0)),
+            'attn_v_z_mean_active': result.get('attn_v_z_mean_active', jnp.float32(0.0)),
             'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
             'per_layer_know_out_norm': result.get('per_layer_know_out_norm', jnp.zeros(1)),
         }
@@ -1536,7 +1583,8 @@ def main():
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
                   or model_version.startswith('spatial-r1-v3')
-                  or model_version.startswith('spatial-r1-v4'))
+                  or model_version.startswith('spatial-r1-v4')
+                  or model_version.startswith('rw-v'))
 
     mesh_model = cfg['training'].get('mesh_model', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
@@ -1583,22 +1631,39 @@ def main():
     # Shard params: neuron_pool N-axis on 'model', rest replicated
     param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
     params = shard_params_to_mesh(params, param_shardings)
-    opt_state = optimizer.init(params)  # reinit with sharded params
+
+    _is_resuming = (resume_path is not None and _file_exists(resume_path))
+    if _is_resuming:
+        _opt_template = optimizer.init(params)
+        def _restore_leaf(restored_val, template_val):
+            # template_val is already correctly sharded across all devices.
+            # Create a zero with the same sharding, then add restored value.
+            # This forces the result to inherit template's sharding.
+            return jnp.zeros_like(template_val) + jnp.asarray(restored_val, dtype=template_val.dtype).reshape(template_val.shape)
+        opt_state = jax.tree.map(_restore_leaf, opt_state, _opt_template)
+        del _opt_template
+        if is_host0:
+            print(f"  Optimizer state restored from checkpoint and sharded to mesh")
+    else:
+        opt_state = optimizer.init(params)
 
     # Create shard_map functions if mesh_model > 1
     _sharded_fns = None
     if mesh_model > 1:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
-        _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw', 'make_sharded_srw_paired'])
-        make_sharded_srw, make_sharded_srw_paired = _v3.make_sharded_srw, _v3.make_sharded_srw_paired
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
+        make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
         _gnm = cfg['model'].get('gate_norm_mode', 'sqrt_active')
         _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
         if model_version.startswith('spatial-r1-v3.9.5'):
             _srw_kwargs['gate_norm_mode'] = _gnm
         _sharded_single = make_sharded_srw(**_srw_kwargs)
-        _sharded_paired = make_sharded_srw_paired(**_srw_kwargs)
-        _sharded_fns = (_sharded_single, _sharded_paired)
+        if hasattr(_v3, 'make_sharded_srw_paired'):
+            _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
+            _sharded_fns = (_sharded_single, _sharded_paired)
+        else:
+            _sharded_fns = _sharded_single  # v4.0.2: no paired (Q/K split)
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
 
@@ -1670,7 +1735,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp'}.get(model_version, 'models.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -2270,17 +2335,35 @@ def main():
                             k_extra = f" gate_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
                         if k_aN > 0:    # v3.9.2
                             k_extra += f" active_N={k_aN:.0f}"
-                        k_pos = k_strong
-                        k_neg = max(k_act - k_strong, 0.0)
-                        k_pos_n = k_pos * n_know_cfg
-                        k_neg_n = k_neg * n_know_cfg
-                        k_total_n = k_act * n_know_cfg
-                        log_message(
-                            f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
-                            f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
-                            f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
-                            f" s_std={k_sstd:.3f}"
-                            f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+
+                        # v4.0.0 (symmetric gate): know_pos metric exists → show pos/neg split
+                        # All others (ReLU/GELU gate): show active/total + optional strong
+                        _has_pos = bool(metrics.get('know_pos', 0.0))
+                        if _has_pos:
+                            k_pos = _m(metrics.get('know_pos', k_strong))
+                            k_neg = max(k_act - k_pos, 0.0)
+                            k_pos_n = k_pos * n_know_cfg
+                            k_neg_n = k_neg * n_know_cfg
+                            k_total_n = k_act * n_know_cfg
+                            log_message(
+                                f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
+                                f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
+                                f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
+                                f" s_std={k_sstd:.3f}"
+                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+                        else:
+                            k_strong_s = f" strong={k_strong * n_know_cfg:.0f}({k_strong*100:.1f}%)" if k_strong > 0 else ""
+                            k_phi_s = ""
+                            k_phi = _m(metrics.get('know_phi_binary', 0.0))
+                            k_z_act = _m(metrics.get('know_z_mean_active', 0.0))
+                            if k_phi > 0:
+                                k_phi_s = f" phi_bin={k_phi*100:.1f}% z_act={k_z_act:.2f}"
+                            log_message(
+                                f"      know: active={k_act * n_know_cfg:.0f}/{n_know_cfg}"
+                                f"({k_act*100:.1f}%){k_strong_s}{k_extra}"
+                                f" s_std={k_sstd:.3f}"
+                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}{k_phi_s}")
+
                         # attn line
                         a_extra = ""
                         if a_gsum > 0:  # v3.9.1+
@@ -2289,16 +2372,34 @@ def main():
                             a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
                         if a_aN > 0:    # v3.9.2
                             a_extra += f" active_N={a_aN:.0f}"
-                        a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
-                        a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
-                        a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
-                        a_v_neg = max(a_v_act - a_v_pos, 0.0)
-                        log_message(
-                            f"      attn: qk_pos={a_qk_pos*100:.1f}% qk_neg={a_qk_neg*100:.1f}%"
-                            f" v_pos={a_v_pos*100:.1f}% v_neg={a_v_neg*100:.1f}%{a_extra}"
-                            f" s_std={a_sstd:.3f}"
-                            f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
-                            f" out_norm={a_out_n:.3f}")
+
+                        _has_attn_pos = bool(metrics.get('attn_qk_pos', metrics.get('attn_pos', 0.0)))
+                        if _has_attn_pos:
+                            a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
+                            a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
+                            a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
+                            a_v_neg = max(a_v_act - a_v_pos, 0.0)
+                            log_message(
+                                f"      attn: qk_pos={a_qk_pos*100:.1f}% qk_neg={a_qk_neg*100:.1f}%"
+                                f" v_pos={a_v_pos*100:.1f}% v_neg={a_v_neg*100:.1f}%{a_extra}"
+                                f" s_std={a_sstd:.3f}"
+                                f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
+                                f" out_norm={a_out_n:.3f}")
+                        else:
+                            a_strong_s = f" strong={a_strong*100:.1f}%" if a_strong > 0 else ""
+                            a_phi_s = ""
+                            a_qk_phi = _m(metrics.get('attn_qk_phi_binary', 0.0))
+                            a_v_phi = _m(metrics.get('attn_v_phi_binary', 0.0))
+                            a_qk_z = _m(metrics.get('attn_qk_z_mean_active', 0.0))
+                            a_v_z = _m(metrics.get('attn_v_z_mean_active', 0.0))
+                            if a_qk_phi > 0:
+                                a_phi_s = f" qk_phi={a_qk_phi*100:.1f}% v_phi={a_v_phi*100:.1f}% qk_z={a_qk_z:.2f} v_z={a_v_z:.2f}"
+                            log_message(
+                                f"      attn: qk_active={a_qk_act:.1%}"
+                                f" v_active={a_v_act:.1%}{a_strong_s}{a_extra}"
+                                f" s_std={a_sstd:.3f}"
+                                f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
+                                f" out_norm={a_out_n:.3f}{a_phi_s}")
                         # Strength (v3.9.3)
                         k_str_m = _m(metrics.get('know_strength_mean', 0.0))
                         if k_str_m > 0:
@@ -2432,6 +2533,42 @@ def main():
                         )
                         log_message(f"  New best model saved! val_loss={best_val_loss:.4f}")
                     del params_single, opt_state_single
+
+                # Dead neuron diagnosis (rw-v4.0.2)
+                if model_version.startswith('rw-v') and is_host0:
+                    try:
+                        from models.dawn_spatial_v402_exp import diagnose_dead_neurons as _diag_dead
+                        _diag_cfg = {
+                            'd_model': cfg['model']['d_model'],
+                            'n_layers': cfg['model']['n_layers'],
+                            'n_heads': cfg['model']['n_heads'],
+                            'max_seq_len': cfg['model']['max_seq_len'],
+                            'n_q': cfg['model'].get('n_q', 790),
+                            'n_k': cfg['model'].get('n_k', 790),
+                            'n_v': cfg['model'].get('n_v', 2600),
+                            'n_know': cfg['model'].get('n_know', 25200),
+                        }
+                        _params_cpu = _gather_for_save(params)
+                        # Collect real val data for dead neuron diagnosis
+                        val_loader.reset()
+                        _diag_batches = []
+                        for _di, (_dids, _dmask) in enumerate(val_loader):
+                            _diag_batches.append(np.array(_dids))
+                            if len(_diag_batches) * _dids.shape[0] >= 128:
+                                break
+                        _diag_tokens = jnp.array(np.concatenate(_diag_batches, axis=0)[:128])
+                        _dead = jax.device_get(_diag_dead(
+                            _params_cpu, _diag_cfg, _diag_tokens,
+                            n_batches=4, batch_size=32))
+                        del _diag_tokens
+                        for _pn in ('Q', 'K', 'V', 'Know'):
+                            _ps = _dead[_pn]
+                            log_message(
+                                f"      [DEAD] {_pn}: dead={int(_ps['n_dead'])}({float(_ps['dead_frac'])*100:.1f}%)"
+                                f" rare(<1%)={int(_ps['n_rare'])}({float(_ps['rare_frac'])*100:.1f}%)")
+                        del _params_cpu, _dead
+                    except Exception as e:
+                        log_message(f"      [DEAD] diagnosis failed: {e}")
 
             # ---- Mid-epoch checkpoint ----
             if global_step % ckpt_interval == 0 and global_step > 0:

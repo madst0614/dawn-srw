@@ -1156,6 +1156,19 @@ class DAWN(nn.Module):
 #    Pure functions only. Training code above is untouched.
 # ================================================================
 
+def _squeeze_params(params):
+    """Remove leading singleton dim from all param arrays.
+
+    Device-replicated checkpoints store params with shape (1, ...).
+    Squeeze axis 0 when it is size 1 so indexing and matmul work correctly.
+    """
+    def _sq(x):
+        if hasattr(x, 'ndim') and x.ndim >= 2 and x.shape[0] == 1:
+            return x.squeeze(0)
+        return x
+    return jax.tree.map(_sq, params)
+
+
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference. Binary gate + xr²-weighted soft denominator."""
     scores = h @ emb_norm.T
@@ -1181,7 +1194,12 @@ def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
 
 
 def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
-    """Like _srw_inference but also returns normalized gate [B,S,N] for analysis."""
+    """Like _srw_inference but also returns raw and normalized gate for analysis.
+
+    Returns: (out, gate_raw, gate_norm)
+        gate_raw: [B,S,N] raw sigmoid gate before normalization
+        gate_norm: [B,S,N] gate / gate.sum (probability-normalized)
+    """
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -1203,7 +1221,7 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, w_read, w_write):
     den = weighted + 1e-6
     den = jnp.maximum(den, 1e-3)
     out = raw_out.astype(jnp.float32) / den
-    return out.astype(jnp.float32), gate_norm
+    return out.astype(jnp.float32), gate, gate_norm
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
@@ -1270,6 +1288,7 @@ def prefill(params, model_cfg, input_ids):
 
     Returns: logits [B,S,vocab], cache_K, cache_V [n_layers,B,H,max_seq,d_head], cache_len
     """
+    params = _squeeze_params(params)
     B, S = input_ids.shape
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
@@ -1349,6 +1368,7 @@ def prefill(params, model_cfg, input_ids):
 
 def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     """Single token decode with KV cache. Returns logits [B,vocab], updated cache."""
+    params = _squeeze_params(params)
     token_id = token_id.reshape(-1, 1)
     B = token_id.shape[0]
     d_model = model_cfg['d_model']
@@ -1359,7 +1379,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     router_params = params['router']
 
     x = (params['token_emb']['embedding'][token_id]
-         + params['pos_emb']['embedding'][[cache_len]])
+         + params['pos_emb']['embedding'][cache_len][jnp.newaxis, :])
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
@@ -1403,6 +1423,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     Uses jax.lax.scan over batches, _srw_inference per layer (no chunking).
     Returns: (avg_loss, ppl, accuracy, total_valid) — all jnp scalars.
     """
+    params = _squeeze_params(params)
+
     n_seqs = all_tokens.shape[0]
     n_batches = n_seqs // batch_size
     tokens = all_tokens[:n_batches * batch_size].reshape(n_batches, batch_size, -1).astype(jnp.int32)
@@ -1428,32 +1450,10 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
 
-    print(f"  [DEBUG] emb type={type(emb_matrix)}, shape={emb_matrix.shape}, dtype={emb_matrix.dtype}")
-    print(f"  [DEBUG] pos type={type(pos_matrix)}, shape={pos_matrix.shape}, dtype={pos_matrix.dtype}")
-    print(f"  [DEBUG] tokens type={type(all_tokens)}, shape={all_tokens.shape}, dtype={all_tokens.dtype}")
-    print(f"  [DEBUG] tokens_reshaped shape={tokens.shape}, dtype={tokens.dtype}")
-    print(f"  [DEBUG] pool_params keys={list(pool_params.keys())}")
-    print(f"  [DEBUG] params type={type(params)}")
-    for k in params:
-        v = params[k]
-        if hasattr(v, 'shape'):
-            print(f"  [DEBUG] params['{k}'] shape={v.shape} type={type(v)}")
-        elif isinstance(v, dict):
-            for k2 in v:
-                v2 = v[k2]
-                if hasattr(v2, 'shape'):
-                    print(f"  [DEBUG] params['{k}']['{k2}'] shape={v2.shape} type={type(v2)}")
-
-    # Test indexing outside JIT
-    test_ids = jnp.array([[0, 1, 2]], dtype=jnp.int32)
-    test_result = emb_matrix[test_ids]
-    print(f"  [DEBUG] test emb_matrix[[[0,1,2]]] shape={test_result.shape}")  # should be (1, 3, 384)
-    import sys; sys.stdout.flush()
-
     def forward_batch(input_ids):
         B, S = input_ids.shape
-        positions = jnp.arange(S)
-        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions][jnp.newaxis, :, :]
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
 
         def layer_fn(x, bp):
             normed = _layer_norm(x, bp['norm1']['scale'], bp['norm1']['bias'])
@@ -1531,6 +1531,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
 
 def vectorized_neuron_health(params):
     """All neuron health stats. Returns dict of jnp values (single device_get later)."""
+    params = _squeeze_params(params)
     pool = params['neuron_pool']
     results = {}
     for pool_name, emb_key in [('QK', 'qk_emb'), ('V', 'v_emb'), ('Know', 'know_emb')]:
@@ -1556,6 +1557,7 @@ def vectorized_neuron_health(params):
 
 def vectorized_weight_analysis(params, max_sample=2048):
     """Weight analysis: effective rank + cosine sim. All on device."""
+    params = _squeeze_params(params)
     pool = params['neuron_pool']
     results = {}
     for pool_name, emb_key in [('QK', 'qk_emb'), ('V', 'v_emb'), ('Know', 'know_emb')]:
@@ -1590,21 +1592,13 @@ def vectorized_weight_analysis(params, max_sample=2048):
     return results
 
 
-def analysis_forward(params, model_cfg, input_ids):
+def analysis_forward(params, model_cfg, input_ids, mode='full'):
     """Forward returning per-layer gate distributions + output norms.
 
-    For D.1 (Q/K specialization), D.4 (layer balance), D.3/D.5 (knowledge neurons).
-
-    Returns:
-        logits: [B, S, vocab]
-        layer_info: dict with stacked arrays:
-            gate_Q: [n_layers, B, S, n_qk]
-            gate_K: [n_layers, B, S, n_qk]
-            gate_V: [n_layers, B, S, n_v]
-            gate_Know: [n_layers, B, S, n_know]
-            attn_out_norm: [n_layers]
-            know_out_norm: [n_layers]
+    mode='full': returns gate_raw + gate_norm
+    mode='light': returns gate_norm only (half memory)
     """
+    params = _squeeze_params(params)
     B, S = input_ids.shape
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
@@ -1625,6 +1619,7 @@ def analysis_forward(params, model_cfg, input_ids):
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+    _return_raw = (mode == 'full')
 
     def analysis_layer(carry, xs):
         x = carry
@@ -1635,13 +1630,13 @@ def analysis_forward(params, model_cfg, input_ids):
         h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
         tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
 
-        Q, gate_Q = _srw_inference_with_gates(
+        Q, gate_Q_raw, gate_Q = _srw_inference_with_gates(
             normed, h_Q, qk_norm, tau_all[:, :, 0:1],
             pool_params['qk_read'], pool_params['qk_write'])
-        K, gate_K = _srw_inference_with_gates(
+        K, gate_K_raw, gate_K = _srw_inference_with_gates(
             normed, h_K, qk_norm, tau_all[:, :, 1:2],
             pool_params['qk_read'], pool_params['qk_write'])
-        V, gate_V = _srw_inference_with_gates(
+        V, gate_V_raw, gate_V = _srw_inference_with_gates(
             normed, h_V, v_norm, tau_all[:, :, 2:3],
             pool_params['v_read'], pool_params['v_write'])
         _qk_s = pool_params['qk_scale']
@@ -1668,19 +1663,25 @@ def analysis_forward(params, model_cfg, input_ids):
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
         h_k = normed @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
         tau_k = normed @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-        know_out, gate_Know = _srw_inference_with_gates(
+        know_out, gate_Know_raw, gate_Know = _srw_inference_with_gates(
             normed, h_k, know_norm_w, tau_k,
             pool_params['know_read'], pool_params['know_write'])
         know_out = know_out * pool_params['know_scale']
         know_out_norm = jnp.linalg.norm(know_out, axis=-1).mean()
         x = x + know_out
 
-        return x, {
+        info = {
             'gate_Q': gate_Q, 'gate_K': gate_K,
             'gate_V': gate_V, 'gate_Know': gate_Know,
             'attn_out_norm': attn_out_norm,
             'know_out_norm': know_out_norm,
         }
+        if _return_raw:
+            info['gate_Q_raw'] = gate_Q_raw
+            info['gate_K_raw'] = gate_K_raw
+            info['gate_V_raw'] = gate_V_raw
+            info['gate_Know_raw'] = gate_Know_raw
+        return x, info
 
     xs = {'params': stacked}
     x, layer_info = jax.lax.scan(analysis_layer, x, xs)
@@ -1698,6 +1699,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
     True = suppress.
     Returns: forward_fn(input_ids) -> logits [B, S, vocab]
     """
+    params = _squeeze_params(params)
+    params = jax.tree.map(jnp.asarray, params)
     qk_mult = jnp.where(suppress_masks.get('qk', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \
         if 'qk' in suppress_masks else None
     v_mult = jnp.where(suppress_masks.get('v', jnp.zeros(1, dtype=bool)), 0.0, 1.0) \

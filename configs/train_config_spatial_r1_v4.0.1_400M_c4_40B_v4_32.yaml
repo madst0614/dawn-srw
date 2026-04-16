@@ -1,0 +1,50 @@
+# DAWN Spatial-R1 v4.0.1 Training Config - 400M - v4-32 Pod
+# GELU gate (z × Φ(z)) + den floor=1.0
+# Global batch: 1024 = 16 chips x 64 per_device_batch
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "spatial-r1-v4.0.1"
+  d_model: 1280
+  n_layers: 18
+  n_heads: 16
+  d_route: 256
+
+  n_know: 100000
+  n_qk: 6400
+  n_v: 10400
+
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+  router_dropout: 0.1
+
+training:
+  batch_size: 1024
+  mesh_model: 2
+  mesh_data: 8
+  n_chunks_know: 4
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_ratio: 0.08
+  orthogonality_weight: 0.01
+  diversity_weight: 0.1
+  load_balance_weight: 0.1
+  checkpoint_interval: 200
+  val_interval: 200
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.0.1_400M_c4_40B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.0.1_400M_c4_40B
