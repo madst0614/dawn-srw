@@ -5356,6 +5356,193 @@ def analyze_write_coverage(params, cfg, output_dir):
 
 
 # ============================================================
+# §7.2.3b Read Direction Coverage
+# ============================================================
+
+def analyze_read_coverage(params, cfg, output_dir):
+    """§7.2.3b: SVD effective rank, pairwise cos sim, covering radius per pool
+    for read vectors; plus read vs write rank comparison and read-write
+    subspace overlap via principal angles (k=50,100,200)."""
+    print("\n" + "="*60)
+    print("§7.2.3b: Read Direction Coverage")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    d_model = model_cfg['d_model']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+
+    pools = {
+        'qk':   ('qk_read',   'qk_write',   n_qk),
+        'v':    ('v_read',    'v_write',    n_v),
+        'know': ('know_read', 'know_write', n_know),
+    }
+
+    subspace_ks = [50, 100, 200]
+    results = {}
+    rank_compare = {}
+
+    for pool_name, (r_key, w_key, n_pool) in pools.items():
+        print(f"\n  Pool: {pool_name} (N={n_pool}, d={d_model})")
+        R = np.array(jax.device_get(pool_p[r_key]))   # [N, d]
+        W = np.array(jax.device_get(pool_p[w_key]))   # [N, d]
+        R_n = R / (np.linalg.norm(R, axis=-1, keepdims=True) + 1e-8)
+        W_n = W / (np.linalg.norm(W, axis=-1, keepdims=True) + 1e-8)
+
+        # SVD (subsample if too large) — shared subsample index for R and W
+        print(f"    Computing SVD...")
+        rng = np.random.RandomState(42)
+        if n_pool > 5000:
+            idx = rng.choice(n_pool, 5000, replace=False)
+            R_sub = R_n[idx]
+            W_sub = W_n[idx]
+        else:
+            R_sub = R_n
+            W_sub = W_n
+
+        U_r, S_r, _ = np.linalg.svd(R_sub, full_matrices=False)
+        U_w, S_w, _ = np.linalg.svd(W_sub, full_matrices=False)
+
+        S2_r = S_r ** 2
+        S2r_norm = S2_r / (S2_r.sum() + 1e-12)
+        eff_rank_r = float(np.exp(-np.sum(S2r_norm * np.log(S2r_norm + 1e-12))))
+
+        S2_w = S_w ** 2
+        S2w_norm = S2_w / (S2_w.sum() + 1e-12)
+        eff_rank_w = float(np.exp(-np.sum(S2w_norm * np.log(S2w_norm + 1e-12))))
+
+        print(f"    read  SVD effective rank: {eff_rank_r:.1f} / {min(n_pool, d_model)}")
+        print(f"    write SVD effective rank: {eff_rank_w:.1f} / {min(n_pool, d_model)}")
+
+        # Pairwise cosine similarity (read)
+        print(f"    Computing pairwise cos sim (read)...")
+        chunk = 1000
+        cos_vals = []
+        for i in range(0, len(R_sub), chunk):
+            sim_chunk = R_sub[i:i+chunk] @ R_sub.T
+            for ci in range(sim_chunk.shape[0]):
+                global_i = i + ci
+                row = sim_chunk[ci]
+                row[global_i] = np.nan
+                cos_vals.append(row[~np.isnan(row)])
+
+        cos_flat = np.concatenate(cos_vals)
+        cos_hist, cos_edges = np.histogram(cos_flat, bins=100, range=(-1.0, 1.0))
+
+        # Covering radius (read)
+        print(f"    Computing covering radius (read)...")
+        n_probes = 10000
+        probes = rng.randn(n_probes, d_model).astype(np.float32)
+        probes /= (np.linalg.norm(probes, axis=-1, keepdims=True) + 1e-8)
+
+        max_cos_per_probe = np.zeros(n_probes, dtype=np.float32)
+        for i in range(0, n_probes, chunk):
+            sim = probes[i:i+chunk] @ R_sub.T
+            max_cos_per_probe[i:i+chunk] = sim.max(axis=-1)
+
+        cover_hist, cover_edges = np.histogram(max_cos_per_probe, bins=50, range=(0.0, 1.0))
+
+        # Read-Write subspace overlap (principal angles) at k in {50,100,200}
+        print(f"    Computing read-write subspace overlap...")
+        max_k = min(U_r.shape[1], U_w.shape[1])
+        subspace = {}
+        for k in subspace_ks:
+            kk = min(k, max_k)
+            Ur_k = U_r[:, :kk]
+            Uw_k = U_w[:, :kk]
+            # principal angles: singular values of Ur_k^T @ Uw_k  ∈ [0,1]
+            M = Ur_k.T @ Uw_k
+            sv = np.linalg.svd(M, compute_uv=False)
+            sv = np.clip(sv, 0.0, 1.0)
+            angles_rad = np.arccos(sv)
+            subspace[f'k={kk}'] = {
+                'k': int(kk),
+                'singular_values': sv.tolist(),
+                'sv_mean': float(sv.mean()),
+                'sv_min': float(sv.min()),
+                'sv_max': float(sv.max()),
+                'principal_angles_deg_mean': float(np.degrees(angles_rad.mean())),
+                'principal_angles_deg_min': float(np.degrees(angles_rad.min())),
+                'principal_angles_deg_max': float(np.degrees(angles_rad.max())),
+                'overlap_frobenius': float(np.sqrt((sv ** 2).sum())),
+                'overlap_frac': float((sv ** 2).sum() / kk),
+            }
+            print(f"      k={kk:3d}: sv_mean={sv.mean():.4f}, "
+                  f"overlap_frac={(sv ** 2).sum() / kk:.4f}, "
+                  f"principal_angle_mean={np.degrees(angles_rad.mean()):.1f}deg")
+
+        pool_result = {
+            'n_pool': n_pool,
+            'svd_eff_rank': eff_rank_r,
+            'svd_top10': S_r[:10].tolist(),
+            'write_svd_eff_rank': eff_rank_w,
+            'write_svd_top10': S_w[:10].tolist(),
+            'pairwise_cos': {
+                'mean': float(cos_flat.mean()),
+                'std': float(cos_flat.std()),
+                'p5': float(np.percentile(cos_flat, 5)),
+                'p95': float(np.percentile(cos_flat, 95)),
+                'histogram': cos_hist.tolist(),
+                'edges': cos_edges.tolist(),
+            },
+            'covering': {
+                'mean_max_cos': float(max_cos_per_probe.mean()),
+                'min_max_cos': float(max_cos_per_probe.min()),
+                'p5_max_cos': float(np.percentile(max_cos_per_probe, 5)),
+                'histogram': cover_hist.tolist(),
+                'edges': cover_edges.tolist(),
+            },
+            'rw_subspace_overlap': subspace,
+        }
+        results[pool_name] = pool_result
+        rank_compare[pool_name] = {
+            'read_eff_rank': eff_rank_r,
+            'write_eff_rank': eff_rank_w,
+            'ratio_r_over_w': eff_rank_r / (eff_rank_w + 1e-12),
+            'diff_r_minus_w': eff_rank_r - eff_rank_w,
+            'd_model': d_model,
+            'max_rank': min(n_pool, d_model),
+        }
+        print(f"    pairwise cos mean={pool_result['pairwise_cos']['mean']:.4f}, "
+              f"covering mean_max_cos={pool_result['covering']['mean_max_cos']:.4f}")
+
+    results['_rank_compare'] = rank_compare
+
+    _save_json(results, output_dir, 'read_cov', 'read_coverage.json')
+
+    d_model_val = model_cfg['d_model']
+    rank_parts = [f"{pn}_rank={results[pn]['svd_eff_rank']:.1f}/{d_model_val}" for pn in pools]
+    cover_parts = [f"{pn}={results[pn]['covering']['mean_max_cos']:.2f}" for pn in pools]
+    print(f"\n  Summary: {' '.join(rank_parts)}")
+    print(f"           covering_radius: {' '.join(cover_parts)}")
+
+    print("\n  Read vs Write effective rank:")
+    print(f"    {'pool':<6} {'read':>10} {'write':>10} {'R/W':>8} {'R-W':>10}  max_rank")
+    for pn in pools:
+        rc = rank_compare[pn]
+        print(f"    {pn:<6} {rc['read_eff_rank']:>10.1f} {rc['write_eff_rank']:>10.1f} "
+              f"{rc['ratio_r_over_w']:>8.3f} {rc['diff_r_minus_w']:>+10.1f}  {rc['max_rank']}")
+
+    print("\n  Read-Write subspace overlap (mean σ of U_r^T U_w):")
+    header = "    " + f"{'pool':<6}" + "".join([f" k={k:<5}" for k in subspace_ks])
+    print(header)
+    for pn in pools:
+        row = f"    {pn:<6}"
+        for k in subspace_ks:
+            key = f"k={min(k, min(results[pn]['n_pool'], d_model_val))}"
+            sv_mean = results[pn]['rw_subspace_overlap'][key]['sv_mean']
+            row += f" {sv_mean:>6.3f} "
+        print(row)
+
+    print("\n  Done: read_cov")
+    return results
+
+
+# ============================================================
 # §7.1.2 Selection Gini / Concentration per Pool
 # ============================================================
 
@@ -6444,7 +6631,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,read_cov,rw_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -6479,6 +6666,20 @@ def main():
 
     only = set(args.only.split(',')) if args.only else None
     skip = set(args.skip.split(',')) if args.skip else set()
+
+    # Meta-aliases: expand shorthand into constituent analyses.
+    _only_aliases = {
+        'rw_cov': {'write_cov', 'read_cov'},
+    }
+    if only is not None:
+        for alias, members in _only_aliases.items():
+            if alias in only:
+                only.discard(alias)
+                only.update(members)
+    for alias, members in _only_aliases.items():
+        if alias in skip:
+            skip.discard(alias)
+            skip.update(members)
 
     def _should_run(name):
         """Check if analysis 'name' should run based on --only and --skip."""
@@ -6709,6 +6910,9 @@ def main():
 
     if _should_run('write_cov'):
         analyze_write_coverage(params, cfg, args.output)
+
+    if _should_run('read_cov'):
+        analyze_read_coverage(params, cfg, args.output)
 
     if _should_run('sel_gini'):
         if val_tokens is not None:
