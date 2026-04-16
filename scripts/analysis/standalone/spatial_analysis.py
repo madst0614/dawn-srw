@@ -4648,9 +4648,20 @@ def _compute_per_neuron_contribution(params_jax, model_cfg, input_ids,
 
             N = gate.shape[-1]
             if return_vector:
-                # [B, S, N, d] — 메모리 주의, 작은 샘플에서만 사용
-                contrib_vec = (gate[..., jnp.newaxis] * xr[..., jnp.newaxis]) * w_n[jnp.newaxis, jnp.newaxis, :, :]
-                contrib_norm = jnp.linalg.norm(contrib_vec, axis=-1)
+                # chunked [B, S, chunk, d] → concat. 전체 [B,S,N,d]는 OOM 위험.
+                chunk_v = min(chunk_size, 256)
+                contrib_vec_parts = []
+                contrib_norm_parts = []
+                for c_start in range(0, N, chunk_v):
+                    c_end = min(c_start + chunk_v, N)
+                    g_c = gate[:, :, c_start:c_end]
+                    xr_c = xr[:, :, c_start:c_end]
+                    w_c = w_n[c_start:c_end, :]
+                    cv = (g_c[..., jnp.newaxis] * xr_c[..., jnp.newaxis]) * w_c[jnp.newaxis, jnp.newaxis, :, :]
+                    contrib_vec_parts.append(cv)
+                    contrib_norm_parts.append(jnp.linalg.norm(cv, axis=-1))
+                contrib_vec = jnp.concatenate(contrib_vec_parts, axis=2)
+                contrib_norm = jnp.concatenate(contrib_norm_parts, axis=2)
                 return {'contrib_norm': contrib_norm, 'gate': gate, 'den': den, 'contrib_vec': contrib_vec}
             else:
                 # chunked norm 계산 — [B, S, N] 반환
