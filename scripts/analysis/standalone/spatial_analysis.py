@@ -44,6 +44,7 @@ import jax.numpy as jnp
 import flax.serialization as serialization
 import yaml
 import importlib
+import functools
 
 
 # ============================================================
@@ -4435,6 +4436,2002 @@ def analyze_composition(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §7.2.1 Read-Write Alignment Distribution
+# ============================================================
+
+def analyze_rw_alignment(params, cfg, output_dir):
+    """§7.2.1: cos(r, w) 분포 — pool별 삼봉/연속/단일봉 판정."""
+    print("\n" + "="*60)
+    print("§7.2.1: Read-Write Alignment Distribution")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+
+    pools = {
+        'qk':   ('qk_read',   'qk_write',   n_qk),
+        'v':    ('v_read',     'v_write',     n_v),
+        'know': ('know_read',  'know_write',  n_know),
+    }
+
+    results = {}
+    for pool_name, (r_key, w_key, n_pool) in pools.items():
+        print(f"\n  Pool: {pool_name} (N={n_pool})")
+        r = pool_p[r_key]   # [N, d_model]
+        w = pool_p[w_key]   # [N, d_model]
+
+        # unit normalize
+        r_n = r / (jnp.linalg.norm(r, axis=-1, keepdims=True) + 1e-8)
+        w_n = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
+        cos_rw = jnp.sum(r_n * w_n, axis=-1)  # [N]
+        cos_np = np.array(jax.device_get(cos_rw))
+
+        # 히스토그램
+        hist_counts, hist_edges = np.histogram(cos_np, bins=100, range=(-1.0, 1.0))
+
+        # 통계
+        stats = {
+            'mean': float(np.mean(cos_np)),
+            'std': float(np.std(cos_np)),
+            'min': float(np.min(cos_np)),
+            'max': float(np.max(cos_np)),
+            'median': float(np.median(cos_np)),
+            'p10': float(np.percentile(cos_np, 10)),
+            'p90': float(np.percentile(cos_np, 90)),
+            'frac_neg_05': float((cos_np < -0.5).mean()),
+            'frac_pos_01': float((cos_np > 0.1).mean()),
+            'n_pool': n_pool,
+        }
+
+        # Mode detection (scipy optional)
+        peaks_info = []
+        try:
+            from scipy.signal import find_peaks
+            from scipy.ndimage import gaussian_filter1d
+            density = hist_counts.astype(float)
+            density_smooth = gaussian_filter1d(density, sigma=2.0)
+            peak_idx, peak_props = find_peaks(density_smooth, height=density_smooth.max() * 0.05,
+                                               distance=5)
+            bin_centers = 0.5 * (hist_edges[:-1] + hist_edges[1:])
+            for pi in peak_idx:
+                peaks_info.append({
+                    'cos_value': float(bin_centers[pi]),
+                    'height': float(density_smooth[pi]),
+                })
+            stats['n_modes'] = len(peak_idx)
+            print(f"    Detected {len(peak_idx)} mode(s): {[p['cos_value'] for p in peaks_info]}")
+        except ImportError:
+            stats['n_modes'] = None
+            print("    scipy not available, skipping mode detection")
+
+        stats['peaks'] = peaks_info
+        stats['histogram'] = {
+            'counts': hist_counts.tolist(),
+            'edges': hist_edges.tolist(),
+        }
+
+        results[pool_name] = stats
+
+        # raw cos values를 npy로 저장
+        subdir = 'rw_alignment'
+        save_path = os.path.join(output_dir, subdir)
+        os.makedirs(save_path, exist_ok=True)
+        npy_path = os.path.join(save_path, f'{pool_name}_cos_rw.npy')
+        np.save(npy_path, cos_np)
+        print(f"    Saved: {npy_path}")
+
+        print(f"    mean={stats['mean']:.4f}, std={stats['std']:.4f}, "
+              f"median={stats['median']:.4f}, range=[{stats['min']:.4f}, {stats['max']:.4f}]")
+
+    _save_json(results, output_dir, 'rw_alignment', 'rw_alignment_summary.json')
+
+    # distribution type summary
+    type_parts = []
+    for pn in ['qk', 'v', 'know']:
+        s = results[pn]
+        nm = s.get('n_modes')
+        if nm is not None and nm > 0:
+            peaks_str = ','.join(f"{p['cos_value']:.2f}" for p in s['peaks'])
+            if nm == 1:
+                type_parts.append(f"{pn}=unimodal({peaks_str})")
+            elif nm == 2:
+                type_parts.append(f"{pn}=bimodal({peaks_str})")
+            else:
+                type_parts.append(f"{pn}={nm}-modal({peaks_str})")
+        else:
+            type_parts.append(f"{pn}=unknown")
+    print(f"  Distribution type: {' '.join(type_parts)}")
+
+    print("  Done: rw_alignment")
+    return results
+
+
+# ============================================================
+# 공통 헬퍼: per-neuron contribution 분해
+# ============================================================
+
+def _compute_per_neuron_contribution(params_jax, model_cfg, input_ids,
+                                      pool='know', layer_idx=None,
+                                      return_vector=False, chunk_size=512):
+    """주어진 pool/layer에서 per-neuron contribution 반환 (non-JIT, layer-by-layer forward).
+
+    Returns dict:
+        'contrib_norm': [B, S, N]  — ‖gate_i × (x · r_i) × w_i‖
+        'gate':         [B, S, N]
+        'den':          [B, S]     — sqrt(active_N) + 1.0
+        'contrib_vec':  [B, S, N, d]  (return_vector=True일 때만)
+    """
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+
+    if layer_idx is None:
+        layer_idx = n_layers // 2
+
+    B, S = input_ids.shape
+    positions = jnp.arange(S)[jnp.newaxis, :]
+    emb_matrix = jnp.asarray(params_jax['token_emb']['embedding'])
+    pos_matrix = jnp.asarray(params_jax['pos_emb']['embedding'])
+    x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+
+    # forward to target layer
+    for li in range(layer_idx + 1):
+        bp = block_params_list[li]
+        normed1 = _layer_norm_fn(x, jnp.asarray(bp['norm1']['scale']), jnp.asarray(bp['norm1']['bias']))
+        h_all = normed1 @ jnp.asarray(router_p['proj_attn']['kernel']) + jnp.asarray(router_p['proj_attn']['bias'])
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed1 @ jnp.asarray(router_p['tau_attn']['kernel']) + jnp.asarray(router_p['tau_attn']['bias'])
+
+        Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+        K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+        V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s
+
+        d_head = d_model // n_heads
+        Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+        scale = jnp.sqrt(jnp.float32(d_head))
+        sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+        sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+        aw = jax.nn.softmax(sc, axis=-1)
+        ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+        attn_out = ao @ jnp.asarray(bp['attn']['expand_O']['kernel'])
+        x_after_attn = x + attn_out
+
+        if li == layer_idx and pool in ('qk', 'v'):
+            # attn pool contribution — compute at this layer's attn stage
+            # (simplified: treat entire attn as the pool contribution)
+            pass
+
+        normed2 = _layer_norm_fn(x_after_attn, jnp.asarray(bp['norm2']['scale']), jnp.asarray(bp['norm2']['bias']))
+
+        if li == layer_idx and pool == 'know':
+            # per-neuron contribution at know pool
+            h_k = normed2 @ jnp.asarray(router_p['proj_know']['kernel']) + jnp.asarray(router_p['proj_know']['bias'])
+            tau_k = normed2 @ jnp.asarray(router_p['tau_know']['kernel']) + jnp.asarray(router_p['tau_know']['bias'])
+            scores_k = h_k @ know_emb_n.T
+            sf = scores_k.astype(jnp.float32)
+            s_mean = sf.mean(axis=-1, keepdims=True)
+            s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+            tau = s_mean + tau_k * s_std
+            raw = scores_k - tau.astype(scores_k.dtype)
+            gate = jnp.maximum(raw, 0.0)
+            gate = jnp.clip(gate, 0.0, 10.0)  # [B, S, N]
+            active_N = (gate > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
+            den = jnp.sqrt(active_N.squeeze(-1)) + 1.0  # [B, S]
+
+            r_n = pool_p['know_read'] / (jnp.linalg.norm(pool_p['know_read'], axis=-1, keepdims=True) + 1e-8)
+            w_n = pool_p['know_write'] / (jnp.linalg.norm(pool_p['know_write'], axis=-1, keepdims=True) + 1e-8)
+            xr = normed2 @ r_n.T  # [B, S, N]
+
+            N = gate.shape[-1]
+            if return_vector:
+                # chunked [B, S, chunk, d] → concat. 전체 [B,S,N,d]는 OOM 위험.
+                chunk_v = min(chunk_size, 256)
+                contrib_vec_parts = []
+                contrib_norm_parts = []
+                for c_start in range(0, N, chunk_v):
+                    c_end = min(c_start + chunk_v, N)
+                    g_c = gate[:, :, c_start:c_end]
+                    xr_c = xr[:, :, c_start:c_end]
+                    w_c = w_n[c_start:c_end, :]
+                    cv = (g_c[..., jnp.newaxis] * xr_c[..., jnp.newaxis]) * w_c[jnp.newaxis, jnp.newaxis, :, :]
+                    contrib_vec_parts.append(cv)
+                    contrib_norm_parts.append(jnp.linalg.norm(cv, axis=-1))
+                contrib_vec = jnp.concatenate(contrib_vec_parts, axis=2)
+                contrib_norm = jnp.concatenate(contrib_norm_parts, axis=2)
+                return {'contrib_norm': contrib_norm, 'gate': gate, 'den': den, 'contrib_vec': contrib_vec}
+            else:
+                # chunked norm 계산 — [B, S, N] 반환
+                contrib_norm_parts = []
+                for c_start in range(0, N, chunk_size):
+                    c_end = min(c_start + chunk_size, N)
+                    g_chunk = gate[:, :, c_start:c_end]
+                    xr_chunk = xr[:, :, c_start:c_end]
+                    w_chunk = w_n[c_start:c_end, :]
+                    # [B, S, chunk, d]
+                    contrib_chunk = (g_chunk[..., jnp.newaxis] * xr_chunk[..., jnp.newaxis]) * w_chunk[jnp.newaxis, jnp.newaxis, :, :]
+                    norm_chunk = jnp.linalg.norm(contrib_chunk, axis=-1)  # [B, S, chunk]
+                    contrib_norm_parts.append(norm_chunk)
+                contrib_norm = jnp.concatenate(contrib_norm_parts, axis=-1)
+                return {'contrib_norm': contrib_norm, 'gate': gate, 'den': den}
+
+        # know forward for non-target layers
+        know_out = _srw_inference_fn(normed2, normed2 @ jnp.asarray(router_p['proj_know']['kernel']) + jnp.asarray(router_p['proj_know']['bias']),
+                                     know_emb_n, normed2 @ jnp.asarray(router_p['tau_know']['kernel']) + jnp.asarray(router_p['tau_know']['bias']),
+                                     pool_p['know_read'], pool_p['know_write']) * know_s
+        x = x_after_attn + know_out
+
+    # fallback (should not reach here if layer_idx < n_layers)
+    return {'contrib_norm': jnp.zeros((B, S, 1)), 'gate': jnp.zeros((B, S, 1)), 'den': jnp.ones((B, S))}
+
+
+# ============================================================
+# §8.1+§8.2+§8.3 Residual Dynamics
+# ============================================================
+
+def analyze_residual_dynamics(params, cfg, val_tokens, output_dir,
+                               n_batches=20, batch_size=8):
+    """§8.1 Residual Trajectory + §8.2 Per-Unit Contribution + §8.3 Force Composition."""
+    print("\n" + "="*60)
+    print("§8: Residual Dynamics (Trajectory + Per-Unit + Force)")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_know = model_cfg['n_know']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    forward_fn = _build_forward_extended(params_jax, model_cfg)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}, n_layers={n_layers}")
+
+    stat_keys = ['x_norm', 'dx_norm', 'attn_norm', 'know_norm',
+                 'cos_x_prev', 'cos_attn_x', 'cos_know_x', 'cos_x0', 'eff_rank']
+    layer_stats = [{k: 0.0 for k in stat_keys} for _ in range(n_layers)]
+
+    mid_layer = n_layers // 2
+    know_contrib_acc = np.zeros(n_know, dtype=np.float64)
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+
+        # JIT forward — device_get 1회
+        result = jax.device_get(forward_fn(batch))
+        for li in range(n_layers):
+            for k in stat_keys:
+                layer_stats[li][k] += float(result[k][li])
+
+        # §8.2: per-neuron contribution at mid layer
+        contrib_result = _compute_per_neuron_contribution(params_jax, model_cfg, batch,
+                                                           pool='know', layer_idx=mid_layer)
+        cn = np.array(jax.device_get(contrib_result['contrib_norm'].mean(axis=(0, 1))))
+        know_contrib_acc += cn
+
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # 평균
+    for li in range(n_layers):
+        for k in layer_stats[li]:
+            layer_stats[li][k] /= actual_batches
+
+    know_contrib_mean = know_contrib_acc / actual_batches  # [N]
+
+    # §8.2 Pareto share
+    sorted_contrib = np.sort(know_contrib_mean)[::-1]
+    total = sorted_contrib.sum() + 1e-12
+    top1_idx = max(1, int(0.01 * n_know))
+    top10_idx = max(1, int(0.10 * n_know))
+    pareto = {
+        'know': {
+            'top_1pct_share': float(sorted_contrib[:top1_idx].sum() / total),
+            'top_10pct_share': float(sorted_contrib[:top10_idx].sum() / total),
+        }
+    }
+
+    # 저장
+    _save_json({
+        'per_layer': {f'layer_{li}': layer_stats[li] for li in range(n_layers)},
+        'n_batches': actual_batches,
+        'batch_size': batch_size,
+    }, output_dir, 'residual_dynamics', 'layer_stats.json')
+
+    _save_json(pareto, output_dir, 'residual_dynamics', 'pareto.json')
+
+    # per-neuron contrib npy
+    save_path = os.path.join(output_dir, 'residual_dynamics')
+    os.makedirs(save_path, exist_ok=True)
+    np.save(os.path.join(save_path, 'per_neuron_contrib_know.npy'), know_contrib_mean)
+    print(f"  Saved: {os.path.join(save_path, 'per_neuron_contrib_know.npy')}")
+
+    # --- pretty print ---
+    print("\n  §8.1 Residual Trajectory:")
+    print("  Layer |  x_norm | dx_norm |  cos_x0 | cos_prev | acos_cum | eff_rank")
+    print("  ------+---------+---------+---------+----------+----------+---------")
+    acos_cum = 0.0
+    for li in range(n_layers):
+        s = layer_stats[li]
+        cp = max(-1.0, min(1.0, s['cos_x_prev']))
+        acos_cum += np.arccos(cp)
+        print(f"   L{li:2d}  | {s['x_norm']:7.2f} | {s['dx_norm']:7.3f} | {s['cos_x0']:7.4f} | {s['cos_x_prev']:8.4f} | {acos_cum:8.3f}  | {s['eff_rank']:7.1f}")
+
+    print(f"\n  §8.3 Force Composition:")
+    print("  Layer | attn_norm | know_norm | cos(a,x) | cos(k,x)")
+    print("  ------+-----------+-----------+----------+---------")
+    for li in range(n_layers):
+        s = layer_stats[li]
+        print(f"   L{li:2d}  | {s['attn_norm']:9.4f} | {s['know_norm']:9.4f} | {s['cos_attn_x']:8.4f} | {s['cos_know_x']:8.4f}")
+
+    x0 = layer_stats[0]['x_norm']
+    xL = layer_stats[n_layers-1]['x_norm']
+    ratio = xL / (x0 + 1e-8)
+    c0 = layer_stats[0]['cos_x0']
+    cL = layer_stats[n_layers-1]['cos_x0']
+    third = max(1, n_layers // 3)
+    early_ar = np.mean([layer_stats[li]['attn_norm'] / (layer_stats[li]['know_norm'] + 1e-8) for li in range(third)])
+    mid_ar = np.mean([layer_stats[li]['attn_norm'] / (layer_stats[li]['know_norm'] + 1e-8) for li in range(third, 2*third)])
+    late_ar = np.mean([layer_stats[li]['attn_norm'] / (layer_stats[li]['know_norm'] + 1e-8) for li in range(2*third, n_layers)])
+    print(f"\n  Summary:")
+    print(f"    Norm growth: x_norm L0={x0:.2f} → L{n_layers-1}={xL:.2f} (×{ratio:.1f})")
+    print(f"    cos(x, x0) decay: L0={c0:.4f} → L{n_layers-1}={cL:.4f}")
+    print(f"    attn/know ratio: early={early_ar:.1f}× mid={mid_ar:.1f}× late={late_ar:.1f}×")
+    er0 = layer_stats[0]['eff_rank']
+    erL = layer_stats[n_layers-1]['eff_rank']
+    print(f"    Eff rank: L0={er0:.1f} → L{n_layers-1}={erL:.1f} (d_model={model_cfg['d_model']})")
+
+    top50_idx = max(1, int(0.50 * n_know))
+    top50_share = float(sorted_contrib[:top50_idx].sum() / total)
+    print(f"\n  §8.2 Per-Unit Contribution (know pool, layer {mid_layer}):")
+    print(f"    Top  1%: {pareto['know']['top_1pct_share']:.1%} of total contribution")
+    print(f"    Top 10%: {pareto['know']['top_10pct_share']:.1%} of total contribution")
+    print(f"    Top 50%: {top50_share:.1%} of total contribution")
+    thresholds = [1.0, 0.1, 0.01, 0.001]
+    print(f"    Contribution distribution:")
+    for t in thresholds:
+        frac = float((know_contrib_mean > t).sum() / len(know_contrib_mean))
+        bar = '█' * int(frac * 50)
+        print(f"      >{t:<6g}: {bar} {frac:.1%}")
+
+    print(f"\n  Done: residual_dynamics (top-1% Pareto={pareto['know']['top_1pct_share']:.2%})")
+    return layer_stats
+
+
+# ============================================================
+# §6.3 Phase Dynamics (학습 로그 post-processing)
+# ============================================================
+
+def analyze_phase_dynamics(output_dir, dawn_log=None, baseline_log=None):
+    """§6.3: 학습 로그에서 loss/tau/active_frac 시계열 비교 및 phase 경계 검출."""
+    print("\n" + "="*60)
+    print("§6.3: Phase Dynamics")
+    print("="*60)
+
+    if dawn_log is None:
+        print("  --dawn_log not provided. Skipping phase dynamics.")
+        return None
+
+    def _load_log(path):
+        """JSON-lines 또는 CSV 학습 로그 로드. 각 행: {step, loss, tau_*, active_frac_*}."""
+        records = []
+        with open(path, 'r') as f:
+            first_line = f.readline().strip()
+            f.seek(0)
+            if first_line.startswith('{'):
+                # JSON-lines
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        records.append(json.loads(line))
+            else:
+                # CSV
+                import csv
+                reader = csv.DictReader(f)
+                for row in reader:
+                    rec = {}
+                    for k, v in row.items():
+                        try:
+                            rec[k] = float(v)
+                        except (ValueError, TypeError):
+                            rec[k] = v
+                    records.append(rec)
+        return records
+
+    def _extract_series(records, key):
+        """로그 레코드 리스트에서 step/key 시계열 추출."""
+        steps, vals = [], []
+        for r in records:
+            s = r.get('step', r.get('global_step', None))
+            v = r.get(key, None)
+            if s is not None and v is not None:
+                steps.append(float(s))
+                vals.append(float(v))
+        return np.array(steps), np.array(vals)
+
+    def _moving_avg(arr, window=100):
+        if len(arr) < window:
+            return arr
+        kernel = np.ones(window) / window
+        return np.convolve(arr, kernel, mode='valid')
+
+    print(f"  Loading DAWN log: {dawn_log}")
+    dawn_records = _load_log(dawn_log)
+    print(f"    {len(dawn_records)} records loaded")
+
+    dawn_steps, dawn_loss = _extract_series(dawn_records, 'loss')
+    results = {'dawn': {'n_records': len(dawn_records)}}
+
+    # tau/active_frac per pool
+    for pool in ['qk', 'v', 'know']:
+        for metric in ['tau', 'active_frac']:
+            key = f'{metric}_{pool}'
+            steps, vals = _extract_series(dawn_records, key)
+            if len(vals) > 0:
+                results['dawn'][key] = {
+                    'mean': float(vals.mean()),
+                    'final': float(vals[-1]),
+                    'n_points': len(vals),
+                }
+
+    # loss moving average
+    if len(dawn_loss) > 0:
+        dawn_loss_ma = _moving_avg(dawn_loss)
+        results['dawn']['loss_ma_final'] = float(dawn_loss_ma[-1]) if len(dawn_loss_ma) > 0 else None
+
+    # baseline 비교
+    if baseline_log is not None:
+        print(f"  Loading baseline log: {baseline_log}")
+        base_records = _load_log(baseline_log)
+        print(f"    {len(base_records)} records loaded")
+        base_steps, base_loss = _extract_series(base_records, 'loss')
+        results['baseline'] = {'n_records': len(base_records)}
+
+        # gap 계산 (step 정렬)
+        if len(dawn_loss) > 0 and len(base_loss) > 0:
+            min_len = min(len(dawn_loss), len(base_loss))
+            gap = dawn_loss[:min_len] - base_loss[:min_len]
+            gap_ma = _moving_avg(gap)
+
+            # phase 경계: gap 도함수 부호 변화
+            if len(gap_ma) > 2:
+                d_gap = np.diff(gap_ma)
+                sign_changes = np.where(np.diff(np.sign(d_gap)))[0]
+                # 대응하는 step (window offset 보정)
+                window = 100
+                phase_boundaries = []
+                for idx in sign_changes:
+                    step_idx = idx + window // 2
+                    if step_idx < len(dawn_steps):
+                        phase_boundaries.append({
+                            'step': float(dawn_steps[step_idx]),
+                            'gap_value': float(gap_ma[idx]),
+                        })
+                results['phases'] = phase_boundaries
+                print(f"    Detected {len(phase_boundaries)} phase boundaries")
+            else:
+                results['phases'] = []
+
+            results['gap'] = {
+                'mean': float(gap.mean()),
+                'final': float(gap[-1]),
+                'min': float(gap.min()),
+                'max': float(gap.max()),
+            }
+
+    # timeseries 저장 (step, loss, tau, active_frac)
+    timeseries = {}
+    for key in ['loss', 'tau_qk', 'tau_v', 'tau_know', 'active_frac_qk', 'active_frac_v', 'active_frac_know']:
+        steps, vals = _extract_series(dawn_records, key)
+        if len(vals) > 0:
+            # 서브샘플 (최대 2000 포인트)
+            if len(vals) > 2000:
+                idx = np.linspace(0, len(vals)-1, 2000, dtype=int)
+                steps, vals = steps[idx], vals[idx]
+            timeseries[key] = {'steps': steps.tolist(), 'values': vals.tolist()}
+
+    _save_json(timeseries, output_dir, 'phase_dynamics', 'timeseries.json')
+    _save_json(results, output_dir, 'phase_dynamics', 'phases.json')
+    print("  Done: phase_dynamics")
+    return results
+
+
+# ============================================================
+# §8.4 Drift-Prediction Alignment
+# ============================================================
+
+def analyze_drift_alignment(params, cfg, val_tokens, output_dir,
+                             n_batches=20, batch_size=8):
+    """§8.4: per-layer early-exit logits → target rank & cos(x_L, emb[target])."""
+    print("\n" + "="*60)
+    print("§8.4: Drift-Prediction Alignment")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+    emb_matrix = params_jax['token_emb']['embedding']
+    pos_matrix = params_jax['pos_emb']['embedding']
+    norm_p = params_jax['norm']
+
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s_val = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    stacked_bp = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    @jax.jit
+    def _drift_forward(input_ids):
+        """per-layer early-exit stats via scan. Returns {top1, top5, rank, cos_et} [n_layers]."""
+        B, S = input_ids.shape
+        targets = input_ids[:, 1:]
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+
+        def layer_fn(carry, bp):
+            x = carry
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+            normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            know_out = _srw_inference_fn(normed2,
+                normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias'],
+                know_emb_n,
+                normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias'],
+                pool_p['know_read'], pool_p['know_write']) * know_s
+            x = x + know_out
+            # early-exit
+            x_normed = _layer_norm_fn(x, norm_p['scale'], norm_p['bias'])
+            logits = x_normed @ emb_matrix.T
+            pred_logits = logits[:, :-1, :]
+            top5 = jax.lax.top_k(pred_logits, 5)[1]
+            top1_hit = (top5[:, :, 0] == targets).astype(jnp.float32).mean()
+            top5_hit = (top5 == targets[:, :, jnp.newaxis]).any(axis=-1).astype(jnp.float32).mean()
+            target_logit = jnp.take_along_axis(pred_logits, targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+            rank = (pred_logits > target_logit[:, :, jnp.newaxis]).sum(axis=-1).astype(jnp.float32).mean()
+            target_emb = emb_matrix[targets]
+            x_pred = x_normed[:, :-1, :]
+            cos_et = ((x_pred * target_emb).sum(-1) / (
+                jnp.linalg.norm(x_pred, axis=-1) * jnp.linalg.norm(target_emb, axis=-1) + 1e-8)).mean()
+            stats = {'top1': top1_hit, 'top5': top5_hit, 'rank': rank, 'cos_et': cos_et}
+            return x, stats
+
+        _, all_stats = jax.lax.scan(layer_fn, x, stacked_bp)
+        return all_stats
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    layer_acc = [{
+        'cos_emb_target': 0.0, 'early_exit_top1_acc': 0.0,
+        'early_exit_top5_acc': 0.0, 'mean_target_rank': 0.0,
+    } for _ in range(n_layers)]
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        result = jax.device_get(_drift_forward(batch))
+        for li in range(n_layers):
+            layer_acc[li]['early_exit_top1_acc'] += float(result['top1'][li])
+            layer_acc[li]['early_exit_top5_acc'] += float(result['top5'][li])
+            layer_acc[li]['mean_target_rank'] += float(result['rank'][li])
+            layer_acc[li]['cos_emb_target'] += float(result['cos_et'][li])
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # 평균
+    for li in range(n_layers):
+        for k in layer_acc[li]:
+            layer_acc[li][k] /= actual_batches
+
+    results = {
+        'per_layer': {f'layer_{li}': layer_acc[li] for li in range(n_layers)},
+        'n_batches': actual_batches,
+    }
+    _save_json(results, output_dir, 'drift_alignment', 'layer_alignment.json')
+
+    # --- pretty print ---
+    print("\n  §8.4 Drift-Prediction Alignment:")
+    print("  Layer | top1_acc | top5_acc | mean_rank | cos(x,emb)")
+    print("  ------+----------+----------+-----------+-----------")
+    for li in range(n_layers):
+        d = layer_acc[li]
+        print(f"   L{li:2d}  | {d['early_exit_top1_acc']:8.4f} | {d['early_exit_top5_acc']:8.4f} | {d['mean_target_rank']:9.1f} | {d['cos_emb_target']:10.4f}")
+
+    emerge_layer = None
+    for li in range(n_layers):
+        if layer_acc[li]['early_exit_top1_acc'] > 0.10:
+            emerge_layer = li
+            break
+    final = layer_acc[n_layers - 1]
+    c0 = layer_acc[0]['cos_emb_target']
+    cL = final['cos_emb_target']
+    print(f"\n  Summary:")
+    if emerge_layer is not None:
+        print(f"    Prediction emerges at: L{emerge_layer} (top1 > 10%)")
+    else:
+        print(f"    Prediction does not reach 10% top1 at any layer")
+    print(f"    Final accuracy: top1={final['early_exit_top1_acc']:.1%}, top5={final['early_exit_top5_acc']:.1%}")
+    print(f"    cos(x, emb[target]) growth: L0={c0:.4f} → L{n_layers-1}={cL:.4f}")
+
+    print(f"\n  Done: drift_alignment")
+    return results
+
+
+# ============================================================
+# §7.1.1 Gate Confidence/Intensity (Φ/z 분리)
+# ============================================================
+
+def analyze_gate_confidence_intensity(params, cfg, val_tokens, output_dir,
+                                       n_batches=20, batch_size=8):
+    """§7.1.1: per-layer per-pool z/phi/gate 분포 히스토그램."""
+    print("\n" + "="*60)
+    print("§7.1.1: Gate Confidence/Intensity (z/phi/gate)")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    max_seq = model_cfg['max_seq_len']
+
+    z_bins = 50
+    z_range = (-5.0, 5.0)
+    phi_bins = 50
+    phi_range = (0.0, 1.0)
+    gate_bins = 50
+    gate_range = (0.0, 10.0)
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    forward_fn = _build_forward_zpg(params_jax, model_cfg,
+                                     z_bins=z_bins, z_range=z_range,
+                                     phi_bins=phi_bins, phi_range=phi_range,
+                                     gate_bins=gate_bins, gate_range=gate_range)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    pool_names = ['qk_Q', 'qk_K', 'v', 'know']
+    acc = {}
+    for pn in pool_names:
+        acc[pn] = {}
+        for li in range(n_layers):
+            acc[pn][li] = {
+                'z_hist': np.zeros(z_bins, dtype=np.float64),
+                'phi_hist': np.zeros(phi_bins, dtype=np.float64),
+                'gate_hist': np.zeros(gate_bins, dtype=np.float64),
+                'z_mean': 0.0, 'phi_mean': 0.0, 'gate_mean': 0.0,
+                'active_frac': 0.0,
+            }
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        result = jax.device_get(forward_fn(batch))
+
+        for li in range(n_layers):
+            for pn in pool_names:
+                acc[pn][li]['z_hist'] += np.array(result[f'{pn}_z_hist'][li])
+                acc[pn][li]['phi_hist'] += np.array(result[f'{pn}_phi_hist'][li])
+                acc[pn][li]['gate_hist'] += np.array(result[f'{pn}_gate_hist'][li])
+                acc[pn][li]['z_mean'] += float(result[f'{pn}_z_mean'][li])
+                acc[pn][li]['phi_mean'] += float(result[f'{pn}_phi_mean'][li])
+                acc[pn][li]['gate_mean'] += float(result[f'{pn}_gate_mean'][li])
+                acc[pn][li]['active_frac'] += float(result[f'{pn}_active_frac'][li])
+
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    z_edges = np.linspace(z_range[0], z_range[1], z_bins + 1).tolist()
+    phi_edges = np.linspace(phi_range[0], phi_range[1], phi_bins + 1).tolist()
+    gate_edges = np.linspace(gate_range[0], gate_range[1], gate_bins + 1).tolist()
+
+    results = {}
+    for pn in pool_names:
+        results[pn] = {}
+        for li in range(n_layers):
+            d = acc[pn][li]
+            for k in ['z_mean', 'phi_mean', 'gate_mean', 'active_frac']:
+                d[k] /= actual_batches
+            results[pn][f'layer_{li}'] = {
+                'z_mean': d['z_mean'], 'phi_mean': d['phi_mean'],
+                'gate_mean': d['gate_mean'], 'active_frac': d['active_frac'],
+                'z_hist': d['z_hist'].tolist(),
+                'phi_hist': d['phi_hist'].tolist(),
+                'gate_hist': d['gate_hist'].tolist(),
+            }
+
+    results['_hist_edges'] = {'z': z_edges, 'phi': phi_edges, 'gate': gate_edges}
+
+    _save_json(results, output_dir, 'gate_ci', 'gate_ci_results.json')
+
+    # --- pretty print ---
+    print("\n  §7.1.1 Gate Confidence/Intensity:\n")
+    print("  Know pool z/phi/gate per layer:")
+    print("  Layer |  z_mean | phi_mean | gate_mean | active%")
+    print("  ------+---------+----------+-----------+--------")
+    for li in range(n_layers):
+        d = acc['know'][li]
+        print(f"   L{li:2d}  | {d['z_mean']:7.3f} | {d['phi_mean']:8.4f} | {d['gate_mean']:9.4f} | {d['active_frac']:6.1%}")
+
+    for pn in ['qk_Q', 'qk_K', 'v']:
+        z_avg = np.mean([acc[pn][li]['z_mean'] for li in range(n_layers)])
+        phi_avg = np.mean([acc[pn][li]['phi_mean'] for li in range(n_layers)])
+        af_avg = np.mean([acc[pn][li]['active_frac'] for li in range(n_layers)])
+        label = f"{pn} pool".ljust(10)
+        print(f"  {label}(layer-avg): z_mean={z_avg:.3f}, phi={phi_avg:.4f}, active={af_avg:.1%}")
+
+    # know z distribution summary (layer-avg histogram)
+    know_z_avg = np.zeros(z_bins, dtype=np.float64)
+    for li in range(n_layers):
+        know_z_avg += acc['know'][li]['z_hist']
+    know_z_avg /= (know_z_avg.sum() + 1e-12)
+
+    z_edges_np = np.linspace(z_range[0], z_range[1], z_bins + 1)
+    coarse_bounds = [(-5, -3), (-3, -1), (-1, 0), (0, 1), (1, 3), (3, 5)]
+    print(f"\n  Know z distribution (layer-avg):")
+    for lo, hi in coarse_bounds:
+        mask = (z_edges_np[:-1] >= lo) & (z_edges_np[:-1] < hi)
+        frac = float(know_z_avg[mask].sum())
+        bar = '█' * int(frac * 50)
+        print(f"    [{lo:+2d},{hi:+2d}): {bar} {frac:.1%}")
+
+    print("\n  Done: gate_ci")
+    return results
+
+
+# ============================================================
+# §7.2.3 Write Direction Coverage
+# ============================================================
+
+def analyze_write_coverage(params, cfg, output_dir):
+    """§7.2.3: SVD effective rank, pairwise cos sim, covering radius per pool."""
+    print("\n" + "="*60)
+    print("§7.2.3: Write Direction Coverage")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    d_model = model_cfg['d_model']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+
+    pools = {
+        'qk':   ('qk_write', n_qk),
+        'v':    ('v_write',  n_v),
+        'know': ('know_write', n_know),
+    }
+
+    results = {}
+    for pool_name, (w_key, n_pool) in pools.items():
+        print(f"\n  Pool: {pool_name} (N={n_pool}, d={d_model})")
+        W = np.array(jax.device_get(pool_p[w_key]))  # [N, d]
+        W_n = W / (np.linalg.norm(W, axis=-1, keepdims=True) + 1e-8)
+
+        # SVD effective rank
+        print(f"    Computing SVD...")
+        if n_pool <= 5000:
+            _, S_vals, _ = np.linalg.svd(W_n, full_matrices=False)
+        else:
+            # subsample for SVD if too large
+            rng = np.random.RandomState(42)
+            idx = rng.choice(n_pool, 5000, replace=False)
+            _, S_vals, _ = np.linalg.svd(W_n[idx], full_matrices=False)
+
+        S2 = S_vals ** 2
+        S2_norm = S2 / (S2.sum() + 1e-12)
+        eff_rank = float(np.exp(-np.sum(S2_norm * np.log(S2_norm + 1e-12))))
+        print(f"    SVD effective rank: {eff_rank:.1f} / {min(n_pool, d_model)}")
+
+        # Pairwise cosine similarity
+        print(f"    Computing pairwise cos sim...")
+        subsample_size = min(n_pool, 5000)
+        rng = np.random.RandomState(42)
+        if n_pool > subsample_size:
+            idx = rng.choice(n_pool, subsample_size, replace=False)
+            W_sub = W_n[idx]
+        else:
+            W_sub = W_n
+
+        # chunked matmul for memory
+        chunk = 1000
+        cos_vals = []
+        for i in range(0, len(W_sub), chunk):
+            sim_chunk = W_sub[i:i+chunk] @ W_sub.T  # [chunk, subsample_size]
+            # off-diagonal만
+            for ci in range(sim_chunk.shape[0]):
+                global_i = i + ci
+                row = sim_chunk[ci]
+                row[global_i] = np.nan  # 자기 자신 제외
+                cos_vals.append(row[~np.isnan(row)])
+
+        cos_flat = np.concatenate(cos_vals)
+        cos_hist, cos_edges = np.histogram(cos_flat, bins=100, range=(-1.0, 1.0))
+
+        # Covering radius: random unit vectors에 대한 nearest write max cos
+        print(f"    Computing covering radius...")
+        n_probes = 10000
+        probes = rng.randn(n_probes, d_model).astype(np.float32)
+        probes /= (np.linalg.norm(probes, axis=-1, keepdims=True) + 1e-8)
+
+        max_cos_per_probe = np.zeros(n_probes, dtype=np.float32)
+        for i in range(0, n_probes, chunk):
+            sim = probes[i:i+chunk] @ W_sub.T  # [chunk, subsample]
+            max_cos_per_probe[i:i+chunk] = sim.max(axis=-1)
+
+        cover_hist, cover_edges = np.histogram(max_cos_per_probe, bins=50, range=(0.0, 1.0))
+
+        pool_result = {
+            'n_pool': n_pool,
+            'svd_eff_rank': eff_rank,
+            'svd_top10': S_vals[:10].tolist(),
+            'pairwise_cos': {
+                'mean': float(cos_flat.mean()),
+                'std': float(cos_flat.std()),
+                'p5': float(np.percentile(cos_flat, 5)),
+                'p95': float(np.percentile(cos_flat, 95)),
+                'histogram': cos_hist.tolist(),
+                'edges': cos_edges.tolist(),
+            },
+            'covering': {
+                'mean_max_cos': float(max_cos_per_probe.mean()),
+                'min_max_cos': float(max_cos_per_probe.min()),
+                'p5_max_cos': float(np.percentile(max_cos_per_probe, 5)),
+                'histogram': cover_hist.tolist(),
+                'edges': cover_edges.tolist(),
+            },
+        }
+        results[pool_name] = pool_result
+        print(f"    pairwise cos mean={pool_result['pairwise_cos']['mean']:.4f}, "
+              f"covering mean_max_cos={pool_result['covering']['mean_max_cos']:.4f}")
+
+    _save_json(results, output_dir, 'write_cov', 'write_coverage.json')
+
+    d_model_val = model_cfg['d_model']
+    rank_parts = [f"{pn}_rank={results[pn]['svd_eff_rank']:.1f}/{d_model_val}" for pn in pools]
+    cover_parts = [f"{pn}={results[pn]['covering']['mean_max_cos']:.2f}" for pn in pools]
+    print(f"  Summary: {' '.join(rank_parts)}")
+    print(f"           covering_radius: {' '.join(cover_parts)}")
+
+    print("  Done: write_cov")
+    return results
+
+
+# ============================================================
+# §7.1.2 Selection Gini / Concentration per Pool
+# ============================================================
+
+def analyze_selection_gini(params, cfg, val_tokens, output_dir,
+                            n_batches=20, batch_size=8):
+    """§7.1.2: per-layer per-pool Gini coefficient, activation coverage."""
+    print("\n" + "="*60)
+    print("§7.1.2: Selection Gini / Concentration")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    forward_fn = _build_forward_extended(params_jax, model_cfg)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    pool_info = {'qk': n_qk, 'v': n_v, 'know': n_know}
+    freq_acc = {}
+    active_count_acc = {}
+    for pn, n_pool in pool_info.items():
+        freq_acc[pn] = [np.zeros(n_pool, dtype=np.float64) for _ in range(n_layers)]
+        active_count_acc[pn] = [0.0 for _ in range(n_layers)]
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        result = jax.device_get(forward_fn(batch))
+
+        for li in range(n_layers):
+            freq_acc['qk'][li] += result['qk_q_active'][li]
+            freq_acc['v'][li] += result['v_active'][li]
+            freq_acc['know'][li] += result['know_active'][li]
+            active_count_acc['qk'][li] += float(result['qk_q_active_count'][li])
+            active_count_acc['v'][li] += float(result['v_active_count'][li])
+            active_count_acc['know'][li] += float(result['know_active_count'][li])
+
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    def _gini(freq):
+        f = np.sort(freq)
+        n = len(f)
+        if f.sum() < 1e-12:
+            return 1.0
+        cum = np.cumsum(f)
+        return float(1.0 - 2.0 * cum.sum() / (n * f.sum()) + 1.0 / n)
+
+    results = {}
+    for pn, n_pool in pool_info.items():
+        results[pn] = {}
+        for li in range(n_layers):
+            freq = freq_acc[pn][li] / actual_batches  # avg per-neuron activation freq
+            gini = _gini(freq)
+            coverage = float((freq > 0).sum() / n_pool)
+            mean_active = active_count_acc[pn][li] / actual_batches
+            results[pn][f'layer_{li}'] = {
+                'gini': gini,
+                'coverage': coverage,
+                'mean_active_count': mean_active,
+                'active_frac': float(mean_active / n_pool),
+            }
+        # layer 평균 출력
+        ginis = [results[pn][f'layer_{li}']['gini'] for li in range(n_layers)]
+        print(f"  {pn}: Gini mean={np.mean(ginis):.4f}, range=[{min(ginis):.4f}, {max(ginis):.4f}]")
+
+    _save_json(results, output_dir, 'sel_gini', 'per_layer_pool.json')
+
+    print(f"\n  Know pool per-layer:")
+    print(f"  Layer |  Gini | coverage | active_N")
+    print(f"  ------+-------+----------+---------")
+    for li in range(n_layers):
+        d = results['know'][f'layer_{li}']
+        print(f"   L{li:2d}  | {d['gini']:.3f} | {d['coverage']:8.4f} | {d['mean_active_count']:8.0f}")
+
+    print("  Done: sel_gini")
+    return results
+
+
+# ============================================================
+# §7.1.3 Selection Transition (layer-pair Jaccard)
+# ============================================================
+
+def analyze_selection_transition(params, cfg, val_tokens, output_dir,
+                                  n_batches=10, batch_size=4):
+    """§7.1.3: layer L과 L+1 active set Jaccard similarity per pool."""
+    print("\n" + "="*60)
+    print("§7.1.3: Selection Transition (Jaccard)")
+    print("="*60)
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    jit_fwd = jax.jit(lambda ids: analysis_forward(params_jax, model_cfg, ids, mode='full'))
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    pool_names = ['know']
+    jaccard_acc = {pn: np.zeros(n_layers - 1, dtype=np.float64) for pn in pool_names}
+    turnover_acc = {pn: np.zeros(n_layers - 1, dtype=np.float64) for pn in pool_names}
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        _, layer_info = jit_fwd(batch)
+        # gate_Know_raw: [n_layers, B, S, n_know]
+        gate_know_raw = layer_info['gate_Know_raw']
+
+        for li in range(n_layers - 1):
+            know_L = (gate_know_raw[li] > 0).astype(jnp.float32)
+            know_L1 = (gate_know_raw[li + 1] > 0).astype(jnp.float32)
+            inter = (know_L * know_L1).sum(axis=-1)
+            union = jnp.maximum(know_L + know_L1 - know_L * know_L1, 1e-8).sum(axis=-1)
+            jacc = inter / union
+            jacc_mean = float(jax.device_get(jacc.mean()))
+            jaccard_acc['know'][li] += jacc_mean
+            turnover_acc['know'][li] += (1.0 - jacc_mean)
+
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # 평균
+    results = {}
+    for pn in pool_names:
+        jaccard_avg = jaccard_acc[pn] / actual_batches
+        turnover_avg = turnover_acc[pn] / actual_batches
+        results[pn] = {
+            f'pair_{li}_{li+1}': {
+                'jaccard': float(jaccard_avg[li]),
+                'turnover': float(turnover_avg[li]),
+            } for li in range(n_layers - 1)
+        }
+        print(f"  {pn}: Jaccard mean={jaccard_avg.mean():.4f}, turnover mean={turnover_avg.mean():.4f}")
+
+        # per-layer-pair compact display
+        labels = [f"L{li}→{li+1}" for li in range(n_layers - 1)]
+        vals = [f"{jaccard_avg[li]:.3f}" for li in range(n_layers - 1)]
+        print(f"  Know pool Jaccard (L→L+1):")
+        print(f"  {' '.join(f'{l:>7s}' for l in labels)}")
+        print(f"  {' '.join(f'{v:>7s}' for v in vals)}")
+
+    _save_json(results, output_dir, 'sel_trans', 'layer_pair_jaccard.json')
+    print("  Done: sel_trans")
+    return results
+
+
+# ============================================================
+# §7.4.1+§7.4.2 Combinatorial Coverage & Reuse
+# ============================================================
+
+def analyze_combinatorial_coverage(params, cfg, val_tokens, output_dir,
+                                    n_batches=100, batch_size=8):
+    """§7.4.1+7.4.2: active set hash로 unique combination 수, reuse entropy."""
+    print("\n" + "="*60)
+    print("§7.4.1+7.4.2: Combinatorial Coverage & Reuse")
+    print("="*60)
+
+    from collections import Counter
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_know = model_cfg['n_know']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    jit_fwd = jax.jit(lambda ids: analysis_forward(params_jax, model_cfg, ids, mode='full'))
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    rng = np.random.RandomState(42)
+    HASH_MOD = 999983
+    prime_vec_np = rng.randint(1, HASH_MOD, size=n_know).astype(np.int32)
+
+    mid_layer = n_layers // 2
+    combo_counters = {li: Counter() for li in [mid_layer]}
+    size_acc = {li: [] for li in [mid_layer]}
+    total_tokens = 0
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        B, S = batch.shape
+        _, layer_info = jit_fwd(batch)
+
+        gate_mid = layer_info['gate_Know_raw'][mid_layer]
+        active_mask_np = np.array(jax.device_get((gate_mid > 0)))  # [B, S, N] bool
+
+        # host측 hash (JAX int overflow 회피)
+        active_int = active_mask_np.astype(np.int32)
+        hashes_np = (active_int * prime_vec_np[np.newaxis, np.newaxis, :]).sum(axis=-1) % HASH_MOD
+        sizes_np = active_int.sum(axis=-1)
+
+        for h_val in hashes_np.flatten():
+            combo_counters[mid_layer][int(h_val)] += 1
+        size_acc[mid_layer].extend(sizes_np.flatten().tolist())
+        total_tokens += B * S
+
+        if (b + 1) % 10 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # 결과 정리
+    results = {}
+    for li in [mid_layer]:
+        counter = combo_counters[li]
+        n_unique = len(counter)
+        n_total = sum(counter.values())
+
+        # reuse entropy
+        if n_total > 0:
+            probs = np.array(list(counter.values()), dtype=np.float64) / n_total
+            entropy = float(-np.sum(probs * np.log(probs + 1e-12)))
+        else:
+            entropy = 0.0
+
+        # top-1000
+        top_combos = counter.most_common(1000)
+        top_freq = [(cnt / n_total) for _, cnt in top_combos]
+
+        sizes = np.array(size_acc[li])
+        results[f'layer_{li}'] = {
+            'n_unique_combinations': n_unique,
+            'n_total_tokens': n_total,
+            'reuse_entropy': entropy,
+            'max_entropy': float(np.log(n_unique + 1)),
+            'top10_reuse_frac': float(sum(top_freq[:10])),
+            'top100_reuse_frac': float(sum(top_freq[:100])),
+            'active_set_size_mean': float(sizes.mean()),
+            'active_set_size_std': float(sizes.std()),
+            'active_set_size_median': float(np.median(sizes)),
+        }
+        print(f"  Layer {li}: {n_unique} unique combos / {n_total} tokens, "
+              f"entropy={entropy:.2f}, top-10 reuse={results[f'layer_{li}']['top10_reuse_frac']:.4f}")
+
+    _save_json(results, output_dir, 'combo', 'combinatorial_coverage.json')
+    print("  Done: combo")
+    return results
+
+
+# ============================================================
+# §7.4.3 Additivity Test
+# ============================================================
+
+def analyze_additivity(params, cfg, val_tokens, output_dir,
+                        n_tokens=10, n_batches=1):
+    """§7.4.3: leave-one-out additivity test via _compute_per_neuron_contribution."""
+    print("\n" + "="*60)
+    print("§7.4.3: Additivity Test")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_know = model_cfg['n_know']
+    d_model = model_cfg['d_model']
+    n_heads = model_cfg['n_heads']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s_val = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+    r_n = pool_p['know_read'] / (jnp.linalg.norm(pool_p['know_read'], axis=-1, keepdims=True) + 1e-8)
+    w_n = pool_p['know_write'] / (jnp.linalg.norm(pool_p['know_write'], axis=-1, keepdims=True) + 1e-8)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+
+    sample_layers = [0, n_layers // 2, n_layers - 1]
+    sample_layers = [li for li in sample_layers if li < n_layers]
+
+    # single sequence forward로 per-token contrib 추출
+    input_ids = jnp.array(tokens[:1], dtype=jnp.int32)  # [1, S]
+    n_tok = min(n_tokens, max_seq - 2)
+    tok_positions = list(range(max_seq // 4, max_seq // 4 + n_tok))
+
+    results = {'per_layer': {}, 'n_tokens': n_tok, 'n_layers_sampled': len(sample_layers)}
+
+    for li in sample_layers:
+        print(f"  Layer {li}...")
+
+        # forward to target layer (single seq, full S)
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = params_jax['token_emb']['embedding'][input_ids] + params_jax['pos_emb']['embedding'][positions]
+
+        for l in range(li + 1):
+            bp = block_params_list[l]
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale_v = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+            normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            if l < li:
+                know_out = _srw_inference_fn(normed2,
+                    normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias'],
+                    know_emb_n,
+                    normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias'],
+                    pool_p['know_read'], pool_p['know_write']) * know_s
+                x = x + know_out
+
+        # at target layer: get gate + per-token contribution for sampled tokens
+        h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
+        tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
+        scores_k = h_k @ know_emb_n.T
+        sf = scores_k.astype(jnp.float32)
+        s_mean = sf.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_k * s_std
+        raw = scores_k - tau.astype(scores_k.dtype)
+        gate_all = jnp.maximum(raw, 0.0)
+        gate_all = jnp.clip(gate_all, 0.0, 10.0)  # [1, S, N]
+        active_N = (gate_all > 0).sum(axis=-1, keepdims=True).astype(jnp.float32)
+        den_all = jnp.sqrt(active_N.squeeze(-1)) + 1.0  # [1, S]
+        xr_all = normed2 @ r_n.T  # [1, S, N]
+
+        gate_np = np.array(jax.device_get(gate_all[0]))  # [S, N]
+        den_np = np.array(jax.device_get(den_all[0]))     # [S]
+        xr_np = np.array(jax.device_get(xr_all[0]))       # [S, N]
+        w_n_np = np.array(jax.device_get(w_n))             # [N, d]
+
+        cos_raw_list = []
+        cos_norm_list = []
+        residual_frac_list = []
+
+        for ti in tok_positions:
+            g = gate_np[ti]        # [N]
+            active_idx = np.where(g > 0)[0]
+            if len(active_idx) < 2:
+                continue
+
+            top_k = min(20, len(active_idx))
+            top_idx = active_idx[np.argsort(-g[active_idx])[:top_k]]
+
+            d_val = max(den_np[ti], 1.0)
+
+            # per-neuron contrib vectors for active neurons only
+            g_active = g[active_idx]                   # [A]
+            xr_active = xr_np[ti, active_idx]          # [A]
+            w_active = w_n_np[active_idx]               # [A, d]
+            cv_active = (g_active * xr_active)[:, np.newaxis] * w_active  # [A, d]
+
+            full_raw = cv_active.sum(axis=0)  # [d]
+
+            residual_frac_list.append(0.0)  # sum == full by construction
+
+            # top neurons contrib
+            for rank_i, ni in enumerate(top_idx):
+                local_i = np.searchsorted(active_idx, ni)
+                contrib_i = cv_active[local_i]  # [d]
+
+                # raw cos (always 1.0 by construction for leave-one-out diff)
+                cos_raw_list.append(1.0)
+
+                # normalized cos
+                g_i = g[ni]
+                den_without = max(d_val - g_i, 1.0)
+                removed_raw = full_raw - contrib_i
+                norm_full = full_raw / d_val
+                norm_without = removed_raw / den_without
+                norm_diff = norm_full - norm_without
+                contrib_i_norm = contrib_i / d_val
+                nd = np.linalg.norm(norm_diff)
+                cn = np.linalg.norm(contrib_i_norm)
+                if nd > 1e-8 and cn > 1e-8:
+                    cos_n = float(np.dot(norm_diff, contrib_i_norm) / (nd * cn))
+                    cos_norm_list.append(cos_n)
+
+        layer_result = {
+            'cos_raw_mean': float(np.mean(cos_raw_list)) if cos_raw_list else 0.0,
+            'cos_raw_std': float(np.std(cos_raw_list)) if cos_raw_list else 0.0,
+            'cos_norm_mean': float(np.mean(cos_norm_list)) if cos_norm_list else 0.0,
+            'cos_norm_std': float(np.std(cos_norm_list)) if cos_norm_list else 0.0,
+            'residual_frac_mean': float(np.mean(residual_frac_list)) if residual_frac_list else 0.0,
+            'n_samples': len(cos_raw_list),
+        }
+        results['per_layer'][f'layer_{li}'] = layer_result
+        print(f"    cos_raw={layer_result['cos_raw_mean']:.4f}±{layer_result['cos_raw_std']:.4f}, "
+              f"cos_norm={layer_result['cos_norm_mean']:.4f}, n={layer_result['n_samples']}")
+
+    _save_json(results, output_dir, 'addit', 'additivity_results.json')
+
+    all_raw = [results['per_layer'][k]['cos_raw_mean'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    all_raw_s = [results['per_layer'][k]['cos_raw_std'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    all_norm = [results['per_layer'][k]['cos_norm_mean'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    all_norm_s = [results['per_layer'][k]['cos_norm_std'] for k in results['per_layer'] if results['per_layer'][k]['n_samples'] > 0]
+    if all_raw:
+        print(f"  Raw additivity: cos={np.mean(all_raw):.4f}±{np.mean(all_raw_s):.4f} (theoretically 1.0)")
+        print(f"  Normalized:     cos={np.mean(all_norm):.4f}±{np.mean(all_norm_s):.4f} (den shift causes deviation)")
+
+    print("  Done: addit")
+    return results
+
+
+# ============================================================
+# Appendix B.1+B.2 Domain Suppression Extended
+# ============================================================
+
+def analyze_domain_suppression_ext(params, cfg, output_dir,
+                                    suppress_levels=None):
+    """Appendix B.1+B.2: 도메인별 targeted/random suppression + selectivity index."""
+    print("\n" + "="*60)
+    print("Appendix B: Domain Suppression Extended")
+    print("="*60)
+
+    if suppress_levels is None:
+        suppress_levels = [0.01, 0.03, 0.05, 0.10]
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+    _mod = get_model_module()
+    analysis_forward = _mod.analysis_forward
+    build_suppressed_forward = _mod.build_suppressed_forward
+    prefill_fn = _mod.prefill
+
+    model_cfg = get_model_cfg(cfg)
+    n_know = model_cfg['n_know']
+    n_layers = model_cfg['n_layers']
+    mid_layer = n_layers // 2
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    jit_analysis = jax.jit(lambda p, ids: analysis_forward(p, model_cfg, ids))
+
+    # Step 1: domain activation profiles (재사용 패턴)
+    print("  Collecting domain activation profiles...")
+    domain_profiles = {}
+    for domain, prompts in DOMAIN_PROMPTS.items():
+        acc = np.zeros(n_know, dtype=np.float64)
+        n_tokens = 0
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+            _, layer_info = jit_analysis(params_jax, ids_dev)
+            gate = np.array(jax.device_get(layer_info['gate_Know_raw'][mid_layer]))
+            gate_valid = gate[0, :ids.shape[1], :]
+            acc += gate_valid.mean(axis=0)
+            n_tokens += 1
+        domain_profiles[domain] = acc / n_tokens
+
+    # Step 2: domain-specific neurons (contrastive)
+    all_domains = list(DOMAIN_PROMPTS.keys())
+    domain_neurons = {}
+    for domain in all_domains:
+        others_mean = np.mean([domain_profiles[d] for d in all_domains if d != domain], axis=0)
+        specificity = domain_profiles[domain] - others_mean
+        domain_neurons[domain] = np.argsort(-specificity)
+
+    # Step 3: baseline loss per domain
+    @jax.jit
+    def get_loss(params_j, input_ids):
+        logits, _, _, _ = prefill_fn(params_j, model_cfg, input_ids)
+        shift_logits = logits[:, :-1, :]
+        shift_targets = input_ids[:, 1:]
+        log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+        target_lp = jnp.take_along_axis(log_probs, shift_targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+        return -target_lp.mean()
+
+    def _eval_domain_loss(forward_fn, domain):
+        """특정 forward로 domain prompts에 대한 평균 loss."""
+        losses = []
+        for prompt in DOMAIN_PROMPTS[domain]:
+            ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+            ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+            ids_pad[0, :ids.shape[1]] = ids
+            ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+            loss = float(jax.device_get(forward_fn(ids_dev)))
+            losses.append(loss)
+        return float(np.mean(losses))
+
+    # baseline
+    baseline_fn = jax.jit(lambda ids: get_loss(params_jax, ids))
+    baseline_losses = {}
+    for domain in all_domains:
+        baseline_losses[domain] = _eval_domain_loss(baseline_fn, domain)
+    print(f"  Baseline losses: {baseline_losses}")
+
+    # Step 4: targeted suppression per domain
+    results = {'targeted': {}, 'random_baseline': {}, 'selectivity': {}}
+
+    for target_domain in all_domains:
+        print(f"\n  Target domain: {target_domain}")
+        results['targeted'][target_domain] = {}
+
+        for pct in suppress_levels:
+            n_suppress = max(1, int(pct * n_know))
+            suppress_idx = domain_neurons[target_domain][:n_suppress]
+            mask = np.zeros(n_know, dtype=bool)
+            mask[suppress_idx] = True
+
+            sup_forward = jax.jit(build_suppressed_forward(params_jax, model_cfg,
+                                                            {'know': jnp.array(mask)}))
+            sup_fn = lambda ids, sf=sup_forward: get_loss(
+                # rebuild: use suppressed forward's logits
+                params_jax, ids)  # placeholder — 아래에서 직접 forward
+
+            # suppressed forward 평가 (loss 직접 계산)
+            domain_loss_drop = {}
+            for eval_domain in all_domains:
+                sup_losses = []
+                for prompt in DOMAIN_PROMPTS[eval_domain]:
+                    ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+                    ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+                    ids_pad[0, :ids.shape[1]] = ids
+                    ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+                    logits = sup_forward(ids_dev)
+                    # compute loss from logits
+                    shift_logits = logits[:, :-1, :]
+                    shift_targets = ids_dev[:, 1:]
+                    log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+                    target_lp = jnp.take_along_axis(log_probs, shift_targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+                    loss = float(jax.device_get(-target_lp.mean()))
+                    sup_losses.append(loss)
+                sup_loss = float(np.mean(sup_losses))
+                domain_loss_drop[eval_domain] = sup_loss - baseline_losses[eval_domain]
+
+            results['targeted'][target_domain][f'suppress_{pct}'] = {
+                'n_suppress': n_suppress,
+                'loss_drop': domain_loss_drop,
+                'target_drop': domain_loss_drop[target_domain],
+            }
+            print(f"    {pct*100:.0f}% ({n_suppress}): target_drop={domain_loss_drop[target_domain]:.4f}")
+
+    # Step 5: random baseline
+    rng = np.random.RandomState(42)
+    n_random_trials = 3
+    for pct in suppress_levels:
+        n_suppress = max(1, int(pct * n_know))
+        random_drops = {d: [] for d in all_domains}
+
+        for trial in range(n_random_trials):
+            rand_idx = rng.choice(n_know, n_suppress, replace=False)
+            mask = np.zeros(n_know, dtype=bool)
+            mask[rand_idx] = True
+            rand_forward = jax.jit(build_suppressed_forward(params_jax, model_cfg,
+                                                             {'know': jnp.array(mask)}))
+            for eval_domain in all_domains:
+                rand_losses = []
+                for prompt in DOMAIN_PROMPTS[eval_domain]:
+                    ids = tokenizer(prompt, return_tensors='np', add_special_tokens=False)['input_ids']
+                    ids_pad = np.zeros((1, max_seq), dtype=np.int32)
+                    ids_pad[0, :ids.shape[1]] = ids
+                    ids_dev = jnp.array(ids_pad, dtype=jnp.int32)
+                    logits = rand_forward(ids_dev)
+                    shift_logits = logits[:, :-1, :]
+                    shift_targets = ids_dev[:, 1:]
+                    log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+                    target_lp = jnp.take_along_axis(log_probs, shift_targets[:, :, jnp.newaxis], axis=-1).squeeze(-1)
+                    loss = float(jax.device_get(-target_lp.mean()))
+                    rand_losses.append(loss)
+                random_drops[eval_domain].append(float(np.mean(rand_losses)) - baseline_losses[eval_domain])
+
+        results['random_baseline'][f'suppress_{pct}'] = {
+            d: float(np.mean(random_drops[d])) for d in all_domains
+        }
+        print(f"  Random {pct*100:.0f}%: {results['random_baseline'][f'suppress_{pct}']}")
+
+    # Step 6: selectivity index
+    for target_domain in all_domains:
+        results['selectivity'][target_domain] = {}
+        for pct in suppress_levels:
+            td = results['targeted'][target_domain][f'suppress_{pct}']['target_drop']
+            control_drops = [results['targeted'][target_domain][f'suppress_{pct}']['loss_drop'][d]
+                            for d in all_domains if d != target_domain]
+            cd = float(np.mean(control_drops))
+            selectivity = (td - cd) / (abs(td) + 1e-8)
+            results['selectivity'][target_domain][f'suppress_{pct}'] = {
+                'target_drop': td, 'control_drop': cd,
+                'selectivity_index': selectivity,
+            }
+
+    _save_json(results, output_dir, 'dom_supp', 'domain_suppression.json')
+
+    # selectivity index summary (avg across domains)
+    si_parts = []
+    for pct in suppress_levels:
+        sis = [results['selectivity'][d][f'suppress_{pct}']['selectivity_index']
+               for d in all_domains if f'suppress_{pct}' in results['selectivity'].get(d, {})]
+        if sis:
+            si_parts.append(f"{pct:.0%}: SI={np.mean(sis):.2f}")
+    if si_parts:
+        print(f"  Selectivity index (targeted vs random): {' '.join(si_parts)}")
+
+    print("  Done: dom_supp")
+    return results
+
+
+# ============================================================
+# §7.2.2 R-W Angle vs Function (조건부)
+# ============================================================
+
+def analyze_rw_function_correlation(params, cfg, val_tokens, output_dir,
+                                     n_batches=10, batch_size=4):
+    """§7.2.2: cos(r,w) bin별 뉴런 기능 상관관계. Task 1.1 결과 필요."""
+    print("\n" + "="*60)
+    print("§7.2.2: R-W Angle vs Function")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_know = model_cfg['n_know']
+    max_seq = model_cfg['max_seq_len']
+
+    cos_rw_path = os.path.join(output_dir, 'rw_alignment', 'know_cos_rw.npy')
+    if not os.path.exists(cos_rw_path):
+        print(f"  rw_alignment results not found ({cos_rw_path}). Run --only rw_align first.")
+        return None
+
+    cos_rw = np.load(cos_rw_path)
+    print(f"  Loaded cos(r,w) for {len(cos_rw)} know neurons")
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    forward_fn = _build_forward_extended(params_jax, model_cfg)
+
+    n_bins = 10
+    bin_edges = np.linspace(cos_rw.min() - 0.001, cos_rw.max() + 0.001, n_bins + 1)
+    bin_assignments = np.digitize(cos_rw, bin_edges) - 1
+    bin_assignments = np.clip(bin_assignments, 0, n_bins - 1)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    gate_acc = np.zeros((n_layers, n_know), dtype=np.float64)
+    active_acc = np.zeros((n_layers, n_know), dtype=np.float64)
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        result = jax.device_get(forward_fn(batch))
+        gate_acc += result['know_gate_mean']      # [n_layers, n_know]
+        active_acc += result['know_active']        # [n_layers, n_know]
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    gate_avg = gate_acc / actual_batches
+    active_avg = active_acc / actual_batches
+
+    bin_results = []
+    for bi in range(n_bins):
+        idx = np.where(bin_assignments == bi)[0]
+        if len(idx) == 0:
+            bin_results.append(None)
+            continue
+
+        bin_cos = cos_rw[idx]
+        # layer-averaged gate/active for neurons in this bin
+        bin_gate = gate_avg[:, idx].mean(axis=1)  # [n_layers]
+        bin_active = active_avg[:, idx].mean(axis=1)
+
+        # early/mid/late peak 분류
+        peak_layer = int(np.argmax(bin_gate))
+        if peak_layer < n_layers // 3:
+            peak_phase = 'early'
+        elif peak_layer < 2 * n_layers // 3:
+            peak_phase = 'mid'
+        else:
+            peak_phase = 'late'
+
+        bin_results.append({
+            'bin_range': [float(bin_edges[bi]), float(bin_edges[bi+1])],
+            'n_neurons': len(idx),
+            'cos_rw_mean': float(bin_cos.mean()),
+            'cos_rw_std': float(bin_cos.std()),
+            'gate_mean_per_layer': bin_gate.tolist(),
+            'active_frac_per_layer': bin_active.tolist(),
+            'peak_layer': peak_layer,
+            'peak_phase': peak_phase,
+            'overall_gate_mean': float(gate_avg[:, idx].mean()),
+            'overall_active_frac': float(active_avg[:, idx].mean()),
+        })
+
+    # 전체 상관계수
+    overall_gate = gate_avg.mean(axis=0)  # [n_know]
+    overall_active = active_avg.mean(axis=0)
+    corr_gate = float(np.corrcoef(cos_rw, overall_gate)[0, 1]) if n_know > 1 else 0.0
+    corr_active = float(np.corrcoef(cos_rw, overall_active)[0, 1]) if n_know > 1 else 0.0
+
+    results = {
+        'bins': [b for b in bin_results if b is not None],
+        'correlation': {
+            'cos_rw_vs_gate_mean': corr_gate,
+            'cos_rw_vs_active_frac': corr_active,
+        },
+        'n_batches': actual_batches,
+    }
+    _save_json(results, output_dir, 'rw_func', 'bin_vs_metric.json')
+
+    valid_bins = [b for b in bin_results if b is not None]
+    if valid_bins:
+        print(f"\n  cos(r,w) bin | neurons | gate_mean | active% | peak_layer")
+        print(f"  -------------+---------+-----------+---------+-----------")
+        for b in valid_bins:
+            lo, hi = b['bin_range']
+            print(f"  [{lo:+5.2f},{hi:+5.2f}) | {b['n_neurons']:>7d} | {b['overall_gate_mean']:9.4f} | {b['overall_active_frac']:6.1%} | {b['peak_phase']:>5s} (L{b['peak_layer']})")
+
+    print(f"\n  Correlation: cos_rw vs gate={corr_gate:.4f}, vs active_frac={corr_active:.4f}")
+    print("  Done: rw_func")
+    return results
+
+
+# ============================================================
+# z/phi/gate histogram JIT forward (gate_ci 전용)
+# ============================================================
+
+def _build_forward_zpg(params_jax, model_cfg,
+                        z_bins=50, z_range=(-5.0, 5.0),
+                        phi_bins=50, phi_range=(0.0, 1.0),
+                        gate_bins=50, gate_range=(0.0, 10.0)):
+    """z/phi/gate histogram + scalar stats forward 빌더.
+
+    scan 내부에서 histogram reduce — [L,B,S,N] 텐서가 host로 나가지 않음.
+
+    Returns forward_fn(input_ids) -> dict:
+        '<pool>_z_hist':    [n_layers, z_bins]
+        '<pool>_phi_hist':  [n_layers, phi_bins]
+        '<pool>_gate_hist': [n_layers, gate_bins]
+        '<pool>_z_mean':    [n_layers]
+        '<pool>_phi_mean':  [n_layers]
+        '<pool>_gate_mean': [n_layers]
+        '<pool>_active_frac': [n_layers]
+        (pool: qk_Q, qk_K, v, know)
+    """
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_fn = _mod._srw_inference
+
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+    emb_matrix = params_jax['token_emb']['embedding']
+    pos_matrix = params_jax['pos_emb']['embedding']
+
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    stacked_bp = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    @jax.jit
+    def forward_fn(input_ids):
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+
+        def _hist(vals_flat, n_bins, lo, hi):
+            step = (hi - lo) / n_bins
+            idx = jnp.clip(((vals_flat - lo) / step).astype(jnp.int32), 0, n_bins - 1)
+            return jnp.zeros(n_bins, dtype=jnp.float32).at[idx].add(
+                jnp.ones_like(vals_flat, dtype=jnp.float32))
+
+        def _zpg(h, emb_n, tau_off):
+            scores = h @ emb_n.T
+            sf = scores.astype(jnp.float32)
+            s_mean = sf.mean(axis=-1, keepdims=True)
+            s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+            tau = s_mean + tau_off * s_std
+            raw = scores - tau.astype(scores.dtype)
+            z = raw.astype(jnp.float32) / s_std
+            phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
+            gate = jnp.where(z > 0, z * phi, 0.0)
+            return z, phi, gate
+
+        def _pool_stats(z, phi, gate):
+            zf = z.reshape(-1)
+            pf = phi.reshape(-1)
+            gf = gate.reshape(-1)
+            return {
+                'z_hist': _hist(zf, z_bins, z_range[0], z_range[1]),
+                'phi_hist': _hist(pf, phi_bins, phi_range[0], phi_range[1]),
+                'gate_hist': _hist(gf, gate_bins, gate_range[0], gate_range[1]),
+                'z_mean': z.mean(), 'phi_mean': phi.mean(),
+                'gate_mean': gate.mean(),
+                'active_frac': (gate > 0).astype(jnp.float32).mean(),
+            }
+
+        def layer_fn(carry, bp):
+            x = carry
+
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+
+            # attn pool z/phi/gate
+            z_qQ, phi_qQ, g_qQ = _zpg(h_Q, qk_emb_n, tau_all[:, :, 0:1])
+            z_qK, phi_qK, g_qK = _zpg(h_K, qk_emb_n, tau_all[:, :, 1:2])
+            z_v, phi_v, g_v = _zpg(h_V, v_emb_n, tau_all[:, :, 2:3])
+
+            s_qQ = _pool_stats(z_qQ, phi_qQ, g_qQ)
+            s_qK = _pool_stats(z_qK, phi_qK, g_qK)
+            s_v = _pool_stats(z_v, phi_v, g_v)
+
+            # attn forward for residual progression
+            Q = _srw_inference_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1],
+                                  pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            K = _srw_inference_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2],
+                                  pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            V = _srw_inference_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3],
+                                  pool_p['v_read'], pool_p['v_write']) * v_s
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x = x + attn_out
+
+            # know pool z/phi/gate
+            normed2 = _layer_norm_fn(x, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
+            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
+            z_kn, phi_kn, g_kn = _zpg(h_k, know_emb_n, tau_k)
+            s_kn = _pool_stats(z_kn, phi_kn, g_kn)
+
+            # know forward for residual
+            know_out = _srw_inference_fn(normed2, h_k, know_emb_n, tau_k,
+                                         pool_p['know_read'], pool_p['know_write']) * know_s
+            x = x + know_out
+
+            stats = {}
+            for prefix, s in [('qk_Q', s_qQ), ('qk_K', s_qK), ('v', s_v), ('know', s_kn)]:
+                for k, v_val in s.items():
+                    stats[f'{prefix}_{k}'] = v_val
+            return x, stats
+
+        _, all_stats = jax.lax.scan(layer_fn, x, stacked_bp)
+        return all_stats
+
+    return forward_fn
+
+
+# ============================================================
+# 공통 JIT forward 헬퍼 (리팩토링용)
+# ============================================================
+
+def _build_forward_extended(params_jax, model_cfg):
+    """공통 JIT forward 빌더. 반환된 함수는 JIT-compiled.
+
+    Returns a function: forward_fn(input_ids) -> dict with keys:
+      Tier A (항상 반환, scalar per layer):
+        'x_norm':           [n_layers]  — ‖x_L‖ mean(B,S)
+        'dx_norm':          [n_layers]  — ‖x_L - x_{L-1}‖ mean
+        'attn_norm':        [n_layers]  — ‖attn_out‖ mean
+        'know_norm':        [n_layers]  — ‖know_out‖ mean
+        'cos_x_prev':       [n_layers]  — cos(x_L, x_{L-1}) mean
+        'cos_attn_x':       [n_layers]  — cos(attn_out, x_after_attn) mean
+        'cos_know_x':       [n_layers]  — cos(know_out, x_final) mean
+        'cos_x0':           [n_layers]  — cos(x_L_mean, x_0_mean)
+
+      Per-neuron activation (mean over B,S):
+        'qk_q_active':      [n_layers, n_qk]  — (gate_Q > 0) freq
+        'qk_k_active':      [n_layers, n_qk]
+        'v_active':          [n_layers, n_v]
+        'know_active':       [n_layers, n_know]
+
+      Active count (mean over B,S):
+        'qk_q_active_count': [n_layers]
+        'qk_k_active_count': [n_layers]
+        'v_active_count':    [n_layers]
+        'know_active_count': [n_layers]
+
+      Per-neuron gate mean (mean over B,S):
+        'know_gate_mean':    [n_layers, n_know]
+
+      Residual effective rank (covariance eigenvalue entropy):
+        'eff_rank':          [n_layers]
+    """
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_with_gates_fn = _mod._srw_inference_with_gates
+
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+    emb_matrix = params_jax['token_emb']['embedding']
+    pos_matrix = params_jax['pos_emb']['embedding']
+
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    stacked_bp = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    @jax.jit
+    def forward_fn(input_ids):
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+        x0_mean = x.mean(axis=(0, 1))  # [d]
+
+        def layer_fn(carry, bp):
+            x = carry
+            x_pre = x
+
+            # --- Attention ---
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+
+            Q_out, gate_Q_raw, _ = _srw_inference_with_gates_fn(
+                normed1, h_Q, qk_emb_n, tau_all[:, :, 0:1],
+                pool_p['qk_read'], pool_p['qk_write'])
+            K_out, gate_K_raw, _ = _srw_inference_with_gates_fn(
+                normed1, h_K, qk_emb_n, tau_all[:, :, 1:2],
+                pool_p['qk_read'], pool_p['qk_write'])
+            V_out, gate_V_raw, _ = _srw_inference_with_gates_fn(
+                normed1, h_V, v_emb_n, tau_all[:, :, 2:3],
+                pool_p['v_read'], pool_p['v_write'])
+            Q_out = Q_out * qk_s
+            K_out = K_out * qk_s
+            V_out = V_out * v_s
+
+            d_head = d_model // n_heads
+            Qr = Q_out.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K_out.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V_out.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x_after_attn = x + attn_out
+
+            # --- Know ---
+            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
+            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
+            know_out, gate_Know_raw, _ = _srw_inference_with_gates_fn(
+                normed2, h_k, know_emb_n, tau_k,
+                pool_p['know_read'], pool_p['know_write'])
+            know_out = know_out * know_s
+            x_new = x_after_attn + know_out
+
+            # --- Stats (reduce to scalar / [N]) ---
+            x_norm = jnp.linalg.norm(x_new, axis=-1).mean()
+            dx_norm = jnp.linalg.norm(x_new - x_pre, axis=-1).mean()
+            attn_n = jnp.linalg.norm(attn_out, axis=-1).mean()
+            know_n = jnp.linalg.norm(know_out, axis=-1).mean()
+
+            # cos(x_new, x_pre)
+            xf = x_new.reshape(-1, d_model)
+            xpf = x_pre.reshape(-1, d_model)
+            cos_xp = ((xf * xpf).sum(-1) / (jnp.linalg.norm(xf, axis=-1) * jnp.linalg.norm(xpf, axis=-1) + 1e-8)).mean()
+
+            # cos(attn_out, x_after_attn)
+            af = attn_out.reshape(-1, d_model)
+            xaf = x_after_attn.reshape(-1, d_model)
+            cos_ax = ((af * xaf).sum(-1) / (jnp.linalg.norm(af, axis=-1) * jnp.linalg.norm(xaf, axis=-1) + 1e-8)).mean()
+
+            # cos(know_out, x_new)
+            kf = know_out.reshape(-1, d_model)
+            xnf = x_new.reshape(-1, d_model)
+            cos_kx = ((kf * xnf).sum(-1) / (jnp.linalg.norm(kf, axis=-1) * jnp.linalg.norm(xnf, axis=-1) + 1e-8)).mean()
+
+            # cos(x_mean, x0_mean)
+            x_mean = x_new.mean(axis=(0, 1))
+            cos_x0_val = jnp.dot(x_mean, x0_mean) / (jnp.linalg.norm(x_mean) * jnp.linalg.norm(x0_mean) + 1e-8)
+
+            # per-neuron activation stats
+            qk_q_act = (gate_Q_raw > 0).astype(jnp.float32).mean(axis=(0, 1))  # [n_qk]
+            qk_k_act = (gate_K_raw > 0).astype(jnp.float32).mean(axis=(0, 1))
+            v_act = (gate_V_raw > 0).astype(jnp.float32).mean(axis=(0, 1))  # [n_v]
+            know_act = (gate_Know_raw > 0).astype(jnp.float32).mean(axis=(0, 1))  # [n_know]
+            know_gate_m = gate_Know_raw.mean(axis=(0, 1))  # [n_know]
+
+            # active counts
+            qk_q_ac = (gate_Q_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+            qk_k_ac = (gate_K_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+            v_ac = (gate_V_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+            know_ac = (gate_Know_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+
+            # residual effective rank (covariance eigenvalue 기반)
+            x_flat = x_new.reshape(-1, d_model)
+            x_centered = x_flat - x_flat.mean(axis=0, keepdims=True)
+            cov = (x_centered.T @ x_centered) / (x_flat.shape[0] - 1)
+            eigvals = jnp.linalg.eigvalsh(cov)
+            eigvals = jnp.maximum(eigvals, 1e-12)
+            normed_eig = eigvals / eigvals.sum()
+            eff_rank = jnp.exp(-jnp.sum(normed_eig * jnp.log(normed_eig)))
+
+            layer_stats = {
+                'x_norm': x_norm, 'dx_norm': dx_norm,
+                'attn_norm': attn_n, 'know_norm': know_n,
+                'cos_x_prev': cos_xp, 'cos_attn_x': cos_ax,
+                'cos_know_x': cos_kx, 'cos_x0': cos_x0_val,
+                'qk_q_active': qk_q_act, 'qk_k_active': qk_k_act,
+                'v_active': v_act, 'know_active': know_act,
+                'know_gate_mean': know_gate_m,
+                'qk_q_active_count': qk_q_ac, 'qk_k_active_count': qk_k_ac,
+                'v_active_count': v_ac, 'know_active_count': know_ac,
+                'eff_rank': eff_rank,
+            }
+            return x_new, layer_stats
+
+        _, all_stats = jax.lax.scan(layer_fn, x, stacked_bp)
+        return all_stats
+
+    return forward_fn
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -4447,7 +6444,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -4461,6 +6458,14 @@ def main():
                         help="Max sentences for R.2 POS selectivity")
     parser.add_argument("--p6_samples", type=int, default=100,
                         help="Token samples for P6 compositional expressiveness")
+    parser.add_argument("--addit_n_tokens", type=int, default=10,
+                        help="Number of tokens to sample for additivity test")
+    parser.add_argument("--dom_supp_suppress_levels", default="0.01,0.03,0.05,0.10",
+                        help="Comma-separated suppress fractions for domain suppression")
+    parser.add_argument("--dawn_log", default=None,
+                        help="Path to DAWN training log (JSON-lines or CSV)")
+    parser.add_argument("--baseline_log", default=None,
+                        help="Path to baseline training log (JSON-lines or CSV)")
     args = parser.parse_args()
 
     # Initialize dynamic model module
@@ -4499,7 +6504,8 @@ def main():
     val_path = args.val_data or cfg.get('data', {}).get('bin_val')
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
-                     'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene', 'compose']
+                     'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene', 'compose',
+                     'resid_dyn', 'drift', 'gate_ci', 'sel_gini', 'sel_trans', 'combo', 'addit', 'rw_func']
     print(f"  DEBUG: val_path={val_path}, only={only}, check={any(k in (only or set()) for k in _val_analyses)}")
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         print(f"  Loading val tokens from {val_path}...")
@@ -4671,6 +6677,78 @@ def main():
                                n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping compose (no --val_data)")
+
+    if _should_run('rw_align'):
+        analyze_rw_alignment(params, cfg, args.output)
+
+    if _should_run('resid_dyn'):
+        if val_tokens is not None:
+            analyze_residual_dynamics(params, cfg, val_tokens, args.output,
+                                      n_batches=_nb or 20, batch_size=min(_abs, 8))
+        else:
+            print("\n  Skipping resid_dyn (no --val_data)")
+
+    if _should_run('phase'):
+        analyze_phase_dynamics(args.output,
+                               dawn_log=args.dawn_log,
+                               baseline_log=args.baseline_log)
+
+    if _should_run('drift'):
+        if val_tokens is not None:
+            analyze_drift_alignment(params, cfg, val_tokens, args.output,
+                                     n_batches=_nb or 20, batch_size=min(_abs, 8))
+        else:
+            print("\n  Skipping drift (no --val_data)")
+
+    if _should_run('gate_ci'):
+        if val_tokens is not None:
+            analyze_gate_confidence_intensity(params, cfg, val_tokens, args.output,
+                                              n_batches=_nb or 20, batch_size=min(_abs, 8))
+        else:
+            print("\n  Skipping gate_ci (no --val_data)")
+
+    if _should_run('write_cov'):
+        analyze_write_coverage(params, cfg, args.output)
+
+    if _should_run('sel_gini'):
+        if val_tokens is not None:
+            analyze_selection_gini(params, cfg, val_tokens, args.output,
+                                    n_batches=_nb or 20, batch_size=min(_abs, 8))
+        else:
+            print("\n  Skipping sel_gini (no --val_data)")
+
+    if _should_run('sel_trans'):
+        if val_tokens is not None:
+            analyze_selection_transition(params, cfg, val_tokens, args.output,
+                                          n_batches=_nb or 10, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping sel_trans (no --val_data)")
+
+    if _should_run('combo'):
+        if val_tokens is not None:
+            analyze_combinatorial_coverage(params, cfg, val_tokens, args.output,
+                                            n_batches=_nb or 100, batch_size=min(_abs, 8))
+        else:
+            print("\n  Skipping combo (no --val_data)")
+
+    if _should_run('addit'):
+        if val_tokens is not None:
+            analyze_additivity(params, cfg, val_tokens, args.output,
+                                n_tokens=args.addit_n_tokens, n_batches=_nb or 1)
+        else:
+            print("\n  Skipping addit (no --val_data)")
+
+    if _should_run('dom_supp'):
+        sup_levels = [float(x) for x in args.dom_supp_suppress_levels.split(',')]
+        analyze_domain_suppression_ext(params, cfg, args.output,
+                                        suppress_levels=sup_levels)
+
+    if _should_run('rw_func'):
+        if val_tokens is not None:
+            analyze_rw_function_correlation(params, cfg, val_tokens, args.output,
+                                             n_batches=_nb or 10, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping rw_func (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
