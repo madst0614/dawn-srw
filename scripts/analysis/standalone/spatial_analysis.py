@@ -4742,7 +4742,52 @@ def analyze_residual_dynamics(params, cfg, val_tokens, output_dir,
     np.save(os.path.join(save_path, 'per_neuron_contrib_know.npy'), know_contrib_mean)
     print(f"  Saved: {os.path.join(save_path, 'per_neuron_contrib_know.npy')}")
 
-    print(f"  Done: residual_dynamics (top-1% Pareto={pareto['know']['top_1pct_share']:.2%})")
+    # --- pretty print ---
+    print("\n  §8.1 Residual Trajectory:")
+    print("  Layer |  x_norm | dx_norm |  cos_x0 | cos_prev | acos_cum")
+    print("  ------+---------+---------+---------+----------+---------")
+    acos_cum = 0.0
+    for li in range(n_layers):
+        s = layer_stats[li]
+        cp = max(-1.0, min(1.0, s['cos_x_prev']))
+        acos_cum += np.arccos(cp)
+        print(f"   L{li:2d}  | {s['x_norm']:7.2f} | {s['dx_norm']:7.3f} | {s['cos_x0']:7.4f} | {s['cos_x_prev']:8.4f} | {acos_cum:8.3f}")
+
+    print(f"\n  §8.3 Force Composition:")
+    print("  Layer | attn_norm | know_norm | cos(a,x) | cos(k,x)")
+    print("  ------+-----------+-----------+----------+---------")
+    for li in range(n_layers):
+        s = layer_stats[li]
+        print(f"   L{li:2d}  | {s['attn_norm']:9.4f} | {s['know_norm']:9.4f} | {s['cos_attn_x']:8.4f} | {s['cos_know_x']:8.4f}")
+
+    x0 = layer_stats[0]['x_norm']
+    xL = layer_stats[n_layers-1]['x_norm']
+    ratio = xL / (x0 + 1e-8)
+    c0 = layer_stats[0]['cos_x0']
+    cL = layer_stats[n_layers-1]['cos_x0']
+    third = max(1, n_layers // 3)
+    early_ar = np.mean([layer_stats[li]['attn_norm'] / (layer_stats[li]['know_norm'] + 1e-8) for li in range(third)])
+    mid_ar = np.mean([layer_stats[li]['attn_norm'] / (layer_stats[li]['know_norm'] + 1e-8) for li in range(third, 2*third)])
+    late_ar = np.mean([layer_stats[li]['attn_norm'] / (layer_stats[li]['know_norm'] + 1e-8) for li in range(2*third, n_layers)])
+    print(f"\n  Summary:")
+    print(f"    Norm growth: x_norm L0={x0:.2f} → L{n_layers-1}={xL:.2f} (×{ratio:.1f})")
+    print(f"    cos(x, x0) decay: L0={c0:.4f} → L{n_layers-1}={cL:.4f}")
+    print(f"    attn/know ratio: early={early_ar:.1f}× mid={mid_ar:.1f}× late={late_ar:.1f}×")
+
+    top50_idx = max(1, int(0.50 * n_know))
+    top50_share = float(sorted_contrib[:top50_idx].sum() / total)
+    print(f"\n  §8.2 Per-Unit Contribution (know pool, layer {mid_layer}):")
+    print(f"    Top  1%: {pareto['know']['top_1pct_share']:.1%} of total contribution")
+    print(f"    Top 10%: {pareto['know']['top_10pct_share']:.1%} of total contribution")
+    print(f"    Top 50%: {top50_share:.1%} of total contribution")
+    thresholds = [1.0, 0.1, 0.01, 0.001]
+    print(f"    Contribution distribution:")
+    for t in thresholds:
+        frac = float((know_contrib_mean > t).sum() / len(know_contrib_mean))
+        bar = '█' * int(frac * 50)
+        print(f"      >{t:<6g}: {bar} {frac:.1%}")
+
+    print(f"\n  Done: residual_dynamics (top-1% Pareto={pareto['know']['top_1pct_share']:.2%})")
     return layer_stats
 
 
@@ -5008,10 +5053,32 @@ def analyze_drift_alignment(params, cfg, val_tokens, output_dir,
         'n_batches': actual_batches,
     }
     _save_json(results, output_dir, 'drift_alignment', 'layer_alignment.json')
-    print(f"  Done: drift_alignment")
-    for li in [0, n_layers//4, n_layers//2, 3*n_layers//4, n_layers-1]:
+
+    # --- pretty print ---
+    print("\n  §8.4 Drift-Prediction Alignment:")
+    print("  Layer | top1_acc | top5_acc | mean_rank | cos(x,emb)")
+    print("  ------+----------+----------+-----------+-----------")
+    for li in range(n_layers):
         d = layer_acc[li]
-        print(f"    L{li}: top1={d['early_exit_top1_acc']:.4f}, rank={d['mean_target_rank']:.1f}, cos={d['cos_emb_target']:.4f}")
+        print(f"   L{li:2d}  | {d['early_exit_top1_acc']:8.4f} | {d['early_exit_top5_acc']:8.4f} | {d['mean_target_rank']:9.1f} | {d['cos_emb_target']:10.4f}")
+
+    emerge_layer = None
+    for li in range(n_layers):
+        if layer_acc[li]['early_exit_top1_acc'] > 0.10:
+            emerge_layer = li
+            break
+    final = layer_acc[n_layers - 1]
+    c0 = layer_acc[0]['cos_emb_target']
+    cL = final['cos_emb_target']
+    print(f"\n  Summary:")
+    if emerge_layer is not None:
+        print(f"    Prediction emerges at: L{emerge_layer} (top1 > 10%)")
+    else:
+        print(f"    Prediction does not reach 10% top1 at any layer")
+    print(f"    Final accuracy: top1={final['early_exit_top1_acc']:.1%}, top5={final['early_exit_top5_acc']:.1%}")
+    print(f"    cos(x, emb[target]) growth: L0={c0:.4f} → L{n_layers-1}={cL:.4f}")
+
+    print(f"\n  Done: drift_alignment")
     return results
 
 
@@ -5100,7 +5167,39 @@ def analyze_gate_confidence_intensity(params, cfg, val_tokens, output_dir,
     results['_hist_edges'] = {'z': z_edges, 'phi': phi_edges, 'gate': gate_edges}
 
     _save_json(results, output_dir, 'gate_ci', 'gate_ci_results.json')
-    print("  Done: gate_ci")
+
+    # --- pretty print ---
+    print("\n  §7.1.1 Gate Confidence/Intensity:\n")
+    print("  Know pool z/phi/gate per layer:")
+    print("  Layer |  z_mean | phi_mean | gate_mean | active%")
+    print("  ------+---------+----------+-----------+--------")
+    for li in range(n_layers):
+        d = acc['know'][li]
+        print(f"   L{li:2d}  | {d['z_mean']:7.3f} | {d['phi_mean']:8.4f} | {d['gate_mean']:9.4f} | {d['active_frac']:6.1%}")
+
+    for pn in ['qk_Q', 'qk_K', 'v']:
+        z_avg = np.mean([acc[pn][li]['z_mean'] for li in range(n_layers)])
+        phi_avg = np.mean([acc[pn][li]['phi_mean'] for li in range(n_layers)])
+        af_avg = np.mean([acc[pn][li]['active_frac'] for li in range(n_layers)])
+        label = f"{pn} pool".ljust(10)
+        print(f"  {label}(layer-avg): z_mean={z_avg:.3f}, phi={phi_avg:.4f}, active={af_avg:.1%}")
+
+    # know z distribution summary (layer-avg histogram)
+    know_z_avg = np.zeros(z_bins, dtype=np.float64)
+    for li in range(n_layers):
+        know_z_avg += acc['know'][li]['z_hist']
+    know_z_avg /= (know_z_avg.sum() + 1e-12)
+
+    z_edges_np = np.linspace(z_range[0], z_range[1], z_bins + 1)
+    coarse_bounds = [(-5, -3), (-3, -1), (-1, 0), (0, 1), (1, 3), (3, 5)]
+    print(f"\n  Know z distribution (layer-avg):")
+    for lo, hi in coarse_bounds:
+        mask = (z_edges_np[:-1] >= lo) & (z_edges_np[:-1] < hi)
+        frac = float(know_z_avg[mask].sum())
+        bar = '█' * int(frac * 50)
+        print(f"    [{lo:+2d},{hi:+2d}): {bar} {frac:.1%}")
+
+    print("\n  Done: gate_ci")
     return results
 
 
