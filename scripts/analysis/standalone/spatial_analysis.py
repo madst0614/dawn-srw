@@ -5532,8 +5532,9 @@ def analyze_combinatorial_coverage(params, cfg, val_tokens, output_dir,
     print(f"  batches={actual_batches}, batch_size={batch_size}")
 
     rng = np.random.RandomState(42)
-    LARGE_PRIME = 2**61 - 1
-    prime_vec = jnp.array(rng.randint(1, LARGE_PRIME, size=n_know, dtype=np.int64))
+    HASH_MOD = 2**30 - 35
+    prime_vec_np = rng.randint(1, HASH_MOD, size=n_know).astype(np.int32)
+    prime_vec = jnp.array(prime_vec_np)
 
     mid_layer = n_layers // 2
     combo_counters = {li: Counter() for li in [mid_layer]}
@@ -5545,11 +5546,17 @@ def analyze_combinatorial_coverage(params, cfg, val_tokens, output_dir,
         B, S = batch.shape
         _, layer_info = jit_fwd(batch)
 
-        # gate_Know_raw at mid layer: [B, S, n_know]
         gate_mid = layer_info['gate_Know_raw'][mid_layer]
-        active_mask = (gate_mid > 0).astype(jnp.int64)
+        active_mask = (gate_mid > 0).astype(jnp.int32)
 
-        hashes = (active_mask * prime_vec[jnp.newaxis, jnp.newaxis, :]).sum(axis=-1) % LARGE_PRIME
+        # chunked hash to avoid int32 overflow on large N sums
+        chunk = 1000
+        N = active_mask.shape[-1]
+        hash_acc = jnp.zeros(active_mask.shape[:2], dtype=jnp.int32)
+        for ci in range(0, N, chunk):
+            ce = min(ci + chunk, N)
+            hash_acc = (hash_acc + (active_mask[:, :, ci:ce] * prime_vec[ci:ce]).sum(axis=-1)) % HASH_MOD
+        hashes = hash_acc
         active_sizes = active_mask.sum(axis=-1)
 
         hashes_np = np.array(jax.device_get(hashes)).flatten()
