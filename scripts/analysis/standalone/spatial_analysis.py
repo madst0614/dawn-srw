@@ -5122,6 +5122,193 @@ def analyze_drift_alignment(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §7.1.1 Gate Confidence/Intensity (Φ/z 분리)
+# ============================================================
+
+def analyze_gate_confidence_intensity(params, cfg, val_tokens, output_dir,
+                                       n_batches=20, batch_size=8):
+    """§7.1.1: per-layer per-pool z/phi/gate 분포 히스토그램."""
+    print("\n" + "="*60)
+    print("§7.1.1: Gate Confidence/Intensity (z/phi/gate)")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    _srw_fn = _mod._srw_inference
+
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s_val = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    actual_batches = min(n_batches, n_seqs // batch_size)
+    print(f"  batches={actual_batches}, batch_size={batch_size}")
+
+    # 히스토그램 bins
+    z_bins = 50
+    z_range = (-5.0, 5.0)
+    phi_bins = 50
+    phi_range = (0.0, 1.0)
+    gate_bins = 50
+    gate_range = (0.0, 10.0)
+
+    # pool별 emb/read/write 매핑
+    pool_configs = [
+        ('qk_Q', qk_emb_n, pool_p['qk_read'], pool_p['qk_write'], lambda tau_all: tau_all[:,:,0:1], 'proj_attn', 'tau_attn', 0),
+        ('qk_K', qk_emb_n, pool_p['qk_read'], pool_p['qk_write'], lambda tau_all: tau_all[:,:,1:2], 'proj_attn', 'tau_attn', 1),
+        ('v',    v_emb_n,   pool_p['v_read'],  pool_p['v_write'],  lambda tau_all: tau_all[:,:,2:3], 'proj_attn', 'tau_attn', 2),
+    ]
+
+    def _compute_z_phi_gate(normed, h, emb_n, tau_off):
+        """z, phi, gate 계산 (inline threshold)."""
+        scores = h @ emb_n.T
+        sf = scores.astype(jnp.float32)
+        s_mean = sf.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(sf - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_off * s_std
+        raw = scores - tau.astype(scores.dtype)
+        z = raw.astype(jnp.float32) / s_std
+        phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
+        gate = jnp.where(z > 0, z * phi, 0.0)
+        return z, phi, gate
+
+    # 누적기: per layer per pool → hist counts + scalar stats
+    pool_names = ['qk_Q', 'qk_K', 'v', 'know']
+    acc = {}
+    for pn in pool_names:
+        acc[pn] = {}
+        for li in range(n_layers):
+            acc[pn][li] = {
+                'z_hist': np.zeros(z_bins, dtype=np.float64),
+                'phi_hist': np.zeros(phi_bins, dtype=np.float64),
+                'gate_hist': np.zeros(gate_bins, dtype=np.float64),
+                'z_mean': 0.0, 'phi_mean': 0.0, 'gate_mean': 0.0,
+                'active_frac': 0.0,
+            }
+
+    for b in range(actual_batches):
+        batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
+        B, S = batch.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = params_jax['token_emb']['embedding'][batch] + params_jax['pos_emb']['embedding'][positions]
+
+        for li in range(n_layers):
+            bp = block_params_list[li]
+
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+
+            # Attn pools: z/phi/gate
+            for pn, emb_n, rd, wr, tau_fn, _, _, _ in pool_configs:
+                tau_off = tau_fn(tau_all)
+                h_pool = {'qk_Q': h_Q, 'qk_K': h_K, 'v': h_V}[pn]
+                z, phi, gate = _compute_z_phi_gate(normed1, h_pool, emb_n, tau_off)
+
+                z_np = np.array(jax.device_get(z)).flatten()
+                phi_np = np.array(jax.device_get(phi)).flatten()
+                gate_np = np.array(jax.device_get(gate)).flatten()
+
+                acc[pn][li]['z_hist'] += np.histogram(z_np, bins=z_bins, range=z_range)[0]
+                acc[pn][li]['phi_hist'] += np.histogram(phi_np, bins=phi_bins, range=phi_range)[0]
+                acc[pn][li]['gate_hist'] += np.histogram(gate_np, bins=gate_bins, range=gate_range)[0]
+                acc[pn][li]['z_mean'] += float(z_np.mean())
+                acc[pn][li]['phi_mean'] += float(phi_np.mean())
+                acc[pn][li]['gate_mean'] += float(gate_np.mean())
+                acc[pn][li]['active_frac'] += float((gate_np > 0).mean())
+
+            # Attn forward (needed for x progression)
+            Q = _srw_fn(normed1, h_Q, qk_emb_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            K = _srw_fn(normed1, h_K, qk_emb_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
+            V = _srw_fn(normed1, h_V, v_emb_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
+            d_head = d_model // n_heads
+            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
+            scale_v = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x_after_attn = x + attn_out
+
+            # Know pool: z/phi/gate
+            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
+            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
+            z, phi, gate = _compute_z_phi_gate(normed2, h_k, know_emb_n, tau_k)
+
+            z_np = np.array(jax.device_get(z)).flatten()
+            phi_np = np.array(jax.device_get(phi)).flatten()
+            gate_np = np.array(jax.device_get(gate)).flatten()
+
+            acc['know'][li]['z_hist'] += np.histogram(z_np, bins=z_bins, range=z_range)[0]
+            acc['know'][li]['phi_hist'] += np.histogram(phi_np, bins=phi_bins, range=phi_range)[0]
+            acc['know'][li]['gate_hist'] += np.histogram(gate_np, bins=gate_bins, range=gate_range)[0]
+            acc['know'][li]['z_mean'] += float(z_np.mean())
+            acc['know'][li]['phi_mean'] += float(phi_np.mean())
+            acc['know'][li]['gate_mean'] += float(gate_np.mean())
+            acc['know'][li]['active_frac'] += float((gate_np > 0).mean())
+
+            # know forward for x progression
+            know_out = _srw_fn(normed2, h_k, know_emb_n, tau_k,
+                               pool_p['know_read'], pool_p['know_write']) * know_s
+            x = x_after_attn + know_out
+
+        if (b + 1) % 5 == 0:
+            print(f"    batch {b+1}/{actual_batches}")
+
+    # 평균 + 결과 정리
+    z_edges = np.linspace(z_range[0], z_range[1], z_bins + 1).tolist()
+    phi_edges = np.linspace(phi_range[0], phi_range[1], phi_bins + 1).tolist()
+    gate_edges = np.linspace(gate_range[0], gate_range[1], gate_bins + 1).tolist()
+
+    results = {}
+    for pn in pool_names:
+        results[pn] = {}
+        for li in range(n_layers):
+            d = acc[pn][li]
+            for k in ['z_mean', 'phi_mean', 'gate_mean', 'active_frac']:
+                d[k] /= actual_batches
+            results[pn][f'layer_{li}'] = {
+                'z_mean': d['z_mean'], 'phi_mean': d['phi_mean'],
+                'gate_mean': d['gate_mean'], 'active_frac': d['active_frac'],
+                'z_hist': d['z_hist'].tolist(),
+                'phi_hist': d['phi_hist'].tolist(),
+                'gate_hist': d['gate_hist'].tolist(),
+            }
+
+    results['_hist_edges'] = {'z': z_edges, 'phi': phi_edges, 'gate': gate_edges}
+
+    _save_json(results, output_dir, 'gate_ci', 'gate_ci_results.json')
+    print("  Done: gate_ci")
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -5134,7 +5321,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -5191,7 +5378,7 @@ def main():
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
                      'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene', 'compose',
-                     'resid_dyn', 'drift']
+                     'resid_dyn', 'drift', 'gate_ci']
     print(f"  DEBUG: val_path={val_path}, only={only}, check={any(k in (only or set()) for k in _val_analyses)}")
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         print(f"  Loading val tokens from {val_path}...")
@@ -5385,6 +5572,13 @@ def main():
                                      n_batches=_nb or 20, batch_size=min(_abs, 8))
         else:
             print("\n  Skipping drift (no --val_data)")
+
+    if _should_run('gate_ci'):
+        if val_tokens is not None:
+            analyze_gate_confidence_intensity(params, cfg, val_tokens, args.output,
+                                              n_batches=_nb or 20, batch_size=min(_abs, 8))
+        else:
+            print("\n  Skipping gate_ci (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
