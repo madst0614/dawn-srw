@@ -44,6 +44,7 @@ import jax.numpy as jnp
 import flax.serialization as serialization
 import yaml
 import importlib
+import functools
 
 
 # ============================================================
@@ -6345,6 +6346,176 @@ def analyze_rw_function_correlation(params, cfg, val_tokens, output_dir,
     print(f"  Correlation: cos_rw vs gate={corr_gate:.4f}, vs active_frac={corr_active:.4f}")
     print("  Done: rw_func")
     return results
+
+
+# ============================================================
+# 공통 JIT forward 헬퍼 (리팩토링용)
+# ============================================================
+
+def _build_forward_extended(params_jax, model_cfg):
+    """공통 JIT forward 빌더. 반환된 함수는 JIT-compiled.
+
+    Returns a function: forward_fn(input_ids) -> dict with keys:
+      Tier A (항상 반환, scalar per layer):
+        'x_norm':           [n_layers]  — ‖x_L‖ mean(B,S)
+        'dx_norm':          [n_layers]  — ‖x_L - x_{L-1}‖ mean
+        'attn_norm':        [n_layers]  — ‖attn_out‖ mean
+        'know_norm':        [n_layers]  — ‖know_out‖ mean
+        'cos_x_prev':       [n_layers]  — cos(x_L, x_{L-1}) mean
+        'cos_attn_x':       [n_layers]  — cos(attn_out, x_after_attn) mean
+        'cos_know_x':       [n_layers]  — cos(know_out, x_final) mean
+        'cos_x0':           [n_layers]  — cos(x_L_mean, x_0_mean)
+
+      Per-neuron activation (mean over B,S):
+        'qk_q_active':      [n_layers, n_qk]  — (gate_Q > 0) freq
+        'qk_k_active':      [n_layers, n_qk]
+        'v_active':          [n_layers, n_v]
+        'know_active':       [n_layers, n_know]
+
+      Active count (mean over B,S):
+        'qk_q_active_count': [n_layers]
+        'qk_k_active_count': [n_layers]
+        'v_active_count':    [n_layers]
+        'know_active_count': [n_layers]
+
+      Per-neuron gate mean (mean over B,S):
+        'know_gate_mean':    [n_layers, n_know]
+    """
+    _mod = get_model_module()
+    _layer_norm_fn = _mod._layer_norm
+    _srw_inference_with_gates_fn = _mod._srw_inference_with_gates
+
+    n_layers = model_cfg['n_layers']
+    n_heads = model_cfg['n_heads']
+    d_model = model_cfg['d_model']
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+
+    pool_p = params_jax['neuron_pool']
+    router_p = params_jax['router']
+    emb_matrix = params_jax['token_emb']['embedding']
+    pos_matrix = params_jax['pos_emb']['embedding']
+
+    qk_emb_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_emb_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    qk_s = pool_p.get('qk_scale', 1.0)
+    v_s = pool_p.get('v_scale', 1.0)
+    know_s = pool_p.get('know_scale', 1.0)
+
+    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    stacked_bp = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
+
+    @jax.jit
+    def forward_fn(input_ids):
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = emb_matrix[input_ids.astype(jnp.int32)] + pos_matrix[positions]
+        x0_mean = x.mean(axis=(0, 1))  # [d]
+
+        def layer_fn(carry, bp):
+            x = carry
+            x_pre = x
+
+            # --- Attention ---
+            normed1 = _layer_norm_fn(x, bp['norm1']['scale'], bp['norm1']['bias'])
+            h_all = normed1 @ router_p['proj_attn']['kernel'] + router_p['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed1 @ router_p['tau_attn']['kernel'] + router_p['tau_attn']['bias']
+
+            Q_out, gate_Q_raw, _ = _srw_inference_with_gates_fn(
+                normed1, h_Q, qk_emb_n, tau_all[:, :, 0:1],
+                pool_p['qk_read'], pool_p['qk_write'])
+            K_out, gate_K_raw, _ = _srw_inference_with_gates_fn(
+                normed1, h_K, qk_emb_n, tau_all[:, :, 1:2],
+                pool_p['qk_read'], pool_p['qk_write'])
+            V_out, gate_V_raw, _ = _srw_inference_with_gates_fn(
+                normed1, h_V, v_emb_n, tau_all[:, :, 2:3],
+                pool_p['v_read'], pool_p['v_write'])
+            Q_out = Q_out * qk_s
+            K_out = K_out * qk_s
+            V_out = V_out * v_s
+
+            d_head = d_model // n_heads
+            Qr = Q_out.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kr = K_out.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vr = V_out.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = ao @ bp['attn']['expand_O']['kernel']
+            x_after_attn = x + attn_out
+
+            # --- Know ---
+            normed2 = _layer_norm_fn(x_after_attn, bp['norm2']['scale'], bp['norm2']['bias'])
+            h_k = normed2 @ router_p['proj_know']['kernel'] + router_p['proj_know']['bias']
+            tau_k = normed2 @ router_p['tau_know']['kernel'] + router_p['tau_know']['bias']
+            know_out, gate_Know_raw, _ = _srw_inference_with_gates_fn(
+                normed2, h_k, know_emb_n, tau_k,
+                pool_p['know_read'], pool_p['know_write'])
+            know_out = know_out * know_s
+            x_new = x_after_attn + know_out
+
+            # --- Stats (reduce to scalar / [N]) ---
+            x_norm = jnp.linalg.norm(x_new, axis=-1).mean()
+            dx_norm = jnp.linalg.norm(x_new - x_pre, axis=-1).mean()
+            attn_n = jnp.linalg.norm(attn_out, axis=-1).mean()
+            know_n = jnp.linalg.norm(know_out, axis=-1).mean()
+
+            # cos(x_new, x_pre)
+            xf = x_new.reshape(-1, d_model)
+            xpf = x_pre.reshape(-1, d_model)
+            cos_xp = ((xf * xpf).sum(-1) / (jnp.linalg.norm(xf, axis=-1) * jnp.linalg.norm(xpf, axis=-1) + 1e-8)).mean()
+
+            # cos(attn_out, x_after_attn)
+            af = attn_out.reshape(-1, d_model)
+            xaf = x_after_attn.reshape(-1, d_model)
+            cos_ax = ((af * xaf).sum(-1) / (jnp.linalg.norm(af, axis=-1) * jnp.linalg.norm(xaf, axis=-1) + 1e-8)).mean()
+
+            # cos(know_out, x_new)
+            kf = know_out.reshape(-1, d_model)
+            xnf = x_new.reshape(-1, d_model)
+            cos_kx = ((kf * xnf).sum(-1) / (jnp.linalg.norm(kf, axis=-1) * jnp.linalg.norm(xnf, axis=-1) + 1e-8)).mean()
+
+            # cos(x_mean, x0_mean)
+            x_mean = x_new.mean(axis=(0, 1))
+            cos_x0_val = jnp.dot(x_mean, x0_mean) / (jnp.linalg.norm(x_mean) * jnp.linalg.norm(x0_mean) + 1e-8)
+
+            # per-neuron activation stats
+            qk_q_act = (gate_Q_raw > 0).astype(jnp.float32).mean(axis=(0, 1))  # [n_qk]
+            qk_k_act = (gate_K_raw > 0).astype(jnp.float32).mean(axis=(0, 1))
+            v_act = (gate_V_raw > 0).astype(jnp.float32).mean(axis=(0, 1))  # [n_v]
+            know_act = (gate_Know_raw > 0).astype(jnp.float32).mean(axis=(0, 1))  # [n_know]
+            know_gate_m = gate_Know_raw.mean(axis=(0, 1))  # [n_know]
+
+            # active counts
+            qk_q_ac = (gate_Q_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+            qk_k_ac = (gate_K_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+            v_ac = (gate_V_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+            know_ac = (gate_Know_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
+
+            layer_stats = {
+                'x_norm': x_norm, 'dx_norm': dx_norm,
+                'attn_norm': attn_n, 'know_norm': know_n,
+                'cos_x_prev': cos_xp, 'cos_attn_x': cos_ax,
+                'cos_know_x': cos_kx, 'cos_x0': cos_x0_val,
+                'qk_q_active': qk_q_act, 'qk_k_active': qk_k_act,
+                'v_active': v_act, 'know_active': know_act,
+                'know_gate_mean': know_gate_m,
+                'qk_q_active_count': qk_q_ac, 'qk_k_active_count': qk_k_ac,
+                'v_active_count': v_ac, 'know_active_count': know_ac,
+            }
+            return x_new, layer_stats
+
+        _, all_stats = jax.lax.scan(layer_fn, x, stacked_bp)
+        return all_stats
+
+    return forward_fn
 
 
 # ============================================================
