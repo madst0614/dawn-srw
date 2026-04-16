@@ -4670,138 +4670,40 @@ def analyze_residual_dynamics(params, cfg, val_tokens, output_dir,
     print("§8: Residual Dynamics (Trajectory + Per-Unit + Force)")
     print("="*60)
 
-    _mod = get_model_module()
-    _layer_norm_fn = _mod._layer_norm
-    _srw_inference_fn = _mod._srw_inference
-
     model_cfg = get_model_cfg(cfg)
     n_layers = model_cfg['n_layers']
-    n_heads = model_cfg['n_heads']
-    d_model = model_cfg['d_model']
     n_know = model_cfg['n_know']
-    n_qk = model_cfg['n_qk']
-    n_v = model_cfg['n_v']
     max_seq = model_cfg['max_seq_len']
 
     params_jax = jax.tree.map(jnp.asarray, params)
-    pool_p = params_jax['neuron_pool']
-    router_p = params_jax['router']
-
-    know_emb_n = pool_p['know_emb'] / (jnp.linalg.norm(pool_p['know_emb'], axis=-1, keepdims=True) + 1e-8)
-    qk_n = pool_p['qk_emb'] / (jnp.linalg.norm(pool_p['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_n = pool_p['v_emb'] / (jnp.linalg.norm(pool_p['v_emb'], axis=-1, keepdims=True) + 1e-8)
-    qk_s = pool_p.get('qk_scale', 1.0)
-    v_s_val = pool_p.get('v_scale', 1.0)
-    know_s = pool_p.get('know_scale', 1.0)
-
-    block_params_list = [params_jax[f'block_{i}'] for i in range(n_layers)]
+    forward_fn = _build_forward_extended(params_jax, model_cfg)
 
     n_seqs = len(val_tokens) // max_seq
     tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
     actual_batches = min(n_batches, n_seqs // batch_size)
     print(f"  batches={actual_batches}, batch_size={batch_size}, n_layers={n_layers}")
 
-    # 누적기 초기화
-    layer_stats = [{
-        'x_norm': 0.0, 'dx_norm': 0.0, 'attn_norm': 0.0, 'know_norm': 0.0,
-        'cos_x_prev': 0.0, 'cos_attn_x': 0.0, 'cos_know_x': 0.0,
-        'cos_x0': 0.0,
-    } for _ in range(n_layers)]
+    stat_keys = ['x_norm', 'dx_norm', 'attn_norm', 'know_norm',
+                 'cos_x_prev', 'cos_attn_x', 'cos_know_x', 'cos_x0']
+    layer_stats = [{k: 0.0 for k in stat_keys} for _ in range(n_layers)]
 
-    # §8.2: per-neuron contribution (mid layer만, 메모리 절약)
     mid_layer = n_layers // 2
     know_contrib_acc = np.zeros(n_know, dtype=np.float64)
-    n_tokens_total = 0
 
     for b in range(actual_batches):
         batch = jnp.array(tokens[b * batch_size:(b + 1) * batch_size], dtype=jnp.int32)
-        B, S = batch.shape
-        positions = jnp.arange(S)[jnp.newaxis, :]
-        x = params_jax['token_emb']['embedding'][batch] + params_jax['pos_emb']['embedding'][positions]
-        x0_mean = x.mean(axis=(0, 1))
 
+        # JIT forward — device_get 1회
+        result = jax.device_get(forward_fn(batch))
         for li in range(n_layers):
-            bp = block_params_list[li]
-            x_pre = x
-
-            # Attention
-            normed1 = _layer_norm_fn(x, jnp.asarray(bp['norm1']['scale']), jnp.asarray(bp['norm1']['bias']))
-            h_all = normed1 @ jnp.asarray(router_p['proj_attn']['kernel']) + jnp.asarray(router_p['proj_attn']['bias'])
-            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-            tau_all = normed1 @ jnp.asarray(router_p['tau_attn']['kernel']) + jnp.asarray(router_p['tau_attn']['bias'])
-
-            Q = _srw_inference_fn(normed1, h_Q, qk_n, tau_all[:,:,0:1], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            K = _srw_inference_fn(normed1, h_K, qk_n, tau_all[:,:,1:2], pool_p['qk_read'], pool_p['qk_write']) * qk_s
-            V = _srw_inference_fn(normed1, h_V, v_n, tau_all[:,:,2:3], pool_p['v_read'], pool_p['v_write']) * v_s_val
-
-            d_head = d_model // n_heads
-            Qr = Q.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Kr = K.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            Vr = V.reshape(B,S,n_heads,d_head).transpose(0,2,1,3)
-            scale_v = jnp.sqrt(jnp.float32(d_head))
-            sc = jnp.einsum('bhsd,bhtd->bhst', Qr, Kr) / scale_v
-            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
-            aw = jax.nn.softmax(sc, axis=-1)
-            ao = jnp.einsum('bhst,bhtd->bhsd', aw, Vr).transpose(0,2,1,3).reshape(B,S,d_model)
-            attn_out = ao @ jnp.asarray(bp['attn']['expand_O']['kernel'])
-            x_after_attn = x + attn_out
-
-            # Know
-            normed2 = _layer_norm_fn(x_after_attn, jnp.asarray(bp['norm2']['scale']), jnp.asarray(bp['norm2']['bias']))
-            know_out = _srw_inference_fn(normed2,
-                normed2 @ jnp.asarray(router_p['proj_know']['kernel']) + jnp.asarray(router_p['proj_know']['bias']),
-                know_emb_n,
-                normed2 @ jnp.asarray(router_p['tau_know']['kernel']) + jnp.asarray(router_p['tau_know']['bias']),
-                pool_p['know_read'], pool_p['know_write']) * know_s
-            x = x_after_attn + know_out
-
-            # 통계 수집 (device에서 reduce 후 scalar)
-            x_norm = float(jax.device_get(jnp.linalg.norm(x, axis=-1).mean()))
-            dx_norm = float(jax.device_get(jnp.linalg.norm(x - x_pre, axis=-1).mean()))
-            attn_n = float(jax.device_get(jnp.linalg.norm(attn_out, axis=-1).mean()))
-            know_n = float(jax.device_get(jnp.linalg.norm(know_out, axis=-1).mean()))
-
-            # cos(x_{L+1}, x_L)
-            x_flat = x.reshape(-1, d_model)
-            xp_flat = x_pre.reshape(-1, d_model)
-            cos_xp = float(jax.device_get(
-                (x_flat * xp_flat).sum(-1) / (jnp.linalg.norm(x_flat, axis=-1) * jnp.linalg.norm(xp_flat, axis=-1) + 1e-8)
-            ).mean())
-
-            # cos(attn_out, x_after_attn)
-            cos_ax = float(jax.device_get(
-                (attn_out.reshape(-1, d_model) * x_after_attn.reshape(-1, d_model)).sum(-1) /
-                (jnp.linalg.norm(attn_out.reshape(-1, d_model), axis=-1) * jnp.linalg.norm(x_after_attn.reshape(-1, d_model), axis=-1) + 1e-8)
-            ).mean())
-
-            # cos(know_out, x_final)
-            cos_kx = float(jax.device_get(
-                (know_out.reshape(-1, d_model) * x.reshape(-1, d_model)).sum(-1) /
-                (jnp.linalg.norm(know_out.reshape(-1, d_model), axis=-1) * jnp.linalg.norm(x.reshape(-1, d_model), axis=-1) + 1e-8)
-            ).mean())
-
-            # cos(x, x0)
-            x_mean = x.mean(axis=(0, 1))
-            cos_x0 = float(jax.device_get(
-                jnp.dot(x_mean, x0_mean) / (jnp.linalg.norm(x_mean) * jnp.linalg.norm(x0_mean) + 1e-8)
-            ))
-
-            layer_stats[li]['x_norm'] += x_norm
-            layer_stats[li]['dx_norm'] += dx_norm
-            layer_stats[li]['attn_norm'] += attn_n
-            layer_stats[li]['know_norm'] += know_n
-            layer_stats[li]['cos_x_prev'] += cos_xp
-            layer_stats[li]['cos_attn_x'] += cos_ax
-            layer_stats[li]['cos_know_x'] += cos_kx
-            layer_stats[li]['cos_x0'] += cos_x0
+            for k in stat_keys:
+                layer_stats[li][k] += float(result[k][li])
 
         # §8.2: per-neuron contribution at mid layer
         contrib_result = _compute_per_neuron_contribution(params_jax, model_cfg, batch,
                                                            pool='know', layer_idx=mid_layer)
-        cn = np.array(jax.device_get(contrib_result['contrib_norm'].mean(axis=(0, 1))))  # [N]
+        cn = np.array(jax.device_get(contrib_result['contrib_norm'].mean(axis=(0, 1))))
         know_contrib_acc += cn
-        n_tokens_total += B * S
 
         if (b + 1) % 5 == 0:
             print(f"    batch {b+1}/{actual_batches}")
