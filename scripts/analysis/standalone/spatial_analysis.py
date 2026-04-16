@@ -4435,6 +4435,104 @@ def analyze_composition(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §7.2.1 Read-Write Alignment Distribution
+# ============================================================
+
+def analyze_rw_alignment(params, cfg, output_dir):
+    """§7.2.1: cos(r, w) 분포 — pool별 삼봉/연속/단일봉 판정."""
+    print("\n" + "="*60)
+    print("§7.2.1: Read-Write Alignment Distribution")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_qk = model_cfg['n_qk']
+    n_v = model_cfg['n_v']
+    n_know = model_cfg['n_know']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+    pool_p = params_jax['neuron_pool']
+
+    pools = {
+        'qk':   ('qk_read',   'qk_write',   n_qk),
+        'v':    ('v_read',     'v_write',     n_v),
+        'know': ('know_read',  'know_write',  n_know),
+    }
+
+    results = {}
+    for pool_name, (r_key, w_key, n_pool) in pools.items():
+        print(f"\n  Pool: {pool_name} (N={n_pool})")
+        r = pool_p[r_key]   # [N, d_model]
+        w = pool_p[w_key]   # [N, d_model]
+
+        # unit normalize
+        r_n = r / (jnp.linalg.norm(r, axis=-1, keepdims=True) + 1e-8)
+        w_n = w / (jnp.linalg.norm(w, axis=-1, keepdims=True) + 1e-8)
+        cos_rw = jnp.sum(r_n * w_n, axis=-1)  # [N]
+        cos_np = np.array(jax.device_get(cos_rw))
+
+        # 히스토그램
+        hist_counts, hist_edges = np.histogram(cos_np, bins=100, range=(-1.0, 1.0))
+
+        # 통계
+        stats = {
+            'mean': float(np.mean(cos_np)),
+            'std': float(np.std(cos_np)),
+            'min': float(np.min(cos_np)),
+            'max': float(np.max(cos_np)),
+            'median': float(np.median(cos_np)),
+            'p10': float(np.percentile(cos_np, 10)),
+            'p90': float(np.percentile(cos_np, 90)),
+            'frac_neg_05': float((cos_np < -0.5).mean()),
+            'frac_pos_01': float((cos_np > 0.1).mean()),
+            'n_pool': n_pool,
+        }
+
+        # Mode detection (scipy optional)
+        peaks_info = []
+        try:
+            from scipy.signal import find_peaks
+            from scipy.ndimage import gaussian_filter1d
+            density = hist_counts.astype(float)
+            density_smooth = gaussian_filter1d(density, sigma=2.0)
+            peak_idx, peak_props = find_peaks(density_smooth, height=density_smooth.max() * 0.05,
+                                               distance=5)
+            bin_centers = 0.5 * (hist_edges[:-1] + hist_edges[1:])
+            for pi in peak_idx:
+                peaks_info.append({
+                    'cos_value': float(bin_centers[pi]),
+                    'height': float(density_smooth[pi]),
+                })
+            stats['n_modes'] = len(peak_idx)
+            print(f"    Detected {len(peak_idx)} mode(s): {[p['cos_value'] for p in peaks_info]}")
+        except ImportError:
+            stats['n_modes'] = None
+            print("    scipy not available, skipping mode detection")
+
+        stats['peaks'] = peaks_info
+        stats['histogram'] = {
+            'counts': hist_counts.tolist(),
+            'edges': hist_edges.tolist(),
+        }
+
+        results[pool_name] = stats
+
+        # raw cos values를 npy로 저장
+        subdir = 'rw_alignment'
+        save_path = os.path.join(output_dir, subdir)
+        os.makedirs(save_path, exist_ok=True)
+        npy_path = os.path.join(save_path, f'{pool_name}_cos_rw.npy')
+        np.save(npy_path, cos_np)
+        print(f"    Saved: {npy_path}")
+
+        print(f"    mean={stats['mean']:.4f}, std={stats['std']:.4f}, "
+              f"median={stats['median']:.4f}, range=[{stats['min']:.4f}, {stats['max']:.4f}]")
+
+    _save_json(results, output_dir, 'rw_alignment', 'rw_alignment_summary.json')
+    print("  Done: rw_alignment")
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -4447,7 +4545,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -4671,6 +4769,9 @@ def main():
                                n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping compose (no --val_data)")
+
+    if _should_run('rw_align'):
+        analyze_rw_alignment(params, cfg, args.output)
 
     print(f"\nDone. Results in {args.output}/")
 
