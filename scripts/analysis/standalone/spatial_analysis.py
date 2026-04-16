@@ -4702,7 +4702,7 @@ def analyze_residual_dynamics(params, cfg, val_tokens, output_dir,
     print(f"  batches={actual_batches}, batch_size={batch_size}, n_layers={n_layers}")
 
     stat_keys = ['x_norm', 'dx_norm', 'attn_norm', 'know_norm',
-                 'cos_x_prev', 'cos_attn_x', 'cos_know_x', 'cos_x0']
+                 'cos_x_prev', 'cos_attn_x', 'cos_know_x', 'cos_x0', 'eff_rank']
     layer_stats = [{k: 0.0 for k in stat_keys} for _ in range(n_layers)]
 
     mid_layer = n_layers // 2
@@ -4762,14 +4762,14 @@ def analyze_residual_dynamics(params, cfg, val_tokens, output_dir,
 
     # --- pretty print ---
     print("\n  §8.1 Residual Trajectory:")
-    print("  Layer |  x_norm | dx_norm |  cos_x0 | cos_prev | acos_cum")
-    print("  ------+---------+---------+---------+----------+---------")
+    print("  Layer |  x_norm | dx_norm |  cos_x0 | cos_prev | acos_cum | eff_rank")
+    print("  ------+---------+---------+---------+----------+----------+---------")
     acos_cum = 0.0
     for li in range(n_layers):
         s = layer_stats[li]
         cp = max(-1.0, min(1.0, s['cos_x_prev']))
         acos_cum += np.arccos(cp)
-        print(f"   L{li:2d}  | {s['x_norm']:7.2f} | {s['dx_norm']:7.3f} | {s['cos_x0']:7.4f} | {s['cos_x_prev']:8.4f} | {acos_cum:8.3f}")
+        print(f"   L{li:2d}  | {s['x_norm']:7.2f} | {s['dx_norm']:7.3f} | {s['cos_x0']:7.4f} | {s['cos_x_prev']:8.4f} | {acos_cum:8.3f}  | {s['eff_rank']:7.1f}")
 
     print(f"\n  §8.3 Force Composition:")
     print("  Layer | attn_norm | know_norm | cos(a,x) | cos(k,x)")
@@ -4791,6 +4791,9 @@ def analyze_residual_dynamics(params, cfg, val_tokens, output_dir,
     print(f"    Norm growth: x_norm L0={x0:.2f} → L{n_layers-1}={xL:.2f} (×{ratio:.1f})")
     print(f"    cos(x, x0) decay: L0={c0:.4f} → L{n_layers-1}={cL:.4f}")
     print(f"    attn/know ratio: early={early_ar:.1f}× mid={mid_ar:.1f}× late={late_ar:.1f}×")
+    er0 = layer_stats[0]['eff_rank']
+    erL = layer_stats[n_layers-1]['eff_rank']
+    print(f"    Eff rank: L0={er0:.1f} → L{n_layers-1}={erL:.1f} (d_model={model_cfg['d_model']})")
 
     top50_idx = max(1, int(0.50 * n_know))
     top50_share = float(sorted_contrib[:top50_idx].sum() / total)
@@ -6221,6 +6224,9 @@ def _build_forward_extended(params_jax, model_cfg):
 
       Per-neuron gate mean (mean over B,S):
         'know_gate_mean':    [n_layers, n_know]
+
+      Residual effective rank (covariance eigenvalue entropy):
+        'eff_rank':          [n_layers]
     """
     _mod = get_model_module()
     _layer_norm_fn = _mod._layer_norm
@@ -6340,6 +6346,15 @@ def _build_forward_extended(params_jax, model_cfg):
             v_ac = (gate_V_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
             know_ac = (gate_Know_raw > 0).astype(jnp.float32).sum(axis=-1).mean()
 
+            # residual effective rank (covariance eigenvalue 기반)
+            x_flat = x_new.reshape(-1, d_model)
+            x_centered = x_flat - x_flat.mean(axis=0, keepdims=True)
+            cov = (x_centered.T @ x_centered) / (x_flat.shape[0] - 1)
+            eigvals = jnp.linalg.eigvalsh(cov)
+            eigvals = jnp.maximum(eigvals, 1e-12)
+            normed_eig = eigvals / eigvals.sum()
+            eff_rank = jnp.exp(-jnp.sum(normed_eig * jnp.log(normed_eig)))
+
             layer_stats = {
                 'x_norm': x_norm, 'dx_norm': dx_norm,
                 'attn_norm': attn_n, 'know_norm': know_n,
@@ -6350,6 +6365,7 @@ def _build_forward_extended(params_jax, model_cfg):
                 'know_gate_mean': know_gate_m,
                 'qk_q_active_count': qk_q_ac, 'qk_k_active_count': qk_k_ac,
                 'v_active_count': v_ac, 'know_active_count': know_ac,
+                'eff_rank': eff_rank,
             }
             return x_new, layer_stats
 
