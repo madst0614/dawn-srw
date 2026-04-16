@@ -5868,6 +5868,124 @@ def analyze_combinatorial_coverage(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §7.4.3 Additivity Test
+# ============================================================
+
+def analyze_additivity(params, cfg, val_tokens, output_dir,
+                        n_tokens=10, n_batches=1):
+    """§7.4.3: leave-one-out additivity test via _compute_per_neuron_contribution."""
+    print("\n" + "="*60)
+    print("§7.4.3: Additivity Test")
+    print("="*60)
+
+    model_cfg = get_model_cfg(cfg)
+    n_layers = model_cfg['n_layers']
+    n_know = model_cfg['n_know']
+    max_seq = model_cfg['max_seq_len']
+
+    params_jax = jax.tree.map(jnp.asarray, params)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    batch_size = min(2, n_seqs)
+
+    # 샘플링할 layers
+    sample_layers = [0, n_layers // 2, n_layers - 1]
+    sample_layers = [li for li in sample_layers if li < n_layers]
+
+    batch = jnp.array(tokens[:batch_size], dtype=jnp.int32)
+    # 분석할 token positions (seq 중간 부근)
+    n_tok = min(n_tokens, max_seq - 2)
+    tok_positions = list(range(max_seq // 4, max_seq // 4 + n_tok))
+
+    results = {'per_layer': {}, 'n_tokens': n_tok, 'n_layers_sampled': len(sample_layers)}
+
+    for li in sample_layers:
+        print(f"  Layer {li}...")
+
+        # return_vector=True로 전체 contribution 벡터 획득 (소수 토큰만)
+        contrib_result = _compute_per_neuron_contribution(
+            params_jax, model_cfg, batch,
+            pool='know', layer_idx=li, return_vector=True)
+
+        gate = np.array(jax.device_get(contrib_result['gate']))       # [B, S, N]
+        den = np.array(jax.device_get(contrib_result['den']))         # [B, S]
+        contrib_vec = np.array(jax.device_get(contrib_result['contrib_vec']))  # [B, S, N, d]
+
+        cos_raw_list = []
+        cos_norm_list = []
+        residual_frac_list = []
+
+        for ti in tok_positions:
+            for bi in range(batch_size):
+                g = gate[bi, ti, :]  # [N]
+                active_idx = np.where(g > 0)[0]
+                if len(active_idx) < 2:
+                    continue
+
+                # top-20 active neurons by gate magnitude
+                top_k = min(20, len(active_idx))
+                top_idx = active_idx[np.argsort(-g[active_idx])[:top_k]]
+
+                cv = contrib_vec[bi, ti, :, :]  # [N, d]
+                d_val = max(den[bi, ti], 1.0)
+
+                # full output from active neurons
+                full_raw = cv[active_idx].sum(axis=0)  # [d]
+                full_norm = full_raw / d_val
+
+                # sum of individual contributions
+                sum_contrib = cv[top_idx].sum(axis=0)
+
+                # additivity check: sum ≈ full?
+                if np.linalg.norm(full_raw) > 1e-8:
+                    residual_frac = float(np.linalg.norm(full_raw - cv[active_idx].sum(axis=0)) /
+                                          np.linalg.norm(full_raw))
+                else:
+                    residual_frac = 0.0
+                residual_frac_list.append(residual_frac)
+
+                # leave-one-out per top neuron
+                for ni in top_idx:
+                    contrib_i = cv[ni]  # [d]
+                    g_i = g[ni]
+
+                    # raw (pre-norm) cos
+                    removed_raw = full_raw - contrib_i
+                    diff = full_raw - removed_raw  # = contrib_i
+                    if np.linalg.norm(contrib_i) > 1e-8 and np.linalg.norm(diff) > 1e-8:
+                        cos_r = float(np.dot(diff, contrib_i) /
+                                      (np.linalg.norm(diff) * np.linalg.norm(contrib_i) + 1e-8))
+                        cos_raw_list.append(cos_r)
+
+                    # normalized cos
+                    den_without = max(d_val - g_i, 1.0) if d_val > 0 else 1.0
+                    norm_without = removed_raw / den_without
+                    norm_diff = full_norm - norm_without
+                    contrib_i_norm = contrib_i / d_val
+                    if np.linalg.norm(norm_diff) > 1e-8 and np.linalg.norm(contrib_i_norm) > 1e-8:
+                        cos_n = float(np.dot(norm_diff, contrib_i_norm) /
+                                      (np.linalg.norm(norm_diff) * np.linalg.norm(contrib_i_norm) + 1e-8))
+                        cos_norm_list.append(cos_n)
+
+        layer_result = {
+            'cos_raw_mean': float(np.mean(cos_raw_list)) if cos_raw_list else 0.0,
+            'cos_raw_std': float(np.std(cos_raw_list)) if cos_raw_list else 0.0,
+            'cos_norm_mean': float(np.mean(cos_norm_list)) if cos_norm_list else 0.0,
+            'cos_norm_std': float(np.std(cos_norm_list)) if cos_norm_list else 0.0,
+            'residual_frac_mean': float(np.mean(residual_frac_list)) if residual_frac_list else 0.0,
+            'n_samples': len(cos_raw_list),
+        }
+        results['per_layer'][f'layer_{li}'] = layer_result
+        print(f"    cos_raw={layer_result['cos_raw_mean']:.4f}±{layer_result['cos_raw_std']:.4f}, "
+              f"cos_norm={layer_result['cos_norm_mean']:.4f}, n={layer_result['n_samples']}")
+
+    _save_json(results, output_dir, 'addit', 'additivity_results.json')
+    print("  Done: addit")
+    return results
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -5880,7 +5998,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,sel_gini,sel_trans,combo")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,sel_gini,sel_trans,combo,addit")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -5894,6 +6012,8 @@ def main():
                         help="Max sentences for R.2 POS selectivity")
     parser.add_argument("--p6_samples", type=int, default=100,
                         help="Token samples for P6 compositional expressiveness")
+    parser.add_argument("--addit_n_tokens", type=int, default=10,
+                        help="Number of tokens to sample for additivity test")
     parser.add_argument("--dawn_log", default=None,
                         help="Path to DAWN training log (JSON-lines or CSV)")
     parser.add_argument("--baseline_log", default=None,
@@ -5937,7 +6057,7 @@ def main():
     _val_analyses = ['val', 'routing', 'gate_dist', 'utilization',
                      'act_context', 'layer_role', 'gate_mech', 'comp_expr',
                      'neuron_cluster', 'cross_ref', 'deep', 'op_space', 'intervene', 'compose',
-                     'resid_dyn', 'drift', 'gate_ci', 'sel_gini', 'sel_trans', 'combo']
+                     'resid_dyn', 'drift', 'gate_ci', 'sel_gini', 'sel_trans', 'combo', 'addit']
     print(f"  DEBUG: val_path={val_path}, only={only}, check={any(k in (only or set()) for k in _val_analyses)}")
     if val_path and (only is None or any(k in (only or set()) for k in _val_analyses)):
         print(f"  Loading val tokens from {val_path}...")
@@ -6162,6 +6282,13 @@ def main():
                                             n_batches=_nb or 100, batch_size=min(_abs, 8))
         else:
             print("\n  Skipping combo (no --val_data)")
+
+    if _should_run('addit'):
+        if val_tokens is not None:
+            analyze_additivity(params, cfg, val_tokens, args.output,
+                                n_tokens=args.addit_n_tokens, n_batches=_nb or 1)
+        else:
+            print("\n  Skipping addit (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
