@@ -362,9 +362,14 @@ def analyze_validation(params, cfg, val_tokens, output_dir, batch_size=32, max_b
 # ============================================================
 
 def _save_json(data, output_dir, subdir, filename):
-    path = os.path.join(output_dir, subdir)
-    os.makedirs(path, exist_ok=True)
-    filepath = os.path.join(path, filename)
+    if subdir and subdir != '.':
+        path = output_dir.rstrip('/') + '/' + subdir if _is_gcs(output_dir) else os.path.join(output_dir, subdir)
+    else:
+        path = output_dir
+    filepath = path.rstrip('/') + '/' + filename if _is_gcs(path) else os.path.join(path, filename)
+
+    if not _is_gcs(path):
+        os.makedirs(path, exist_ok=True)
 
     def convert(obj):
         if isinstance(obj, (np.integer, jnp.integer)):
@@ -379,7 +384,7 @@ def _save_json(data, output_dir, subdir, filename):
             return np.array(obj).tolist()
         return obj
 
-    with open(filepath, 'w') as f:
+    with _open_file(filepath, 'w') as f:
         json.dump(data, f, indent=2, default=convert)
     print(f"  Saved: {filepath}")
 
@@ -4467,7 +4472,8 @@ def main():
 
     only = set(args.only.split(',')) if args.only else None
     print(f"  ONLY={only}")
-    os.makedirs(args.output, exist_ok=True)
+    if not _is_gcs(args.output):
+        os.makedirs(args.output, exist_ok=True)
 
     # Save checkpoint info
     _save_json(ckpt_info, args.output, '.', 'checkpoint_info.json')
