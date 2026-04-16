@@ -4448,6 +4448,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
                         help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose")
+    parser.add_argument("--skip", default=None,
+                        help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -4471,14 +4473,24 @@ def main():
     params, ckpt_info = load_checkpoint_params(args.checkpoint, model, cfg)
 
     only = set(args.only.split(',')) if args.only else None
-    print(f"  ONLY={only}")
+    skip = set(args.skip.split(',')) if args.skip else set()
+
+    def _should_run(name):
+        """Check if analysis 'name' should run based on --only and --skip."""
+        if name in skip:
+            return False
+        if only is not None:
+            return name in only
+        return True
+
+    print(f"  ONLY={only}, SKIP={skip or 'none'}")
     if not _is_gcs(args.output):
         os.makedirs(args.output, exist_ok=True)
 
     # Save checkpoint info
     _save_json(ckpt_info, args.output, '.', 'checkpoint_info.json')
 
-    if only is None or 'info' in only:
+    if _should_run('info'):
         analyze_model_info(params, cfg, args.output)
 
     print(f"  BEFORE VAL CHECK")
@@ -4498,23 +4510,23 @@ def main():
         elif only:
             print(f"  Val tokens not needed for: {only}")
 
-    if only is None or 'val' in only:
+    if _should_run('val'):
         if val_tokens is not None:
             analyze_validation(params, cfg, val_tokens, args.output,
                              args.batch_size, args.max_batches)
         else:
             print("\n  Skipping validation (no --val_data)")
 
-    if only is None or 'health' in only:
+    if _should_run('health'):
         analyze_neuron_health(params, cfg, args.output)
 
-    if only is None or 'generate' in only:
+    if _should_run('generate'):
         analyze_generation(params, cfg, args.output,
                           prompt=args.prompt,
                           max_new_tokens=args.max_new_tokens,
                           temperature=args.temperature)
 
-    if only is None or 'weights' in only:
+    if _should_run('weights'):
         analyze_weights(params, cfg, args.output)
 
     # Analysis-specific overrides from CLI
@@ -4522,27 +4534,27 @@ def main():
     _bs = args.batch_size
     _abs = min(_bs, 8)  # analysis batch size (capped for memory)
 
-    if only is None or 'routing' in only:
+    if _should_run('routing'):
         if val_tokens is not None:
             analyze_routing(params, cfg, val_tokens, args.output,
                            n_batches=_nb or 50, batch_size=_abs)
         else:
             print("\n  Skipping routing (no --val_data)")
 
-    if only is None or 'samples' in only:
+    if _should_run('samples'):
         analyze_generation_samples(params, cfg, args.output,
                                    max_new_tokens=args.max_new_tokens,
                                    temperature=args.temperature)
 
     # --- D8/D10: Gate distribution and neuron utilization ---
-    if only is None or 'gate_dist' in only:
+    if _should_run('gate_dist'):
         if val_tokens is not None:
             analyze_gate_distribution(params, cfg, val_tokens, args.output,
                                      n_batches=_nb or 20, batch_size=_abs)
         else:
             print("\n  Skipping gate_dist (no --val_data)")
 
-    if only is None or 'utilization' in only:
+    if _should_run('utilization'):
         if val_tokens is not None:
             analyze_neuron_utilization(params, cfg, val_tokens, args.output,
                                       n_batches=_nb or 20, batch_size=_abs)
@@ -4556,18 +4568,18 @@ def main():
         if needs_val:
             val_tokens = load_val_tokens(val_path)
 
-    if only is None or 'r1' in only:
+    if _should_run('r1'):
         if val_tokens is not None:
             analyze_qk_specialization(params, cfg, val_tokens, args.output,
                                      n_batches=_nb or 50, batch_size=_abs)
         else:
             print("\n  Skipping R.1 (no --val_data)")
 
-    if only is None or 'r2' in only:
+    if _should_run('r2'):
         analyze_pos_selectivity(params, cfg, args.output,
                                max_sentences=args.r2_sentences, batch_size=min(_abs, 4))
 
-    if only is None or 'r4' in only:
+    if _should_run('r4'):
         if val_tokens is not None:
             analyze_layer_balance(params, cfg, val_tokens, args.output,
                                 n_batches=_nb or 20, batch_size=_abs)
@@ -4575,49 +4587,49 @@ def main():
             print("\n  Skipping R.4 (no --val_data)")
 
     r3_results = None
-    if only is None or 'r3' in only:
+    if _should_run('r3'):
         r3_results = analyze_knowledge_neurons(params, cfg, args.output)
 
-    if only is None or 'r5' in only:
+    if _should_run('r5'):
         analyze_suppression(params, cfg, args.output,
                            knowledge_results=r3_results)
 
     # --- Paper analyses (P1-P6) ---
-    if only is None or 'rw_proj' in only:
+    if _should_run('rw_proj'):
         analyze_rw_projection(params, cfg, args.output)
 
-    if only is None or 'act_context' in only:
+    if _should_run('act_context'):
         if val_tokens is not None:
             analyze_activation_context(params, cfg, val_tokens, args.output,
                                       n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping act_context (no --val_data)")
 
-    if only is None or 'layer_role' in only:
+    if _should_run('layer_role'):
         if val_tokens is not None:
             analyze_layer_role_matrix(params, cfg, val_tokens, args.output,
                                      n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping layer_role (no --val_data)")
 
-    if only is None or 'cross_suppress' in only:
+    if _should_run('cross_suppress'):
         analyze_cross_domain_suppression(params, cfg, args.output)
 
-    if only is None or 'gate_mech' in only:
+    if _should_run('gate_mech'):
         if val_tokens is not None:
             analyze_gate_mechanism(params, cfg, val_tokens, args.output,
                                   n_batches=_nb or 5, batch_size=min(_abs, 2))
         else:
             print("\n  Skipping gate_mech (no --val_data)")
 
-    if only is None or 'comp_expr' in only:
+    if _should_run('comp_expr'):
         if val_tokens is not None:
             analyze_compositional_expressiveness(params, cfg, val_tokens, args.output,
                                                 n_samples=args.p6_samples, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping comp_expr (no --val_data)")
 
-    if only is None or 'neuron_cluster' in only:
+    if _should_run('neuron_cluster'):
         if val_tokens is not None:
             analyze_neuron_clustering(params, cfg, val_tokens, args.output,
                                      n_batches=_nb or 10, batch_size=min(_abs, 4))
@@ -4625,35 +4637,35 @@ def main():
             # Part A works without val, Part B skipped
             analyze_neuron_clustering(params, cfg, None, args.output)
 
-    if only is None or 'cross_ref' in only:
+    if _should_run('cross_ref'):
         if val_tokens is not None:
             analyze_cross_reference(params, cfg, val_tokens, args.output,
                                    n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping cross_ref (no --val_data)")
 
-    if only is None or 'deep' in only:
+    if _should_run('deep'):
         if val_tokens is not None:
             analyze_deep_analysis(params, cfg, val_tokens, args.output,
                                  n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping deep (no --val_data)")
 
-    if only is None or 'op_space' in only:
+    if _should_run('op_space'):
         if val_tokens is not None:
             analyze_operation_space(params, cfg, val_tokens, args.output,
                                    n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping op_space (no --val_data)")
 
-    if only is None or 'intervene' in only:
+    if _should_run('intervene'):
         if val_tokens is not None:
             analyze_interventions(params, cfg, val_tokens, args.output,
                                  n_batches=_nb or 50, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping intervene (no --val_data)")
 
-    if only is None or 'compose' in only:
+    if _should_run('compose'):
         if val_tokens is not None:
             analyze_composition(params, cfg, val_tokens, args.output,
                                n_batches=_nb or 10, batch_size=min(_abs, 4))
