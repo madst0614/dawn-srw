@@ -217,7 +217,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                         P(),                     # score_std scalar
                         P(),                     # gate_sum scalar
                         P(),                     # active_n_mean scalar
-                        P(),                     # score_mean scalar
                         P('data', None, None),   # strong [B,S,1]
                         P('data', None, None),   # phi_binary [B,S,1]
                         P('data', None, None)),  # z_mean_active [B,S,1]
@@ -325,8 +324,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()
         active_n_mean = jax.lax.psum(total_active, 'model').mean()
-        score_mean_out = s_mean.mean()
-        return out.astype(jnp.float32), active_frac, global_gate_max, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, strong_frac, phi_binary_frac, z_mean_active
+        return out.astype(jnp.float32), active_frac, global_gate_max, score_lb, score_std_out, es_out, active_n_mean, strong_frac, phi_binary_frac, z_mean_active
 
     return fused_gate_srw
 
@@ -357,7 +355,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                         P(),                         # score_std scalar
                         P(),                         # gate_sum scalar
                         P(),                         # active_n_mean scalar
-                        P(),                         # score_mean scalar
                         P('data', None, None),       # strong [B,S,1]
                         P('data', None, None),       # phi_binary [B,S,1]
                         P('data', None, None)),      # z_mean_active [B,S,1]
@@ -472,8 +469,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()
         active_n_mean = jax.lax.psum(total_active, 'model').mean()
-        score_mean_out = s_mean.mean()
-        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, strong_frac_mean, phi_binary_frac_mean, z_mean_active_mean
+        return out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb, score_std_out, es_out, active_n_mean, strong_frac_mean, phi_binary_frac_mean, z_mean_active_mean
 
     return fused_gate_srw_paired
 
@@ -565,9 +561,8 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     score_std_out = s_std.mean()
     es_out = total_weighted_cost.mean()
     active_n_mean = total_active.mean()
-    score_mean_out = s_mean.mean()
     z_mean_active = total_z_sum / (total_active + 1e-8)
-    return out.astype(jnp.float32), total_active / N, total_gate_max, score_lb, score_std_out, es_out, active_n_mean, score_mean_out, total_strong / N, total_phi_binary / N, z_mean_active
+    return out.astype(jnp.float32), total_active / N, total_gate_max, score_lb, score_std_out, es_out, active_n_mean, total_strong / N, total_phi_binary / N, z_mean_active
 
 
 # ================================================================
@@ -706,21 +701,21 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         fused_single, fused_paired = sharded_fns
         h_QK = jnp.stack([h_Q, h_K], axis=2)
         tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-        QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm, qk_smean, qk_strong, qk_phi_bin, qk_z_act = fused_paired(
+        QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm, qk_strong, qk_phi_bin, qk_z_act = fused_paired(
             x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write)
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
         Q = QK_out[:, :, 0, :] * qk_scale
         K = QK_out[:, :, 1, :] * qk_scale
-        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_smean, v_strong, v_phi_bin, v_z_act = fused_single(
+        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_strong, v_phi_bin, v_z_act = fused_single(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write)
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
         V = V * v_scale
     else:
-        Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_anm, q_smean, q_strong, q_phi_bin, q_z_act = _srw_chunked(
+        Q, q_active, q_raw_gmax, q_lb, q_sstd, q_es, q_anm, q_strong, q_phi_bin, q_z_act = _srw_chunked(
             x, h_Q, qk_emb_unit, tau_all[:, :, 0:1], qk_read, qk_write, n_chunks_qk)
-        K, k_active, k_raw_gmax, k_lb, k_sstd, k_es, k_anm, k_smean, k_strong, k_phi_bin, k_z_act = _srw_chunked(
+        K, k_active, k_raw_gmax, k_lb, k_sstd, k_es, k_anm, k_strong, k_phi_bin, k_z_act = _srw_chunked(
             x, h_K, qk_emb_unit, tau_all[:, :, 1:2], qk_read, qk_write, n_chunks_qk)
-        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_smean, v_strong, v_phi_bin, v_z_act = _srw_chunked(
+        V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm, v_strong, v_phi_bin, v_z_act = _srw_chunked(
             x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write, n_chunks_v)
         qk_raw_norm = (jnp.linalg.norm(Q, axis=-1).mean() + jnp.linalg.norm(K, axis=-1).mean()) / 2
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
@@ -733,7 +728,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         qk_active = (q_active + k_active) / 2
         qk_raw_gmax = jnp.maximum(q_raw_gmax, k_raw_gmax)
         qk_anm = (q_anm + k_anm) / 2
-        qk_smean = (q_smean + k_smean) / 2
         qk_strong = (q_strong + k_strong) / 2
         qk_phi_bin = (q_phi_bin + k_phi_bin) / 2
         qk_z_act = (q_z_act + k_z_act) / 2
@@ -777,7 +771,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_score_std = (qk_sstd + v_sstd) / 2
     attn_gate_sum = (qk_es + v_es) / 2
     attn_active_n_mean = (qk_anm + v_anm) / 2
-    attn_score_mean = (qk_smean + v_smean) / 2
     attn_tau_mean = tau_all.mean()
     attn_strong = (qk_strong.mean() + v_strong.mean()) / 2
     attn_qk_phi_binary = qk_phi_bin.mean()
@@ -785,7 +778,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_qk_z_mean_active = qk_z_act.mean()
     attn_v_z_mean_active = v_z_act.mean()
     return (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
-            attn_score_std, attn_gate_sum, attn_active_n_mean, attn_score_mean,
+            attn_score_std, attn_gate_sum, attn_active_n_mean,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
             q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
             attn_strong, attn_qk_phi_binary, attn_v_phi_binary,
@@ -810,10 +803,10 @@ def _know_forward(x, pool_params, router_params, rng,
 
     if sharded_fns is not None:
         fused_single, fused_paired = sharded_fns
-        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, score_mean, strong_frac, phi_binary_frac, z_mean_act = fused_single(
+        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, strong_frac, phi_binary_frac, z_mean_act = fused_single(
             x, h, know_emb_unit, tau, know_read, know_write)
     else:
-        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, score_mean, strong_frac, phi_binary_frac, z_mean_act = _srw_chunked(
+        out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean, strong_frac, phi_binary_frac, z_mean_act = _srw_chunked(
             x, h, know_emb_unit, tau, know_read, know_write, n_chunks_know)
 
     know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
@@ -832,7 +825,7 @@ def _know_forward(x, pool_params, router_params, rng,
     know_phi_binary = phi_binary_frac.mean()
     know_z_mean_active = z_mean_act.mean()
     return (out, aux, active_frac, raw_gate_max, score_std, gate_sum, active_n_mean,
-            emb_norm_val, read_norm_val, write_norm_val, score_mean, know_out_norm,
+            emb_norm_val, read_norm_val, write_norm_val, know_out_norm,
             know_tau_mean, know_raw_out_norm, know_strong, know_phi_binary, know_z_mean_active)
 
 
@@ -1008,8 +1001,6 @@ class DAWN(nn.Module):
             k_emb_n_all = _z
             k_read_n_all = _z
             k_write_n_all = _z
-            attn_smean_all = _z
-            know_smean_all = _z
             know_out_norm_all = _z
             attn_out_norm_all = _z
             attn_tau_mean_all = _z
@@ -1050,7 +1041,7 @@ class DAWN(nn.Module):
                 normed = _layer_norm(
                     x, bp['norm1']['scale'], bp['norm1']['bias'])
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
-                 a_sstd, a_gsum, a_active_n_mean, a_smean,
+                 a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
                  a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
                  a_strong, a_qk_phi_bin, a_v_phi_bin,
@@ -1068,7 +1059,7 @@ class DAWN(nn.Module):
                 normed = _layer_norm(
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 (know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum, k_active_n_mean,
-                 k_emb_n, k_read_n, k_write_n, k_smean, k_out_norm,
+                 k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_raw_out_norm, k_strong, k_phi_bin, k_z_act
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
@@ -1079,7 +1070,7 @@ class DAWN(nn.Module):
                            k_active, k_raw_gmax, k_sstd, k_gsum, k_active_n_mean,
                            a_qk_active, a_v_active, a_raw_gmax, a_sstd, a_gsum, a_active_n_mean,
                            k_emb_n, k_read_n, k_write_n,
-                           a_smean, k_smean, k_out_norm,
+                           k_out_norm,
                            a_out_norm, a_tau_mean, k_tau_mean,
                            a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
                            a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -1095,7 +1086,7 @@ class DAWN(nn.Module):
                 know_active_all, know_raw_gmax_all, know_sstd_all, know_gsum_all, know_active_n_mean_all,
                 attn_qk_active_all, attn_v_active_all, attn_raw_gmax_all, attn_sstd_all, attn_gsum_all, attn_active_n_mean_all,
                 k_emb_n_all, k_read_n_all, k_write_n_all,
-                attn_smean_all, know_smean_all, know_out_norm_all,
+                know_out_norm_all,
                 attn_out_norm_all, attn_tau_mean_all, know_tau_mean_all,
                 attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
                 attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
@@ -1145,8 +1136,6 @@ class DAWN(nn.Module):
             'know_read_norm': k_read_n_all.mean(),
             'know_write_norm': k_write_n_all.mean(),
 
-            'attn_score_mean': attn_smean_all.mean(),
-            'know_score_mean': know_smean_all.mean(),
             'know_out_norm': know_out_norm_all.mean(),
             'attn_out_norm': attn_out_norm_all.mean(),
             'attn_tau_mean': attn_tau_mean_all.mean(),
@@ -1195,24 +1184,6 @@ class DAWN(nn.Module):
             result['logits'] = self.token_emb.attend(x)
 
         return result
-
-    def diversity_loss(self):
-        def _div(neurons, max_sample=4096):
-            N = neurons.shape[0]
-            if N > max_sample:
-                stride = N // max_sample
-                neurons = neurons[::stride][:max_sample]
-            n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
-            sim = n @ n.T
-            mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
-            return jnp.abs(sim * mask).sum() / mask.sum()
-        pool = self.neuron_pool
-        return (_div(pool.qk_emb) + _div(pool.qk_read) + _div(pool.qk_write) +
-                _div(pool.v_emb) + _div(pool.v_read) + _div(pool.v_write) +
-                _div(pool.know_emb) + _div(pool.know_read) + _div(pool.know_write)) / 9
-
-    def get_auxiliary_losses(self):
-        return {'neuron_diversity': self.diversity_loss()}
 
     def get_config(self):
         return {
