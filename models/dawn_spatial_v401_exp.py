@@ -693,6 +693,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+    attn_tau_std = tau_all.std(axis=(0, 1))  # [3] — per-Q/K/V, per-token offset std
+    attn_tau_kernel_norm = jnp.linalg.norm(router_params['tau_attn']['kernel'])
 
     qk_scale = pool_params['qk_scale']
     v_scale = pool_params['v_scale']
@@ -782,7 +784,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             attn_out_norm, attn_tau_mean, qk_raw_norm, v_raw_norm,
             q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
             attn_strong, attn_qk_phi_binary, attn_v_phi_binary,
-            attn_qk_z_mean_active, attn_v_z_mean_active)
+            attn_qk_z_mean_active, attn_v_z_mean_active,
+            attn_tau_std, attn_tau_kernel_norm)
 
 
 def _know_forward(x, pool_params, router_params, rng,
@@ -798,6 +801,8 @@ def _know_forward(x, pool_params, router_params, rng,
 
     know_emb_unit = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+    know_tau_std = tau.std()
+    know_tau_kernel_norm = jnp.linalg.norm(router_params['tau_know']['kernel'])
 
     know_scale = pool_params['know_scale']
 
@@ -826,7 +831,8 @@ def _know_forward(x, pool_params, router_params, rng,
     know_z_mean_active = z_mean_act.mean()
     return (out, aux, active_frac, raw_gate_max, score_std, gate_sum, active_n_mean,
             emb_norm_val, read_norm_val, write_norm_val, know_out_norm,
-            know_tau_mean, know_raw_out_norm, know_strong, know_phi_binary, know_z_mean_active)
+            know_tau_mean, know_raw_out_norm, know_strong, know_phi_binary, know_z_mean_active,
+            know_tau_std, know_tau_kernel_norm)
 
 
 # ================================================================
@@ -1013,6 +1019,10 @@ class DAWN(nn.Module):
             attn_v_norm_dbg_all = _z
             attn_logit_max_all = _z
             attn_o_input_norm_all = _z
+            attn_tau_std_all = _z
+            know_tau_std_all = _z
+            attn_tau_kernel_norm_all = _z
+            know_tau_kernel_norm_all = _z
             for layer in self.layers:
                 x, aux = layer(x, self.neuron_pool, self.router,
                                attention_mask, deterministic)
@@ -1045,7 +1055,8 @@ class DAWN(nn.Module):
                  a_out_norm, a_tau_mean, a_qk_raw_norm, a_v_raw_norm,
                  a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
                  a_strong, a_qk_phi_bin, a_v_phi_bin,
-                 a_qk_z_act, a_v_z_act
+                 a_qk_z_act, a_v_z_act,
+                 a_tau_std, a_tau_kernel_norm
                 ) = _attn_forward(
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
@@ -1060,7 +1071,8 @@ class DAWN(nn.Module):
                     x, bp['norm2']['scale'], bp['norm2']['bias'])
                 (know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum, k_active_n_mean,
                  k_emb_n, k_read_n, k_write_n, k_out_norm,
-                 k_tau_mean, k_raw_out_norm, k_strong, k_phi_bin, k_z_act
+                 k_tau_mean, k_raw_out_norm, k_strong, k_phi_bin, k_z_act,
+                 k_tau_std, k_tau_kernel_norm
                 ) = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
@@ -1076,7 +1088,9 @@ class DAWN(nn.Module):
                            a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
                            k_strong, a_strong,
                            k_phi_bin, a_qk_phi_bin, a_v_phi_bin,
-                           k_z_act, a_qk_z_act, a_v_z_act)
+                           k_z_act, a_qk_z_act, a_v_z_act,
+                           a_tau_std, k_tau_std,
+                           a_tau_kernel_norm, k_tau_kernel_norm)
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -1093,7 +1107,9 @@ class DAWN(nn.Module):
                 attn_logit_max_all, attn_o_input_norm_all,
                 know_strong_all, attn_strong_all,
                 know_phi_bin_all, attn_qk_phi_bin_all, attn_v_phi_bin_all,
-                know_z_act_all, attn_qk_z_act_all, attn_v_z_act_all) = jax.lax.scan(
+                know_z_act_all, attn_qk_z_act_all, attn_v_z_act_all,
+                attn_tau_std_all, know_tau_std_all,
+                attn_tau_kernel_norm_all, know_tau_kernel_norm_all) = jax.lax.scan(
                 scan_body, x, xs)
             total_aux = (attn_auxes + know_auxes).mean()
 
@@ -1140,6 +1156,10 @@ class DAWN(nn.Module):
             'attn_out_norm': attn_out_norm_all.mean(),
             'attn_tau_mean': attn_tau_mean_all.mean(),
             'know_tau_mean': know_tau_mean_all.mean(),
+            'attn_tau_std': attn_tau_std_all.mean(axis=0),   # [3] Q/K/V
+            'know_tau_std': know_tau_std_all.mean(),
+            'attn_tau_kernel_norm': attn_tau_kernel_norm_all.mean(),
+            'know_tau_kernel_norm': know_tau_kernel_norm_all.mean(),
             'attn_qk_raw_norm': attn_qk_raw_norm_all.mean(),
             'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
             'know_raw_out_norm': know_raw_out_norm_all.mean(),

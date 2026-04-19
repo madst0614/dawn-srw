@@ -806,6 +806,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
+            'attn_tau_std': result.get('attn_tau_std', jnp.zeros(3)),
+            'know_tau_std': result.get('know_tau_std', jnp.float32(0.0)),
+            'attn_tau_kernel_norm': result.get('attn_tau_kernel_norm', jnp.float32(0.0)),
+            'know_tau_kernel_norm': result.get('know_tau_kernel_norm', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -2335,9 +2339,26 @@ def main():
                         k_tau_m = _m(metrics.get('know_tau_mean', 0.0))
                         k_out_n = _m(metrics.get('know_out_norm', 0.0))
 
+                        # tau_offset per-token std + kernel Frobenius norm
+                        # (distinguishes bias-only offset from active per-token routing)
+                        try:
+                            a_tau_s = np.asarray(jax.device_get(metrics.get(
+                                'attn_tau_std', jnp.zeros(3))))
+                            if a_tau_s.size < 3:
+                                a_tau_s = np.zeros(3, dtype=np.float32)
+                        except Exception:
+                            a_tau_s = np.zeros(3, dtype=np.float32)
+                        k_tau_s = _m(metrics.get('know_tau_std', 0.0))
+                        a_kern = _m(metrics.get('attn_tau_kernel_norm', 0.0))
+                        k_kern = _m(metrics.get('know_tau_kernel_norm', 0.0))
+
                         log_message(
                             f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
                             f" know={k_tau_m:.3f} | grad_norm={m_grad:.3f}")
+                        log_message(
+                            f"      tau_struct: k_std={k_tau_s:.3f}"
+                            f" a_std=[{float(a_tau_s[0]):.3f},{float(a_tau_s[1]):.3f},{float(a_tau_s[2]):.3f}]"
+                            f" k_kern={k_kern:.2f} a_kern={a_kern:.2f}")
                         log_message(
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
