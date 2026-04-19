@@ -276,7 +276,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         # Skewness via E[(X-μ)^3] = E[X^3] - 3μσ² - μ³
         cube_mean = global_cube / N_total
         central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
-        score_skew = (central_third / (s_std ** 3 + 1e-8)).mean()
+        score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
 
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
@@ -346,19 +346,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         strong_frac = jax.lax.psum(total_strong, 'model') / N_total
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
         z_mean_active = jax.lax.psum(total_z_sum, 'model') / (global_active + 1e-8)
-        z_lt_075_frac = (jax.lax.psum(total_z_lt_075, 'model') / (global_active + 1e-8)).mean()
-        z_lt_030_frac = (jax.lax.psum(total_z_lt_030, 'model') / (global_active + 1e-8)).mean()
+        z_lt_075_frac = jax.lax.stop_gradient(
+            (jax.lax.psum(total_z_lt_075, 'model') / (global_active + 1e-8)).mean())
+        z_lt_030_frac = jax.lax.stop_gradient(
+            (jax.lax.psum(total_z_lt_030, 'model') / (global_active + 1e-8)).mean())
 
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()
         active_n_mean = global_active.mean()
-        tau_abs_mean = tau.mean()
-        active_per_token_std = global_active.std()
+        tau_abs_mean = jax.lax.stop_gradient(tau).mean()
+        active_per_token_std = jax.lax.stop_gradient(global_active).std()
         # Gate entropy: per-token H = -(1/S) Σ g log g + log S over global pool
         global_g_log_g = jax.lax.psum(total_g_log_g, 'model')
         gate_sum_eps = global_weighted_cost + 1e-8
         entropy_per_token = -global_g_log_g / gate_sum_eps + jnp.log(gate_sum_eps)
-        gate_entropy = entropy_per_token.mean()
+        gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
         return (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac, phi_binary_frac, z_mean_active,
                 tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
@@ -453,7 +455,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         # Skewness via E[(X-μ)^3] = E[X^3] - 3μσ² - μ³
         cube_mean = global_cube / N_total
         central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
-        score_skew = (central_third / (s_std ** 3 + 1e-8)).mean()
+        score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
 
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
@@ -530,18 +532,20 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         z_mean_active = jax.lax.psum(total_z_sum, 'model') / (global_active + 1e-8)
         z_mean_active_mean = z_mean_active.mean(axis=2)
         raw_gate_max_mean = global_gate_max.mean(axis=2)
-        z_lt_075_frac = (jax.lax.psum(total_z_lt_075, 'model') / (global_active + 1e-8)).mean()
-        z_lt_030_frac = (jax.lax.psum(total_z_lt_030, 'model') / (global_active + 1e-8)).mean()
+        z_lt_075_frac = jax.lax.stop_gradient(
+            (jax.lax.psum(total_z_lt_075, 'model') / (global_active + 1e-8)).mean())
+        z_lt_030_frac = jax.lax.stop_gradient(
+            (jax.lax.psum(total_z_lt_030, 'model') / (global_active + 1e-8)).mean())
 
         score_std_out = s_std.mean()
         es_out = global_weighted_cost.mean()
         active_n_mean = global_active.mean()
-        tau_abs_mean = tau.mean()
-        active_per_token_std = global_active.std()
+        tau_abs_mean = jax.lax.stop_gradient(tau).mean()
+        active_per_token_std = jax.lax.stop_gradient(global_active).std()
         global_g_log_g = jax.lax.psum(total_g_log_g, 'model')
         gate_sum_eps = global_weighted_cost + 1e-8
         entropy_per_token = -global_g_log_g / gate_sum_eps + jnp.log(gate_sum_eps)
-        gate_entropy = entropy_per_token.mean()
+        gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
         return (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                 score_std_out, es_out, active_n_mean, strong_frac_mean, phi_binary_frac_mean,
                 z_mean_active_mean, tau_abs_mean, z_lt_075_frac, z_lt_030_frac,
@@ -595,7 +599,7 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     # Skewness via E[(X-μ)^3] = E[X^3] - 3μσ² - μ³
     cube_mean = cube_sum / N
     central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
-    score_skew = (central_third / (s_std ** 3 + 1e-8)).mean()
+    score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
 
     # Score LB: CV² of per-neuron score mean (spread-invariant)
     mean_score = ns_sum / N
@@ -659,14 +663,14 @@ def _srw_chunked(x, h, emb_unit, tau_offset, w_read, w_write, n_chunks):
     active_n_mean = total_active.mean()
     z_mean_active = total_z_sum / (total_active + 1e-8)
     active_eps = total_active + 1e-8
-    z_lt_075_frac = (total_z_lt_075 / active_eps).mean()
-    z_lt_030_frac = (total_z_lt_030 / active_eps).mean()
-    tau_abs_mean = tau.mean()
-    active_per_token_std = total_active.std()
+    z_lt_075_frac = jax.lax.stop_gradient((total_z_lt_075 / active_eps).mean())
+    z_lt_030_frac = jax.lax.stop_gradient((total_z_lt_030 / active_eps).mean())
+    tau_abs_mean = jax.lax.stop_gradient(tau).mean()
+    active_per_token_std = jax.lax.stop_gradient(total_active).std()
     # Gate entropy: H = -(1/S) Σ g log g + log S, where S = Σ g
     gate_sum_eps = total_weighted_cost + 1e-8
     entropy_per_token = -total_g_log_g / gate_sum_eps + jnp.log(gate_sum_eps)
-    gate_entropy = entropy_per_token.mean()
+    gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
     return (out.astype(jnp.float32), total_active / N, total_gate_max, score_lb,
             score_std_out, es_out, active_n_mean, total_strong / N,
             total_phi_binary / N, z_mean_active,
@@ -802,8 +806,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
-    attn_tau_std = tau_all.std(axis=(0, 1))  # [3] — per-Q/K/V, per-token offset std
-    attn_tau_kernel_norm = jnp.linalg.norm(router_params['tau_attn']['kernel'])
+    # Pure observational metrics — wrap in stop_gradient to avoid NaN VJP
+    # hazards (norm of zero kernel at init; std of constant when kernel=0).
+    _tau_all_sg = jax.lax.stop_gradient(tau_all)
+    attn_tau_std = _tau_all_sg.std(axis=(0, 1))  # [3] — per-Q/K/V, per-token offset std
+    attn_tau_kernel_norm = jnp.sqrt(
+        jnp.sum(jax.lax.stop_gradient(router_params['tau_attn']['kernel']) ** 2) + 1e-12)
 
     qk_scale = pool_params['qk_scale']
     v_scale = pool_params['v_scale']
@@ -939,8 +947,10 @@ def _know_forward(x, pool_params, router_params, rng,
 
     know_emb_unit = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
-    know_tau_std = tau.std()
-    know_tau_kernel_norm = jnp.linalg.norm(router_params['tau_know']['kernel'])
+    # Pure observational metrics — stop_gradient to avoid NaN VJP hazards at init.
+    know_tau_std = jax.lax.stop_gradient(tau).std()
+    know_tau_kernel_norm = jnp.sqrt(
+        jnp.sum(jax.lax.stop_gradient(router_params['tau_know']['kernel']) ** 2) + 1e-12)
 
     know_scale = pool_params['know_scale']
 
