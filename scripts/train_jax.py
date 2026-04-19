@@ -810,6 +810,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_tau_std': result.get('know_tau_std', jnp.float32(0.0)),
             'attn_tau_kernel_norm': result.get('attn_tau_kernel_norm', jnp.float32(0.0)),
             'know_tau_kernel_norm': result.get('know_tau_kernel_norm', jnp.float32(0.0)),
+            'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
+            'know_tau_abs_mean': result.get('know_tau_abs_mean', jnp.float32(0.0)),
+            'attn_z_lt_075': result.get('attn_z_lt_075', jnp.float32(0.0)),
+            'know_z_lt_075': result.get('know_z_lt_075', jnp.float32(0.0)),
+            'attn_z_lt_030': result.get('attn_z_lt_030', jnp.float32(0.0)),
+            'know_z_lt_030': result.get('know_z_lt_030', jnp.float32(0.0)),
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
             'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
@@ -2359,6 +2365,19 @@ def main():
                             f"      tau_struct: k_std={k_tau_s:.3f}"
                             f" a_std=[{float(a_tau_s[0]):.3f},{float(a_tau_s[1]):.3f},{float(a_tau_s[2]):.3f}]"
                             f" k_kern={k_kern:.2f} a_kern={a_kern:.2f}")
+
+                        # Absolute gate threshold + z-margin distribution
+                        k_tau_abs = _m(metrics.get('know_tau_abs_mean', 0.0))
+                        a_tau_abs = _m(metrics.get('attn_tau_abs_mean', 0.0))
+                        k_z075 = _m(metrics.get('know_z_lt_075', 0.0))
+                        a_z075 = _m(metrics.get('attn_z_lt_075', 0.0))
+                        k_z030 = _m(metrics.get('know_z_lt_030', 0.0))
+                        a_z030 = _m(metrics.get('attn_z_lt_030', 0.0))
+                        log_message(
+                            f"      gate_margin: k[abs={k_tau_abs:+.3f}"
+                            f" z<075={k_z075*100:.1f}% z<030={k_z030*100:.1f}%]"
+                            f" a[abs={a_tau_abs:+.3f}"
+                            f" z<075={a_z075*100:.1f}% z<030={a_z030*100:.1f}%]")
                         log_message(
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
