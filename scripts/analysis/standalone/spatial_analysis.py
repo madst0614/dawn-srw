@@ -6292,6 +6292,232 @@ def analyze_rw_function_correlation(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §Val4: Z distribution (quantile) + gate entropy verification
+# ============================================================
+
+def analyze_z_distribution(params, cfg, val_tokens, output_dir,
+                            n_batches=4, batch_size=4, n_token_sample=256):
+    """Phase 4: sampled z-quantile at 50/90/99 for active neurons (z > 0).
+    Also cross-checks gate_entropy. Runs only on mid-layer. Val-data only."""
+    print("\n" + "="*60)
+    print("§Val4: Z Distribution (quantile + entropy)")
+    print("="*60)
+
+    _mod = get_model_module()
+    _layer_norm = _mod._layer_norm
+
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    d_model = model_cfg['d_model']
+    n_layers = model_cfg['n_layers']
+
+    pool_params = jax.tree.map(jnp.asarray, params['neuron_pool'])
+    router_params = jax.tree.map(jnp.asarray, params['router'])
+    block_params_list = [jax.tree.map(jnp.asarray, params[f'block_{i}'])
+                         for i in range(n_layers)]
+
+    qk_n = pool_params['qk_emb'] / (jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
+    v_n = pool_params['v_emb'] / (jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    know_n = pool_params['know_emb'] / (jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+
+    _emb = jnp.asarray(params['token_emb']['embedding'])
+    _pos = jnp.asarray(params['pos_emb']['embedding'])
+
+    mid = n_layers // 2
+
+    def _z_stats(h_proj, tau_offset, emb_unit, sample_T):
+        """Compute z values + quantile + gate_entropy for one pool.
+        h_proj: [B, S, d_route]; tau_offset: [B, S, d_tau]; emb_unit: [N, d_route].
+        Returns (z_q50, z_q90, z_q99, gate_entropy)."""
+        scores = (h_proj @ emb_unit.T).astype(jnp.float32)
+        s_mean = scores.mean(axis=-1, keepdims=True)
+        s_std = jnp.sqrt(jnp.mean(jnp.square(scores - s_mean), axis=-1, keepdims=True)) + 1e-8
+        tau = s_mean + tau_offset * s_std
+        z = (scores - tau) / s_std                              # [B, S, N]
+        phi = 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476))
+        gate = jnp.where(z > 0, z * phi, 0.0)
+        # Sample first sample_T tokens for quantile; flatten active z
+        z_sample = z[:, :sample_T, :].reshape(-1)               # [B*sample_T*N]
+        z_pos = jnp.where(z_sample > 0, z_sample, jnp.nan)
+        q = jnp.nanquantile(z_pos, jnp.array([0.50, 0.90, 0.99]))
+        gsum = gate.sum(axis=-1, keepdims=True) + 1e-8
+        gll = (gate * jnp.log(gate + 1e-8)).sum(axis=-1, keepdims=True)
+        entropy = (-gll / gsum + jnp.log(gsum)).mean()
+        return q[0], q[1], q[2], entropy
+
+    @jax.jit
+    def _pool_stats(input_ids):
+        B, S = input_ids.shape
+        positions = jnp.arange(S)[jnp.newaxis, :]
+        x = _emb[input_ids.astype(jnp.int32)] + _pos[positions]
+        # Forward to mid layer
+        for i in range(mid):
+            lp = block_params_list[i]
+            normed = _layer_norm(x, lp['norm1']['scale'], lp['norm1']['bias'])
+            h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+            h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+            tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+            Q = _mod._srw_inference(normed, h_Q, qk_n, tau_all[:, :, 0:1],
+                                    pool_params['qk_read'], pool_params['qk_write'])
+            K = _mod._srw_inference(normed, h_K, qk_n, tau_all[:, :, 1:2],
+                                    pool_params['qk_read'], pool_params['qk_write'])
+            V = _mod._srw_inference(normed, h_V, v_n, tau_all[:, :, 2:3],
+                                    pool_params['v_read'], pool_params['v_write'])
+            n_heads = model_cfg['n_heads']
+            d_head = d_model // n_heads
+            Qh = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Kh = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            Vh = V.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
+            scale = jnp.sqrt(jnp.float32(d_head))
+            sc = jnp.einsum('bhsd,bhtd->bhst', Qh, Kh) / scale
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            sc = jnp.where(causal, sc, jnp.finfo(sc.dtype).min)
+            aw = jax.nn.softmax(sc, axis=-1)
+            attn_out = jnp.einsum('bhst,bhtd->bhsd', aw, Vh)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(B, S, d_model)
+            attn_out = attn_out @ lp['attn']['expand_O']['kernel']
+            x = x + attn_out
+            normed2 = _layer_norm(x, lp['norm2']['scale'], lp['norm2']['bias'])
+            h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+            tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+            know_out = _mod._srw_inference(normed2, h_k, know_n, tau_k,
+                                           pool_params['know_read'], pool_params['know_write'])
+            x = x + know_out
+
+        # At mid-layer pre-block
+        normed = _layer_norm(x, block_params_list[mid]['norm1']['scale'],
+                             block_params_list[mid]['norm1']['bias'])
+        h_all = normed @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
+        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
+        tau_all = normed @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+
+        q_q = _z_stats(h_Q, tau_all[:, :, 0:1], qk_n, n_token_sample)
+        k_q = _z_stats(h_K, tau_all[:, :, 1:2], qk_n, n_token_sample)
+        v_q = _z_stats(h_V, tau_all[:, :, 2:3], v_n, n_token_sample)
+        normed2 = _layer_norm(x, block_params_list[mid]['norm2']['scale'],
+                              block_params_list[mid]['norm2']['bias'])
+        h_k = normed2 @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
+        tau_k = normed2 @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
+        know_q = _z_stats(h_k, tau_k, know_n, n_token_sample)
+        return q_q, k_q, v_q, know_q
+
+    # Prepare val batches
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    total_seqs = min(n_batches * batch_size, n_seqs)
+    tokens = jnp.array(tokens[:total_seqs], dtype=jnp.int32)
+
+    agg = {'Q': [], 'K': [], 'V': [], 'Know': []}
+    for b in range(min(n_batches, total_seqs // batch_size)):
+        batch = tokens[b * batch_size: (b + 1) * batch_size]
+        qr, kr, vr, kwr = _pool_stats(batch)
+        agg['Q'].append([float(x) for x in qr])
+        agg['K'].append([float(x) for x in kr])
+        agg['V'].append([float(x) for x in vr])
+        agg['Know'].append([float(x) for x in kwr])
+        print(f"  batch {b+1}: Q q50={qr[0]:.3f} q90={qr[1]:.3f} q99={qr[2]:.3f} ent={qr[3]:.2f}")
+
+    out = {}
+    for pool_name, rows in agg.items():
+        arr = np.array(rows)  # [n_batches, 4]
+        out[pool_name] = {
+            'z_q50': float(arr[:, 0].mean()),
+            'z_q90': float(arr[:, 1].mean()),
+            'z_q99': float(arr[:, 2].mean()),
+            'gate_entropy': float(arr[:, 3].mean()),
+            'layer': mid,
+            'n_batches': len(rows),
+        }
+        print(f"  {pool_name:4s}: z_q50={out[pool_name]['z_q50']:.3f}"
+              f" z_q90={out[pool_name]['z_q90']:.3f}"
+              f" z_q99={out[pool_name]['z_q99']:.3f}"
+              f" entropy={out[pool_name]['gate_entropy']:.2f}")
+
+    _save_json(out, output_dir, 'z_dist', 'z_distribution.json')
+    print("  Done: z_dist")
+    return out
+
+
+# ============================================================
+# §Val5: tau gradient — task loss vs aux loss decomposition
+# ============================================================
+
+def analyze_tau_gradient_split(params, cfg, val_tokens, output_dir,
+                                model_file="models.dawn_spatial_v401_exp",
+                                n_batches=2, batch_size=4):
+    """Phase 5: jax.grad(task_loss, tau_*) vs jax.grad(aux_loss, tau_*).
+    Reports Frobenius norm of tau_attn / tau_know gradients from each path."""
+    print("\n" + "="*60)
+    print("§Val5: Tau Gradient Split (task vs aux)")
+    print("="*60)
+
+    model = build_model(cfg, model_file)
+    model_cfg = get_model_cfg(cfg)
+    max_seq = model_cfg['max_seq_len']
+    params_j = jax.tree.map(jnp.asarray, params)
+
+    n_seqs = len(val_tokens) // max_seq
+    tokens = val_tokens[:n_seqs * max_seq].reshape(n_seqs, max_seq)
+    total_seqs = min(n_batches * batch_size, n_seqs)
+    tokens = jnp.array(tokens[:total_seqs], dtype=jnp.int32)
+
+    def _tau_norm(grad_tree):
+        ta = grad_tree['router']['tau_attn']
+        tk = grad_tree['router']['tau_know']
+        return float(jnp.sqrt(
+            jnp.sum(ta['kernel'] ** 2) + jnp.sum(ta['bias'] ** 2) +
+            jnp.sum(tk['kernel'] ** 2) + jnp.sum(tk['bias'] ** 2)
+        ))
+
+    @jax.jit
+    def _task_grad(p, input_ids, attention_mask, labels, rng):
+        def loss_fn(p_):
+            r = model.apply({'params': p_}, input_ids, labels=labels,
+                             attention_mask=attention_mask, deterministic=True,
+                             rngs={'dropout': rng})
+            return r['loss']
+        return jax.grad(loss_fn)(p)
+
+    @jax.jit
+    def _aux_grad(p, input_ids, attention_mask, labels, rng):
+        def loss_fn(p_):
+            r = model.apply({'params': p_}, input_ids, labels=labels,
+                             attention_mask=attention_mask, deterministic=True,
+                             rngs={'dropout': rng})
+            return r['aux_loss']
+        return jax.grad(loss_fn)(p)
+
+    task_norms, aux_norms = [], []
+    eval_rng = jax.random.PRNGKey(0)
+    for b in range(min(n_batches, total_seqs // batch_size)):
+        batch = tokens[b * batch_size: (b + 1) * batch_size]
+        mask = jnp.ones_like(batch)
+        labels = jnp.where(mask == 1, batch, -100)
+        t_grad = _task_grad(params_j, batch, mask, labels, eval_rng)
+        a_grad = _aux_grad(params_j, batch, mask, labels, eval_rng)
+        tn = _tau_norm(t_grad)
+        an = _tau_norm(a_grad)
+        task_norms.append(tn)
+        aux_norms.append(an)
+        print(f"  batch {b+1}: task_tau_grad={tn:.4e} aux_tau_grad={an:.4e}"
+              f" ratio={tn / (an + 1e-12):.3f}")
+
+    tn_mean = float(np.mean(task_norms))
+    an_mean = float(np.mean(aux_norms))
+    result = {
+        'task_tau_grad_norm': tn_mean,
+        'aux_tau_grad_norm': an_mean,
+        'ratio_task_over_aux': tn_mean / (an_mean + 1e-12),
+        'per_batch': {'task': task_norms, 'aux': aux_norms},
+    }
+    print(f"\n  Summary: task={tn_mean:.4e} aux={an_mean:.4e} ratio={result['ratio_task_over_aux']:.3f}")
+    print("  (ratio >> 1 = task dominates tau; ~1 = balanced; << 1 = aux dominates)")
+    _save_json(result, output_dir, 'tau_grad', 'tau_grad_split.json')
+    print("  Done: tau_grad")
+    return result
+
+
+# ============================================================
 # z/phi/gate histogram JIT forward (gate_ci 전용)
 # ============================================================
 
@@ -6631,7 +6857,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,read_cov,rw_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,read_cov,rw_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func,z_dist,tau_grad")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -6953,6 +7179,21 @@ def main():
                                              n_batches=_nb or 10, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping rw_func (no --val_data)")
+
+    if _should_run('z_dist'):
+        if val_tokens is not None:
+            analyze_z_distribution(params, cfg, val_tokens, args.output,
+                                    n_batches=_nb or 4, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping z_dist (no --val_data)")
+
+    if _should_run('tau_grad'):
+        if val_tokens is not None:
+            analyze_tau_gradient_split(params, cfg, val_tokens, args.output,
+                                        model_file=args.model_file,
+                                        n_batches=_nb or 2, batch_size=min(_abs, 4))
+        else:
+            print("\n  Skipping tau_grad (no --val_data)")
 
     print(f"\nDone. Results in {args.output}/")
 
