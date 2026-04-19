@@ -2191,6 +2191,9 @@ def main():
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
+    # Emb drift snapshot (sense vectors) — updated every LOG_INTERVAL on host 0.
+    _prev_emb_snap = None
+
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
         epoch_loss = 0.0
@@ -2391,6 +2394,33 @@ def main():
                         log_message(
                             f"      dist: k[skew={k_skew:+.2f} apt_std={k_apt:.1f}]"
                             f" a[skew={a_skew:+.2f} apt_std={a_apt:.1f}]")
+
+                        # Emb drift (relative L2 change since last LOG_INTERVAL snapshot).
+                        drift_qk = drift_v = drift_know = 0.0
+                        try:
+                            pool_now = params['neuron_pool']
+                            cur_qk = pool_now['qk_emb']
+                            cur_v = pool_now['v_emb']
+                            cur_know = pool_now['know_emb']
+                            if _prev_emb_snap is not None:
+                                p_qk, p_v, p_know = _prev_emb_snap
+                                drift_qk = float(
+                                    jnp.linalg.norm(cur_qk - p_qk)
+                                    / (jnp.linalg.norm(p_qk) + 1e-8))
+                                drift_v = float(
+                                    jnp.linalg.norm(cur_v - p_v)
+                                    / (jnp.linalg.norm(p_v) + 1e-8))
+                                drift_know = float(
+                                    jnp.linalg.norm(cur_know - p_know)
+                                    / (jnp.linalg.norm(p_know) + 1e-8))
+                                log_message(
+                                    f"      drift ({LOG_INTERVAL}step):"
+                                    f" qk_emb={drift_qk:.4e}"
+                                    f" v_emb={drift_v:.4e}"
+                                    f" know_emb={drift_know:.4e}")
+                            _prev_emb_snap = (cur_qk, cur_v, cur_know)
+                        except Exception as _drift_err:
+                            log_message(f"      drift: failed ({_drift_err})")
                         log_message(
                             f"      aux: attn={m_attn_aux:.4f} know={m_know_aux:.4f}"
                             f" | norms: emb={k_emb_n:.3f} read={k_read_n:.3f}"
@@ -2546,6 +2576,9 @@ def main():
                         'tau_reg_weighted': tau_reg_weight * avg_tau_reg,
                         'orth_weighted': orth_weight * avg_orth,
                         'div_weighted': div_weight * avg_div,
+                        'drift_qk_emb': drift_qk,
+                        'drift_v_emb': drift_v,
+                        'drift_know_emb': drift_know,
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,
