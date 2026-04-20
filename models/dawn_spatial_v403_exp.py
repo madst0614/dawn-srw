@@ -122,10 +122,9 @@ Changelog:
 Architecture:
   NeuronPool        -- emb[N,d_bn] + w_read[N,D] + w_write[N,D]
   Router            -- proj + tau. Uses pool emb for routing.
-  threshold_gate    -- element-wise threshold, no top_k
-  _srw_chunked    -- N-axis chunked gate+srw (dynamic_slice, bf16, 2-pass)
-  _attn_forward   -- _srw_chunked per Q/K/V -> self-attn
-  _know_forward   -- _srw_chunked
+  _srw_chunked      -- N-axis chunked gate+srw (dynamic_slice, bf16, 2-pass)
+  _attn_forward     -- _srw_chunked per Q/K/V -> self-attn
+  _know_forward     -- _srw_chunked
   DAWN              -- embedding + jax.lax.scan + weight-tied lm_head
 """
 
@@ -172,25 +171,8 @@ def unit_norm_init(scale=1.0):
 
 
 # ================================================================
-# 2. Threshold gate (v18.5 relative tau + dead neuron gradient + exp)
+# 2. shard_map based gate + sense_read_write
 # ================================================================
-
-def threshold_gate(scores, tau_offset):
-    """Relative tau threshold gate with linear (ReLU) activation.
-    scores: [B,S,N], tau_offset: [B,S,1]
-    Returns normalized gate: [B,S,N]
-    """
-    scores_f32 = scores.astype(jnp.float32)
-    s_mean = scores_f32.mean(axis=-1, keepdims=True)
-    s_std = jnp.sqrt(jnp.mean(jnp.square(scores_f32 - s_mean), axis=-1, keepdims=True)) + 1e-8
-    tau = s_mean + tau_offset * s_std
-
-    raw = scores - tau.astype(scores.dtype)
-    z = raw.astype(jnp.float32) / s_std
-    gate = jnp.where(z > 0, z * 0.5 * (1.0 + jax.lax.erf(z * 0.7071067811865476)), 0.0)
-    active_n = (gate > 0.0).sum(axis=-1, keepdims=True).astype(jnp.float32)
-    norm_factor = jnp.maximum(active_n, 1.0)
-    return gate.astype(scores.dtype) / norm_factor.astype(scores.dtype)
 
 
 # ================================================================
@@ -755,44 +737,6 @@ class Router(nn.Module):
             kernel_init=nn.initializers.zeros,
             bias_init=lambda k, s, d: jnp.full(s, -0.5))
 
-    def get_attention_gates(self, x, neuron_pool, deterministic, rng):
-        qk_emb_unit = neuron_pool.qk_emb / (
-            jnp.linalg.norm(neuron_pool.qk_emb, axis=-1, keepdims=True) + 1e-8)
-        v_emb_unit = neuron_pool.v_emb / (
-            jnp.linalg.norm(neuron_pool.v_emb, axis=-1, keepdims=True) + 1e-8)
-        rng, rng_drop = jax.random.split(rng)
-        h_all = self.proj_attn(x)
-        h_all = safe_dropout(h_all, self.router_dropout, deterministic, rng_drop)
-        h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
-
-        tau_all = self.tau_attn(x)
-        g_Q = threshold_gate(h_Q @ qk_emb_unit.T, tau_all[:, :, 0:1])
-        g_K = threshold_gate(h_K @ qk_emb_unit.T, tau_all[:, :, 1:2])
-        g_V = threshold_gate(h_V @ v_emb_unit.T, tau_all[:, :, 2:3])
-
-        t_qk = 1.0 / self.n_qk
-        t_v = 1.0 / self.n_v
-        aux = (
-            ((g_Q.mean(axis=(0, 1)) - t_qk) ** 2).sum() * self.n_qk +
-            ((g_K.mean(axis=(0, 1)) - t_qk) ** 2).sum() * self.n_qk +
-            ((g_V.mean(axis=(0, 1)) - t_v) ** 2).sum() * self.n_v
-        )
-        return g_Q, g_K, g_V, aux
-
-    def get_knowledge_gates(self, x, neuron_pool, deterministic, rng):
-        know_emb_unit = neuron_pool.know_emb / (
-            jnp.linalg.norm(neuron_pool.know_emb, axis=-1, keepdims=True) + 1e-8)
-        rng, rng_drop = jax.random.split(rng)
-        h = self.proj_know(x)
-        h = safe_dropout(h, self.router_dropout, deterministic, rng_drop)
-
-        tau = self.tau_know(x)
-        gate = threshold_gate(h @ know_emb_unit.T, tau)
-
-        t = 1.0 / self.n_know
-        aux = ((gate.mean(axis=(0, 1)) - t) ** 2).sum() * self.n_know
-        return gate, aux
-
 
 # ================================================================
 # 6. Pure functions for scan body
@@ -1017,6 +961,7 @@ def _know_forward(x, pool_params, router_params, rng,
 # ================================================================
 
 class AttentionCircuit(nn.Module):
+    """Container for expand_O; real forward path is _attn_forward()."""
     d_model: int
     n_heads: int
     dropout_rate: float = 0.1
@@ -1025,55 +970,10 @@ class AttentionCircuit(nn.Module):
         self.expand_O = nn.Dense(
             self.d_model, use_bias=False, kernel_init=scaled_normal(0.02))
 
-    def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
-        rng = self.make_rng('dropout')
-        rng, rng_r, rng_d, rng_o = jax.random.split(rng, 4)
-
-        g_Q, g_K, g_V, aux = router.get_attention_gates(
-            x, neuron_pool, deterministic, rng_r)
-
-        def _se(x, g, rd, wr):
-            return (g * (x @ rd.T)) @ wr
-
-        Q = _se(x, g_Q, neuron_pool.qk_read, neuron_pool.qk_write)
-        K = _se(x, g_K, neuron_pool.qk_read, neuron_pool.qk_write)
-        V = _se(x, g_V, neuron_pool.v_read, neuron_pool.v_write)
-
-        B, S, D = x.shape
-        d_head = D // self.n_heads
-        Q = Q.reshape(B, S, self.n_heads, d_head).transpose(0, 2, 1, 3)
-        K = K.reshape(B, S, self.n_heads, d_head).transpose(0, 2, 1, 3)
-        V = V.reshape(B, S, self.n_heads, d_head).transpose(0, 2, 1, 3)
-
-        scale = jnp.sqrt(jnp.float32(d_head))
-        scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
-        causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-        scores = jnp.where(causal, scores, jnp.finfo(scores.dtype).min)
-        attn_w = jax.nn.softmax(scores, axis=-1)
-        attn_w = safe_dropout(attn_w, self.dropout_rate, deterministic, rng_d)
-
-        out = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
-        out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
-        out = self.expand_O(out)
-        out = safe_dropout(out, self.dropout_rate, deterministic, rng_o)
-        return out, aux
-
-
-class KnowledgeCircuit(nn.Module):
-    d_model: int
-    dropout_rate: float = 0.1
-
-    def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
-        rng = self.make_rng('dropout')
-        rng, rng_r = jax.random.split(rng)
-        gate, aux = router.get_knowledge_gates(
-            x, neuron_pool, deterministic, rng_r)
-        out = (gate * (x @ neuron_pool.know_read.T)) @ neuron_pool.know_write
-        out = safe_dropout(out, self.dropout_rate, deterministic, rng)
-        return out, aux
-
 
 class DAWNBlock(nn.Module):
+    """Container for per-layer norms + attn (expand_O) submodules.
+    The real forward path is scan_body in DAWN.__call__."""
     d_model: int
     n_heads: int
     dropout_rate: float = 0.1
@@ -1084,19 +984,6 @@ class DAWNBlock(nn.Module):
         self.attn = AttentionCircuit(
             d_model=self.d_model, n_heads=self.n_heads,
             dropout_rate=self.dropout_rate)
-        self.knowledge = KnowledgeCircuit(
-            d_model=self.d_model, dropout_rate=self.dropout_rate)
-
-    def __call__(self, x, neuron_pool, router, attention_mask, deterministic):
-        normed = self.norm1(x)
-        attn_out, a_aux = self.attn(
-            normed, neuron_pool, router, attention_mask, deterministic)
-        x = x + attn_out
-        normed = self.norm2(x)
-        know_out, k_aux = self.knowledge(
-            normed, neuron_pool, router, attention_mask, deterministic)
-        x = x + know_out
-        return x, a_aux + k_aux
 
 
 # ================================================================
@@ -1214,10 +1101,18 @@ class DAWN(nn.Module):
             know_entropy_all = _z
             attn_z_sum_all = _z
             know_z_sum_all = _z
+            # Trigger Flax param realization for all submodules (init-only).
+            # The real forward runs through scan_body in the else branch and
+            # accesses params by path, not via these module calls.
+            _ = self.neuron_pool.qk_emb  # triggers NeuronPool.setup → all pool params
+            _ = self.router.proj_attn(x)
+            _ = self.router.proj_know(x)
+            _ = self.router.tau_attn(x)
+            _ = self.router.tau_know(x)
             for layer in self.layers:
-                x, aux = layer(x, self.neuron_pool, self.router,
-                               attention_mask, deterministic)
-                total_aux = total_aux + aux
+                _ = layer.norm1(x)
+                _ = layer.norm2(x)
+                _ = layer.attn.expand_O(x)
         else:
             all_params = self.variables['params']
             pool_params = all_params['neuron_pool']
