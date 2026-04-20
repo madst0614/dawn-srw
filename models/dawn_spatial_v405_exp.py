@@ -19,25 +19,19 @@ model space).
 
 Changelog:
   spatial-r1-v4.0.5 (2026-04-20):
-    - Replace v4.0.4 reverse dropout (weakness-based, asymmetric) with
-      bidirectional gate dropout (peak strength). Applied to z before
-      the Φ/gate step:
-        Drop  (z > 0): with Bernoulli(drop_rate_eff)  → z := -1.0
-                       → neuron was selected but is masked out.
-        Boost (z < 0): with Bernoulli(boost_rate_eff) → z := z_peak
-                       where z_peak = max(max(z, axis=-1), 0).
-                       → neuron was below threshold but is lifted to
-                         the current token's positive peak strength.
-      Symmetric uniform-prob Bernoulli, tau-independent. Rich-get-
-      richer attack from both sides: silence random winners, promote
-      random losers to peak level → strong learning signal, fast
-      emb reshaping. Off in eval (deterministic=True short-circuits
-      both rates to 0).
+    - Bidirectional gate dropout replaces weakness-based reverse dropout (v4.0.4).
+      Applied to z before the Φ/gate step:
+          Drop  (z > 0): with Bernoulli(gate_drop_rate)   → z := -1.0
+          Boost (z < 0): with Bernoulli(gate_boost_rate)  → z := z_peak
+          where z_peak = max(max(z, axis=-1), 0).
+      Uniform probability (not weakness-weighted), peak strength (not
+      gap-proportional). Off in eval (both rates passed as 0 → masks
+      all-False, constant-folded).
     - rng: one fold_in(rng, i) per chunk, then split(2) for drop/boost.
     - Config: training.gate_drop_rate, training.gate_boost_rate
       (both default 0.0 so v4.0.5 with flags unset matches v4.0.3).
     - Metrics: drop_rate_actual, boost_rate_actual per pool.
-    - reverse_p_max / rev_rate retired.
+    - weakness computation, reverse_p_max, rev_rate fully removed.
 
   spatial-r1-v4.0.4 (2026-04-20):
     - Reverse dropout: per-chunk, per-neuron weak-neuron boost.
@@ -250,9 +244,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
 
     v4.0.5: bidirectional gate dropout applied to z before the Φ/gate step.
       Drop  (z > 0): Bernoulli(drop_rate_eff)  → z := -1.0
-      Boost (z < 0): Bernoulli(gap · boost_rate_eff) → z := min(gap, z_peak)
+      Boost (z < 0): Bernoulli(boost_rate_eff) → z := z_peak
     drop_rate_eff / boost_rate_eff are runtime scalars; eval passes 0.
-    rng_rev is a replicated PRNGKey; model axis index is folded in so each
+    rng_gate is a replicated PRNGKey; model axis index is folded in so each
     model shard draws an independent stream.
     """
     _model_axis_size = mesh.shape['model']
@@ -265,7 +259,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                        P('data', None, None),    # tau_offset [B,S,1]
                        P('model', None),          # read [N_local, D]
                        P('model', None),          # write [N_local, D]
-                       P(),                        # rng_rev (replicated)
+                       P(),                        # rng_gate (replicated)
                        P(),                        # drop_rate_eff (scalar)
                        P()),                       # boost_rate_eff (scalar)
              out_specs=(P('data', None, None),   # out [B,S,D]
@@ -290,7 +284,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
                         P()),                    # boost_rate_out scalar (v4.0.5)
              check_rep=False)
     def fused_gate_srw(x, h, emb_local, tau_offset, read_local, write_local,
-                        rng_rev, drop_rate_eff, boost_rate_eff):
+                        rng_gate, drop_rate_eff, boost_rate_eff):
         N_local = emb_local.shape[0]
         nc = max(1, N_local // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -358,8 +352,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048):
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         # v4.0.5: fold the model-shard axis into rng so each shard draws
-        # an independent stream (they see the same replicated rng_rev).
-        _rng_shard = jax.random.fold_in(rng_rev, jax.lax.axis_index('model'))
+        # an independent stream (they see the same replicated rng_gate).
+        _rng_shard = jax.random.fold_in(rng_gate, jax.lax.axis_index('model'))
 
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
         @jax.checkpoint
@@ -496,7 +490,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                        P('data', None, None, None),  # tau_offset [B,S,2,1]
                        P('model', None),              # read [N_local, D]
                        P('model', None),              # write [N_local, D]
-                       P(),                            # rng_rev (replicated)
+                       P(),                            # rng_gate (replicated)
                        P(),                            # drop_rate_eff (scalar)
                        P()),                           # boost_rate_eff (scalar)
              out_specs=(P('data', None, None, None), # out [B,S,2,D]
@@ -521,7 +515,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
                         P()),                        # boost_rate_out scalar (v4.0.5)
              check_rep=False)
     def fused_gate_srw_paired(x, h, emb_local, tau_offset, read_local, write_local,
-                                rng_rev, drop_rate_eff, boost_rate_eff):
+                                rng_gate, drop_rate_eff, boost_rate_eff):
         N_local = emb_local.shape[0]
         nc = max(1, N_local // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -590,7 +584,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048):
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         # v4.0.4: fold model-shard index into rng for per-shard independence.
-        _rng_shard = jax.random.fold_in(rng_rev, jax.lax.axis_index('model'))
+        _rng_shard = jax.random.fold_in(rng_gate, jax.lax.axis_index('model'))
 
         # --- Pass 2: gate + srw fused ---
         @jax.checkpoint
@@ -816,7 +810,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_emb_norm_min = _v_emb_norms.min()
     v_emb_norm_std = _v_emb_norms.std()
 
-    rng, rng_drop, rng_rev_q, rng_rev_v = jax.random.split(rng, 4)
+    rng, rng_drop, rng_gate_q, rng_gate_v = jax.random.split(rng, 4)
     _drop_eff = jnp.float32(0.0 if deterministic else float(gate_drop_rate))
     _boost_eff = jnp.float32(0.0 if deterministic else float(gate_boost_rate))
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
@@ -843,7 +837,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_skew, qk_apt_std, qk_entropy, qk_z_sum, qk_kurt,
      qk_drop, qk_boost) = fused_paired(
         x, h_QK, qk_emb_unit, tau_QK, qk_read, qk_write,
-        rng_rev_q, _drop_eff, _boost_eff)
+        rng_gate_q, _drop_eff, _boost_eff)
     qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
@@ -853,7 +847,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_skew, v_apt_std, v_entropy, v_z_sum, v_kurt,
      v_drop, v_boost) = fused_single(
         x, h_V, v_emb_unit, tau_all[:, :, 2:3], v_read, v_write,
-        rng_rev_v, _drop_eff, _boost_eff)
+        rng_gate_v, _drop_eff, _boost_eff)
     v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
     V = V * v_scale
 
@@ -938,7 +932,7 @@ def _know_forward(x, pool_params, router_params, rng,
     know_read = pool_params['know_read']
     know_write = pool_params['know_write']
 
-    rng, rng_drop, rng_rev_k = jax.random.split(rng, 3)
+    rng, rng_drop, rng_gate_k = jax.random.split(rng, 3)
     _drop_eff = jnp.float32(0.0 if deterministic else float(gate_drop_rate))
     _boost_eff = jnp.float32(0.0 if deterministic else float(gate_boost_rate))
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
@@ -963,7 +957,7 @@ def _know_forward(x, pool_params, router_params, rng,
      know_z_sum, know_score_kurt,
      know_drop_rate, know_boost_rate) = fused_single(
         x, h, know_emb_unit, tau, know_read, know_write,
-        rng_rev_k, _drop_eff, _boost_eff)
+        rng_gate_k, _drop_eff, _boost_eff)
 
     know_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     out = out * know_scale
