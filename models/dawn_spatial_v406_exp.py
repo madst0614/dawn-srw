@@ -369,8 +369,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=1e-4):
             chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
             # v4.0.6: per-chunk dead-only penalty. Each chunk owns its [cs]
             # neurons; aggregate their max-gate and mean-score over (B,S).
+            # Neurons live on 'model' axis (one device group per neuron), but
+            # batch samples are sharded on 'data' axis — so reduce across
+            # 'data' so every shard agrees on dead_mask / mean_score.
             max_gate_chunk = gate.max(axis=(0, 1))                             # [cs]
             mean_score_chunk = scores_f.mean(axis=(0, 1))                       # [cs]
+            max_gate_chunk = jax.lax.pmax(max_gate_chunk, 'data')
+            mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
             dead_mask_chunk = jax.lax.stop_gradient(
                 (max_gate_chunk < _dead_thresh).astype(jnp.float32))
             penalty_chunk = jax.nn.relu(-mean_score_chunk) * dead_mask_chunk
@@ -591,9 +596,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=1e-4):
             g_safe = gate + 1e-8
             chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
             # v4.0.6: dead-only penalty per chunk (each chunk owns [cs] neurons).
-            # gate is [B,S,2,cs]; reduce over (B,S,route) for per-neuron stats.
+            # gate is [B,S,2,cs]; reduce over (B,S,route) for per-neuron stats,
+            # then across 'data' axis so every shard agrees on the dead set.
             max_gate_chunk = gate.max(axis=(0, 1, 2))                           # [cs]
             mean_score_chunk = scores_f.mean(axis=(0, 1, 2))                     # [cs]
+            max_gate_chunk = jax.lax.pmax(max_gate_chunk, 'data')
+            mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
             dead_mask_chunk = jax.lax.stop_gradient(
                 (max_gate_chunk < _dead_thresh).astype(jnp.float32))
             penalty_chunk = jax.nn.relu(-mean_score_chunk) * dead_mask_chunk
