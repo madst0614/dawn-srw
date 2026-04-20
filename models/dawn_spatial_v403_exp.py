@@ -2,13 +2,19 @@
 DAWN-Spatial v4.0.3: Sense-Read-Write (JAX/Flax)
 
 Changelog:
-  spatial-r1-v4.0.3 (2026-04-19):
+  spatial-r1-v4.0.3 (2026-04-20):
     - Denominator redefined from Σ gate_j to Σ z_j^+ (positive part of z).
       Numerator still uses gate = z·Φ(z). Numerator/denominator asymmetry
       penalises borderline joiners (z < 0.75, where gate/z < 1) so tau
       learning is a structured vote weighted by neuron contribution.
       Floor of 1.0 kept (prevents tau runaway).
     - z_sum logged alongside gsum (Σ gate, now observational only).
+    - Drop emb forward normalisation (emb_unit = emb / ||emb||).
+      init still uses unit_norm_init so all emb rows start on the unit
+      sphere; during training WD + task loss are the only forces on
+      ||emb||. Per-neuron "strength" degree of freedom: specialists can
+      grow large emb norms, generalists can shrink. read / write stay
+      unit-normalised in the forward (size-dominance guard).
 
   spatial-r1-v4.0.1 (2026-04-12):
     - GELU gate (z × Φ(z)) — confidence × intensity structure.
@@ -756,8 +762,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_read = pool_params['v_read']
     v_write = pool_params['v_write']
 
-    qk_emb_unit = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
-    v_emb_unit = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
+    # v4.0.3: no forward emb normalisation. init is unit; WD + task loss
+    # shape ||emb|| during training.
+    qk_emb_unit = qk_emb
+    v_emb_unit = v_emb
 
     rng, rng_drop = jax.random.split(rng)
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
@@ -907,7 +915,9 @@ def _know_forward(x, pool_params, router_params, rng,
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
-    know_emb_unit = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
+    # v4.0.3: no forward emb normalisation. init is unit; WD + task loss
+    # shape ||emb|| during training.
+    know_emb_unit = know_emb
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     # Pure observational metrics — stop_gradient to avoid NaN VJP hazards at init.
     know_tau_std = jax.lax.stop_gradient(tau).std()
@@ -1422,10 +1432,9 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     B = x.shape[0]
     d_head = d_model // n_heads
 
-    qk_emb = pool_params['qk_emb']
-    qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-8)
-    v_emb = pool_params['v_emb']
-    v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-8)
+    # v4.0.3: no forward emb normalisation.
+    qk_norm = pool_params['qk_emb']
+    v_norm = pool_params['v_emb']
 
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
@@ -1465,8 +1474,8 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _know_forward_inference(x, pool_params, router_params):
     """Inference-only know forward. No chunking, no LB, no dropout."""
-    know_emb = pool_params['know_emb']
-    know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-8)
+    # v4.0.3: no forward emb normalisation.
+    know_norm = pool_params['know_emb']
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     out = _srw_inference(x, h, know_norm, tau,
@@ -1493,10 +1502,9 @@ def prefill(params, model_cfg, input_ids):
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
 
-    qk_norm = pool_params['qk_emb'] / (
-        jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_norm = pool_params['v_emb'] / (
-        jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
+    # v4.0.3: no forward emb normalisation.
+    qk_norm = pool_params['qk_emb']
+    v_norm = pool_params['v_emb']
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
@@ -1630,12 +1638,10 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     emb_matrix = jnp.asarray(params['token_emb']['embedding'])
     pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
 
-    qk_norm = pool_params['qk_emb'] / (
-        jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_norm = pool_params['v_emb'] / (
-        jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
-    know_norm = pool_params['know_emb'] / (
-        jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    # v4.0.3: no forward emb normalisation.
+    qk_norm = pool_params['qk_emb']
+    v_norm = pool_params['v_emb']
+    know_norm = pool_params['know_emb']
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
@@ -1811,12 +1817,10 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
 
-    qk_norm = pool_params['qk_emb'] / (
-        jnp.linalg.norm(pool_params['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-    v_norm = pool_params['v_emb'] / (
-        jnp.linalg.norm(pool_params['v_emb'], axis=-1, keepdims=True) + 1e-8)
-    know_norm_w = pool_params['know_emb'] / (
-        jnp.linalg.norm(pool_params['know_emb'], axis=-1, keepdims=True) + 1e-8)
+    # v4.0.3: no forward emb normalisation.
+    qk_norm = pool_params['qk_emb']
+    v_norm = pool_params['v_emb']
+    know_norm_w = pool_params['know_emb']
 
     block_params_list = [params[f'block_{i}'] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params_list)
@@ -1943,9 +1947,10 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
-        qk_n = pp['qk_emb'] / (jnp.linalg.norm(pp['qk_emb'], axis=-1, keepdims=True) + 1e-8)
-        v_n = pp['v_emb'] / (jnp.linalg.norm(pp['v_emb'], axis=-1, keepdims=True) + 1e-8)
-        kn_n = pp['know_emb'] / (jnp.linalg.norm(pp['know_emb'], axis=-1, keepdims=True) + 1e-8)
+        # v4.0.3: no forward emb normalisation.
+        qk_n = pp['qk_emb']
+        v_n = pp['v_emb']
+        kn_n = pp['know_emb']
 
         for i in range(n_layers):
             bp = params[f'block_{i}']
