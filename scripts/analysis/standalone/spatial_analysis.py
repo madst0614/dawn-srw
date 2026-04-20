@@ -6518,6 +6518,88 @@ def analyze_tau_gradient_split(params, cfg, val_tokens, output_dir,
 
 
 # ============================================================
+# §P1: Emb pairwise cosine (sampled) + write direction + R/W orthogonality
+# ============================================================
+
+def analyze_pool_geometry(params, cfg, output_dir, n_samples=200):
+    """Offline pool-geometry audit for qk/v/know pools:
+      (3) pairwise cosine similarity of emb vectors (n_samples random pairs)
+      (5) write direction anisotropy: ||write.mean(axis=0)||
+          (1=all aligned, 0=uniform)
+      (6) read-write orthogonality: per-neuron cos(read_j, write_j) mean + std
+    Pure offline analysis — checkpoint-only, no forward pass."""
+    print("\n" + "="*60)
+    print("§P1: Pool geometry (emb pairwise cos / write aniso / r-w angle)")
+    print("="*60)
+
+    pool = params['neuron_pool']
+    results = {}
+    rng = np.random.default_rng(42)
+
+    for pool_name, prefix in [('QK', 'qk'), ('V', 'v'), ('Know', 'know')]:
+        emb = np.asarray(pool[f'{prefix}_emb'])        # [N, d_route]
+        read = np.asarray(pool[f'{prefix}_read'])      # [N, d_model]
+        write = np.asarray(pool[f'{prefix}_write'])    # [N, d_model]
+        N = emb.shape[0]
+
+        # (3) Emb pairwise cosine (sampled pairs; N² would be too large)
+        idx_i = rng.integers(0, N, size=n_samples)
+        idx_j = rng.integers(0, N, size=n_samples)
+        same = idx_i == idx_j
+        idx_j[same] = (idx_j[same] + 1) % N             # ensure i != j
+        e_i = emb[idx_i] / (np.linalg.norm(emb[idx_i], axis=-1, keepdims=True) + 1e-8)
+        e_j = emb[idx_j] / (np.linalg.norm(emb[idx_j], axis=-1, keepdims=True) + 1e-8)
+        emb_cos = (e_i * e_j).sum(axis=-1)
+        emb_cos_mean = float(emb_cos.mean())
+        emb_cos_std = float(emb_cos.std())
+        emb_cos_abs_mean = float(np.abs(emb_cos).mean())
+
+        # (5) Write direction anisotropy
+        w_unit = write / (np.linalg.norm(write, axis=-1, keepdims=True) + 1e-8)
+        write_mean_norm = float(np.linalg.norm(w_unit.mean(axis=0)))
+        r_unit = read / (np.linalg.norm(read, axis=-1, keepdims=True) + 1e-8)
+        read_mean_norm = float(np.linalg.norm(r_unit.mean(axis=0)))
+
+        # (6) Read-write per-neuron orthogonality
+        rw_cos = (r_unit * w_unit).sum(axis=-1)         # [N]
+        rw_cos_mean = float(rw_cos.mean())
+        rw_cos_std = float(rw_cos.std())
+        rw_cos_abs_mean = float(np.abs(rw_cos).mean())
+        rw_aligned = float((rw_cos > 0.5).mean())       # fraction aligned (>0)
+        rw_anti = float((rw_cos < -0.5).mean())         # fraction anti-aligned
+
+        results[pool_name] = {
+            'N': int(N),
+            'emb_pairwise_cos_mean': emb_cos_mean,
+            'emb_pairwise_cos_std': emb_cos_std,
+            'emb_pairwise_cos_abs_mean': emb_cos_abs_mean,
+            'write_mean_dir_norm': write_mean_norm,
+            'read_mean_dir_norm': read_mean_norm,
+            'rw_cos_mean': rw_cos_mean,
+            'rw_cos_std': rw_cos_std,
+            'rw_cos_abs_mean': rw_cos_abs_mean,
+            'rw_aligned_frac': rw_aligned,
+            'rw_antialigned_frac': rw_anti,
+            'n_sample_pairs': int(n_samples),
+        }
+
+        print(f"\n  {pool_name} (N={N}):")
+        print(f"    emb pairwise cos ({n_samples} pairs): mean={emb_cos_mean:+.4f}"
+              f" std={emb_cos_std:.4f} |mean|={emb_cos_abs_mean:.4f}")
+        print(f"    write mean-direction |μ|={write_mean_norm:.4f}"
+              f" (1 → all same dir, 0 → uniform on sphere)")
+        print(f"    read  mean-direction |μ|={read_mean_norm:.4f}")
+        print(f"    r-w cos: mean={rw_cos_mean:+.4f} std={rw_cos_std:.4f}"
+              f" |mean|={rw_cos_abs_mean:.4f}")
+        print(f"    r-w aligned(cos>0.5)={rw_aligned*100:.1f}%"
+              f"  anti(cos<-0.5)={rw_anti*100:.1f}%")
+
+    _save_json(results, output_dir, 'pool_geometry', 'pool_geometry.json')
+    print("\n  Done: pool_geom")
+    return results
+
+
+# ============================================================
 # z/phi/gate histogram JIT forward (gate_ci 전용)
 # ============================================================
 
@@ -6857,7 +6939,7 @@ def main():
     parser.add_argument("--max_batches", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--only", default=None,
-                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,read_cov,rw_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func,z_dist,tau_grad")
+                        help="Comma-separated: info,val,health,generate,weights,routing,samples,gate_dist,utilization,r1,r2,r3,r4,r5,rw_proj,act_context,layer_role,cross_suppress,gate_mech,comp_expr,neuron_cluster,cross_ref,deep,op_space,intervene,compose,rw_align,resid_dyn,phase,drift,gate_ci,write_cov,read_cov,rw_cov,sel_gini,sel_trans,combo,addit,dom_supp,rw_func,z_dist,tau_grad,pool_geom")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated analyses to skip (used when --only is not set)")
     parser.add_argument("--prompt", default="The meaning of life is")
@@ -7194,6 +7276,9 @@ def main():
                                         n_batches=_nb or 2, batch_size=min(_abs, 4))
         else:
             print("\n  Skipping tau_grad (no --val_data)")
+
+    if _should_run('pool_geom'):
+        analyze_pool_geometry(params, cfg, args.output, n_samples=200)
 
     print(f"\nDone. Results in {args.output}/")
 
