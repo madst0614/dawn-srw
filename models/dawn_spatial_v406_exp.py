@@ -372,9 +372,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=1e-4):
             # Neurons live on 'model' axis (one device group per neuron), but
             # batch samples are sharded on 'data' axis — so reduce across
             # 'data' so every shard agrees on dead_mask / mean_score.
+            # pmax has no VJP; wrap in stop_gradient (it only feeds dead_mask
+            # which is already non-differentiable). pmean has a VJP so the
+            # mean_score gradient (the actual penalty signal) flows normally.
             max_gate_chunk = gate.max(axis=(0, 1))                             # [cs]
             mean_score_chunk = scores_f.mean(axis=(0, 1))                       # [cs]
-            max_gate_chunk = jax.lax.pmax(max_gate_chunk, 'data')
+            max_gate_chunk = jax.lax.pmax(
+                jax.lax.stop_gradient(max_gate_chunk), 'data')
             mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
             dead_mask_chunk = jax.lax.stop_gradient(
                 (max_gate_chunk < _dead_thresh).astype(jnp.float32))
@@ -598,9 +602,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=1e-4):
             # v4.0.6: dead-only penalty per chunk (each chunk owns [cs] neurons).
             # gate is [B,S,2,cs]; reduce over (B,S,route) for per-neuron stats,
             # then across 'data' axis so every shard agrees on the dead set.
+            # pmax has no VJP; wrap in stop_gradient (dead_mask is already
+            # non-differentiable). pmean is linear so its VJP carries the
+            # mean_score gradient back.
             max_gate_chunk = gate.max(axis=(0, 1, 2))                           # [cs]
             mean_score_chunk = scores_f.mean(axis=(0, 1, 2))                     # [cs]
-            max_gate_chunk = jax.lax.pmax(max_gate_chunk, 'data')
+            max_gate_chunk = jax.lax.pmax(
+                jax.lax.stop_gradient(max_gate_chunk), 'data')
             mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
             dead_mask_chunk = jax.lax.stop_gradient(
                 (max_gate_chunk < _dead_thresh).astype(jnp.float32))
