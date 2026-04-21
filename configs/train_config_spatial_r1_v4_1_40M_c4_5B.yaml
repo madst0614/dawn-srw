@@ -72,7 +72,5 @@ training:
   val_interval: 500
 
 use_amp: true
-# Fresh run dir: asymmetric 0.1 + downward tau cap is a distinct
-# configuration from the earlier 0.15 and symmetric 1.0 runs.
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1cap_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1cap_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1_40M_c4_5B
