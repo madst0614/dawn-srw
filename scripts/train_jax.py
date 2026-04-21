@@ -704,7 +704,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_weight, exploration_ema_decay,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       is_baseline=False, is_spatial=False,
-                      sharded_fns=None):
+                      sharded_fns=None, mesh=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
     v4.1 explore: `ema_ce` is threaded through as a scalar state. The
@@ -712,7 +712,29 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     tokens (per_token_ce > EMA). `explore_active` is a float gate
     (0 during burn-in, 1 after) — passed in rather than comparing
     global_step inside jit to avoid recompilation.
+
+    `mesh` is the NamedSharding mesh and is required when the v4.1
+    exploration loss is active — the EMA reduction is wrapped in a
+    small shard_map to get an explicit valid-weighted global CE.
     """
+    # Build a shard_map'd valid-weighted global CE reducer.  Inputs are
+    # sharded on the 'data' axis (batch-parallel); psum aggregates across
+    # all data-parallel shards (and across hosts in multi-host runs).
+    _ema_reducer = None
+    if mesh is not None:
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P('data', None),       # per_token_ce [B, S-1]
+                           P('data', None)),      # valid_mask    [B, S-1]
+                 out_specs=P(),                    # scalar replicated
+                 check_rep=False)
+        def _ema_reducer_fn(pce, vmask):
+            vm_f = vmask.astype(jnp.float32)
+            local_sum = (pce * vm_f).sum()
+            local_cnt = vm_f.sum()
+            g_sum = jax.lax.psum(local_sum, 'data')
+            g_cnt = jax.lax.psum(local_cnt, 'data')
+            return g_sum / (g_cnt + 1e-8)
+        _ema_reducer = _ema_reducer_fn
 
     @jax.jit
     def train_step(params, opt_state, ema_ce, explore_active,
@@ -810,11 +832,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       surprise_mean, surprise_frac, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
-        # v4.1 EMA update. ce_loss is already globally reduced by XLA SPMD
-        # (valid-weighted mean over batch/seq with sharded batch axis), so no
-        # extra pmean/psum needed at this scope.
+        # v4.1 EMA update. Use an explicit valid-weighted global reduce via
+        # shard_map so the EMA is host-invariant under multi-host (plain jit
+        # doesn't expose `'data'` as a collective axis, and relying on GSPMD
+        # implicit reduction of `ce_loss` is fragile across JAX versions).
+        # Fallback: use ce_loss directly when no mesh / no per_token_ce.
+        if _ema_reducer is not None and result.get('per_token_ce', None) is not None:
+            global_ce_for_ema = _ema_reducer(
+                result['per_token_ce'], result['valid_mask'])
+        else:
+            global_ce_for_ema = ce_loss
         new_ema_ce = (exploration_ema_decay * ema_ce
-                      + (1.0 - exploration_ema_decay) * ce_loss)
+                      + (1.0 - exploration_ema_decay) * global_ce_for_ema)
 
         # XLA SPMD handles gradient all-reduce automatically
         # (loss computed on sharded data → gradients consistent across shards)
@@ -1879,7 +1908,7 @@ def main():
         exploration_weight, exploration_ema_decay,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         is_baseline=is_baseline, is_spatial=is_spatial,
-        sharded_fns=_sharded_fns)
+        sharded_fns=_sharded_fns, mesh=mesh)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
 
     # v4.1 RPE exploration state (persisted across steps).
