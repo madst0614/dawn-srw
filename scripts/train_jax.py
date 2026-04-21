@@ -2852,8 +2852,12 @@ def main():
                             k_z030 = _m(metrics.get('know_z_lt_030', 0.0))
                             k_int_max = _m(metrics.get('know_int_max', 0.0))
                             k_int_cap = _m(metrics.get('know_int_cap_frac', 0.0))
+                            k_act_n = k_act * n_know_cfg
+                            k_strong_n = k_strong * n_know_cfg
+                            k_strong_of_act = k_strong_n / max(k_act_n, 1.0)
                             log_message(
-                                f"      know: act={k_act*100:.1f}% strong={k_strong*100:.1f}%"
+                                f"      know: act={k_act_n:.0f}/{n_know_cfg}({k_act*100:.1f}%)"
+                                f" strong={k_strong_n:.0f}/{k_act_n:.0f}({k_strong_of_act*100:.1f}%)"
                                 f" gate_max={k_raw_gmax:.2f}"
                                 f" int_avg={k_z_act:.2f} int_max={k_int_max:.2f}"
                                 f" cap={k_int_cap*100:.1f}%"
@@ -2896,9 +2900,19 @@ def main():
                             a_z030 = _m(metrics.get('attn_z_lt_030', 0.0))
                             a_int_max = _m(metrics.get('attn_int_max', 0.0))
                             a_int_cap = _m(metrics.get('attn_int_cap_frac', 0.0))
+                            a_qk_act_n = a_qk_act * n_qk_cfg
+                            a_v_act_n = a_v_act * n_v_cfg
+                            # `attn_strong` is avg of qk/v strong fractions;
+                            # combined active count = sum of both active counts.
+                            # Express "strong among active" against the combined
+                            # population so the %denom matches what act= shows.
+                            a_total_act_n = a_qk_act_n + a_v_act_n
+                            a_strong_n = a_strong * (n_qk_cfg + n_v_cfg)
+                            a_strong_of_act = a_strong_n / max(a_total_act_n, 1.0)
                             log_message(
-                                f"      attn: qk_act={a_qk_act*100:.1f}% v_act={a_v_act*100:.1f}%"
-                                f" strong={a_strong*100:.1f}%"
+                                f"      attn: qk_act={a_qk_act_n:.0f}/{n_qk_cfg}({a_qk_act*100:.1f}%)"
+                                f" v_act={a_v_act_n:.0f}/{n_v_cfg}({a_v_act*100:.1f}%)"
+                                f" strong={a_strong_n:.0f}/{a_total_act_n:.0f}({a_strong_of_act*100:.1f}%)"
                                 f" gate_max={a_raw_gmax:.2f}"
                                 f" int_avg[qk={a_qk_z:.2f} v={a_v_z:.2f}]"
                                 f" int_max={a_int_max:.2f} cap={a_int_cap*100:.1f}%"
