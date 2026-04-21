@@ -56,13 +56,15 @@ training:
   # Dead-only penalty (threshold bumped from 1e-4 → 0.01 for v4.1 scale).
   dead_penalty_weight: 0.05
   dead_penalty_threshold: 0.01
-  # v4.1 RPE-style exploration loss (redesigned). Baseline = per-step
-  # batch-global CE mean (no EMA). Asymmetric signal: positive deviation
-  # (surprising tokens) pushes tau_offset DOWN at full strength,
-  # negative deviation (easy tokens) pushes UP at `asymmetry` strength.
-  # Nearly zero-sum per batch → no tau drift. 0 weight to disable.
+  # v4.1 RPE-style exploration loss. Baseline = per-step batch-global
+  # CE mean (no EMA). Signal = per-token deviation from baseline;
+  # `asymmetry` scales the easy-token branch (asym<1.0) vs the hard-token
+  # branch (=1.0). asymmetry=1.0 is fully symmetric → signal mean exactly
+  # 0, no tau drift; runaway risk removed at the cost of relying on the
+  # CE self-correction loop to recover neurons from over-pruned regions.
+  # 0 weight disables the loss entirely.
   exploration_weight: 0.001       # λ
-  exploration_asymmetry: 0.15     # easy-token push strength / hard-token push
+  exploration_asymmetry: 1.0      # symmetric: zero-mean deviation
   n_chunks_know: 1
   n_chunks_qk: 1
   n_chunks_v: 1
@@ -70,5 +72,7 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1_40M_c4_5B
+# Fresh run dir so we don't auto-resume from the asymmetric-run checkpoints
+# (tau already drifted there; symmetric config needs to start from scratch).
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1sym_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1sym_40M_c4_5B
