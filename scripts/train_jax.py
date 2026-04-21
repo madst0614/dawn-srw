@@ -784,12 +784,25 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     per_token_ce - global_mean_ce)                   # [B, S-1]
                 # Asymmetric: full push on hard tokens, `asym`·push on easy ones.
                 signal = jnp.where(deviation > 0, deviation, _asym * deviation)
-                # Sum over layers and route dim to match [B, S-1].
+                # Sum / mean over layers and route dim to match [B, S-1].
                 a_sum = attn_tau_off[:, :, :-1, :].sum(axis=(0, -1))
                 k_sum = know_tau_off[:, :, :-1, :].sum(axis=(0, -1))
+                a_tau_mean = attn_tau_off[:, :, :-1, :].mean(axis=(0, -1))
+                k_tau_mean = know_tau_off[:, :, :-1, :].mean(axis=(0, -1))
+                # Downward cap: when signal > 0 (about to push tau DOWN) and
+                # the per-pool mean tau_offset is already ≤ 0, zero the
+                # contribution for that token. Up-push (signal < 0) always
+                # allowed — CE self-correction can still recover pools that
+                # over-pruned. Comparison op is non-differentiable so no
+                # gradient flows through the mask itself.
+                pos_signal = (signal > 0)
+                a_block = pos_signal & (a_tau_mean <= 0.0)
+                k_block = pos_signal & (k_tau_mean <= 0.0)
+                a_mask = jnp.where(a_block, 0.0, 1.0)
+                k_mask = jnp.where(k_block, 0.0, 1.0)
                 vsum_eps = vmask_f.sum() + 1e-8
-                explore_attn_raw = (signal * a_sum * vmask_f).sum() / vsum_eps
-                explore_know_raw = (signal * k_sum * vmask_f).sum() / vsum_eps
+                explore_attn_raw = (signal * a_mask * a_sum * vmask_f).sum() / vsum_eps
+                explore_know_raw = (signal * k_mask * k_sum * vmask_f).sum() / vsum_eps
                 explore_loss_raw = explore_attn_raw + explore_know_raw
                 # Log-only stats (all stop_gradient via pure reductions).
                 pos_mask = (deviation > 0).astype(jnp.float32) * vmask_f
@@ -799,6 +812,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     pos_mask.sum() + 1e-8)
                 neg_mean = (jnp.maximum(-deviation, 0.0) * vmask_f).sum() / (
                     neg_mask.sum() + 1e-8)
+                # Down-push block fractions (of valid tokens).
+                block_frac_a = jax.lax.stop_gradient(
+                    (a_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
+                block_frac_k = jax.lax.stop_gradient(
+                    (k_block.astype(jnp.float32) * vmask_f).sum() / vsum_eps)
             else:
                 global_mean_ce = jnp.float32(0.0)
                 explore_loss_raw = jnp.float32(0.0)
@@ -807,6 +825,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
                 neg_mean = jnp.float32(0.0)
+                block_frac_a = jnp.float32(0.0)
+                block_frac_k = jnp.float32(0.0)
             explore_loss_weighted = exploration_weight * explore_loss_raw
 
             if is_baseline:
@@ -837,12 +857,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
                                 dead_penalty, global_mean_ce, explore_loss_raw,
                                 explore_attn_raw, explore_know_raw,
-                                pos_frac, pos_mean, neg_mean, result)
+                                pos_frac, pos_mean, neg_mean,
+                                block_frac_a, block_frac_k, result)
 
         (total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
                       dead_penalty, global_mean_ce, explore_loss_raw,
                       explore_attn_raw, explore_know_raw,
-                      pos_frac, pos_mean, neg_mean, result)), grads = \
+                      pos_frac, pos_mean, neg_mean,
+                      block_frac_a, block_frac_k, result)), grads = \
             jax.value_and_grad(loss_fn, has_aux=True)(params)
 
         # XLA SPMD handles gradient all-reduce automatically
@@ -1009,6 +1031,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'explore_attn_raw': explore_attn_raw,
             'explore_know_raw': explore_know_raw,
             'explore_loss_weighted': exploration_weight * explore_loss_raw,
+            'explore_block_frac_a': block_frac_a,
+            'explore_block_frac_k': block_frac_k,
         }
 
         return new_params, new_opt_state, metrics
@@ -2656,12 +2680,15 @@ def main():
                         m_explore_a = _m(metrics.get('explore_attn_raw', 0.0))
                         m_explore_k = _m(metrics.get('explore_know_raw', 0.0))
                         m_explore_w = _m(metrics.get('explore_loss_weighted', 0.0))
+                        m_block_a = _m(metrics.get('explore_block_frac_a', 0.0))
+                        m_block_k = _m(metrics.get('explore_block_frac_k', 0.0))
                         log_message(
                             f"      rpe: mean_ce={m_global_ce:.3f}"
                             f" pos_frac={m_pos_frac*100:.1f}%"
                             f" pos_avg={m_pos_mean:.3f} neg_avg={m_neg_mean:.3f}"
                             f" expl[a={m_explore_a:+.3f} k={m_explore_k:+.3f}]"
-                            f" w={m_explore_w:+.4f}")
+                            f" w={m_explore_w:+.4f}"
+                            f" block[a={m_block_a*100:.1f}% k={m_block_k*100:.1f}%]")
 
                         # Emb norm per-pool stats (mean / max / min / std)
                         k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))
@@ -2927,6 +2954,8 @@ def main():
                         'explore_attn_raw': float(metrics.get('explore_attn_raw', 0.0)),
                         'explore_know_raw': float(metrics.get('explore_know_raw', 0.0)),
                         'explore_loss_weighted': float(metrics.get('explore_loss_weighted', 0.0)),
+                        'explore_block_frac_a': float(metrics.get('explore_block_frac_a', 0.0)),
+                        'explore_block_frac_k': float(metrics.get('explore_block_frac_k', 0.0)),
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,

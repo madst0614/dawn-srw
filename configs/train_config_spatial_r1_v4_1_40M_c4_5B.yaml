@@ -58,13 +58,13 @@ training:
   dead_penalty_threshold: 0.01
   # v4.1 RPE-style exploration loss. Baseline = per-step batch-global
   # CE mean (no EMA). Signal = per-token deviation from baseline;
-  # `asymmetry` scales the easy-token branch (asym<1.0) vs the hard-token
-  # branch (=1.0). asymmetry=1.0 is fully symmetric → signal mean exactly
-  # 0, no tau drift; runaway risk removed at the cost of relying on the
-  # CE self-correction loop to recover neurons from over-pruned regions.
-  # 0 weight disables the loss entirely.
+  # `asymmetry` scales the easy-token branch.  A downward cap in the
+  # training step zeroes the down-push whenever the per-pool mean
+  # tau_offset is ≤ 0 — tau can only drop below 0 when every pool
+  # had positive mean already.  Combined with a small asymmetry this
+  # gives faint, bounded exploration.  0 weight disables the loss.
   exploration_weight: 0.001       # λ
-  exploration_asymmetry: 1.0      # symmetric: zero-mean deviation
+  exploration_asymmetry: 0.1      # easy-token push scale (symmetric=1.0)
   n_chunks_know: 1
   n_chunks_qk: 1
   n_chunks_v: 1
@@ -72,7 +72,7 @@ training:
   val_interval: 500
 
 use_amp: true
-# Fresh run dir so we don't auto-resume from the asymmetric-run checkpoints
-# (tau already drifted there; symmetric config needs to start from scratch).
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1sym_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1sym_40M_c4_5B
+# Fresh run dir: asymmetric 0.1 + downward tau cap is a distinct
+# configuration from the earlier 0.15 and symmetric 1.0 runs.
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1cap_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1cap_40M_c4_5B
