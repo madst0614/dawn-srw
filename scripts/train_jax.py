@@ -171,8 +171,8 @@ def build_model_from_config(cfg):
         elif version == 'spatial-r1-v4.0.6':
             _extra['tau_alpha_init'] = cfg['training'].get('tau_alpha_init', 0.1)
         elif version == 'spatial-r1-v4.1':
-            _extra['tau_alpha_init'] = cfg['training'].get('tau_alpha_init', 0.1)
-            _extra['max_alpha'] = cfg['training'].get('max_alpha', 1.0)
+            # v4.1 removed dynamic tau / alpha entirely; no model-level kwargs.
+            pass
         model = _cls(
             vocab_size=mcfg.get('vocab_size', 30522),
             d_model=mcfg.get('d_model', 384),
@@ -1761,12 +1761,15 @@ def main():
             _srw_kwargs['dead_threshold'] = cfg['training'].get(
                 'dead_penalty_threshold',
                 0.01 if model_version == 'spatial-r1-v4.1' else 1e-4)
-        # v4.1: sharpness / activation_threshold / epsilon / max_intensity
-        # are all closure constants for the new factored gate.
+        # v4.1: sharpness / activation_threshold / activation_cutoff /
+        # epsilon / max_intensity — all closure constants for the
+        # two-stage gate.
         if model_version == 'spatial-r1-v4.1':
-            _srw_kwargs['sharpness'] = cfg['training'].get('sharpness', 50.0)
+            _srw_kwargs['sharpness'] = cfg['training'].get('sharpness', 500.0)
             _srw_kwargs['activation_threshold'] = cfg['training'].get(
                 'activation_threshold', 0.5)
+            _srw_kwargs['activation_cutoff'] = cfg['training'].get(
+                'activation_cutoff', 0.01)
             _srw_kwargs['epsilon'] = cfg['training'].get('epsilon', 1e-4)
             _srw_kwargs['max_intensity'] = cfg['training'].get(
                 'max_intensity', 10.0)
@@ -2523,37 +2526,15 @@ def main():
                         a_ent = _m(metrics.get('attn_gate_entropy', 0.0))
                         k_kurt = _m(metrics.get('know_score_kurt', 0.0))
                         a_kurt = _m(metrics.get('attn_score_kurt', 0.0))
-                        # v4.0.6: dead count + softplus alpha + dynamic tau shift.
+                        # Dead count (v4.0.6+). alpha / tau_shift / s_std_min
+                        # removed in v4.1 (dynamic tau gone).
                         k_dead = _m(metrics.get('know_dead_count', 0.0))
                         a_dead = _m(metrics.get('attn_dead_count', 0.0))
-                        alpha_qk = _m(metrics.get('alpha_qk', 0.0))
-                        alpha_v = _m(metrics.get('alpha_v', 0.0))
-                        alpha_know = _m(metrics.get('alpha_know', 0.0))
-                        k_tshift = _m(metrics.get('know_tau_shift_mean', 0.0))
-                        a_qk_tshift = _m(metrics.get('attn_qk_tau_shift_mean', 0.0))
-                        a_v_tshift = _m(metrics.get('attn_v_tau_shift_mean', 0.0))
                         log_message(
                             f"      dist: k[skew={k_skew:+.2f} kurt={k_kurt:.2f}"
-                            f" apt_std={k_apt:.1f} ent={k_ent:.2f}"
-                            f" dead={int(k_dead)} α={alpha_know:.4f} tshift={k_tshift:+.3f}]"
+                            f" apt_std={k_apt:.1f} ent={k_ent:.2f} dead={int(k_dead)}]"
                             f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
-                            f" apt_std={a_apt:.1f} ent={a_ent:.2f}"
-                            f" dead={int(a_dead)} α_qk={alpha_qk:.4f} α_v={alpha_v:.4f}"
-                            f" tshift_qk={a_qk_tshift:+.3f} tshift_v={a_v_tshift:+.3f}]")
-                        # Worst-token s_std → 1/(s_std+1e-6) max = diff_max.
-                        # tau_shift at that token ≈ -α * diff_max.
-                        k_sstd_min = _m(metrics.get('know_s_std_min', 0.0))
-                        a_sstd_min = _m(metrics.get('attn_s_std_min', 0.0))
-                        k_diff_max = 1.0 / (k_sstd_min + 1e-6)
-                        a_diff_max = 1.0 / (a_sstd_min + 1e-6)
-                        log_message(
-                            f"      diag: k[sstd_min={k_sstd_min:.4f}"
-                            f" diff_max={k_diff_max:.1f}"
-                            f" worst_tshift={-alpha_know * k_diff_max:+.2f}]"
-                            f" a[sstd_min={a_sstd_min:.4f}"
-                            f" diff_max={a_diff_max:.1f}"
-                            f" worst_tshift_qk={-alpha_qk * a_diff_max:+.2f}"
-                            f" worst_tshift_v={-alpha_v * a_diff_max:+.2f}]")
+                            f" apt_std={a_apt:.1f} ent={a_ent:.2f} dead={int(a_dead)}]")
 
                         # Emb norm per-pool stats (mean / max / min / std)
                         k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))
@@ -2803,19 +2784,13 @@ def main():
                         'attn_boost_rate': a_boost,
                         'know_drop_rate': k_drop,
                         'know_boost_rate': k_boost,
-                        # v4.0.6 dynamic tau / dead-penalty (instantaneous).
+                        # Dead-only penalty (v4.0.6+).
                         'dead_penalty': float(metrics.get('dead_penalty', 0.0)),
                         'attn_dead_penalty': float(metrics.get('attn_dead_penalty', 0.0)),
                         'know_dead_penalty': float(metrics.get('know_dead_penalty', 0.0)),
                         'dead_penalty_weighted': dead_penalty_weight * float(metrics.get('dead_penalty', 0.0)),
                         'attn_dead_count': float(metrics.get('attn_dead_count', 0.0)),
                         'know_dead_count': float(metrics.get('know_dead_count', 0.0)),
-                        'attn_qk_tau_shift_mean': float(metrics.get('attn_qk_tau_shift_mean', 0.0)),
-                        'attn_v_tau_shift_mean': float(metrics.get('attn_v_tau_shift_mean', 0.0)),
-                        'know_tau_shift_mean': float(metrics.get('know_tau_shift_mean', 0.0)),
-                        'alpha_qk': float(metrics.get('alpha_qk', 0.0)),
-                        'alpha_v': float(metrics.get('alpha_v', 0.0)),
-                        'alpha_know': float(metrics.get('alpha_know', 0.0)),
                         'accuracy': avg_acc,
                         'lr': current_lr,
                         'steps_per_sec': steps_per_sec,

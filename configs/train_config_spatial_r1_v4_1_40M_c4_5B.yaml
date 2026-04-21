@@ -1,12 +1,15 @@
-# DAWN Spatial-R1 v4.1 -- clean activation × intensity factorisation
+# DAWN Spatial-R1 v4.1 -- two-stage gate (activation × intensity)
 #
-# Gate = activation × intensity
-#   activation = sigmoid(SHARPNESS · (raw - ACTIVATION_THRESHOLD))
-#   intensity  = EPSILON + MAX_INTENSITY · sigmoid(score)
-# Dynamic tau:
-#   alpha  = MAX_ALPHA · sigmoid(raw_alpha)  (sigmoid-capped)
-#   shift  = -alpha / (s_std + 1e-6)
-# Embedding forward-normalized (unit) so neurons = pure direction.
+# Gate structure:
+#   margin        = (score - tau) - ACTIVATION_THRESHOLD
+#   activation    = sigmoid(SHARPNESS · margin)                (near-binary)
+#   active_margin = max(margin - ACTIVATION_CUTOFF, 0)
+#   intensity     = EPSILON + min(active_margin, MAX_INTENSITY) (linear)
+#   gate          = activation × intensity
+#   den           = max(Σ intensity, 1.0)
+#
+# Static tau: tau = s_mean + tau_offset · s_std (dynamic shift removed).
+# Embedding forward-normalised (unit) so neurons = pure direction.
 # Dead threshold raised to 0.01 for the new gate scale.
 #
 # Projection-level dropouts kept at 0.0 (same rationale as v4.0.5/6).
@@ -44,16 +47,15 @@ training:
   warmup_ratio: 0.06
   diversity_weight: 0.1
   load_balance_weight: 0.0
-  # v4.1 physical constants (exposed; defaults match the module-level
-  # values in models/dawn_spatial_v41_exp.py).
-  sharpness: 50.0
+  # v4.1 physical constants (match module-level defaults; overridable).
+  sharpness: 500.0
   activation_threshold: 0.5
+  activation_cutoff: 0.01
   epsilon: 1.0e-4
-  max_alpha: 1.0
   max_intensity: 10.0
-  tau_alpha_init: 0.1          # initial alpha (pre-cap) ≈ 0.1
+  # Dead-only penalty (threshold bumped from 1e-4 → 0.01 for v4.1 scale).
   dead_penalty_weight: 0.05
-  dead_penalty_threshold: 0.01 # raised from v4.0.6's 1e-4 for new gate scale
+  dead_penalty_threshold: 0.01
   n_chunks_know: 1
   n_chunks_qk: 1
   n_chunks_v: 1
