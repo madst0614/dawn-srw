@@ -1182,33 +1182,41 @@ class GCSLogger:
 
     GCS doesn't support true append — each open('a')/write/close overwrites.
     So we always append to a local file and upload the full file to GCS
-    on every sync() call.
+    on every sync() call. sync() is throttled by a minimum-bytes delta
+    so short-log-interval churn doesn't re-upload the same tail
+    continuously; pass force=True at safe-point boundaries.
     """
 
     def __init__(self, gcs_path, local_path):
         self.gcs_path = gcs_path
         self.local_path = local_path
         self._dirty = False
-        # Ensure local parent dir exists
-        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        self._last_synced_size = 0
+        if local_path:
+            Path(local_path).parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, text):
         with open(self.local_path, 'a') as f:
             f.write(text)
         self._dirty = True
 
-    def sync(self):
-        """Upload local file to GCS if there are new writes."""
+    def sync(self, min_delta_bytes=100 * 1024, force=False):
+        """Upload local file to GCS if new writes exceed threshold (or force=True)."""
         if not self._dirty or not self.gcs_path:
             return
         try:
+            cur_size = Path(self.local_path).stat().st_size
+            if not force and (cur_size - self._last_synced_size) < min_delta_bytes:
+                return
             with open(self.local_path, 'rb') as f:
                 data = f.read()
             with _open_file(self.gcs_path, 'wb') as f:
                 f.write(data)
+            self._last_synced_size = cur_size
             self._dirty = False
         except Exception as e:
-            print(f"  [warn] GCS sync failed: {e}")
+            if jax.process_index() == 0:
+                print(f"  [warn] GCS sync failed: {e}", flush=True)
 
 
 # Module-level loggers — set up in main()
@@ -1227,7 +1235,7 @@ def _setup_loggers(training_log_file, jsonl_log_file):
         local_txt = str(tmpdir / Path(training_log_file).name)
         _train_logger = GCSLogger(training_log_file, local_txt)
     else:
-        _train_logger = GCSLogger(None)
+        _train_logger = GCSLogger(None, training_log_file)
 
     if _is_gcs(jsonl_log_file):
         local_jsonl = str(tmpdir / Path(jsonl_log_file).name)
@@ -1236,22 +1244,28 @@ def _setup_loggers(training_log_file, jsonl_log_file):
         _jsonl_logger = GCSLogger(None, jsonl_log_file)
 
 
-def sync_logs():
-    """Flush local logs to GCS. Call periodically (e.g. every LOG_INTERVAL)."""
+def sync_logs(force=False):
+    """Flush local logs to GCS. Throttled unless force=True.
+
+    Periodic LOG_INTERVAL calls should use the default (size-gated),
+    epoch boundaries and end-of-training should pass force=True.
+    """
     if _train_logger:
-        _train_logger.sync()
+        _train_logger.sync(force=force)
     if _jsonl_logger:
-        _jsonl_logger.sync()
+        _jsonl_logger.sync(force=force)
 
 
 def log_message(msg, log_file=None):
-    """Print and write to training log file."""
+    """Print and write to training log file. Host 0 only."""
+    if jax.process_index() != 0:
+        return
     print(msg, flush=True)
     if _train_logger:
         try:
             _train_logger.write(msg + '\n')
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [warn] log_message write failed: {e}", flush=True)
 
 
 def format_time(seconds):
@@ -1263,14 +1277,16 @@ def format_time(seconds):
 
 
 def log_jsonl(record):
-    """Append a JSON-lines record to the JSONL log file."""
+    """Append a JSON-lines record to the JSONL log file. Host 0 only."""
+    if jax.process_index() != 0:
+        return
     if not _jsonl_logger:
         return
     try:
         line = json.dumps(record, default=str)
         _jsonl_logger.write(line + '\n')
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [warn] log_jsonl write failed: {e}", flush=True)
 
 
 def check_nan_inf(metrics_dict, global_step, epoch):
@@ -3236,7 +3252,7 @@ def main():
                 log_message(f"  New best model! val_loss={best_val_loss:.4f}")
 
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
-            sync_logs()
+            sync_logs(force=True)
 
         # Release gathered copies on every host — all hosts hold them after
         # _gather_for_save; host-0-only del leaves multi-GB pinned elsewhere.
@@ -3260,7 +3276,7 @@ def main():
             f"  Final step: {global_step}\n"
             f"{'='*60}"
         )
-        sync_logs()
+        sync_logs(force=True)
 
 
 if __name__ == '__main__':
