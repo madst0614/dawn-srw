@@ -1,18 +1,17 @@
-# DAWN Spatial-R1 v4.1 -- two-stage gate (activation × intensity)
+# DAWN Spatial-R1 v4.1+ -- two-stage gate + bounded explore + mild dropout
 #
-# Gate structure:
-#   margin        = (score - tau) - ACTIVATION_THRESHOLD
-#   activation    = sigmoid(SHARPNESS · margin)                (near-binary)
-#   active_margin = max(margin - ACTIVATION_CUTOFF, 0)
-#   intensity     = EPSILON + min(active_margin, MAX_INTENSITY) (linear)
-#   gate          = activation × intensity
-#   den           = max(Σ intensity, 1.0)
-#
-# Static tau: tau = s_mean + tau_offset · s_std (dynamic shift removed).
-# Embedding forward-normalised (unit) so neurons = pure direction.
-# Dead threshold raised to 0.01 for the new gate scale.
-#
-# Projection-level dropouts kept at 0.0 (same rationale as v4.0.5/6).
+# ============================================================
+# Changes from v4.1 baseline:
+#   1. Explore loss: per-token/layer/route bound off.
+#      Replaces pool-mean block with [LOWER, UPPER] range.
+#      Inside bounds -> normal signal; outside -> off (per-element).
+#   2. Explore warmup: loss disabled for the first N steps so
+#      W_sense has time to settle before tau exploration kicks in.
+#   3. Mild dropout for co-adaptation regularisation (residual + h).
+#      40M @ 5B tokens is well under the overfit threshold, so
+#      0.05 is mostly about preventing rigid co-activation patterns
+#      and introducing gentle exploration in projection space.
+# ============================================================
 
 seed: 1
 
@@ -29,14 +28,20 @@ model:
   n_layers: 12
   n_heads: 6
   max_seq_len: 512
-  dropout: 0.0              # emb / attn-softmax / attn-out / know-out
+  # Mild residual/attn dropout -- helps break co-adaptation without
+  # drowning the signal. 40M@5B has no overfit pressure.
+  dropout: 0.05
   gradient_checkpointing: true
 
   d_route: 128
   n_qk: 1580
   n_v: 2600
   n_know: 25200
-  router_dropout: 0.0       # proj_attn / proj_know
+  # h-level dropout. Scores = h . emb, so dropping h dims is
+  # equivalent to stochastically dimming all neuron scores along
+  # that axis -- horizontal search (area-shift) complement to
+  # tau's vertical search (water-level).
+  router_dropout: 0.05
 
 training:
   batch_size: 128
@@ -47,24 +52,34 @@ training:
   warmup_ratio: 0.06
   diversity_weight: 0.1
   load_balance_weight: 0.0
-  # v4.1 physical constants (match module-level defaults; overridable).
+
+  # ---- v4.1 physical constants (gate shape) ----
   sharpness: 500.0
   activation_threshold: 0.5
   activation_cutoff: 0.01
   epsilon: 1.0e-4
   max_intensity: 10.0
-  # Dead-only penalty (threshold bumped from 1e-4 → 0.01 for v4.1 scale).
+
+  # ---- Dead-only penalty ----
   dead_penalty_weight: 0.05
   dead_penalty_threshold: 0.01
-  # v4.1 RPE-style exploration loss. Baseline = per-step batch-global
-  # CE mean (no EMA). Signal = per-token deviation from baseline;
-  # `asymmetry` scales the easy-token branch.  A downward cap in the
-  # training step zeroes the down-push whenever the per-pool mean
-  # tau_offset is ≤ 0 — tau can only drop below 0 when every pool
-  # had positive mean already.  Combined with a small asymmetry this
-  # gives faint, bounded exploration.  0 weight disables the loss.
-  exploration_weight: 0.001       # λ
-  exploration_asymmetry: 0.1      # easy-token push scale (symmetric=1.0)
+
+  # ---- Explore loss (v4.1+ per-token bound) ----
+  # Baseline = per-batch global-mean CE (no EMA, stateless, zero-sum).
+  # Signal = asymmetric deviation from baseline.
+  # Bounds apply per-element (per-token x per-layer x per-route):
+  #   tau <= LOWER + BOUND_EPS  AND  signal > 0  ->  off
+  #   tau >= UPPER - BOUND_EPS  AND  signal < 0  ->  off
+  #   otherwise                                  ->  normal signal
+  # tau itself is NOT clipped -- only the explore loss is bounded.
+  # CE can push tau outside the bounds if it really needs to.
+  exploration_weight: 0.001        # lambda: overall strength
+  exploration_asymmetry: 0.1       # easy-token push scale (symmetric=1.0)
+  exploration_warmup_steps: 5000   # loss off until this step
+  exploration_lower_bound: -0.5    # down-push bound
+  exploration_upper_bound: 2.0     # up-push bound
+  exploration_bound_eps: 1.0e-3    # tolerance near bounds
+
   n_chunks_know: 1
   n_chunks_qk: 1
   n_chunks_v: 1
