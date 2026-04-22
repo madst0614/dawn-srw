@@ -27,6 +27,7 @@ class StandardAttention(nn.Module):
         self.k_proj = nn.Dense(self.d_model)
         self.v_proj = nn.Dense(self.d_model)
         self.o_proj = nn.Dense(self.d_model, use_bias=False)
+        self.attn_dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self, x, deterministic=False):
         B, S, D = x.shape
@@ -40,12 +41,7 @@ class StandardAttention(nn.Module):
         scores = jnp.where(causal_mask, scores, jnp.finfo(scores.dtype).min)
         attn_weights = jax.nn.softmax(scores, axis=-1)
 
-        if self.dropout_rate > 0.0:
-            rng = self.make_rng('dropout')
-            keep = 1.0 - self.dropout_rate
-            mask = jax.random.bernoulli(rng, keep, attn_weights.shape)
-            mask = jnp.where(deterministic, jnp.ones_like(mask), mask)
-            attn_weights = jnp.where(mask, attn_weights / keep, 0.0)
+        attn_weights = self.attn_dropout(attn_weights, deterministic=deterministic)
 
         out = jnp.einsum('bhst,bhtd->bhsd', attn_weights, v)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
@@ -61,12 +57,7 @@ class StandardFFN(nn.Module):
     def __call__(self, x, deterministic=False):
         h = nn.Dense(self.d_ff)(x)
         h = nn.gelu(h)
-        if self.dropout_rate > 0.0:
-            rng = self.make_rng('dropout')
-            keep = 1.0 - self.dropout_rate
-            mask = jax.random.bernoulli(rng, keep, h.shape)
-            mask = jnp.where(deterministic, jnp.ones_like(mask), mask)
-            h = jnp.where(mask, h / keep, 0.0)
+        h = nn.Dropout(self.dropout_rate)(h, deterministic=deterministic)
         h = nn.Dense(self.d_model)(h)
         return h
 
@@ -120,6 +111,7 @@ class VanillaTransformer(nn.Module):
             for i in range(self.n_layers)
         ]
         self.norm = nn.LayerNorm()
+        self.emb_dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
                  deterministic=False):
@@ -127,12 +119,7 @@ class VanillaTransformer(nn.Module):
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = self.token_emb(input_ids) + self.pos_emb(positions)
 
-        if self.dropout_rate > 0.0:
-            rng = self.make_rng('dropout')
-            keep = 1.0 - self.dropout_rate
-            mask = jax.random.bernoulli(rng, keep, x.shape)
-            mask = jnp.where(deterministic, jnp.ones_like(mask), mask)
-            x = jnp.where(mask, x / keep, 0.0)
+        x = self.emb_dropout(x, deterministic=deterministic)
 
         for layer in self.layers:
             x = layer(x, deterministic)
