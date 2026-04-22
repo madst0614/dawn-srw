@@ -29,6 +29,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import jax
 import jax.numpy as jnp
 from jax.experimental.multihost_utils import process_allgather
+try:
+    from jax.experimental.multihost_utils import broadcast_one_to_all as _bcast_one_to_all
+    _HAVE_BROADCAST = True
+except ImportError:
+    _bcast_one_to_all = None
+    _HAVE_BROADCAST = False
 import optax
 import numpy as np
 import time
@@ -1351,31 +1357,84 @@ def main():
                 if d.is_dir() and d.name.startswith('run_')
             ])
 
-    # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
-    # --resume-from takes priority: resume from a specific run folder
-    if not cli_args.from_scratch:
-        if cli_args.resume_from:
-            folder = cli_args.resume_from.rstrip('/')
-            candidates = _list_files(folder, "*.flax")
-            if candidates:
-                resume_path = candidates[-1]
-                checkpoint_dir = folder
-                if jax.process_index() == 0:
-                    print(f"  Resume from specified folder: {checkpoint_dir}")
-                    print(f"  Resuming from: {resume_path}")
-            else:
-                raise FileNotFoundError(f"No .flax checkpoint found in {folder}")
+    def _broadcast_str_from_host0(s, max_len=512):
+        """Broadcast a string (or None) from host 0 to all hosts.
+
+        Must be called collectively on every host. Each host passes its
+        local value; only host 0's value is adopted everywhere. Empty
+        string and None both encode as all-zero padding and decode back
+        to None. max_len caps the payload (GCS URLs usually fit well
+        under 512 bytes).
+        """
+        if s is None:
+            s = ''
+        encoded = s.encode('utf-8')
+        if len(encoded) > max_len:
+            raise ValueError(
+                f"Path too long for broadcast: {len(encoded)} > {max_len}")
+        buf = np.zeros(max_len, dtype=np.uint8)
+        if jax.process_index() == 0:
+            buf[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+
+        if _HAVE_BROADCAST:
+            broadcast_buf = np.asarray(_bcast_one_to_all(buf))
         else:
-            run_folders = _list_run_folders(base_checkpoint_dir)
-            for folder in reversed(run_folders):
+            gathered = np.asarray(process_allgather(buf))
+            # Shape can be (n_hosts, max_len) or flat (n_hosts * max_len,)
+            # depending on JAX version — pick host 0's slice either way.
+            if gathered.ndim == 1:
+                broadcast_buf = gathered[:max_len]
+            else:
+                broadcast_buf = gathered[0]
+        result = bytes(broadcast_buf).rstrip(b'\x00').decode('utf-8')
+        return result if result else None
+
+    # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
+    # --resume-from takes priority: resume from a specific run folder.
+    #
+    # Only host 0 lists GCS; the resulting (resume_path, checkpoint_dir)
+    # is broadcast to all hosts. Independent per-host listing can diverge
+    # under gcsfs caching, concurrent cleanup, or preemption-timing
+    # races — a split resume mis-syncs global_step across the mesh and
+    # later halts collectives inside train_step.
+    if not cli_args.from_scratch:
+        _host0_resume_path = None
+        _host0_checkpoint_dir = None
+        _host0_explicit_missing = False
+
+        if jax.process_index() == 0:
+            if cli_args.resume_from:
+                folder = cli_args.resume_from.rstrip('/')
                 candidates = _list_files(folder, "*.flax")
                 if candidates:
-                    resume_path = candidates[-1]
-                    checkpoint_dir = folder
-                    if jax.process_index() == 0:
-                        print(f"  Auto-resume: found checkpoint in {checkpoint_dir}")
-                        print(f"  Resuming from: {resume_path}")
-                    break
+                    _host0_resume_path = candidates[-1]
+                    _host0_checkpoint_dir = folder
+                    print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
+                    print(f"  Resuming from: {_host0_resume_path}")
+                else:
+                    _host0_explicit_missing = True
+                    print(f"  No .flax checkpoint found in {folder}")
+            else:
+                run_folders = _list_run_folders(base_checkpoint_dir)
+                for folder in reversed(run_folders):
+                    candidates = _list_files(folder, "*.flax")
+                    if candidates:
+                        _host0_resume_path = candidates[-1]
+                        _host0_checkpoint_dir = folder
+                        print(f"  Auto-resume: found checkpoint in {_host0_checkpoint_dir}")
+                        print(f"  Resuming from: {_host0_resume_path}")
+                        break
+
+        # Collective broadcast — all hosts must call.
+        resume_path = _broadcast_str_from_host0(_host0_resume_path)
+        checkpoint_dir = _broadcast_str_from_host0(_host0_checkpoint_dir)
+        # Broadcast the explicit-missing signal as a single-byte string
+        # so every host raises together.
+        _missing_signal = _broadcast_str_from_host0(
+            'MISSING' if _host0_explicit_missing else '')
+        if _missing_signal == 'MISSING':
+            raise FileNotFoundError(
+                f"No .flax checkpoint found in {cli_args.resume_from}")
 
     # Create new run folder if not resuming
     if checkpoint_dir is None:
@@ -1675,6 +1734,20 @@ def main():
                 print("\nNo checkpoint found. Starting from scratch.")
             else:
                 print("\nStarting from scratch (--from-scratch).")
+
+    # Fail-fast check: global_step must match across hosts after resume.
+    # broadcast handles the common path but we still verify — if it ever
+    # drifts, hang-debugging mid-training is painful; raise now instead.
+    if n_hosts > 1:
+        _gs_local = np.array([global_step], dtype=np.int64)
+        _gs_all = np.asarray(process_allgather(_gs_local)).flatten()
+        if not np.all(_gs_all == global_step):
+            raise RuntimeError(
+                f"global_step inconsistent across hosts after resume: "
+                f"host {host_id} sees {global_step}, all hosts: {_gs_all.tolist()}. "
+                f"Resume broadcast likely failed or checkpoint files diverged.")
+        if is_host0:
+            print(f"  [verified] global_step={global_step} consistent across {n_hosts} hosts")
 
     # Save config.json for this run (host 0 only)
     if is_host0:
