@@ -1349,7 +1349,7 @@ def main():
         kst = timezone(timedelta(hours=9))
         ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
         rand_suffix = _random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', 'v17.1')
+        version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
@@ -1645,7 +1645,7 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
-    model_version = cfg['model'].get('model_version', '17.1')
+    model_version = cfg['model'].get('model_version', 'spatial-r1-v4.1')
     is_baseline = model_version == 'baseline'
     is_spatial = (model_version == 'spatial-r1'
                   or model_version.startswith('spatial-r1-v2')
