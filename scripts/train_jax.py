@@ -1033,19 +1033,24 @@ def shard_to_mesh(data, sharding, global_shape):
     per_host = data.shape[0]
 
     def data_callback(index):
-        # index is a tuple of slices for each dimension
-        # The batch slice tells us which global rows this device needs
+        # index is a tuple of slices for each dimension.
+        # The batch slice tells us which global rows this device needs.
         batch_slice = index[0]
         start = batch_slice.start or 0
         stop = batch_slice.stop or global_shape[0]
-        # Map global indices to this host's local data
         local_start = start - host_id * per_host
         local_stop = stop - host_id * per_host
-        # If this slice belongs to our host, return it; else zeros (shouldn't happen)
         if 0 <= local_start < per_host:
             return np.array(data[local_start:local_stop])
-        else:
-            return np.zeros((stop - start,) + data.shape[1:], dtype=data.dtype)
+        # Previously returned silent zeros — that corrupts training with
+        # a zero-batch whenever the mesh's host locality doesn't match
+        # the data partition. Fail loud instead so the misconfiguration
+        # is caught at setup rather than showing up as mysterious loss.
+        raise RuntimeError(
+            f"shard_to_mesh: device requests global index [{start}, {stop}) "
+            f"but host {host_id} has local range [0, {per_host}) "
+            f"(local_start={local_start}). Mesh layout likely doesn't match "
+            f"host locality. Check create_mesh() device order.")
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
 
@@ -2482,16 +2487,20 @@ def main():
             # Device-side accumulation — no per-step TPU→CPU sync on the
             # regression/metric scalars. Window + epoch values are
             # materialized only at log boundary and end of epoch.
-            _win_loss_jax = _win_loss_jax + metrics['total_loss']
-            _win_ce_jax = _win_ce_jax + metrics['ce_loss']
-            _win_aux_jax = _win_aux_jax + metrics['aux_loss']
-            _win_tau_reg_jax = _win_tau_reg_jax + metrics.get('tau_reg', jnp.float32(0.0))
-            _win_orth_jax = _win_orth_jax + metrics['orth_loss']
-            _win_div_jax = _win_div_jax + metrics['div_loss']
+            # Token-weighted accumulation: every window/epoch loss is summed
+            # as (loss * valid_count) so the final avg divides by total
+            # valid tokens, matching evaluate()'s token-level mean. Makes
+            # train/val loss directly comparable.
+            _valid_f = metrics['valid_count'].astype(jnp.float32)
+            _win_loss_jax = _win_loss_jax + metrics['total_loss'] * _valid_f
+            _win_ce_jax = _win_ce_jax + metrics['ce_loss'] * _valid_f
+            _win_aux_jax = _win_aux_jax + metrics['aux_loss'] * _valid_f
+            _win_tau_reg_jax = _win_tau_reg_jax + metrics.get('tau_reg', jnp.float32(0.0)) * _valid_f
+            _win_orth_jax = _win_orth_jax + metrics['orth_loss'] * _valid_f
+            _win_div_jax = _win_div_jax + metrics['div_loss'] * _valid_f
             _win_correct_jax = _win_correct_jax + metrics['correct']
             _win_valid_jax = _win_valid_jax + metrics['valid_count']
 
-            _valid_f = metrics['valid_count'].astype(jnp.float32)
             _epoch_loss_jax = _epoch_loss_jax + metrics['ce_loss'] * _valid_f
             _epoch_correct_jax = _epoch_correct_jax + metrics['correct']
             _epoch_valid_jax = _epoch_valid_jax + metrics['valid_count']
@@ -2529,16 +2538,17 @@ def main():
                     'orth': _win_orth_jax, 'div': _win_div_jax,
                     'correct': _win_correct_jax, 'valid': _win_valid_jax,
                 })
-                _win_count_safe = max(win_count, 1)
-                avg_loss = float(_win_vals['loss']) / _win_count_safe
-                avg_ce = float(_win_vals['ce']) / _win_count_safe
-                avg_aux = float(_win_vals['aux']) / _win_count_safe
-                avg_tau_reg = float(_win_vals['tau_reg']) / _win_count_safe
-                avg_orth = float(_win_vals['orth']) / _win_count_safe
-                avg_div = float(_win_vals['div']) / _win_count_safe
                 _win_correct_py = int(_win_vals['correct'])
                 _win_valid_py = int(_win_vals['valid'])
-                avg_acc = _win_correct_py / _win_valid_py if _win_valid_py > 0 else 0.0
+                # Token-weighted: divide by total valid tokens, not step count.
+                _vdiv = _win_valid_py if _win_valid_py > 0 else 1
+                avg_loss = float(_win_vals['loss']) / _vdiv
+                avg_ce = float(_win_vals['ce']) / _vdiv
+                avg_aux = float(_win_vals['aux']) / _vdiv
+                avg_tau_reg = float(_win_vals['tau_reg']) / _vdiv
+                avg_orth = float(_win_vals['orth']) / _vdiv
+                avg_div = float(_win_vals['div']) / _vdiv
+                avg_acc = _win_correct_py / _vdiv
 
                 # Full NaN/INF check on the materialized window averages.
                 if check_nan_inf({
