@@ -30,7 +30,7 @@ model:
   max_seq_len: 512
   # Mild residual/attn dropout -- helps break co-adaptation without
   # drowning the signal. 40M@5B has no overfit pressure.
-  dropout: 0.1
+  dropout: 0.05
   gradient_checkpointing: true
 
   d_route: 128
@@ -41,7 +41,7 @@ model:
   # equivalent to stochastically dimming all neuron scores along
   # that axis -- horizontal search (area-shift) complement to
   # tau's vertical search (water-level).
-  router_dropout: 0.1
+  router_dropout: 0.05
 
 training:
   batch_size: 128
