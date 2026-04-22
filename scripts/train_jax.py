@@ -2472,10 +2472,20 @@ def main():
         print(f"\n!!! SIGTERM received (host {host_id}) at step={global_step} -- flagging preemption !!!", flush=True)
 
     def _gather_for_save(x):
-        """Gather sharded params for checkpoint save. Only needed for baseline FSDP."""
-        if is_baseline:
-            return jax.device_get(process_allgather(x))
-        return jax.device_get(x)
+        """Gather sharded params to host-local full arrays for checkpoint save.
+
+        Always calls process_allgather so sharded axes are correctly
+        reconstructed regardless of mesh shape. Under the current
+        mesh_model=2 config the model axis stays within one host and a
+        plain device_get on host 0 happens to reconstruct the full
+        array; under mesh_model>=4 (axis crosses host boundaries) only
+        process_allgather produces the full array on host 0. For
+        already-replicated params this is effectively a no-op — the
+        collective returns the same global view on every host.
+
+        Must be called from ALL hosts simultaneously (collective).
+        """
+        return jax.device_get(process_allgather(x))
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
