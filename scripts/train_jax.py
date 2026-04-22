@@ -1195,20 +1195,22 @@ def load_checkpoint(path, target_params, target_opt_state):
 # ============================================================
 
 class GCSLogger:
-    """Logger that writes to a local file and periodically syncs to GCS.
+    """Logger that writes to a local file and syncs to GCS on sync().
 
     GCS doesn't support true append — each open('a')/write/close overwrites.
     So we always append to a local file and upload the full file to GCS
-    on every sync() call. sync() is throttled by a minimum-bytes delta
-    so short-log-interval churn doesn't re-upload the same tail
-    continuously; pass force=True at safe-point boundaries.
+    on every sync() call. Callers decide the sync cadence (training
+    loop syncs once per LOG_INTERVAL); the logger itself doesn't
+    throttle. Uploading the whole file every LOG_INTERVAL is cheap in
+    GCS API cost ($5 per 1M write ops) and in host-0 wall time
+    (percent-of-a-percent over a multi-hour run), and the
+    near-real-time visibility is worth it.
     """
 
     def __init__(self, gcs_path, local_path):
         self.gcs_path = gcs_path
         self.local_path = local_path
         self._dirty = False
-        self._last_synced_size = 0
         if local_path:
             Path(local_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1217,19 +1219,15 @@ class GCSLogger:
             f.write(text)
         self._dirty = True
 
-    def sync(self, min_delta_bytes=100 * 1024, force=False):
-        """Upload local file to GCS if new writes exceed threshold (or force=True)."""
+    def sync(self):
+        """Upload local file to GCS if there are unflushed writes."""
         if not self._dirty or not self.gcs_path:
             return
         try:
-            cur_size = Path(self.local_path).stat().st_size
-            if not force and (cur_size - self._last_synced_size) < min_delta_bytes:
-                return
             with open(self.local_path, 'rb') as f:
                 data = f.read()
             with _open_file(self.gcs_path, 'wb') as f:
                 f.write(data)
-            self._last_synced_size = cur_size
             self._dirty = False
         except Exception as e:
             if jax.process_index() == 0:
@@ -1261,16 +1259,12 @@ def _setup_loggers(training_log_file, jsonl_log_file):
         _jsonl_logger = GCSLogger(None, jsonl_log_file)
 
 
-def sync_logs(force=False):
-    """Flush local logs to GCS. Throttled unless force=True.
-
-    Periodic LOG_INTERVAL calls should use the default (size-gated),
-    epoch boundaries and end-of-training should pass force=True.
-    """
+def sync_logs():
+    """Flush local logs to GCS. Call every LOG_INTERVAL for live visibility."""
     if _train_logger:
-        _train_logger.sync(force=force)
+        _train_logger.sync()
     if _jsonl_logger:
-        _jsonl_logger.sync(force=force)
+        _jsonl_logger.sync()
 
 
 def log_message(msg, log_file=None):
@@ -3261,7 +3255,7 @@ def main():
                 log_message(f"  New best model! val_loss={best_val_loss:.4f}")
 
             log_message(f"  Best val loss so far: {best_val_loss:.4f}")
-            sync_logs(force=True)
+            sync_logs()
 
         # Release gathered copies on every host — all hosts hold them after
         # _gather_for_save; host-0-only del leaves multi-GB pinned elsewhere.
@@ -3285,7 +3279,7 @@ def main():
             f"  Final step: {global_step}\n"
             f"{'='*60}"
         )
-        sync_logs(force=True)
+        sync_logs()
 
 
 if __name__ == '__main__':
