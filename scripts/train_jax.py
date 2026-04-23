@@ -1399,10 +1399,11 @@ def main():
     def _list_run_folders(base):
         """List run_* subdirectories under base (local or GCS).
 
-        Silent empty-list on GCS errors previously masked credential or
-        permission failures as "no prior run found" — a brand-new run
-        would start writing into a fresh folder next to the user's
-        actual run. Fail loud instead.
+        FileNotFoundError on GCS is treated as "no prior runs yet" to
+        match the local-path behavior (Path.exists() check below) —
+        first training on a fresh checkpoint_dir shouldn't fail. Every
+        other exception still propagates so credential / permission
+        failures can't masquerade as "nothing to resume".
         """
         if _is_gcs(base):
             fs = _get_gcs_fs()
@@ -1410,7 +1411,10 @@ def main():
                 raise ImportError(
                     f"Cannot list GCS path {base}: gcsfs not available.")
             bucket_path = base.replace('gs://', '').rstrip('/')
-            entries = fs.ls(bucket_path)
+            try:
+                entries = fs.ls(bucket_path)
+            except FileNotFoundError:
+                return []
             runs = sorted([
                 'gs://' + e for e in entries
                 if '/run_' in e
