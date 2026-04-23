@@ -1,16 +1,9 @@
-# DAWN Spatial-R1 v4.1+ -- two-stage gate + bounded explore + mild dropout
+# DAWN Spatial-R1 v4.1+ -- symmetric-explore variant
 #
-# ============================================================
-# Changes from v4.1 baseline:
-#   1. Explore loss: per-token/layer/route bound off.
-#      Replaces pool-mean block with [LOWER, UPPER] range.
-#      Inside bounds -> normal signal; outside -> off (per-element).
-#   2. Explore warmup: loss disabled for the first N steps so
-#      W_sense has time to settle before tau exploration kicks in.
-#   3. Mild dropout for co-adaptation regularisation (residual + h).
-#      40M @ 5B tokens is well under the overfit threshold, so
-#      0.05 is mostly about preventing rigid co-activation patterns
-#      and introducing gentle exploration in projection space.
+# Sister of train_config_spatial_r1_v4_1_40M_c4_5B.yaml with
+# exploration_asymmetry = 1.0 (easy-token push at full strength).
+# Everything else identical. Separate checkpoint_dir / log_dir so
+# runs never collide and saved training_config resume is unambiguous.
 # ============================================================
 
 seed: 1
@@ -75,7 +68,7 @@ training:
   # tau itself is NOT clipped -- only the explore loss is bounded.
   # CE can push tau outside the bounds if it really needs to.
   exploration_weight: 0.001        # lambda: overall strength
-  exploration_asymmetry: 0.1       # easy-token push scale (symmetric=1.0)
+  exploration_asymmetry: 1.0       # symmetric: easy-token push at full strength
   exploration_warmup_steps: 5000   # loss off until this step
   exploration_lower_bound: -0.5    # down-push bound
   exploration_upper_bound: 2.0     # up-push bound
@@ -88,5 +81,5 @@ training:
   val_interval: 500
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1_sym_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1_sym_40M_c4_5B
