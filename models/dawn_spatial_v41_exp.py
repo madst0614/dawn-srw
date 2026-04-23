@@ -406,12 +406,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         B, S, D = x.shape
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
-        # v4.1: forward-normalise emb to unit. Grad flows back through the
-        # normalise op (tangent-space projection).
-        emb_f32 = emb_local.astype(jnp.float32)
-        emb_unit_f32 = emb_f32 / (
-            jnp.linalg.norm(emb_f32, axis=-1, keepdims=True) + 1e-6)
-        emb_bf = emb_unit_f32.astype(jnp.bfloat16)
+        # emb used as-is (v4.0.6-style). ||emb|| is a learnable DoF —
+        # WD controls size; per-neuron magnitude drives competitive
+        # sparsity. read/write still forward-normalise below.
+        emb_bf = emb_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
@@ -688,11 +686,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         # h: [B,S,2,d_route], tau_offset: [B,S,2,1]
         h_bf = h.astype(jnp.bfloat16)
         x_bf = x.astype(jnp.bfloat16)
-        # v4.1: forward-normalise emb to unit.
-        emb_f32 = emb_local.astype(jnp.float32)
-        emb_unit_f32 = emb_f32 / (
-            jnp.linalg.norm(emb_f32, axis=-1, keepdims=True) + 1e-6)
-        emb_bf = emb_unit_f32.astype(jnp.bfloat16)
+        # emb used as-is; norm is a learnable DoF (v4.0.6-style).
+        emb_bf = emb_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1_r = jnp.zeros((B, S, 2, 1))
@@ -911,8 +906,9 @@ class NeuronPool(nn.Module):
         db = self.d_route
         dm = self.d_model
 
-        # Sense (routing, low-dim). Unit-norm init; v4.1 forward also
-        # re-normalises so neurons stay pure direction.
+        # Sense (routing, low-dim). Unit-norm init — rows start on the
+        # unit sphere; forward does NOT re-normalise (v4.0.6-style, so
+        # ||emb|| stays a learnable DoF).
         self.qk_emb = self.param('qk_emb', unit_norm_init(), (self.n_qk, db))
         self.v_emb = self.param('v_emb', unit_norm_init(), (self.n_v, db))
         self.know_emb = self.param('know_emb', unit_norm_init(), (self.n_know, db))
@@ -984,7 +980,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_read = pool_params['v_read']
     v_write = pool_params['v_write']
 
-    # v4.1: forward normalisation happens inside the sharded fn.
+    # emb used as-is; *_unit names kept for downstream readability.
     qk_emb_unit = qk_emb
     v_emb_unit = v_emb
 
@@ -1137,7 +1133,7 @@ def _know_forward(x, pool_params, router_params, rng,
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
-    # v4.1: forward normalisation happens inside the sharded fn.
+    # emb used as-is; *_unit name kept for downstream readability.
     know_emb_unit = know_emb
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     # Pure observational metrics — stop_gradient to avoid NaN VJP hazards at init.
@@ -1698,8 +1694,8 @@ def _squeeze_params(params):
 
 def _srw_inference(x, h, emb_norm, tau_offset, w_read, w_write):
     """Non-chunked SRW for inference. v4.1: gate = activation × intensity,
-    den = max(Σintensity, 1.0). emb_norm is expected unit-norm (caller
-    normalises)."""
+    den = max(Σintensity, 1.0). emb_norm is passed as-is (no forward
+    unit-norm; v4.0.6-style)."""
     scores = h @ emb_norm.T
     scores_f32 = scores.astype(jnp.float32)
     s_mean = scores_f32.mean(axis=-1, keepdims=True)
@@ -1760,11 +1756,10 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     B = x.shape[0]
     d_head = d_model // n_heads
 
-    # v4.1: forward-normalise emb (matches training path).
-    qk_emb = pool_params['qk_emb']
-    v_emb = pool_params['v_emb']
-    qk_norm = qk_emb / (jnp.linalg.norm(qk_emb, axis=-1, keepdims=True) + 1e-6)
-    v_norm = v_emb / (jnp.linalg.norm(v_emb, axis=-1, keepdims=True) + 1e-6)
+    # emb used as-is (matches training path — v4.0.6-style, no
+    # forward unit-norm).
+    qk_norm = pool_params['qk_emb']
+    v_norm = pool_params['v_emb']
 
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
@@ -1804,9 +1799,8 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _know_forward_inference(x, pool_params, router_params):
     """Inference-only know forward. No chunking, no LB, no dropout."""
-    # v4.1: forward-normalise emb.
-    know_emb = pool_params['know_emb']
-    know_norm = know_emb / (jnp.linalg.norm(know_emb, axis=-1, keepdims=True) + 1e-6)
+    # emb used as-is (matches training path).
+    know_norm = pool_params['know_emb']
     h = x @ router_params['proj_know']['kernel'] + router_params['proj_know']['bias']
     tau = x @ router_params['tau_know']['kernel'] + router_params['tau_know']['bias']
     out = _srw_inference(x, h, know_norm, tau,
