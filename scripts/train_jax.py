@@ -1849,12 +1849,28 @@ def main():
     start_step_in_epoch = 0
     best_val_loss = float('inf')
 
+    def _strip_legacy_process_axis(ckpt_pytree, template_pytree):
+        """Legacy-compat for ckpts saved before _gather_for_save used
+        tiled=True. process_allgather(tiled=False) prepended a
+        (n_processes,) axis to every leaf (all slices equal for both
+        replicated and sharded-then-gathered arrays). Here we detect
+        the extra leading axis and take [0]. No-op on correctly-shaped
+        leaves."""
+        def _fix(ckpt_leaf, template_leaf):
+            arr = np.asarray(ckpt_leaf)
+            if arr.ndim == template_leaf.ndim + 1:
+                return arr[0]
+            return arr
+        return jax.tree.map(_fix, ckpt_pytree, template_pytree)
+
     if resume_path and _file_exists(resume_path):
         if is_host0:
             print(f"\nResuming from: {resume_path}")
         ckpt = load_checkpoint(resume_path, params, opt_state)
-        params = ckpt['params']
-        opt_state = ckpt['opt_state']
+        ckpt_params = _strip_legacy_process_axis(ckpt['params'], params)
+        ckpt_opt_state = _strip_legacy_process_axis(ckpt['opt_state'], opt_state)
+        params = ckpt_params
+        opt_state = ckpt_opt_state
         start_epoch = ckpt.get('epoch', 0)
         global_step = ckpt.get('step', 0)
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
@@ -2498,18 +2514,17 @@ def main():
     def _gather_for_save(x):
         """Gather sharded params to host-local full arrays for checkpoint save.
 
-        Always calls process_allgather so sharded axes are correctly
-        reconstructed regardless of mesh shape. Under the current
-        mesh_model=2 config the model axis stays within one host and a
-        plain device_get on host 0 happens to reconstruct the full
-        array; under mesh_model>=4 (axis crosses host boundaries) only
-        process_allgather produces the full array on host 0. For
-        already-replicated params this is effectively a no-op — the
-        collective returns the same global view on every host.
+        Uses process_allgather with tiled=True so the output reconstructs
+        the global shape — sharded axes get concatenated across processes
+        and replicated arrays pass through unchanged. Without tiled=True
+        (JAX default) process_allgather PREPENDS a (n_processes,) axis to
+        every leaf, which silently corrupted every checkpoint written
+        before 2026-04-23 on any mesh that triggered this path. Legacy
+        ckpts are de-corrupted in the load path (see _strip_legacy_process_axis).
 
         Must be called from ALL hosts simultaneously (collective).
         """
-        return jax.device_get(process_allgather(x))
+        return jax.device_get(process_allgather(x, tiled=True))
 
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
