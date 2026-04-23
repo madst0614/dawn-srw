@@ -111,11 +111,16 @@ Architecture:
   DAWN                 -- embedding + jax.lax.scan + weight-tied lm_head
 
 Changelog:
-  spatial-r1-v4.1 (2026-04-21):
+  spatial-r1-v4.1 (2026-04-21; emb forward-norm reverted 2026-04-23):
     - Two-stage gate: activation × intensity with ACTIVATION_CUTOFF.
-    - Emb forward-normalised (unit) restored.
     - Dynamic tau + raw_alpha params removed entirely.
     - Den = Σ intensity; dead threshold 1e-4 → 0.01.
+    - Emb forward-norm: originally restored here, then reverted in-place
+      on 2026-04-23 back to v4.0.6-style (no forward unit-norm). ||emb||
+      is a learnable DoF again — WD + task loss shape it so per-neuron
+      magnitude can drive competitive sparsity (qk active regime ~5-6%,
+      vs ~28% under forward unit-norm). read / write still
+      forward-normalise per chunk; init still unit_norm_init.
 
   spatial-r1-v4.0.6 (2026-04-20):
     - Gate confidence: Φ(z) (normal CDF) → sigmoid(scores - tau).
