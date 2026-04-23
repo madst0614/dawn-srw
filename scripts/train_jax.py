@@ -1686,6 +1686,8 @@ def main():
     params = variables['params']
     if is_host0:
         print("=== model.init done ===", flush=True)
+        _te_shape = params['token_emb']['embedding'].shape
+        print(f"  [diag] token_emb.embedding.shape after model.init: {_te_shape}", flush=True)
 
         n_params = count_parameters(params)
         print(f"\nModel parameters: {n_params:,}")
@@ -1960,6 +1962,9 @@ def main():
     # Shard params: neuron_pool N-axis on 'model', rest replicated
     param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
     params = shard_params_to_mesh(params, param_shardings)
+    if is_host0:
+        _te_shape = params['token_emb']['embedding'].shape
+        print(f"  [diag] token_emb.embedding.shape after shard_params_to_mesh: {_te_shape}", flush=True)
 
     _is_resuming = (resume_path is not None and _file_exists(resume_path))
     if _is_resuming:
@@ -2040,6 +2045,9 @@ def main():
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
+        if is_host0:
+            _te_shape = params['token_emb']['embedding'].shape
+            print(f"  [diag] token_emb.embedding.shape right before warmup: {_te_shape}", flush=True)
         _dp, _do, dummy_metrics = train_step_fn(
             params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
             _dummy_emb_snap, jnp.asarray(0, jnp.int32))
