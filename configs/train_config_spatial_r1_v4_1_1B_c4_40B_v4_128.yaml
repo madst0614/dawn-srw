@@ -1,0 +1,89 @@
+# DAWN Spatial-R1 v4.1 Training Config - 1B Scale - v4-128 Pod
+#
+# Two-stage gate (activation x intensity), free-norm pool, RPE-driven
+# exploration, dead-only penalty. Same model geometry / data / mesh /
+# lr / batch / weight_decay as the v3.9.4 1B baseline so the runs
+# stay comparable; only learning dynamics + log cadence are v4.1.
+#
+# max_intensity = 100.0 (vs 10.0 in v4.1 sym 40M) — wider intensity
+# headroom for the larger model; cap diagnostic fires at ~99.999.
+#
+# Global batch: 2048 = 64 chips × 32 per_device_batch
+# Tokens/step: 2048 × 512 = ~1M tokens/step
+# Total micro-step ≈ 38k (40B / 1M)
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "spatial-r1-v4.1"
+  d_model: 2048
+  n_layers: 18
+  n_heads: 16
+  d_route: 384
+
+  n_know: 158800
+  n_qk: 9900
+  n_v: 16100
+
+  max_seq_len: 512
+  # v4.1: lower dropout (40B tokens means no overfit pressure).
+  dropout: 0.05
+  gradient_checkpointing: true
+  router_dropout: 0.02
+
+training:
+  batch_size: 2048
+  mesh_model: 4
+  mesh_data: 16
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.0002
+  weight_decay: 0.1
+  pool_weight_decay: 0.02    # free-norm pool params (emb/read/write) softer WD
+  warmup_ratio: 0.06
+  diversity_weight: 0.1
+  load_balance_weight: 0.0   # v4.1 removed LB
+
+  # ---- v4.1 physical constants (gate shape) ----
+  sharpness: 500.0
+  activation_threshold: 0.5
+  activation_cutoff: 0.01
+  epsilon: 1.0e-4
+  max_intensity: 100.0
+
+  # ---- Dead-only penalty ----
+  dead_penalty_weight: 0.05
+  dead_penalty_threshold: 0.01
+
+  # ---- Explore loss (v4.1+ per-token bound) ----
+  # Baseline = per-batch global-mean CE (no EMA, stateless, zero-sum).
+  # Signal = asymmetric deviation from baseline.
+  # Bounds apply per-element (per-token x per-layer x per-route):
+  #   tau <= LOWER + BOUND_EPS  AND  signal > 0  ->  off
+  #   tau >= UPPER - BOUND_EPS  AND  signal < 0  ->  off
+  #   otherwise                                  ->  normal signal
+  # tau itself is NOT clipped -- only the explore loss is bounded.
+  # CE can push tau outside the bounds if it really needs to.
+  exploration_weight: 0.001        # lambda: overall strength
+  exploration_asymmetry: 1.0       # symmetric: easy-token push at full strength
+  exploration_warmup_steps: 2500   # ~6.6% of total step (38k); 1B has half the steps so 5000 -> 2500
+  exploration_lower_bound: -0.5    # down-push bound
+  exploration_upper_bound: 2.0     # up-push bound
+  exploration_bound_eps: 1.0e-3    # tolerance near bounds
+
+  checkpoint_interval: 200
+  val_interval: 200
+  # ---- 2-tier log cadence (step units) ----
+  log_interval: 100
+  log_analysis_multiplier: 20
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1_1B_c4_40B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1_1B_c4_40B
