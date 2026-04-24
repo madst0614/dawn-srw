@@ -1648,9 +1648,8 @@ def _print_regular_block(rec, ctx):
             f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
         )
     log_message(
-        f"  time: elapsed={format_time(ctx['epoch_elapsed'])}"
-        f" ETA={format_time(ctx['eta'])}"
-        f" ({ctx['s_per_it']:.2f}s/it)"
+        f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
+        f" {ctx['s_per_it']:.2f}s/it"
     )
 
 
