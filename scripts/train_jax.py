@@ -489,6 +489,19 @@ def compute_spatial_diversity_loss(params):
 # Train / eval steps (pmap for multi-device)
 # ============================================================
 
+def _model_accepts_analysis(model):
+    """Return True if model.__call__ accepts an `analysis` kwarg.
+
+    v4.1+ accepts it (routes the full-stats forward); older versions
+    don't — passing it there raises, so we must gate it.
+    """
+    import inspect as _inspect
+    try:
+        return 'analysis' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
@@ -539,6 +552,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _explore_upper = jnp.float32(exploration_upper_bound)
     _explore_eps = jnp.float32(exploration_bound_eps)
     _warmup_steps = jnp.int32(exploration_warmup_steps)
+    _pass_analysis_kw = _model_accepts_analysis(model)
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
@@ -549,6 +563,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             extra_kw = {}
             if sharded_fns is not None:
                 extra_kw['sharded_fns'] = sharded_fns
+            if _pass_analysis_kw:
+                extra_kw['analysis'] = False
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -786,39 +802,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
-            'attn_tau_std': result.get('attn_tau_std', jnp.zeros(3)),
-            'know_tau_std': result.get('know_tau_std', jnp.float32(0.0)),
-            'attn_tau_kernel_norm': result.get('attn_tau_kernel_norm', jnp.float32(0.0)),
-            'know_tau_kernel_norm': result.get('know_tau_kernel_norm', jnp.float32(0.0)),
             'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
             'know_tau_abs_mean': result.get('know_tau_abs_mean', jnp.float32(0.0)),
-            # z-margin boundary.
-            'attn_z_lt_075': result.get('attn_z_lt_075', jnp.float32(0.0)),
-            'know_z_lt_075': result.get('know_z_lt_075', jnp.float32(0.0)),
-            'attn_z_lt_030': result.get('attn_z_lt_030', jnp.float32(0.0)),
-            'know_z_lt_030': result.get('know_z_lt_030', jnp.float32(0.0)),
-            # Distribution shape.
-            'attn_score_skew': result.get('attn_score_skew', jnp.float32(0.0)),
-            'know_score_skew': result.get('know_score_skew', jnp.float32(0.0)),
-            'attn_active_per_token_std': result.get('attn_active_per_token_std', jnp.float32(0.0)),
-            'know_active_per_token_std': result.get('know_active_per_token_std', jnp.float32(0.0)),
-            'attn_gate_entropy': result.get('attn_gate_entropy', jnp.float32(0.0)),
-            'know_gate_entropy': result.get('know_gate_entropy', jnp.float32(0.0)),
-            'attn_z_sum': result.get('attn_z_sum', jnp.float32(0.0)),
-            'know_z_sum': result.get('know_z_sum', jnp.float32(0.0)),
-            'attn_score_kurt': result.get('attn_score_kurt', jnp.float32(0.0)),
-            'know_score_kurt': result.get('know_score_kurt', jnp.float32(0.0)),
-            # Emb norm stats.
+            # Emb norm stats (REGULAR subset; *_max moved to analysis_step).
             'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
-            'know_emb_norm_max': result.get('know_emb_norm_max', jnp.float32(0.0)),
             'know_emb_norm_min': result.get('know_emb_norm_min', jnp.float32(0.0)),
             'know_emb_norm_std': result.get('know_emb_norm_std', jnp.float32(0.0)),
             'qk_emb_norm_mean': result.get('qk_emb_norm_mean', jnp.float32(0.0)),
-            'qk_emb_norm_max': result.get('qk_emb_norm_max', jnp.float32(0.0)),
             'qk_emb_norm_min': result.get('qk_emb_norm_min', jnp.float32(0.0)),
             'qk_emb_norm_std': result.get('qk_emb_norm_std', jnp.float32(0.0)),
             'v_emb_norm_mean': result.get('v_emb_norm_mean', jnp.float32(0.0)),
-            'v_emb_norm_max': result.get('v_emb_norm_max', jnp.float32(0.0)),
             'v_emb_norm_min': result.get('v_emb_norm_min', jnp.float32(0.0)),
             'v_emb_norm_std': result.get('v_emb_norm_std', jnp.float32(0.0)),
             'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
@@ -828,25 +821,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
-            # Output / raw norms.
+            # Output norms (REGULAR subset).
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
-            'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
-            'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
-            'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
-            # Debug norms.
-            'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
-            'debug_emb_norm': result.get('debug_emb_norm', jnp.float32(0.0)),
-            'debug_o_proj_norm': result.get('debug_o_proj_norm', jnp.float32(0.0)),
-            'debug_q_norm': result.get('debug_q_norm', jnp.float32(0.0)),
-            'debug_k_norm': result.get('debug_k_norm', jnp.float32(0.0)),
-            'debug_v_norm': result.get('debug_v_norm', jnp.float32(0.0)),
-            'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
-            'debug_o_input_norm': result.get('debug_o_input_norm', jnp.float32(0.0)),
-            # phi_binary / z_mean_active.
-            'know_phi_binary': result.get('know_phi_binary', jnp.float32(0.0)),
+            # z_mean_active (kept: cheap scalar).
             'know_z_mean_active': result.get('know_z_mean_active', jnp.float32(0.0)),
-            'attn_qk_phi_binary': result.get('attn_qk_phi_binary', jnp.float32(0.0)),
-            'attn_v_phi_binary': result.get('attn_v_phi_binary', jnp.float32(0.0)),
             'attn_qk_z_mean_active': result.get('attn_qk_z_mean_active', jnp.float32(0.0)),
             'attn_v_z_mean_active': result.get('attn_v_z_mean_active', jnp.float32(0.0)),
             # Per-layer diagnostics.
@@ -882,11 +860,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_tau_off_p99': explore_stats['know_tau_off_p99'],
             'know_tau_off_p01': explore_stats['know_tau_off_p01'],
             'know_tau_off_neg_frac': explore_stats['know_tau_off_neg_frac'],
-            # v4.1 intensity diagnostics.
+            # v4.1 intensity diagnostics (int_cap_frac moved to analysis_step).
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
             'know_int_max': result.get('know_int_max', jnp.float32(0.0)),
-            'attn_int_cap_frac': result.get('attn_int_cap_frac', jnp.float32(0.0)),
-            'know_int_cap_frac': result.get('know_int_cap_frac', jnp.float32(0.0)),
             # Emb drift (relative L2) since prev snapshot — see top of fn.
             'drift_qk_emb': drift_qk_emb,
             'drift_v_emb': drift_v_emb,
@@ -899,7 +875,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
 
 def create_eval_step(model, sharded_fns=None):
-    """Create a jit-compiled evaluation step."""
+    """Create a jit-compiled evaluation step.
+
+    Uses the SLIM forward (analysis=False) — eval only needs loss /
+    correct / valid_count.
+    """
+    _pass_analysis_kw = _model_accepts_analysis(model)
 
     @jax.jit
     def eval_step(params, input_ids, attention_mask):
@@ -908,6 +889,8 @@ def create_eval_step(model, sharded_fns=None):
         extra_kw = {}
         if sharded_fns is not None:
             extra_kw['sharded_fns'] = sharded_fns
+        if _pass_analysis_kw:
+            extra_kw['analysis'] = False
         result = model.apply(
             {'params': params},
             input_ids,
@@ -920,6 +903,39 @@ def create_eval_step(model, sharded_fns=None):
         return result['loss'], result['correct'], result['valid_count']
 
     return eval_step
+
+
+def create_analysis_step(model, sharded_fns=None):
+    """Create a jit-compiled analysis step (FULL forward, observational).
+
+    Runs the model with `analysis=True` and the ANALYSIS variant of
+    sharded_fns. Returns a dict of distribution / boundary / debug
+    stats that the 2-tier logger's ANALYSIS block consumes. Called
+    once per val tick (val_interval), so the compile cost amortises.
+    """
+    _pass_analysis_kw = _model_accepts_analysis(model)
+
+    @jax.jit
+    def analysis_step(params, input_ids, attention_mask):
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+        eval_rng = jax.random.PRNGKey(0)
+        extra_kw = {}
+        if sharded_fns is not None:
+            extra_kw['sharded_fns'] = sharded_fns
+        if _pass_analysis_kw:
+            extra_kw['analysis'] = True
+        result = model.apply(
+            {'params': params},
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            deterministic=True,
+            rngs={'dropout': eval_rng},
+            **extra_kw,
+        )
+        return result
+
+    return analysis_step
 
 
 # ============================================================
@@ -1305,18 +1321,22 @@ def check_nan_inf(metrics_dict, global_step, epoch):
 # ============================================================
 #
 # REGULAR  every log_interval steps                        (default 100)
-# ANALYSIS every log_interval * log_analysis_multiplier    (default 2000)
+# ANALYSIS every val_interval    (fires alongside mid-epoch val)
 #
-# REGULAR carries the full training-dynamics block (loss, activity,
-# tau structure, emb norms, RPE, per-layer). ANALYSIS extends that with
-# distribution-shape / boundary / saturation / debug diagnostics that
-# are expensive to eyeball on every step but cheap to compute — all
-# metrics are already in the train_step result regardless, so the
-# REGULAR/ANALYSIS split is about console + JSONL volume, not TPU cost.
+# v4.1: ANALYSIS is no longer scheduled from the REGULAR path. The
+# distribution / boundary / saturation stats require a separate forward
+# with the full-stats shard_map kernels (analysis_step), so running
+# them every log_interval was a pure HBM waste. They now fire on the
+# val tick, sharing the same cadence as mid-epoch validation.
 #
-# _build_analysis_record takes a REGULAR record as `base` and extends it,
-# so the JSONL line on an ANALYSIS step (type='train_analysis') carries
-# every REGULAR field plus the ANALYSIS additions — no duplicate records.
+# REGULAR carries the training-dynamics block (loss, activity, tau
+# structure, emb norms, RPE, per-layer). ANALYSIS (emitted from the val
+# path, `type='train_analysis'`) adds distribution-shape / boundary /
+# saturation / debug diagnostics.
+#
+# _build_analysis_record accepts `base={}` on the new path — the
+# `base`/`metrics` split is preserved for back-compat but the ANALYSIS
+# record is now standalone.
 
 
 def _fmt_act_count(frac, total):
@@ -1503,7 +1523,15 @@ def _print_regular_block(rec, ctx):
 
 
 def _build_analysis_record(base, metrics, ctx):
-    """ANALYSIS tier: distribution shape, boundary, saturation, debug. Extends DEEP."""
+    """ANALYSIS tier: distribution shape, boundary, saturation, debug.
+
+    In v4.1 this is fed by analysis_step (a separate full-stats forward
+    run at val ticks), not by train_step. `base` is an empty dict on the
+    new path — kept for back-compat. All ANALYSIS fields come from
+    `metrics`, which is the dict returned by analysis_step. Needs
+    `attn_out_norm` / `know_out_norm` for the raw_n print line, so
+    those are pulled from analysis_result too.
+    """
     m = metrics
     rec = dict(base)
     # tau per-route std (attn [3]) — materialise once.
@@ -1514,6 +1542,8 @@ def _build_analysis_record(base, metrics, ctx):
     except Exception:
         a_tau_s = np.zeros(3, dtype=np.float32)
     rec.update({
+        'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
+        'know_out_norm': float(m.get('know_out_norm', 0.0)),
         'attn_score_skew': float(m.get('attn_score_skew', 0.0)),
         'know_score_skew': float(m.get('know_score_skew', 0.0)),
         'attn_score_kurt': float(m.get('attn_score_kurt', 0.0)),
@@ -2313,7 +2343,13 @@ def main():
 
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path (v4.1 removed its non-sharded fallback).
+    #
+    # v4.1: two parallel kernel sets. `_sharded_fns` = slim (train path,
+    # observational stats stripped). `_sharded_fns_analysis` = full
+    # (all distribution/boundary/saturation stats; used only by
+    # analysis_step at val time).
     _sharded_fns = None
+    _sharded_fns_analysis = None
     _spec = MODEL_REGISTRY.get(model_version)
     _force_sharded = bool(_spec and _spec.force_sharded)
     if _spec is not None and (mesh_model > 1 or _force_sharded):
@@ -2327,14 +2363,32 @@ def main():
         _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
         if _spec.sharded_kwargs is not None:
             _srw_kwargs.update(_spec.sharded_kwargs(cfg))
+        # Slim (train) — kwargs don't set analysis, so defaults to False.
         _sharded_single = make_sharded_srw(**_srw_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
             _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
             _sharded_fns = (_sharded_single, _sharded_paired)
         else:
             _sharded_fns = _sharded_single
+        # Analysis (observation only). Factory kwargs forward analysis=True
+        # only to factories that accept it — v4.1 does, earlier versions
+        # silently absorb it via **kwargs or raise; only probe when the
+        # factory advertises the kwarg.
+        import inspect as _inspect
+        _supports_analysis = (
+            'analysis' in _inspect.signature(make_sharded_srw).parameters
+        )
+        if _supports_analysis:
+            _sharded_single_a = make_sharded_srw(analysis=True, **_srw_kwargs)
+            if hasattr(_v3, 'make_sharded_srw_paired'):
+                _sharded_paired_a = _v3.make_sharded_srw_paired(
+                    analysis=True, **_srw_kwargs)
+                _sharded_fns_analysis = (_sharded_single_a, _sharded_paired_a)
+            else:
+                _sharded_fns_analysis = _sharded_single_a
         if is_host0:
-            print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused)")
+            print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
+                  f"; analysis kernels={'on' if _supports_analysis else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -2348,6 +2402,14 @@ def main():
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
+    # v4.1: analysis_step is only meaningful when the full analysis
+    # kernels exist. Older model versions skip it — analysis logging
+    # degrades to empty then.
+    if _sharded_fns_analysis is not None:
+        analysis_step_fn = create_analysis_step(
+            model, sharded_fns=_sharded_fns_analysis)
+    else:
+        analysis_step_fn = None
 
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
@@ -2863,13 +2925,14 @@ def main():
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
-    # 2-tier logging cadence. ANALYSIS interval is a multiple of REGULAR
-    # so every ANALYSIS step is also a REGULAR step — no duplicate JSONL
-    # records, and console output stacks cleanly (REGULAR -> ANALYSIS).
+    # Logging cadence. REGULAR every log_interval steps. ANALYSIS is
+    # now driven from the val path (fires on val_interval) — the old
+    # log_analysis_multiplier config key is kept as a legacy no-op so
+    # existing configs resume cleanly.
     LOG_REGULAR = log_interval
-    LOG_ANALYSIS = log_interval * log_analysis_multiplier
     if is_host0:
-        print(f"  Log cadence: regular={LOG_REGULAR} analysis={LOG_ANALYSIS}",
+        print(f"  Log cadence: regular={LOG_REGULAR}"
+              f" analysis=on-val(interval={val_interval})",
               flush=True)
 
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
@@ -2980,14 +3043,12 @@ def main():
             global_step += 1
             epoch_step_counter += 1
 
-            # ---- 2-tier periodic logging (REGULAR / ANALYSIS) ----
+            # ---- REGULAR periodic logging ----
+            # ANALYSIS is driven from the val path (below), not from here —
+            # the ANALYSIS stats now require a separate forward with the
+            # full-stats kernels and only run on val ticks.
             _is_early_debug = global_step in (1, 5, 10, 20, 50)
             is_regular = (global_step % LOG_REGULAR == 0) or _is_early_debug or debug_mode
-            is_analysis = is_regular and (
-                (global_step % LOG_ANALYSIS == 0)
-                or (global_step == 1)
-                or debug_mode
-            )
 
             if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
@@ -3058,12 +3119,7 @@ def main():
                     }
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
                     _print_regular_block(rec, ctx)
-                    if is_analysis:
-                        rec = _build_analysis_record(rec, metrics, ctx)
-                        _print_analysis_block(rec, ctx)
-                        log_jsonl({'type': 'train_analysis', **rec})
-                    else:
-                        log_jsonl({'type': 'train', **rec})
+                    log_jsonl({'type': 'train', **rec})
                     sync_logs()
 
                 # Reset window accumulators (all hosts)
@@ -3103,6 +3159,57 @@ def main():
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     _new_best = True
+
+                # ---- ANALYSIS: run full-stats forward on one val batch ----
+                # Single analysis forward, same frequency as val. Compiles
+                # once on first call (extra HBM + time logged). Result dict
+                # is released after the JSONL write so HBM snaps back.
+                if analysis_step_fn is not None:
+                    val_loader.reset()
+                    _analysis_batch = None
+                    for _ab_ids, _ab_mask in val_loader:
+                        _analysis_batch = (_ab_ids, _ab_mask)
+                        break
+                    if _analysis_batch is not None:
+                        _a_ids, _a_mask = _analysis_batch
+                        _a_gb = _a_ids.shape[0] * jax.process_count()
+                        _a_gs = (_a_gb, _a_ids.shape[1])
+                        _a_ids = shard_to_mesh(_a_ids, data_sharding, _a_gs)
+                        _a_mask = shard_to_mesh(_a_mask, data_sharding, _a_gs)
+                        try:
+                            _a_compile_start = time.time()
+                            analysis_result = analysis_step_fn(
+                                params, _a_ids, _a_mask)
+                            # Force the computation so HBM usage of the
+                            # analysis kernels registers now, not on the
+                            # next Python line.
+                            jax.block_until_ready(
+                                analysis_result.get('aux_loss',
+                                                    jnp.float32(0.0)))
+                            _a_elapsed = time.time() - _a_compile_start
+                            if is_host0:
+                                _ctx_a = {
+                                    'n_qk_cfg': cfg['model'].get('n_qk', 0),
+                                    'n_v_cfg': cfg['model'].get('n_v', 0),
+                                    'n_know_cfg': cfg['model'].get('n_know', 0),
+                                }
+                                a_rec = _build_analysis_record(
+                                    {}, analysis_result, _ctx_a)
+                                a_rec['step'] = global_step
+                                a_rec['epoch'] = epoch
+                                a_rec['analysis_step_sec'] = float(_a_elapsed)
+                                _print_analysis_block(a_rec, _ctx_a)
+                                log_jsonl({'type': 'train_analysis', **a_rec})
+                                sync_logs()
+                        finally:
+                            # Explicit release — jit-returned dict holds
+                            # TPU buffers that outlive the val block
+                            # otherwise.
+                            try:
+                                del analysis_result
+                            except NameError:
+                                pass
+                            del _a_ids, _a_mask, _analysis_batch
 
                 # Dead-neuron diagnosis removed during the registry refactor
                 # (was rw-v4.0.2-specific: separate Q/K pools, GELU-z gate).
