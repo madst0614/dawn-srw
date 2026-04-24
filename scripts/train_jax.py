@@ -1337,6 +1337,337 @@ def check_nan_inf(metrics_dict, global_step, epoch):
 
 
 # ============================================================
+# 3-tier periodic logging (FAST / DEEP / ANALYSIS)
+# ============================================================
+#
+# FAST     every log_interval_fast steps       (default 100)
+# DEEP     every log_interval_fast * 5 steps   (default 500)   + includes FAST
+# ANALYSIS every log_interval_fast * 20 steps  (default 2000)  + includes DEEP
+#
+# Each *_build_record extends the lower-tier record so the JSONL line at the
+# highest active tier carries all lower-tier fields (no duplicate records per
+# step). Console output is tier-stacked: higher tiers append to the text
+# produced by lower tiers.
+#
+# All helpers assume host 0 only and that `metrics` has been fully materialised
+# via jax.device_get where needed. Window averages come in via `win_avgs`.
+
+
+def _fmt_act_count(frac, total):
+    """Format 'XX.X%(N)' — active fraction with the implied count."""
+    return f"{frac * 100:.1f}%({int(round(frac * total))})"
+
+
+def _build_fast_record(metrics, win_avgs, ctx, global_step, epoch):
+    """FAST tier: survival + core activity. ~40 fields."""
+    m = metrics
+    rec = {
+        'step': global_step,
+        'epoch': epoch,
+        # Loss components (window-averaged).
+        'total_loss': win_avgs['loss'],
+        'ce_loss': win_avgs['ce'],
+        'aux_loss': win_avgs['aux'],
+        'tau_reg': win_avgs['tau_reg'],
+        'orth_loss': win_avgs['orth'],
+        'div_loss': win_avgs['div'],
+        'aux_weighted': ctx['lb_weight'] * win_avgs['aux'],
+        'tau_reg_weighted': ctx['tau_reg_weight'] * win_avgs['tau_reg'],
+        'orth_weighted': ctx['orth_weight'] * win_avgs['orth'],
+        'div_weighted': ctx['div_weight'] * win_avgs['div'],
+        # Dead-only penalty.
+        'dead_penalty': float(m.get('dead_penalty', 0.0)),
+        'attn_dead_penalty': float(m.get('attn_dead_penalty', 0.0)),
+        'know_dead_penalty': float(m.get('know_dead_penalty', 0.0)),
+        'dead_penalty_weighted': ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)),
+        # Explore loss (RPE; zero during warmup).
+        'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
+        'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
+        # Accuracy / training status.
+        'accuracy': win_avgs['acc'],
+        'grad_norm': float(m['grad_norm']),
+        'lr': ctx['current_lr'],
+        'steps_per_sec': ctx['steps_per_sec'],
+        'elapsed': ctx['total_elapsed'],
+        # Drift (reduced inside train_step).
+        'drift_qk_emb': float(m.get('drift_qk_emb', 0.0)),
+        'drift_v_emb': float(m.get('drift_v_emb', 0.0)),
+        'drift_know_emb': float(m.get('drift_know_emb', 0.0)),
+        # Core activity.
+        'attn_qk_active': float(m.get('attn_qk_active', 0.0)),
+        'attn_v_active': float(m.get('attn_v_active', 0.0)),
+        'know_active': float(m.get('know_active', 0.0)),
+        'attn_strong': float(m.get('attn_strong', 0.0)),
+        'know_strong': float(m.get('know_strong', 0.0)),
+        'attn_raw_gate_max': float(m.get('attn_raw_gate_max', 0.0)),
+        'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
+        'attn_int_max': float(m.get('attn_int_max', 0.0)),
+        'know_int_max': float(m.get('know_int_max', 0.0)),
+        'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
+        'know_dead_count': float(m.get('know_dead_count', 0.0)),
+        'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
+        'know_tau_mean': float(m.get('know_tau_mean', 0.0)),
+        'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
+        'know_out_norm': float(m.get('know_out_norm', 0.0)),
+        'timestamp': datetime.now().isoformat(),
+    }
+    return rec
+
+
+def _print_fast_block(rec, ctx):
+    """Print FAST tier (3-4 lines)."""
+    log_message(
+        f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
+        f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
+        f"grad={rec['grad_norm']:.2f} | "
+        f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
+    )
+    log_message(
+        f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
+        f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
+        f" k={_fmt_act_count(rec['know_active'], ctx['n_know_cfg'])}"
+        f" | strong: qk={rec['attn_strong']*100:.1f}%"
+        f" v={rec['attn_strong']*100:.1f}%"
+        f" k={rec['know_strong']*100:.1f}%"
+    )
+    log_message(
+        f"  gate_max[qk={rec['attn_raw_gate_max']:.1f}"
+        f" v={rec['attn_raw_gate_max']:.1f}"
+        f" k={rec['know_raw_gate_max']:.1f}]"
+        f" int_max[a={rec['attn_int_max']:.1f} k={rec['know_int_max']:.1f}]"
+        f" dead[a={int(rec['attn_dead_count'])} k={int(rec['know_dead_count'])}]"
+        f" drift[qk={rec['drift_qk_emb']:.2e}"
+        f" v={rec['drift_v_emb']:.2e}"
+        f" k={rec['drift_know_emb']:.2e}]"
+    )
+    log_message(
+        f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
+        f" {ctx['s_per_it']:.2f}s/it"
+    )
+
+
+def _build_deep_record(base, metrics, ctx):
+    """DEEP tier: tau structure, emb norms, exploration, per-layer. Extends FAST."""
+    m = metrics
+    rec = dict(base)
+    # tau bias + tau_off distribution (per-batch instantaneous).
+    rec.update({
+        'tau_know_bias': float(m.get('tau_know_bias', 0.0)),
+        'tau_attn_bias_0': float(m.get('tau_attn_bias_0', 0.0)),
+        'tau_attn_bias_1': float(m.get('tau_attn_bias_1', 0.0)),
+        'tau_attn_bias_2': float(m.get('tau_attn_bias_2', 0.0)),
+        'attn_tau_abs_mean': float(m.get('attn_tau_abs_mean', 0.0)),
+        'know_tau_abs_mean': float(m.get('know_tau_abs_mean', 0.0)),
+        'attn_tau_off_min': float(m.get('attn_tau_off_min', 0.0)),
+        'attn_tau_off_max': float(m.get('attn_tau_off_max', 0.0)),
+        'attn_tau_off_p99': float(m.get('attn_tau_off_p99', 0.0)),
+        'attn_tau_off_p01': float(m.get('attn_tau_off_p01', 0.0)),
+        'attn_tau_off_neg_frac': float(m.get('attn_tau_off_neg_frac', 0.0)),
+        'know_tau_off_min': float(m.get('know_tau_off_min', 0.0)),
+        'know_tau_off_max': float(m.get('know_tau_off_max', 0.0)),
+        'know_tau_off_p99': float(m.get('know_tau_off_p99', 0.0)),
+        'know_tau_off_p01': float(m.get('know_tau_off_p01', 0.0)),
+        'know_tau_off_neg_frac': float(m.get('know_tau_off_neg_frac', 0.0)),
+        'attn_score_std': float(m.get('attn_score_std', 0.0)),
+        'know_score_std': float(m.get('know_score_std', 0.0)),
+        # Emb norm stats.
+        'know_emb_norm': float(m.get('know_emb_norm', 0.0)),
+        'know_emb_norm_min': float(m.get('know_emb_norm_min', 0.0)),
+        'know_emb_norm_std': float(m.get('know_emb_norm_std', 0.0)),
+        'qk_emb_norm_mean': float(m.get('qk_emb_norm_mean', 0.0)),
+        'qk_emb_norm_min': float(m.get('qk_emb_norm_min', 0.0)),
+        'qk_emb_norm_std': float(m.get('qk_emb_norm_std', 0.0)),
+        'v_emb_norm_mean': float(m.get('v_emb_norm_mean', 0.0)),
+        'v_emb_norm_min': float(m.get('v_emb_norm_min', 0.0)),
+        'v_emb_norm_std': float(m.get('v_emb_norm_std', 0.0)),
+        # RPE exploration diag.
+        'global_mean_ce': float(m.get('global_mean_ce', 0.0)),
+        'pos_frac': float(m.get('pos_frac', 0.0)),
+        'pos_mean': float(m.get('pos_mean', 0.0)),
+        'neg_mean': float(m.get('neg_mean', 0.0)),
+        'explore_attn_raw': float(m.get('explore_attn_raw', 0.0)),
+        'explore_know_raw': float(m.get('explore_know_raw', 0.0)),
+        'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
+        'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
+        'sig_pos_max': float(m.get('sig_pos_max', 0.0)),
+        'sig_neg_max': float(m.get('sig_neg_max', 0.0)),
+    })
+    # Per-layer norms (materialise lists).
+    try:
+        pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
+        pl_k = jax.device_get(m['per_layer_know_out_norm']).tolist()
+    except Exception:
+        pl_a, pl_k = [], []
+    rec['per_layer_attn_out_norm'] = pl_a
+    rec['per_layer_know_out_norm'] = pl_k
+    return rec
+
+
+def _print_deep_block(rec, ctx):
+    log_message(
+        f"  tau: know_b={rec['tau_know_bias']:+.2f}"
+        f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
+        f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
+        f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
+    )
+    log_message(
+        f"  tau_off k[min={rec['know_tau_off_min']:+.2f} p01={rec['know_tau_off_p01']:+.2f}"
+        f" p99={rec['know_tau_off_p99']:+.2f} max={rec['know_tau_off_max']:+.2f}"
+        f" neg={rec['know_tau_off_neg_frac']*100:.1f}%]"
+        f" a[min={rec['attn_tau_off_min']:+.2f} p01={rec['attn_tau_off_p01']:+.2f}"
+        f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
+        f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
+    )
+    log_message(
+        f"  score_std[a={rec['attn_score_std']:.2f} k={rec['know_score_std']:.2f}]"
+        f" | emb_n k[m={rec['know_emb_norm']:.2f} s={rec['know_emb_norm_std']:.2f}"
+        f" min={rec['know_emb_norm_min']:.2f}]"
+        f" qk[m={rec['qk_emb_norm_mean']:.2f} s={rec['qk_emb_norm_std']:.2f}"
+        f" min={rec['qk_emb_norm_min']:.2f}]"
+        f" v[m={rec['v_emb_norm_mean']:.2f} s={rec['v_emb_norm_std']:.2f}"
+        f" min={rec['v_emb_norm_min']:.2f}]"
+    )
+    log_message(
+        f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+        f" pos={rec['pos_frac']*100:.1f}%"
+        f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+        f" sig[+={rec['sig_pos_max']:.2f} -={rec['sig_neg_max']:.2f}]"
+        f" expl[a={rec['explore_attn_raw']:+.3f} k={rec['explore_know_raw']:+.3f}]"
+        f" w={rec['explore_loss_weighted']:+.4f}"
+        f" block[a={rec['explore_block_frac_a']*100:.1f}%"
+        f" k={rec['explore_block_frac_k']*100:.1f}%]"
+    )
+    _pl_a = rec.get('per_layer_attn_out_norm', []) or []
+    _pl_k = rec.get('per_layer_know_out_norm', []) or []
+    if _pl_a or _pl_k:
+        log_message(
+            f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
+            f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
+        )
+
+
+def _build_analysis_record(base, metrics, ctx):
+    """ANALYSIS tier: distribution shape, boundary, saturation, debug. Extends DEEP."""
+    m = metrics
+    rec = dict(base)
+    # tau per-route std (attn [3]) — materialise once.
+    try:
+        a_tau_s = np.asarray(jax.device_get(m.get('attn_tau_std', jnp.zeros(3))))
+        if a_tau_s.size < 3:
+            a_tau_s = np.zeros(3, dtype=np.float32)
+    except Exception:
+        a_tau_s = np.zeros(3, dtype=np.float32)
+    rec.update({
+        'attn_score_skew': float(m.get('attn_score_skew', 0.0)),
+        'know_score_skew': float(m.get('know_score_skew', 0.0)),
+        'attn_score_kurt': float(m.get('attn_score_kurt', 0.0)),
+        'know_score_kurt': float(m.get('know_score_kurt', 0.0)),
+        'attn_active_per_token_std': float(m.get('attn_active_per_token_std', 0.0)),
+        'know_active_per_token_std': float(m.get('know_active_per_token_std', 0.0)),
+        'attn_gate_entropy': float(m.get('attn_gate_entropy', 0.0)),
+        'know_gate_entropy': float(m.get('know_gate_entropy', 0.0)),
+        'attn_qk_phi_binary': float(m.get('attn_qk_phi_binary', 0.0)),
+        'attn_v_phi_binary': float(m.get('attn_v_phi_binary', 0.0)),
+        'know_phi_binary': float(m.get('know_phi_binary', 0.0)),
+        'attn_z_lt_075': float(m.get('attn_z_lt_075', 0.0)),
+        'know_z_lt_075': float(m.get('know_z_lt_075', 0.0)),
+        'attn_z_lt_030': float(m.get('attn_z_lt_030', 0.0)),
+        'know_z_lt_030': float(m.get('know_z_lt_030', 0.0)),
+        'attn_int_cap_frac': float(m.get('attn_int_cap_frac', 0.0)),
+        'know_int_cap_frac': float(m.get('know_int_cap_frac', 0.0)),
+        'qk_emb_norm_max': float(m.get('qk_emb_norm_max', 0.0)),
+        'v_emb_norm_max': float(m.get('v_emb_norm_max', 0.0)),
+        'know_emb_norm_max': float(m.get('know_emb_norm_max', 0.0)),
+        'attn_tau_std_q': float(a_tau_s[0]),
+        'attn_tau_std_k': float(a_tau_s[1]),
+        'attn_tau_std_v': float(a_tau_s[2]),
+        'know_tau_std': float(m.get('know_tau_std', 0.0)),
+        'attn_tau_kernel_norm': float(m.get('attn_tau_kernel_norm', 0.0)),
+        'know_tau_kernel_norm': float(m.get('know_tau_kernel_norm', 0.0)),
+        'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
+        'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
+        'know_raw_out_norm': float(m.get('know_raw_out_norm', 0.0)),
+        'attn_z_sum': float(m.get('attn_z_sum', 0.0)),
+        'know_z_sum': float(m.get('know_z_sum', 0.0)),
+        'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
+        'debug_emb_norm': float(m.get('debug_emb_norm', 0.0)),
+        'debug_o_proj_norm': float(m.get('debug_o_proj_norm', 0.0)),
+        'debug_q_norm': float(m.get('debug_q_norm', 0.0)),
+        'debug_k_norm': float(m.get('debug_k_norm', 0.0)),
+        'debug_v_norm': float(m.get('debug_v_norm', 0.0)),
+        'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
+        'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
+    })
+    # HBM (host-0 local device 0 snapshot).
+    try:
+        mem = jax.local_devices()[0].memory_stats()
+        if mem:
+            used = mem.get('bytes_in_use', 0) / 1e9
+            peak = mem.get('peak_bytes_in_use', 0) / 1e9
+            limit = mem.get('bytes_limit', 0) / 1e9
+            rec['hbm_used_gb'] = float(used)
+            rec['hbm_peak_gb'] = float(peak)
+            rec['hbm_limit_gb'] = float(limit)
+    except Exception:
+        pass
+    return rec
+
+
+def _print_analysis_block(rec, ctx):
+    log_message(
+        f"  dist k[skew={rec['know_score_skew']:+.2f} kurt={rec['know_score_kurt']:.2f}"
+        f" apt_std={rec['know_active_per_token_std']:.1f} ent={rec['know_gate_entropy']:.2f}]"
+        f" a[skew={rec['attn_score_skew']:+.2f} kurt={rec['attn_score_kurt']:.2f}"
+        f" apt_std={rec['attn_active_per_token_std']:.1f} ent={rec['attn_gate_entropy']:.2f}]"
+    )
+    log_message(
+        f"  boundary k[phi={rec['know_phi_binary']*100:.1f}%"
+        f" z<075={rec['know_z_lt_075']*100:.1f}%"
+        f" z<030={rec['know_z_lt_030']*100:.1f}%]"
+        f" a_qk[phi={rec['attn_qk_phi_binary']*100:.1f}%]"
+        f" a_v[phi={rec['attn_v_phi_binary']*100:.1f}%]"
+        f" a[z<075={rec['attn_z_lt_075']*100:.1f}%"
+        f" z<030={rec['attn_z_lt_030']*100:.1f}%]"
+    )
+    log_message(
+        f"  saturation cap[a={rec['attn_int_cap_frac']*100:.1f}%"
+        f" k={rec['know_int_cap_frac']*100:.1f}%]"
+        f" | emb_max k={rec['know_emb_norm_max']:.2f}"
+        f" qk={rec['qk_emb_norm_max']:.2f}"
+        f" v={rec['v_emb_norm_max']:.2f}"
+    )
+    log_message(
+        f"  tau_struct k_std={rec['know_tau_std']:.2f}"
+        f" a_std=[{rec['attn_tau_std_q']:.2f} {rec['attn_tau_std_k']:.2f} {rec['attn_tau_std_v']:.2f}]"
+        f" k_kern={rec['know_tau_kernel_norm']:.1f}"
+        f" a_kern={rec['attn_tau_kernel_norm']:.1f}"
+    )
+    log_message(
+        f"  raw_n qk={rec['attn_qk_raw_norm']:.2f}"
+        f" v={rec['attn_v_raw_norm']:.2f}"
+        f" k={rec['know_raw_out_norm']:.2f}"
+        f" | out_n a={rec['attn_out_norm']:.2f}"
+        f" k={rec['know_out_norm']:.2f}"
+    )
+    log_message(
+        f"  debug resid={rec['debug_residual_norm']:.2f}"
+        f" emb={rec['debug_emb_norm']:.2f}"
+        f" o_proj={rec['debug_o_proj_norm']:.2f}"
+        f" q={rec['debug_q_norm']:.2f}"
+        f" k={rec['debug_k_norm']:.2f}"
+        f" v={rec['debug_v_norm']:.2f}"
+        f" logit_max={rec['debug_logit_max']:.1f}"
+        f" o_in={rec['debug_o_input_norm']:.2f}"
+    )
+    if 'hbm_used_gb' in rec:
+        log_message(
+            f"  HBM: {rec['hbm_used_gb']:.2f}G / {rec['hbm_limit_gb']:.2f}G"
+            f" (peak={rec['hbm_peak_gb']:.2f}G,"
+            f" free={rec['hbm_limit_gb'] - rec['hbm_used_gb']:.2f}G)"
+        )
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -1398,6 +1729,10 @@ def main():
     exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
     exploration_upper_bound = tcfg.get('exploration_upper_bound', 2.0)
     exploration_bound_eps = tcfg.get('exploration_bound_eps', 1.0e-3)
+    # 3-tier logging cadence.
+    log_interval_fast = int(tcfg.get('log_interval_fast', 100))
+    log_deep_multiplier = int(tcfg.get('log_deep_multiplier', 5))
+    log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
@@ -1596,6 +1931,12 @@ def main():
                 'exploration_upper_bound', exploration_upper_bound)
             exploration_bound_eps = saved_training_config.get(
                 'exploration_bound_eps', exploration_bound_eps)
+            log_interval_fast = int(saved_training_config.get(
+                'log_interval_fast', log_interval_fast))
+            log_deep_multiplier = int(saved_training_config.get(
+                'log_deep_multiplier', log_deep_multiplier))
+            log_analysis_multiplier = int(saved_training_config.get(
+                'log_analysis_multiplier', log_analysis_multiplier))
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -1618,6 +1959,9 @@ def main():
         'exploration_lower_bound': exploration_lower_bound,
         'exploration_upper_bound': exploration_upper_bound,
         'exploration_bound_eps': exploration_bound_eps,
+        'log_interval_fast': log_interval_fast,
+        'log_deep_multiplier': log_deep_multiplier,
+        'log_analysis_multiplier': log_analysis_multiplier,
     }
 
     # ----------------------------------------------------------
@@ -2564,6 +2908,17 @@ def main():
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
+    # 3-tier logging cadence. DEEP/ANALYSIS intervals are multiples of FAST
+    # so every DEEP step is also a FAST step and every ANALYSIS step is also
+    # a DEEP step — no duplicate JSONL records, and console output stacks
+    # cleanly (FAST block -> DEEP block -> ANALYSIS block in that order).
+    LOG_FAST = log_interval_fast
+    LOG_DEEP = log_interval_fast * log_deep_multiplier
+    LOG_ANALYSIS = log_interval_fast * log_analysis_multiplier
+    if is_host0:
+        print(f"  Log cadence: fast={LOG_FAST} deep={LOG_DEEP} analysis={LOG_ANALYSIS}",
+              flush=True)
+
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
     # each log event. Fed into train_step so the drift collective runs inside
     # jit on all hosts; the actual ||·|| reductions live there.
@@ -2672,13 +3027,24 @@ def main():
             global_step += 1
             epoch_step_counter += 1
 
-            # ---- Periodic logging (host 0 only) ----
-            _early_debug = global_step in (1, 5, 10, 20, 50)
-            if global_step % LOG_INTERVAL == 0 or _early_debug or debug_mode:
+            # ---- 3-tier periodic logging (FAST / DEEP / ANALYSIS) ----
+            _is_early_debug = global_step in (1, 5, 10, 20, 50)
+            is_fast = (global_step % LOG_FAST == 0) or _is_early_debug or debug_mode
+            is_deep = is_fast and (
+                (global_step % LOG_DEEP == 0)
+                or (global_step in (1, 20))
+                or debug_mode
+            )
+            is_analysis = is_fast and (
+                (global_step % LOG_ANALYSIS == 0)
+                or (global_step == 1)
+                or debug_mode
+            )
+
+            if is_fast:
                 # Refresh emb-drift snapshot on every host (ref reassignment
                 # only — no collective). Must run outside is_host0 so the
-                # next jit'd train_step sees a consistent snap pytree on all
-                # hosts.
+                # next jit'd train_step sees a consistent snap pytree.
                 _prev_emb_snap = {
                     'qk_emb': params['neuron_pool']['qk_emb'],
                     'v_emb': params['neuron_pool']['v_emb'],
@@ -2693,525 +3059,68 @@ def main():
                 })
                 _win_correct_py = int(_win_vals['correct'])
                 _win_valid_py = int(_win_vals['valid'])
-                # Token-weighted: divide by total valid tokens, not step count.
                 _vdiv = _win_valid_py if _win_valid_py > 0 else 1
-                avg_loss = float(_win_vals['loss']) / _vdiv
-                avg_ce = float(_win_vals['ce']) / _vdiv
-                avg_aux = float(_win_vals['aux']) / _vdiv
-                avg_tau_reg = float(_win_vals['tau_reg']) / _vdiv
-                avg_orth = float(_win_vals['orth']) / _vdiv
-                avg_div = float(_win_vals['div']) / _vdiv
-                avg_acc = _win_correct_py / _vdiv
-
+                win_avgs = {
+                    'loss':    float(_win_vals['loss'])    / _vdiv,
+                    'ce':      float(_win_vals['ce'])      / _vdiv,
+                    'aux':     float(_win_vals['aux'])     / _vdiv,
+                    'tau_reg': float(_win_vals['tau_reg']) / _vdiv,
+                    'orth':    float(_win_vals['orth'])    / _vdiv,
+                    'div':     float(_win_vals['div'])     / _vdiv,
+                    'acc':     _win_correct_py             / _vdiv,
+                }
                 # Full NaN/INF check on the materialized window averages.
                 if check_nan_inf({
-                    'total_loss': avg_loss, 'ce_loss': avg_ce,
-                    'aux_loss': avg_aux, 'tau_reg': avg_tau_reg,
-                    'orth_loss': avg_orth, 'div_loss': avg_div,
+                    'total_loss': win_avgs['loss'], 'ce_loss': win_avgs['ce'],
+                    'aux_loss': win_avgs['aux'], 'tau_reg': win_avgs['tau_reg'],
+                    'orth_loss': win_avgs['orth'], 'div_loss': win_avgs['div'],
                 }, global_step, epoch):
                     raise ValueError(
                         f"NaN/INF window averages at epoch {epoch}, step {global_step}")
 
                 if is_host0:
-                    elapsed = time.time() - win_start_time
-                    steps_per_sec = win_count / elapsed if elapsed > 0 else 0
-
-                    # Current LR from schedule (indexed by optimizer step, not micro-step)
-                    opt_step = global_step // grad_accum_steps
-                    current_lr = float(schedule(opt_step))
-
-                    total_elapsed = time.time() - train_start_time
-                    epoch_elapsed = time.time() - epoch_start
-                    progress = global_step / total_micro_steps * 100
-
-                    # Timing: elapsed<remaining, s/it
-                    s_per_it = epoch_elapsed / epoch_steps if epoch_steps > 0 else 0
-                    remaining_steps = steps_per_epoch - epoch_steps
-                    eta = s_per_it * remaining_steps
-
-                    # Grad norm
-                    m_grad = _m(metrics['grad_norm'])
-
-                    msg = (
-                        f"[Step {global_step}/{total_micro_steps} ({progress:.1f}%)] "
-                        f"loss={avg_loss:.4f} ce={avg_ce:.4f} | "
-                        f"reg(raw): aux={avg_aux:.4f} tau_reg={avg_tau_reg:.4f} "
-                        f"orth={avg_orth:.2e} div={avg_div:.2e} | "
-                        f"acc={avg_acc:.4f} lr={current_lr:.2e} "
-                        f"{format_time(epoch_elapsed)}<{format_time(eta)}, {s_per_it:.2f}s/it"
-                    )
-                    log_message(msg)
-
-                    # Defensive defaults for downstream JSONL so values exist
-                    # even if the detailed-stats block below raises.
-                    a_tau_s = np.zeros(3, dtype=np.float32)
-                    k_tau_s = 0.0
-                    a_kern = 0.0
-                    k_kern = 0.0
-                    k_tau_abs = 0.0
-                    a_tau_abs = 0.0
-                    k_z075 = 0.0
-                    a_z075 = 0.0
-                    k_z030 = 0.0
-                    a_z030 = 0.0
-                    k_skew = 0.0
-                    a_skew = 0.0
-                    k_apt = 0.0
-                    a_apt = 0.0
-                    k_ent = 0.0
-                    a_ent = 0.0
-                    k_zsum = 0.0
-                    a_zsum = 0.0
-                    k_emb_nmax = 0.0
-                    k_emb_nmin = 0.0
-                    k_emb_nstd = 0.0
-                    qk_emb_nmean = 0.0
-                    qk_emb_nmax = 0.0
-                    qk_emb_nmin = 0.0
-                    qk_emb_nstd = 0.0
-                    v_emb_nmean = 0.0
-                    v_emb_nmax = 0.0
-                    v_emb_nmin = 0.0
-                    v_emb_nstd = 0.0
-                    k_kurt = 0.0
-                    a_kurt = 0.0
-                    k_drop = 0.0
-                    a_drop = 0.0
-                    k_boost = 0.0
-                    a_boost = 0.0
-
-                    # Detailed stats (all from metrics, no params access)
-                    try:
-                        tk_b = _m(metrics['tau_know_bias'])
-                        ta_b = [_m(metrics['tau_attn_bias_0']),
-                                _m(metrics['tau_attn_bias_1']),
-                                _m(metrics['tau_attn_bias_2'])]
-                        tau_s = (f"tau: know={tk_b:.2f} "
-                                 f"attn=[{ta_b[0]:.2f},{ta_b[1]:.2f},{ta_b[2]:.2f}]")
-
-                        m_attn_aux = _m(metrics.get('attn_aux', 0.0))
-                        m_know_aux = _m(metrics.get('know_aux', 0.0))
-                        k_emb_n = _m(metrics.get('know_emb_norm', 0.0))
-                        k_read_n = _m(metrics.get('know_read_norm', 0.0))
-                        k_write_n = _m(metrics.get('know_write_norm', 0.0))
-
-                        n_know_cfg = cfg['model'].get('n_know', 27200)
-                        n_qk_cfg = cfg['model'].get('n_qk', 0)
-                        n_v_cfg = cfg['model'].get('n_v', 0)
-                        k_act = _m(metrics['know_active'])
-                        k_aN = _m(metrics.get('know_active_N', 0.0))
-                        k_sstd = _m(metrics.get('know_score_std', 0.0))
-                        k_raw_gmax = _m(metrics.get('know_raw_gate_max', metrics.get('know_gate_max', 0.0)))
-                        k_gsum = _m(metrics.get('know_gate_sum', 0.0))
-                        k_zsum = _m(metrics.get('know_z_sum', 0.0))
-                        k_gconc = _m(metrics.get('know_gate_conc', 0.0))
-                        k_anm = _m(metrics.get('know_active_n_mean', 0.0))
-                        k_strong = _m(metrics.get('know_strong', 0.0))
-
-                        a_qk_act = _m(metrics.get('attn_qk_active', 0.0))
-                        a_v_act = _m(metrics.get('attn_v_active', 0.0))
-                        a_aN = _m(metrics.get('attn_active_N', 0.0))
-                        a_sstd = _m(metrics.get('attn_score_std', 0.0))
-                        a_raw_gmax = _m(metrics.get('attn_raw_gate_max', metrics.get('attn_gate_max', 0.0)))
-                        a_gsum = _m(metrics.get('attn_gate_sum', 0.0))
-                        a_zsum = _m(metrics.get('attn_z_sum', 0.0))
-                        a_gconc = _m(metrics.get('attn_gate_conc', 0.0))
-                        a_anm = _m(metrics.get('attn_active_n_mean', 0.0))
-                        a_strong = _m(metrics.get('attn_strong', 0.0))
-                        a_out_n = _m(metrics.get('attn_out_norm', 0.0))
-
-                        a_tau_m = _m(metrics.get('attn_tau_mean', 0.0))
-                        k_tau_m = _m(metrics.get('know_tau_mean', 0.0))
-                        k_out_n = _m(metrics.get('know_out_norm', 0.0))
-
-                        # tau_offset per-token std + kernel Frobenius norm
-                        # (distinguishes bias-only offset from active per-token routing)
-                        try:
-                            a_tau_s = np.asarray(jax.device_get(metrics.get(
-                                'attn_tau_std', jnp.zeros(3))))
-                            if a_tau_s.size < 3:
-                                a_tau_s = np.zeros(3, dtype=np.float32)
-                        except Exception:
-                            a_tau_s = np.zeros(3, dtype=np.float32)
-                        k_tau_s = _m(metrics.get('know_tau_std', 0.0))
-                        a_kern = _m(metrics.get('attn_tau_kernel_norm', 0.0))
-                        k_kern = _m(metrics.get('know_tau_kernel_norm', 0.0))
-
-                        log_message(
-                            f"      {tau_s} | tau_mean: attn={a_tau_m:.3f}"
-                            f" know={k_tau_m:.3f} | grad_norm={m_grad:.3f}")
-                        log_message(
-                            f"      tau_struct: k_std={k_tau_s:.3f}"
-                            f" a_std=[{float(a_tau_s[0]):.3f},{float(a_tau_s[1]):.3f},{float(a_tau_s[2]):.3f}]"
-                            f" k_kern={k_kern:.2f} a_kern={a_kern:.2f}")
-
-                        # Absolute gate threshold + z-margin distribution
-                        k_tau_abs = _m(metrics.get('know_tau_abs_mean', 0.0))
-                        a_tau_abs = _m(metrics.get('attn_tau_abs_mean', 0.0))
-                        k_z075 = _m(metrics.get('know_z_lt_075', 0.0))
-                        a_z075 = _m(metrics.get('attn_z_lt_075', 0.0))
-                        k_z030 = _m(metrics.get('know_z_lt_030', 0.0))
-                        a_z030 = _m(metrics.get('attn_z_lt_030', 0.0))
-                        log_message(
-                            f"      gate_margin: k[abs={k_tau_abs:+.3f}"
-                            f" z<075={k_z075*100:.2f}% z<030={k_z030*100:.2f}%]"
-                            f" a[abs={a_tau_abs:+.3f}"
-                            f" z<075={a_z075*100:.2f}% z<030={a_z030*100:.2f}%]")
-
-                        # Score-dist skewness + active-count std across tokens
-                        k_skew = _m(metrics.get('know_score_skew', 0.0))
-                        a_skew = _m(metrics.get('attn_score_skew', 0.0))
-                        k_apt = _m(metrics.get('know_active_per_token_std', 0.0))
-                        a_apt = _m(metrics.get('attn_active_per_token_std', 0.0))
-                        k_ent = _m(metrics.get('know_gate_entropy', 0.0))
-                        a_ent = _m(metrics.get('attn_gate_entropy', 0.0))
-                        k_kurt = _m(metrics.get('know_score_kurt', 0.0))
-                        a_kurt = _m(metrics.get('attn_score_kurt', 0.0))
-                        # Dead count (v4.0.6+). alpha / tau_shift / s_std_min
-                        # removed in v4.1 (dynamic tau gone).
-                        k_dead = _m(metrics.get('know_dead_count', 0.0))
-                        a_dead = _m(metrics.get('attn_dead_count', 0.0))
-                        log_message(
-                            f"      dist: k[skew={k_skew:+.2f} kurt={k_kurt:.2f}"
-                            f" apt_std={k_apt:.1f} ent={k_ent:.2f} dead={int(k_dead)}]"
-                            f" a[skew={a_skew:+.2f} kurt={a_kurt:.2f}"
-                            f" apt_std={a_apt:.1f} ent={a_ent:.2f} dead={int(a_dead)}]")
-
-                        # v4.1 tau_offset distribution — prime diagnostic
-                        # for exploration-driven runaway.
-                        a_tau_off_min = _m(metrics.get('attn_tau_off_min', 0.0))
-                        a_tau_off_max = _m(metrics.get('attn_tau_off_max', 0.0))
-                        a_tau_off_p99 = _m(metrics.get('attn_tau_off_p99', 0.0))
-                        a_tau_off_neg = _m(metrics.get('attn_tau_off_neg_frac', 0.0))
-                        k_tau_off_min = _m(metrics.get('know_tau_off_min', 0.0))
-                        k_tau_off_max = _m(metrics.get('know_tau_off_max', 0.0))
-                        k_tau_off_p99 = _m(metrics.get('know_tau_off_p99', 0.0))
-                        k_tau_off_neg = _m(metrics.get('know_tau_off_neg_frac', 0.0))
-                        log_message(
-                            f"      tau_off k: min={k_tau_off_min:+.2f}"
-                            f" max={k_tau_off_max:+.2f}"
-                            f" p99={k_tau_off_p99:+.2f}"
-                            f" neg={k_tau_off_neg*100:.1f}%")
-                        log_message(
-                            f"      tau_off a: min={a_tau_off_min:+.2f}"
-                            f" max={a_tau_off_max:+.2f}"
-                            f" p99={a_tau_off_p99:+.2f}"
-                            f" neg={a_tau_off_neg*100:.1f}%")
-
-                        # v4.1 RPE exploration (batch-global-mean baseline,
-                        # asymmetric signal; no EMA / warmup).
-                        m_global_ce = _m(metrics.get('global_mean_ce', 0.0))
-                        m_pos_frac = _m(metrics.get('pos_frac', 0.0))
-                        m_pos_mean = _m(metrics.get('pos_mean', 0.0))
-                        m_neg_mean = _m(metrics.get('neg_mean', 0.0))
-                        m_explore_a = _m(metrics.get('explore_attn_raw', 0.0))
-                        m_explore_k = _m(metrics.get('explore_know_raw', 0.0))
-                        m_explore_w = _m(metrics.get('explore_loss_weighted', 0.0))
-                        m_block_a = _m(metrics.get('explore_block_frac_a', 0.0))
-                        m_block_k = _m(metrics.get('explore_block_frac_k', 0.0))
-                        m_sig_pmax = _m(metrics.get('sig_pos_max', 0.0))
-                        m_sig_nmax = _m(metrics.get('sig_neg_max', 0.0))
-                        log_message(
-                            f"      rpe: mean_ce={m_global_ce:.3f}"
-                            f" pos_frac={m_pos_frac*100:.1f}%"
-                            f" pos_avg={m_pos_mean:.3f} neg_avg={m_neg_mean:.3f}"
-                            f" sig[max+={m_sig_pmax:.2f} max-={m_sig_nmax:.2f}]"
-                            f" expl[a={m_explore_a:+.3f} k={m_explore_k:+.3f}]"
-                            f" w={m_explore_w:+.4f}"
-                            f" block[a={m_block_a*100:.1f}% k={m_block_k*100:.1f}%]")
-
-                        # Emb norm per-pool stats (mean / max / min / std)
-                        k_emb_nmax = _m(metrics.get('know_emb_norm_max', 0.0))
-                        k_emb_nmin = _m(metrics.get('know_emb_norm_min', 0.0))
-                        k_emb_nstd = _m(metrics.get('know_emb_norm_std', 0.0))
-                        qk_emb_nmean = _m(metrics.get('qk_emb_norm_mean', 0.0))
-                        qk_emb_nmax = _m(metrics.get('qk_emb_norm_max', 0.0))
-                        qk_emb_nmin = _m(metrics.get('qk_emb_norm_min', 0.0))
-                        qk_emb_nstd = _m(metrics.get('qk_emb_norm_std', 0.0))
-                        v_emb_nmean = _m(metrics.get('v_emb_norm_mean', 0.0))
-                        v_emb_nmax = _m(metrics.get('v_emb_norm_max', 0.0))
-                        v_emb_nmin = _m(metrics.get('v_emb_norm_min', 0.0))
-                        v_emb_nstd = _m(metrics.get('v_emb_norm_std', 0.0))
-                        log_message(
-                            f"      emb_n: k[{k_emb_n:.3f}/{k_emb_nstd:.3f} min={k_emb_nmin:.3f}]"
-                            f" qk[{qk_emb_nmean:.3f}/{qk_emb_nstd:.3f} min={qk_emb_nmin:.3f}]"
-                            f" v[{v_emb_nmean:.3f}/{v_emb_nstd:.3f} min={v_emb_nmin:.3f}]")
-
-                        # Emb drift: reduced inside train_step (all hosts),
-                        # so here we just read scalar metrics.
-                        drift_qk = _m(metrics.get('drift_qk_emb', 0.0))
-                        drift_v = _m(metrics.get('drift_v_emb', 0.0))
-                        drift_know = _m(metrics.get('drift_know_emb', 0.0))
-                        log_message(
-                            f"      drift ({LOG_INTERVAL}step):"
-                            f" qk_emb={drift_qk:.4e}"
-                            f" v_emb={drift_v:.4e}"
-                            f" know_emb={drift_know:.4e}")
-                        # v4.1: aux line removed (lb_weight=0 → no loss contribution).
-                        k_raw_n = _m(metrics.get('know_raw_out_norm', 0.0))
-                        a_qk_raw_n = _m(metrics.get('attn_qk_raw_norm', 0.0))
-                        a_v_raw_n = _m(metrics.get('attn_v_raw_norm', 0.0))
-
-                        # know line: show active_N or gate_sum/conc depending on version
-                        k_extra = ""
-                        if k_gsum > 0:  # v3.9.1+
-                            k_extra = f" gate_max={k_raw_gmax:.4f} conc={k_gconc:.1f} gsum={k_gsum:.1f}"
-                        if k_anm > 0:  # v3.9.5
-                            k_extra = f" gate_max={k_raw_gmax:.4f} active_n={k_anm:.0f} gsum={k_gsum:.1f}"
-                        if k_zsum > 0:  # v4.0.3 (Σz^+ denominator)
-                            k_extra += f" z_sum={k_zsum:.1f}"
-                        if k_aN > 0:    # v3.9.2
-                            k_extra += f" active_N={k_aN:.0f}"
-
-                        # v4.0.0 (symmetric gate): know_pos metric exists → show pos/neg split
-                        # All others (ReLU/GELU gate): show active/total + optional strong
-                        _has_pos = bool(metrics.get('know_pos', 0.0))
-                        if _has_pos:
-                            k_pos = _m(metrics.get('know_pos', k_strong))
-                            k_neg = max(k_act - k_pos, 0.0)
-                            k_pos_n = k_pos * n_know_cfg
-                            k_neg_n = k_neg * n_know_cfg
-                            k_total_n = k_act * n_know_cfg
-                            log_message(
-                                f"      know: pos={k_pos_n:.0f}({k_pos*100:.1f}%)"
-                                f" neg={k_neg_n:.0f}({k_neg*100:.1f}%)"
-                                f" active={k_total_n:.0f}({k_act*100:.1f}%){k_extra}"
-                                f" s_std={k_sstd:.3f}"
-                                f" raw_norm={k_raw_n:.6f} out_norm={k_out_n:.3f}")
+                    _elapsed = time.time() - win_start_time
+                    _steps_per_sec = (win_count / _elapsed) if _elapsed > 0 else 0.0
+                    _opt_step = global_step // grad_accum_steps
+                    _current_lr = float(schedule(_opt_step))
+                    _total_elapsed = time.time() - train_start_time
+                    _epoch_elapsed = time.time() - epoch_start
+                    _progress = (global_step / total_micro_steps * 100
+                                 if total_micro_steps > 0 else 0.0)
+                    _s_per_it = _epoch_elapsed / epoch_steps if epoch_steps > 0 else 0.0
+                    _remaining = max(steps_per_epoch - epoch_steps, 0)
+                    _eta = _s_per_it * _remaining
+                    ctx = {
+                        'lb_weight': lb_weight,
+                        'tau_reg_weight': tau_reg_weight,
+                        'orth_weight': orth_weight,
+                        'div_weight': div_weight,
+                        'dead_penalty_weight': dead_penalty_weight,
+                        'n_qk_cfg': cfg['model'].get('n_qk', 0),
+                        'n_v_cfg': cfg['model'].get('n_v', 0),
+                        'n_know_cfg': cfg['model'].get('n_know', 0),
+                        'current_lr': _current_lr,
+                        'steps_per_sec': _steps_per_sec,
+                        'total_elapsed': _total_elapsed,
+                        'epoch_elapsed': _epoch_elapsed,
+                        'eta': _eta,
+                        's_per_it': _s_per_it,
+                        'total_micro_steps': total_micro_steps,
+                        'progress': _progress,
+                    }
+                    rec = _build_fast_record(metrics, win_avgs, ctx, global_step, epoch)
+                    _print_fast_block(rec, ctx)
+                    if is_deep:
+                        rec = _build_deep_record(rec, metrics, ctx)
+                        _print_deep_block(rec, ctx)
+                        if is_analysis:
+                            rec = _build_analysis_record(rec, metrics, ctx)
+                            _print_analysis_block(rec, ctx)
+                            log_jsonl({'type': 'train_analysis', **rec})
                         else:
-                            # v4.1 compressed know line.
-                            k_phi = _m(metrics.get('know_phi_binary', 0.0))
-                            k_z_act = _m(metrics.get('know_z_mean_active', 0.0))
-                            k_z075 = _m(metrics.get('know_z_lt_075', 0.0))
-                            k_z030 = _m(metrics.get('know_z_lt_030', 0.0))
-                            k_int_max = _m(metrics.get('know_int_max', 0.0))
-                            k_int_cap = _m(metrics.get('know_int_cap_frac', 0.0))
-                            k_act_n = k_act * n_know_cfg
-                            k_strong_n = k_strong * n_know_cfg
-                            k_strong_of_act = k_strong_n / max(k_act_n, 1.0)
-                            log_message(
-                                f"      know: act={k_act_n:.0f}/{n_know_cfg}({k_act*100:.1f}%)"
-                                f" strong={k_strong_n:.0f}/{k_act_n:.0f}({k_strong_of_act*100:.1f}%)"
-                                f" gate_max={k_raw_gmax:.2f}"
-                                f" int_avg={k_z_act:.2f} int_max={k_int_max:.2f}"
-                                f" cap={k_int_cap*100:.1f}%"
-                                f" s_std={k_sstd:.2f} raw={k_raw_n:.3f} out={k_out_n:.2f}"
-                                f" phi_bin={k_phi*100:.1f}% bnd={k_z075*100:.1f}%"
-                                f" mid={k_z030*100:.1f}%")
-
-                        # attn line
-                        a_extra = ""
-                        if a_gsum > 0:  # v3.9.1+
-                            a_extra = f" gate_max={a_raw_gmax:.4f} conc={a_gconc:.1f} gsum={a_gsum:.1f}"
-                        if a_anm > 0:  # v3.9.5
-                            a_extra = f" gate_max={a_raw_gmax:.4f} active_n={a_anm:.0f} gsum={a_gsum:.1f}"
-                        if a_aN > 0:    # v3.9.2
-                            a_extra += f" active_N={a_aN:.0f}"
-                        if a_zsum > 0:  # v4.0.3 (Σz^+ denominator)
-                            a_extra += f" z_sum={a_zsum:.1f}"
-
-                        _has_attn_pos = bool(metrics.get('attn_qk_pos', metrics.get('attn_pos', 0.0)))
-                        if _has_attn_pos:
-                            a_qk_pos = _m(metrics.get('attn_qk_pos', metrics.get('attn_pos', metrics.get('attn_strong', 0.0))))
-                            a_v_pos = _m(metrics.get('attn_v_pos', 0.0))
-                            a_qk_neg = max(a_qk_act - a_qk_pos, 0.0)
-                            a_v_neg = max(a_v_act - a_v_pos, 0.0)
-                            log_message(
-                                f"      attn: qk_pos={a_qk_pos*n_qk_cfg:.0f}({a_qk_pos*100:.1f}%)"
-                                f" qk_neg={a_qk_neg*n_qk_cfg:.0f}({a_qk_neg*100:.1f}%)"
-                                f" v_pos={a_v_pos*n_v_cfg:.0f}({a_v_pos*100:.1f}%)"
-                                f" v_neg={a_v_neg*n_v_cfg:.0f}({a_v_neg*100:.1f}%){a_extra}"
-                                f" s_std={a_sstd:.3f}"
-                                f" qk_raw={a_qk_raw_n:.6f} v_raw={a_v_raw_n:.6f}"
-                                f" out_norm={a_out_n:.3f}")
-                        else:
-                            # v4.1 compressed attn line.
-                            a_qk_phi = _m(metrics.get('attn_qk_phi_binary', 0.0))
-                            a_v_phi = _m(metrics.get('attn_v_phi_binary', 0.0))
-                            a_qk_z = _m(metrics.get('attn_qk_z_mean_active', 0.0))
-                            a_v_z = _m(metrics.get('attn_v_z_mean_active', 0.0))
-                            a_z075 = _m(metrics.get('attn_z_lt_075', 0.0))
-                            a_z030 = _m(metrics.get('attn_z_lt_030', 0.0))
-                            a_int_max = _m(metrics.get('attn_int_max', 0.0))
-                            a_int_cap = _m(metrics.get('attn_int_cap_frac', 0.0))
-                            a_qk_act_n = a_qk_act * n_qk_cfg
-                            a_v_act_n = a_v_act * n_v_cfg
-                            # `attn_strong` is avg of qk/v strong fractions;
-                            # combined active count = sum of both active counts.
-                            # Express "strong among active" against the combined
-                            # population so the %denom matches what act= shows.
-                            a_total_act_n = a_qk_act_n + a_v_act_n
-                            a_strong_n = a_strong * (n_qk_cfg + n_v_cfg)
-                            a_strong_of_act = a_strong_n / max(a_total_act_n, 1.0)
-                            log_message(
-                                f"      attn: qk_act={a_qk_act_n:.0f}/{n_qk_cfg}({a_qk_act*100:.1f}%)"
-                                f" v_act={a_v_act_n:.0f}/{n_v_cfg}({a_v_act*100:.1f}%)"
-                                f" strong={a_strong_n:.0f}/{a_total_act_n:.0f}({a_strong_of_act*100:.1f}%)"
-                                f" gate_max={a_raw_gmax:.2f}"
-                                f" int_avg[qk={a_qk_z:.2f} v={a_v_z:.2f}]"
-                                f" int_max={a_int_max:.2f} cap={a_int_cap*100:.1f}%"
-                                f" s_std={a_sstd:.2f}"
-                                f" qk_raw={a_qk_raw_n:.3f} v_raw={a_v_raw_n:.3f}"
-                                f" out={a_out_n:.2f}"
-                                f" phi_bin[qk={a_qk_phi*100:.1f}% v={a_v_phi*100:.1f}%]"
-                                f" bnd={a_z075*100:.1f}% mid={a_z030*100:.1f}%")
-                        # Strength (v3.9.3)
-                        k_str_m = _m(metrics.get('know_strength_mean', 0.0))
-                        if k_str_m > 0:
-                            k_str_s = _m(metrics.get('know_strength_std', 0.0))
-                            k_str_mn = _m(metrics.get('know_strength_min', 0.0))
-                            k_str_mx = _m(metrics.get('know_strength_max', 0.0))
-                            k_lg_m = _m(metrics.get('know_logit_mean', 0.0))
-                            k_lg_s = _m(metrics.get('know_logit_std', 0.0))
-                            log_message(
-                                f"      know_str: mean={k_str_m:.2f} std={k_str_s:.2f}"
-                                f" min={k_str_mn:.2f} max={k_str_mx:.2f}"
-                                f" | logit: mean={k_lg_m:.3f} std={k_lg_s:.3f}")
-                        a_v_str_m = _m(metrics.get('attn_v_strength_mean', 0.0))
-                        if a_v_str_m > 0:
-                            a_v_str_s = _m(metrics.get('attn_v_strength_std', 0.0))
-                            a_v_str_mn = _m(metrics.get('attn_v_strength_min', 0.0))
-                            a_v_str_mx = _m(metrics.get('attn_v_strength_max', 0.0))
-                            a_v_lg_m = _m(metrics.get('attn_v_logit_mean', 0.0))
-                            a_v_lg_s = _m(metrics.get('attn_v_logit_std', 0.0))
-                            log_message(
-                                f"      v_str: mean={a_v_str_m:.2f} std={a_v_str_s:.2f}"
-                                f" min={a_v_str_mn:.2f} max={a_v_str_mx:.2f}"
-                                f" | logit: mean={a_v_lg_m:.3f} std={a_v_lg_s:.3f}")
-                        # Full DEBUG (per-layer stacks, attn q/k/v norms,
-                        # residual/emb/o_proj) is verbose — emit every 500
-                        # steps or when explicitly in debug mode / early-debug
-                        # window. Logit_max + out norm are cheap signals that
-                        # fit on the attn line, so skip the one-line summary.
-                        _full_debug = (debug_mode or _early_debug
-                                        or (global_step % 500 == 0))
-                        if _full_debug:
-                            d_res = _m(metrics.get('debug_residual_norm', 0.0))
-                            d_emb = _m(metrics.get('debug_emb_norm', 0.0))
-                            d_oproj = _m(metrics.get('debug_o_proj_norm', 0.0))
-                            d_q = _m(metrics.get('debug_q_norm', 0.0))
-                            d_k = _m(metrics.get('debug_k_norm', 0.0))
-                            d_v = _m(metrics.get('debug_v_norm', 0.0))
-                            d_lm = _m(metrics.get('debug_logit_max', 0.0))
-                            d_oi = _m(metrics.get('debug_o_input_norm', 0.0))
-                            log_message(
-                                f"      [DEBUG] residual={d_res:.3f}"
-                                f" emb={d_emb:.3f} o_proj={d_oproj:.3f}"
-                                f" read={k_read_n:.3f}")
-                            log_message(
-                                f"      [DEBUG] attn_detail:"
-                                f" q={d_q:.3f} k={d_k:.3f} v={d_v:.3f}"
-                                f" logit_max={d_lm:.3f}"
-                                f" o_in={d_oi:.3f} o_out={a_out_n:.3f}")
-                            try:
-                                pl_attn = jax.device_get(metrics['per_layer_attn_out_norm'])
-                                pl_know = jax.device_get(metrics['per_layer_know_out_norm'])
-                                attn_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_attn))
-                                know_s = ', '.join(f'l{i}={v:.2f}' for i, v in enumerate(pl_know))
-                                log_message(f"      [DEBUG] per_layer_attn: [{attn_s}]")
-                                log_message(f"      [DEBUG] per_layer_know: [{know_s}]")
-                            except Exception:
-                                pass
-                    except Exception:
-                        log_message(f"      grad_norm={m_grad:.3f}")
-
-                    # JSONL structured log.
-                    # *_loss / tau_reg: raw values (pre-weight).
-                    # *_weighted: contribution to total_loss (= raw * weight).
-                    log_jsonl({
-                        'type': 'train',
-                        'step': global_step,
-                        'epoch': epoch,
-                        'total_loss': avg_loss,
-                        'ce_loss': avg_ce,
-                        'aux_loss': avg_aux,
-                        'tau_reg': avg_tau_reg,
-                        'orth_loss': avg_orth,
-                        'div_loss': avg_div,
-                        'aux_weighted': lb_weight * avg_aux,
-                        'tau_reg_weighted': tau_reg_weight * avg_tau_reg,
-                        'orth_weighted': orth_weight * avg_orth,
-                        'div_weighted': div_weight * avg_div,
-                        'drift_qk_emb': drift_qk,
-                        'drift_v_emb': drift_v,
-                        'drift_know_emb': drift_know,
-                        # Tau dynamics (Phase 1/2/3a/4 metrics; instantaneous, not window-averaged)
-                        'attn_tau_std_q': float(a_tau_s[0]),
-                        'attn_tau_std_k': float(a_tau_s[1]),
-                        'attn_tau_std_v': float(a_tau_s[2]),
-                        'know_tau_std': k_tau_s,
-                        'attn_tau_kernel_norm': a_kern,
-                        'know_tau_kernel_norm': k_kern,
-                        'attn_tau_abs_mean': a_tau_abs,
-                        'know_tau_abs_mean': k_tau_abs,
-                        'attn_z_lt_075': a_z075,
-                        'know_z_lt_075': k_z075,
-                        'attn_z_lt_030': a_z030,
-                        'know_z_lt_030': k_z030,
-                        'attn_score_skew': a_skew,
-                        'know_score_skew': k_skew,
-                        'attn_active_per_token_std': a_apt,
-                        'know_active_per_token_std': k_apt,
-                        'attn_gate_entropy': a_ent,
-                        'know_gate_entropy': k_ent,
-                        'attn_z_sum': a_zsum,
-                        'know_z_sum': k_zsum,
-                        'know_emb_norm_max': k_emb_nmax,
-                        'know_emb_norm_min': k_emb_nmin,
-                        'know_emb_norm_std': k_emb_nstd,
-                        'qk_emb_norm_mean': qk_emb_nmean,
-                        'qk_emb_norm_max': qk_emb_nmax,
-                        'qk_emb_norm_min': qk_emb_nmin,
-                        'qk_emb_norm_std': qk_emb_nstd,
-                        'v_emb_norm_mean': v_emb_nmean,
-                        'v_emb_norm_max': v_emb_nmax,
-                        'v_emb_norm_min': v_emb_nmin,
-                        'v_emb_norm_std': v_emb_nstd,
-                        'attn_score_kurt': a_kurt,
-                        'know_score_kurt': k_kurt,
-                        'attn_drop_rate': a_drop,
-                        'attn_boost_rate': a_boost,
-                        'know_drop_rate': k_drop,
-                        'know_boost_rate': k_boost,
-                        # Dead-only penalty (v4.0.6+).
-                        'dead_penalty': float(metrics.get('dead_penalty', 0.0)),
-                        'attn_dead_penalty': float(metrics.get('attn_dead_penalty', 0.0)),
-                        'know_dead_penalty': float(metrics.get('know_dead_penalty', 0.0)),
-                        'dead_penalty_weighted': dead_penalty_weight * float(metrics.get('dead_penalty', 0.0)),
-                        'attn_dead_count': float(metrics.get('attn_dead_count', 0.0)),
-                        'know_dead_count': float(metrics.get('know_dead_count', 0.0)),
-                        # v4.1 RPE exploration (redesigned, asymmetric).
-                        'global_mean_ce': float(metrics.get('global_mean_ce', 0.0)),
-                        'pos_frac': float(metrics.get('pos_frac', 0.0)),
-                        'pos_mean': float(metrics.get('pos_mean', 0.0)),
-                        'neg_mean': float(metrics.get('neg_mean', 0.0)),
-                        'explore_loss_raw': float(metrics.get('explore_loss_raw', 0.0)),
-                        'explore_attn_raw': float(metrics.get('explore_attn_raw', 0.0)),
-                        'explore_know_raw': float(metrics.get('explore_know_raw', 0.0)),
-                        'explore_loss_weighted': float(metrics.get('explore_loss_weighted', 0.0)),
-                        'explore_block_frac_a': float(metrics.get('explore_block_frac_a', 0.0)),
-                        'explore_block_frac_k': float(metrics.get('explore_block_frac_k', 0.0)),
-                        'accuracy': avg_acc,
-                        'lr': current_lr,
-                        'steps_per_sec': steps_per_sec,
-                        'elapsed': total_elapsed,
-                        'timestamp': datetime.now().isoformat(),
-                    })
-
-                    # TPU memory stats
-                    try:
-                        mem = jax.local_devices()[0].memory_stats()
-                        if mem:
-                            used = mem.get('bytes_in_use', 0) / 1e9
-                            peak = mem.get('peak_bytes_in_use', 0) / 1e9
-                            limit = mem.get('bytes_limit', 0) / 1e9
-                            log_message(
-                                f"      HBM: {used:.2f}G / {limit:.2f}G "
-                                f"(peak={peak:.2f}G, free={limit - used:.2f}G)")
-                    except Exception:
-                        pass
-
-                    # Sync logs to GCS
+                            log_jsonl({'type': 'train_deep', **rec})
+                    else:
+                        log_jsonl({'type': 'train_fast', **rec})
                     sync_logs()
 
                 # Reset window accumulators (all hosts)
