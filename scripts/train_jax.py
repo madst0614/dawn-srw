@@ -1174,24 +1174,56 @@ def _make_legacy_opt_state_template(params, schedule, weight_decay,
                                     grad_accum_steps=1):
     """Rebuild the pre-1d7a437 optimizer's opt_state shape.
 
-    Old chain was `chain(clip_by_global_norm, adamw(..., mask=fn))`,
-    which gives a 2-tuple opt_state where adamw's add_decayed_weights
-    is wrapped in `MaskedState` (because the old code passed a mask
-    excluding bias / LayerNorm / output_scale). New chain (per-group
-    WD) is a 5-tuple where each `add_decayed_weights` is masked too,
-    just split into base + pool groups.
+    Old chain was `chain(clip_by_global_norm, adamw(..., mask=fn))`
+    where `fn` was only passed when the model had learnable
+    `qk_scale` / `know_scale` (v3.9.7.1+). For older checkpoints
+    (v3.9.4, v3.9.5, etc.) no mask was passed. The wrapper shape
+    differs:
+      with mask: adamw_state[1] = MaskedState(inner_state=EmptyState())
+      no mask:   adamw_state[1] = EmptyState()
+    We replicate the old `_has_scale` check on the live params so the
+    template matches whichever code path saved the checkpoint.
 
-    To deserialize old checkpoints we need the OLD shape as the load
-    template. The actual mask values don't affect opt_state shape —
-    what matters is that `mask` is non-None so the `MaskedState`
-    wrapper is produced. A trivially-true mask suffices.
+    New chain (per-group WD) always masks both add_decayed_weights
+    calls; the migration fills the pool slot from the freshly-init
+    new template so its MaskedState wrapper is correct regardless.
 
     If `grad_accum_steps > 1` the optimizer is wrapped in MultiSteps —
     do the same wrap so the deserialize template lines up with what
     was saved.
     """
-    def _trivial_mask(p):
-        return jax.tree.map(lambda _: True, p)
+    # Replicate the pre-1d7a437 `_has_scale` check on the live params.
+    # v3.9.4 NeuronPool uses fixed sqrt(D) locals (no learnable
+    # qk_scale / know_scale params) → _has_scale=False → mask=None →
+    # adamw_state[1] = bare EmptyState.
+    # v3.9.7.1+ NeuronPool declares qk_scale / v_scale / know_scale as
+    # learnable params → _has_scale=True → mask=fn → adamw_state[1] =
+    # MaskedState(inner_state=EmptyState()).
+    # Use try/except instead of isinstance(params, dict) because Flax
+    # may return a FrozenDict that doesn't subclass dict.
+    try:
+        _pool = params['neuron_pool']
+        _has_scale = 'qk_scale' in _pool or 'know_scale' in _pool
+    except (KeyError, TypeError):
+        _has_scale = False
+    _legacy_mask = None
+    if _has_scale:
+        # Match the exact _wd_mask body from the old train_jax.py at the
+        # time of checkpoint save: exclude bias, LayerNorm scale, and
+        # learnable output_scale; decay everything else.
+        def _legacy_mask_fn(p):
+            def _should_decay(path, _):
+                path_str = '/'.join(str(x) for x in path)
+                if 'bias' in path_str:
+                    return False
+                if 'scale' in path_str and 'norm' in path_str.lower():
+                    return False  # LayerNorm scale
+                if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+                   or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+                    return False  # learnable output_scale
+                return True
+            return jax.tree.map_with_path(_should_decay, p)
+        _legacy_mask = _legacy_mask_fn
 
     old_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -1199,7 +1231,7 @@ def _make_legacy_opt_state_template(params, schedule, weight_decay,
             learning_rate=schedule,
             weight_decay=weight_decay,
             b2=0.95,
-            mask=_trivial_mask,
+            mask=_legacy_mask,
         ),
     )
     if grad_accum_steps > 1:
@@ -1213,17 +1245,22 @@ def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
 
     OLD: (clip_state, adamw_state)
          where adamw_state = (scale_by_adam_state,
-                              add_decayed_weights_state,   # EmptyState
+                              add_decayed_weights_state,   # EmptyState or
+                                                           # MaskedState(EmptyState)
+                                                           # depending on whether
+                                                           # old code passed a mask
                               scale_by_lr_state)
     NEW: (clip_state,
           scale_by_adam_state,
-          add_decayed_weights_state[base],   # EmptyState (identical to old)
-          add_decayed_weights_state[pool],   # EmptyState (new — taken from template)
+          MaskedState(EmptyState()),   # base-WD slot (always masked)
+          MaskedState(EmptyState()),   # pool-WD slot (always masked, new)
           scale_by_lr_state)
 
-    Adam moments + the LR-schedule counter survive the migration. The
-    pool-WD slot is stateless so it's safe to take the freshly-init
-    EmptyState from the new template.
+    Adam moments + the LR-schedule counter survive the migration. Both
+    WD slots are stateless (EmptyState wrapped or not — no numerical
+    content), so they're taken from the freshly-init new template.
+    This keeps the wrapper shape consistent regardless of whether the
+    old checkpoint had a mask (v3.9.7.1+) or not (v3.9.4 and earlier).
 
     Handles MultiSteps wrapping transparently: if both inputs are
     MultiStepsState, recurse into `inner_opt_state` and rewrap.
@@ -1250,7 +1287,10 @@ def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
             f"Legacy adamw inner state should be a 3-tuple "
             f"(scale_by_adam, add_decayed_weights, scale_by_lr), "
             f"got len={len(adamw_state)}.")
-    scale_by_adam_state, base_decayed_state, scale_by_lr_state = adamw_state
+    scale_by_adam_state, _old_base_decayed, scale_by_lr_state = adamw_state
+    # Both WD slots: take from the new template so the MaskedState
+    # wrapper matches regardless of the old mask/no-mask path.
+    base_decayed_state = new_opt_state_template[2]
     pool_decayed_state = new_opt_state_template[3]
     return (
         clip_state,
