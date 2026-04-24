@@ -1207,12 +1207,28 @@ class GCSLogger:
     near-real-time visibility is worth it.
     """
 
-    def __init__(self, gcs_path, local_path):
+    def __init__(self, gcs_path, local_path, resume=False):
         self.gcs_path = gcs_path
         self.local_path = local_path
         self._dirty = False
         if local_path:
             Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        if resume and gcs_path and local_path:
+            # Seed the local file from existing GCS contents so the
+            # subsequent open('a')/write path appends in-place; without
+            # the seed the first sync() would overwrite GCS with only
+            # this session's tail. If the GCS file doesn't exist yet we
+            # silently continue (fresh-looking logger).
+            try:
+                with _open_file(gcs_path, 'rb') as f:
+                    data = f.read()
+                with open(local_path, 'wb') as f:
+                    f.write(data)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                if jax.process_index() == 0:
+                    print(f"  [warn] could not seed log from {gcs_path}: {e}", flush=True)
 
     def write(self, text):
         with open(self.local_path, 'a') as f:
@@ -1239,8 +1255,12 @@ _train_logger = None
 _jsonl_logger = None
 
 
-def _setup_loggers(training_log_file, jsonl_log_file):
-    """Create GCSLogger instances for training log and JSONL log."""
+def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
+    """Create GCSLogger instances for training log and JSONL log.
+
+    resume=True downloads existing GCS content to the local scratch file
+    first so new lines append rather than overwrite.
+    """
     global _train_logger, _jsonl_logger
     import tempfile
     tmpdir = Path(tempfile.gettempdir()) / "dawn_logs"
@@ -1248,15 +1268,15 @@ def _setup_loggers(training_log_file, jsonl_log_file):
 
     if _is_gcs(training_log_file):
         local_txt = str(tmpdir / Path(training_log_file).name)
-        _train_logger = GCSLogger(training_log_file, local_txt)
+        _train_logger = GCSLogger(training_log_file, local_txt, resume=resume)
     else:
-        _train_logger = GCSLogger(None, training_log_file)
+        _train_logger = GCSLogger(None, training_log_file, resume=resume)
 
     if _is_gcs(jsonl_log_file):
         local_jsonl = str(tmpdir / Path(jsonl_log_file).name)
-        _jsonl_logger = GCSLogger(jsonl_log_file, local_jsonl)
+        _jsonl_logger = GCSLogger(jsonl_log_file, local_jsonl, resume=resume)
     else:
-        _jsonl_logger = GCSLogger(None, jsonl_log_file)
+        _jsonl_logger = GCSLogger(None, jsonl_log_file, resume=resume)
 
 
 def sync_logs():
@@ -2455,11 +2475,22 @@ def main():
     # ----------------------------------------------------------
     if is_host0:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
-        jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
+        # On resume, reuse the existing log filenames from the run folder
+        # so the session appends to the prior log instead of fragmenting
+        # into training_log_<ts1>.txt + training_log_<ts2>.txt + ...
+        _existing_logs = sorted(_list_files(log_dir, "training_log_*.txt"))
+        _existing_jsonls = sorted(_list_files(log_dir, "metrics_*.jsonl"))
+        _is_log_resume = (resume_path is not None) and bool(_existing_logs)
+        if _is_log_resume:
+            training_log_file = _existing_logs[-1]
+            jsonl_log_file = (_existing_jsonls[-1] if _existing_jsonls
+                              else _join(log_dir, f'metrics_{timestamp}.jsonl'))
+        else:
+            training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
+            jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
 
         # Set up loggers (local append + periodic GCS sync)
-        _setup_loggers(training_log_file, jsonl_log_file)
+        _setup_loggers(training_log_file, jsonl_log_file, resume=_is_log_resume)
 
         n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
