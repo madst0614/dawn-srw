@@ -62,9 +62,9 @@ from models.dawn_spatial_v41_exp import DAWN as DAWN_V41
 # Constants
 # ============================================================
 
-# Log cadence is config-driven: see log_interval_fast / log_deep_multiplier /
-# log_analysis_multiplier in `training:`. The legacy module-level LOG_INTERVAL
-# constant was removed.
+# Log cadence is config-driven: see log_interval / log_analysis_multiplier
+# in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
+
 
 
 # ============================================================
@@ -1301,20 +1301,22 @@ def check_nan_inf(metrics_dict, global_step, epoch):
 
 
 # ============================================================
-# 3-tier periodic logging (FAST / DEEP / ANALYSIS)
+# 2-tier periodic logging (REGULAR / ANALYSIS)
 # ============================================================
 #
-# FAST     every log_interval_fast steps       (default 100)
-# DEEP     every log_interval_fast * 5 steps   (default 500)   + includes FAST
-# ANALYSIS every log_interval_fast * 20 steps  (default 2000)  + includes DEEP
+# REGULAR  every log_interval steps                        (default 100)
+# ANALYSIS every log_interval * log_analysis_multiplier    (default 2000)
 #
-# Each *_build_record extends the lower-tier record so the JSONL line at the
-# highest active tier carries all lower-tier fields (no duplicate records per
-# step). Console output is tier-stacked: higher tiers append to the text
-# produced by lower tiers.
+# REGULAR carries the full training-dynamics block (loss, activity,
+# tau structure, emb norms, RPE, per-layer). ANALYSIS extends that with
+# distribution-shape / boundary / saturation / debug diagnostics that
+# are expensive to eyeball on every step but cheap to compute — all
+# metrics are already in the train_step result regardless, so the
+# REGULAR/ANALYSIS split is about console + JSONL volume, not TPU cost.
 #
-# All helpers assume host 0 only and that `metrics` has been fully materialised
-# via jax.device_get where needed. Window averages come in via `win_avgs`.
+# _build_analysis_record takes a REGULAR record as `base` and extends it,
+# so the JSONL line on an ANALYSIS step (type='train_analysis') carries
+# every REGULAR field plus the ANALYSIS additions — no duplicate records.
 
 
 def _fmt_act_count(frac, total):
@@ -1322,8 +1324,12 @@ def _fmt_act_count(frac, total):
     return f"{frac * 100:.1f}%({int(round(frac * total))})"
 
 
-def _build_fast_record(metrics, win_avgs, ctx, global_step, epoch):
-    """FAST tier: survival + core activity. ~40 fields."""
+def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
+    """REGULAR tier: all training-dynamics fields needed for live monitoring.
+
+    Equivalent to the former FAST + DEEP record merged; consumers of the
+    old train_fast / train_deep JSONL types should switch to type='train'.
+    """
     m = metrics
     rec = {
         'step': global_step,
@@ -1344,7 +1350,7 @@ def _build_fast_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_dead_penalty': float(m.get('attn_dead_penalty', 0.0)),
         'know_dead_penalty': float(m.get('know_dead_penalty', 0.0)),
         'dead_penalty_weighted': ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)),
-        # Explore loss (RPE; zero during warmup).
+        # Explore loss (RPE).
         'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
         'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
         # Accuracy / training status.
@@ -1373,47 +1379,7 @@ def _build_fast_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_tau_mean': float(m.get('know_tau_mean', 0.0)),
         'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
         'know_out_norm': float(m.get('know_out_norm', 0.0)),
-        'timestamp': datetime.now().isoformat(),
-    }
-    return rec
-
-
-def _print_fast_block(rec, ctx):
-    """Print FAST tier (3-4 lines)."""
-    log_message(
-        f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
-        f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
-        f"grad={rec['grad_norm']:.2f} | "
-        f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
-    )
-    log_message(
-        f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
-        f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
-        f" k={_fmt_act_count(rec['know_active'], ctx['n_know_cfg'])}"
-        f" | strong: a={rec['attn_strong']*100:.1f}%"
-        f" k={rec['know_strong']*100:.1f}%"
-    )
-    log_message(
-        f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
-        f" k={rec['know_raw_gate_max']:.1f}]"
-        f" int_max[a={rec['attn_int_max']:.1f} k={rec['know_int_max']:.1f}]"
-        f" dead[a={int(rec['attn_dead_count'])} k={int(rec['know_dead_count'])}]"
-        f" drift[qk={rec['drift_qk_emb']:.2e}"
-        f" v={rec['drift_v_emb']:.2e}"
-        f" k={rec['drift_know_emb']:.2e}]"
-    )
-    log_message(
-        f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
-        f" {ctx['s_per_it']:.2f}s/it"
-    )
-
-
-def _build_deep_record(base, metrics, ctx):
-    """DEEP tier: tau structure, emb norms, exploration, per-layer. Extends FAST."""
-    m = metrics
-    rec = dict(base)
-    # tau bias + tau_off distribution (per-batch instantaneous).
-    rec.update({
+        # tau structure (bias + offset distribution).
         'tau_know_bias': float(m.get('tau_know_bias', 0.0)),
         'tau_attn_bias_0': float(m.get('tau_attn_bias_0', 0.0)),
         'tau_attn_bias_1': float(m.get('tau_attn_bias_1', 0.0)),
@@ -1453,7 +1419,8 @@ def _build_deep_record(base, metrics, ctx):
         'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
         'sig_pos_max': float(m.get('sig_pos_max', 0.0)),
         'sig_neg_max': float(m.get('sig_neg_max', 0.0)),
-    })
+        'timestamp': datetime.now().isoformat(),
+    }
     # Per-layer norms (materialise lists).
     try:
         pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
@@ -1465,7 +1432,30 @@ def _build_deep_record(base, metrics, ctx):
     return rec
 
 
-def _print_deep_block(rec, ctx):
+def _print_regular_block(rec, ctx):
+    """Print REGULAR tier — ~8 lines covering the live training dynamics."""
+    log_message(
+        f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
+        f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
+        f"grad={rec['grad_norm']:.2f} | "
+        f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
+    )
+    log_message(
+        f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
+        f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
+        f" k={_fmt_act_count(rec['know_active'], ctx['n_know_cfg'])}"
+        f" | strong: a={rec['attn_strong']*100:.1f}%"
+        f" k={rec['know_strong']*100:.1f}%"
+    )
+    log_message(
+        f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
+        f" k={rec['know_raw_gate_max']:.1f}]"
+        f" int_max[a={rec['attn_int_max']:.1f} k={rec['know_int_max']:.1f}]"
+        f" dead[a={int(rec['attn_dead_count'])} k={int(rec['know_dead_count'])}]"
+        f" drift[qk={rec['drift_qk_emb']:.2e}"
+        f" v={rec['drift_v_emb']:.2e}"
+        f" k={rec['drift_know_emb']:.2e}]"
+    )
     log_message(
         f"  tau: know_b={rec['tau_know_bias']:+.2f}"
         f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
@@ -1506,6 +1496,10 @@ def _print_deep_block(rec, ctx):
             f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
             f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
         )
+    log_message(
+        f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
+        f" {ctx['s_per_it']:.2f}s/it"
+    )
 
 
 def _build_analysis_record(base, metrics, ctx):
@@ -1691,9 +1685,8 @@ def main():
     exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
     exploration_upper_bound = tcfg.get('exploration_upper_bound', 2.0)
     exploration_bound_eps = tcfg.get('exploration_bound_eps', 1.0e-3)
-    # 3-tier logging cadence.
-    log_interval_fast = int(tcfg.get('log_interval_fast', 100))
-    log_deep_multiplier = int(tcfg.get('log_deep_multiplier', 5))
+    # 2-tier logging cadence.
+    log_interval = int(tcfg.get('log_interval', 100))
     log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
@@ -1893,10 +1886,11 @@ def main():
                 'exploration_upper_bound', exploration_upper_bound)
             exploration_bound_eps = saved_training_config.get(
                 'exploration_bound_eps', exploration_bound_eps)
-            log_interval_fast = int(saved_training_config.get(
-                'log_interval_fast', log_interval_fast))
-            log_deep_multiplier = int(saved_training_config.get(
-                'log_deep_multiplier', log_deep_multiplier))
+            # Accept legacy log_interval_fast key so ckpts saved before the
+            # 2-tier rename still resume without manual config fiddling.
+            log_interval = int(saved_training_config.get(
+                'log_interval',
+                saved_training_config.get('log_interval_fast', log_interval)))
             log_analysis_multiplier = int(saved_training_config.get(
                 'log_analysis_multiplier', log_analysis_multiplier))
             if jax.process_index() == 0:
@@ -1921,8 +1915,7 @@ def main():
         'exploration_lower_bound': exploration_lower_bound,
         'exploration_upper_bound': exploration_upper_bound,
         'exploration_bound_eps': exploration_bound_eps,
-        'log_interval_fast': log_interval_fast,
-        'log_deep_multiplier': log_deep_multiplier,
+        'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
     }
 
@@ -2870,15 +2863,13 @@ def main():
     ckpt_interval = cfg['training'].get('checkpoint_interval', 5000)
     epoch_step_counter = start_step_in_epoch  # tracks position within current epoch
 
-    # 3-tier logging cadence. DEEP/ANALYSIS intervals are multiples of FAST
-    # so every DEEP step is also a FAST step and every ANALYSIS step is also
-    # a DEEP step — no duplicate JSONL records, and console output stacks
-    # cleanly (FAST block -> DEEP block -> ANALYSIS block in that order).
-    LOG_FAST = log_interval_fast
-    LOG_DEEP = log_interval_fast * log_deep_multiplier
-    LOG_ANALYSIS = log_interval_fast * log_analysis_multiplier
+    # 2-tier logging cadence. ANALYSIS interval is a multiple of REGULAR
+    # so every ANALYSIS step is also a REGULAR step — no duplicate JSONL
+    # records, and console output stacks cleanly (REGULAR -> ANALYSIS).
+    LOG_REGULAR = log_interval
+    LOG_ANALYSIS = log_interval * log_analysis_multiplier
     if is_host0:
-        print(f"  Log cadence: fast={LOG_FAST} deep={LOG_DEEP} analysis={LOG_ANALYSIS}",
+        print(f"  Log cadence: regular={LOG_REGULAR} analysis={LOG_ANALYSIS}",
               flush=True)
 
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
@@ -2989,21 +2980,16 @@ def main():
             global_step += 1
             epoch_step_counter += 1
 
-            # ---- 3-tier periodic logging (FAST / DEEP / ANALYSIS) ----
+            # ---- 2-tier periodic logging (REGULAR / ANALYSIS) ----
             _is_early_debug = global_step in (1, 5, 10, 20, 50)
-            is_fast = (global_step % LOG_FAST == 0) or _is_early_debug or debug_mode
-            is_deep = is_fast and (
-                (global_step % LOG_DEEP == 0)
-                or (global_step in (1, 20))
-                or debug_mode
-            )
-            is_analysis = is_fast and (
+            is_regular = (global_step % LOG_REGULAR == 0) or _is_early_debug or debug_mode
+            is_analysis = is_regular and (
                 (global_step % LOG_ANALYSIS == 0)
                 or (global_step == 1)
                 or debug_mode
             )
 
-            if is_fast:
+            if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
                 # only — no collective). Must run outside is_host0 so the
                 # next jit'd train_step sees a consistent snap pytree.
@@ -3070,19 +3056,14 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                     }
-                    rec = _build_fast_record(metrics, win_avgs, ctx, global_step, epoch)
-                    _print_fast_block(rec, ctx)
-                    if is_deep:
-                        rec = _build_deep_record(rec, metrics, ctx)
-                        _print_deep_block(rec, ctx)
-                        if is_analysis:
-                            rec = _build_analysis_record(rec, metrics, ctx)
-                            _print_analysis_block(rec, ctx)
-                            log_jsonl({'type': 'train_analysis', **rec})
-                        else:
-                            log_jsonl({'type': 'train_deep', **rec})
+                    rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
+                    _print_regular_block(rec, ctx)
+                    if is_analysis:
+                        rec = _build_analysis_record(rec, metrics, ctx)
+                        _print_analysis_block(rec, ctx)
+                        log_jsonl({'type': 'train_analysis', **rec})
                     else:
-                        log_jsonl({'type': 'train_fast', **rec})
+                        log_jsonl({'type': 'train', **rec})
                     sync_logs()
 
                 # Reset window accumulators (all hosts)

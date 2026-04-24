@@ -86,12 +86,10 @@ training:
   n_chunks_v: 1
   checkpoint_interval: 500
   val_interval: 500
-  # ---- 3-tier log cadence (step units) ----
-  # FAST     = log_interval_fast                        (4 lines every 100 steps)
-  # DEEP     = log_interval_fast * log_deep_multiplier  (+5 lines every 500)
-  # ANALYSIS = log_interval_fast * log_analysis_multiplier (+7 lines every 2000)
-  log_interval_fast: 100
-  log_deep_multiplier: 5
+  # ---- 2-tier log cadence (step units) ----
+  # REGULAR  = log_interval                              (~8 lines every 100 steps)
+  # ANALYSIS = log_interval * log_analysis_multiplier    (+7 lines every 2000)
+  log_interval: 100
   log_analysis_multiplier: 20
 
 use_amp: true

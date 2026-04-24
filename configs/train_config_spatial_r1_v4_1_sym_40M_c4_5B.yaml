@@ -79,9 +79,8 @@ training:
   n_chunks_v: 1
   checkpoint_interval: 500
   val_interval: 500
-  # ---- 3-tier log cadence (step units) ----
-  log_interval_fast: 100
-  log_deep_multiplier: 5
+  # ---- 2-tier log cadence (step units) ----
+  log_interval: 100
   log_analysis_multiplier: 20
 
 use_amp: true
