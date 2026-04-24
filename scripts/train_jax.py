@@ -1390,13 +1390,11 @@ def _print_fast_block(rec, ctx):
         f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
         f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
         f" k={_fmt_act_count(rec['know_active'], ctx['n_know_cfg'])}"
-        f" | strong: qk={rec['attn_strong']*100:.1f}%"
-        f" v={rec['attn_strong']*100:.1f}%"
+        f" | strong: a={rec['attn_strong']*100:.1f}%"
         f" k={rec['know_strong']*100:.1f}%"
     )
     log_message(
-        f"  gate_max[qk={rec['attn_raw_gate_max']:.1f}"
-        f" v={rec['attn_raw_gate_max']:.1f}"
+        f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
         f" k={rec['know_raw_gate_max']:.1f}]"
         f" int_max[a={rec['attn_int_max']:.1f} k={rec['know_int_max']:.1f}]"
         f" dead[a={int(rec['attn_dead_count'])} k={int(rec['know_dead_count'])}]"
