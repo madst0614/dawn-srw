@@ -1170,6 +1170,137 @@ def load_checkpoint(path, target_params, target_opt_state):
     return ckpt
 
 
+def _make_legacy_opt_state_template(params, schedule, weight_decay,
+                                    grad_accum_steps=1):
+    """Rebuild the pre-1d7a437 optimizer's opt_state shape.
+
+    Old chain was `chain(clip_by_global_norm, adamw(..., mask=fn))`
+    where `fn` was only passed when the model had learnable
+    `qk_scale` / `know_scale` (v3.9.7.1+). For older checkpoints
+    (v3.9.4, v3.9.5, etc.) no mask was passed. The wrapper shape
+    differs:
+      with mask: adamw_state[1] = MaskedState(inner_state=EmptyState())
+      no mask:   adamw_state[1] = EmptyState()
+    We replicate the old `_has_scale` check on the live params so the
+    template matches whichever code path saved the checkpoint.
+
+    New chain (per-group WD) always masks both add_decayed_weights
+    calls; the migration fills the pool slot from the freshly-init
+    new template so its MaskedState wrapper is correct regardless.
+
+    If `grad_accum_steps > 1` the optimizer is wrapped in MultiSteps —
+    do the same wrap so the deserialize template lines up with what
+    was saved.
+    """
+    # Replicate the pre-1d7a437 `_has_scale` check on the live params.
+    # v3.9.4 NeuronPool uses fixed sqrt(D) locals (no learnable
+    # qk_scale / know_scale params) → _has_scale=False → mask=None →
+    # adamw_state[1] = bare EmptyState.
+    # v3.9.7.1+ NeuronPool declares qk_scale / v_scale / know_scale as
+    # learnable params → _has_scale=True → mask=fn → adamw_state[1] =
+    # MaskedState(inner_state=EmptyState()).
+    # Use try/except instead of isinstance(params, dict) because Flax
+    # may return a FrozenDict that doesn't subclass dict.
+    try:
+        _pool = params['neuron_pool']
+        _has_scale = 'qk_scale' in _pool or 'know_scale' in _pool
+    except (KeyError, TypeError):
+        _has_scale = False
+    _legacy_mask = None
+    if _has_scale:
+        # Match the exact _wd_mask body from the old train_jax.py at the
+        # time of checkpoint save: exclude bias, LayerNorm scale, and
+        # learnable output_scale; decay everything else.
+        def _legacy_mask_fn(p):
+            def _should_decay(path, _):
+                path_str = '/'.join(str(x) for x in path)
+                if 'bias' in path_str:
+                    return False
+                if 'scale' in path_str and 'norm' in path_str.lower():
+                    return False  # LayerNorm scale
+                if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
+                   or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+                    return False  # learnable output_scale
+                return True
+            return jax.tree.map_with_path(_should_decay, p)
+        _legacy_mask = _legacy_mask_fn
+
+    old_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(
+            learning_rate=schedule,
+            weight_decay=weight_decay,
+            b2=0.95,
+            mask=_legacy_mask,
+        ),
+    )
+    if grad_accum_steps > 1:
+        old_optimizer = optax.MultiSteps(
+            old_optimizer, every_k_schedule=grad_accum_steps)
+    return old_optimizer.init(params)
+
+
+def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
+    """Convert pre-1d7a437 2-tuple opt_state to the current 5-tuple format.
+
+    OLD: (clip_state, adamw_state)
+         where adamw_state = (scale_by_adam_state,
+                              add_decayed_weights_state,   # EmptyState or
+                                                           # MaskedState(EmptyState)
+                                                           # depending on whether
+                                                           # old code passed a mask
+                              scale_by_lr_state)
+    NEW: (clip_state,
+          scale_by_adam_state,
+          MaskedState(EmptyState()),   # base-WD slot (always masked)
+          MaskedState(EmptyState()),   # pool-WD slot (always masked, new)
+          scale_by_lr_state)
+
+    Adam moments + the LR-schedule counter survive the migration. Both
+    WD slots are stateless (EmptyState wrapped or not — no numerical
+    content), so they're taken from the freshly-init new template.
+    This keeps the wrapper shape consistent regardless of whether the
+    old checkpoint had a mask (v3.9.7.1+) or not (v3.9.4 and earlier).
+
+    Handles MultiSteps wrapping transparently: if both inputs are
+    MultiStepsState, recurse into `inner_opt_state` and rewrap.
+    """
+    # MultiSteps wrap: peel off the wrapper, recurse, rewrap.
+    _MS = getattr(optax, 'MultiStepsState', None)
+    if _MS is not None and isinstance(old_opt_state, _MS) \
+            and isinstance(new_opt_state_template, _MS):
+        new_inner = _convert_legacy_opt_state(
+            old_opt_state.inner_opt_state,
+            new_opt_state_template.inner_opt_state)
+        return old_opt_state._replace(inner_opt_state=new_inner)
+    if len(old_opt_state) != 2:
+        raise ValueError(
+            f"Legacy opt_state should be a 2-tuple, got len={len(old_opt_state)}.")
+    if len(new_opt_state_template) != 5:
+        raise ValueError(
+            f"New opt_state template should be a 5-tuple, "
+            f"got len={len(new_opt_state_template)}.")
+    clip_state = old_opt_state[0]
+    adamw_state = old_opt_state[1]
+    if len(adamw_state) != 3:
+        raise ValueError(
+            f"Legacy adamw inner state should be a 3-tuple "
+            f"(scale_by_adam, add_decayed_weights, scale_by_lr), "
+            f"got len={len(adamw_state)}.")
+    scale_by_adam_state, _old_base_decayed, scale_by_lr_state = adamw_state
+    # Both WD slots: take from the new template so the MaskedState
+    # wrapper matches regardless of the old mask/no-mask path.
+    base_decayed_state = new_opt_state_template[2]
+    pool_decayed_state = new_opt_state_template[3]
+    return (
+        clip_state,
+        scale_by_adam_state,
+        base_decayed_state,
+        pool_decayed_state,
+        scale_by_lr_state,
+    )
+
+
 # ============================================================
 # Logging
 # ============================================================
@@ -2211,7 +2342,38 @@ def main():
     if resume_path and _file_exists(resume_path):
         if is_host0:
             print(f"\nResuming from: {resume_path}")
-        ckpt = load_checkpoint(resume_path, params, opt_state)
+        try:
+            ckpt = load_checkpoint(resume_path, params, opt_state)
+        except ValueError as e:
+            # Pre-1d7a437 checkpoints have a 2-tuple opt_state (chain(clip,
+            # adamw)); current code uses a 5-tuple (per-group WD splits
+            # adamw into its components). Detect that specific size
+            # mismatch on opt_state, reload with the legacy template, then
+            # convert. Adam moments + LR-schedule counter are preserved;
+            # the new pool-WD slot is stateless so it's filled from a
+            # fresh init.
+            _msg = str(e)
+            _is_opt_state_size_mismatch = (
+                'opt_state' in _msg
+                and 'do not match' in _msg
+            )
+            if not _is_opt_state_size_mismatch:
+                raise
+            if is_host0:
+                print(f"  opt_state size mismatch detected ({_msg.strip()}).")
+                print(f"  Migrating from legacy 2-tuple optimizer "
+                      f"(chain(clip, adamw)) to current 5-tuple "
+                      f"(per-group WD).")
+            legacy_opt_state_template = _make_legacy_opt_state_template(
+                params, schedule, weight_decay,
+                grad_accum_steps=grad_accum_steps)
+            ckpt = load_checkpoint(
+                resume_path, params, legacy_opt_state_template)
+            ckpt['opt_state'] = _convert_legacy_opt_state(
+                ckpt['opt_state'], opt_state)
+            if is_host0:
+                print(f"  opt_state migration OK "
+                      f"(Adam moments + LR counter preserved).")
         ckpt_params = _strip_legacy_process_axis(ckpt['params'], params)
         ckpt_opt_state = _strip_legacy_process_axis(ckpt['opt_state'], opt_state)
         params = ckpt_params
@@ -3097,7 +3259,11 @@ def main():
                     _progress = (global_step / total_micro_steps * 100
                                  if total_micro_steps > 0 else 0.0)
                     _s_per_it = _epoch_elapsed / epoch_steps if epoch_steps > 0 else 0.0
-                    _remaining = max(steps_per_epoch - epoch_steps, 0)
+                    # ETA based on absolute epoch position so resume mid-epoch
+                    # doesn't over-estimate (epoch_steps counts only this
+                    # run's steps; epoch_step_counter starts from
+                    # start_step_in_epoch).
+                    _remaining = max(steps_per_epoch - epoch_step_counter, 0)
                     _eta = _s_per_it * _remaining
                     ctx = {
                         'lb_weight': lb_weight,
