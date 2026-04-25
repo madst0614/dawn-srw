@@ -298,7 +298,7 @@ from jax.experimental.shard_map import shard_map
 #   selection     = sigmoid(SHARPNESS × margin)
 #   intensity     = x @ read.T
 #   out           = sum(selection × intensity × write)
-#                   / max(sum(selection × |intensity|), 1.0)
+#                   / max(sum(sigmoid(50 × margin) × |intensity|), 1.0)
 # ================================================================
 
 SHARPNESS = 500.0              # activation sigmoid sharpness (near-binary)
@@ -375,7 +375,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         selection     = sigmoid(sharpness * margin)
         intensity     = x @ read.T
         out           = sum(selection * intensity * write)
-                        / max(sum(selection * abs(intensity)), 1.0)
+                        / max(sum(sigmoid(50 * margin) * abs(intensity)), 1.0)
 
     No alpha / inverse-std dynamic tau; tau = s_mean + tau_offset * s_std + tau_bias.
     All v4.1 constants are closure-baked.
@@ -560,7 +560,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_strong = (selection > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((selection > 0.1) & (selection < 0.9)
                                     ).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                chunk_z_sum = (selection * jnp.abs(intensity.astype(jnp.float32))
+                chunk_z_sum = (jax.nn.sigmoid(jnp.float32(50.0) * margin)
+                               * jnp.abs(intensity.astype(jnp.float32))
                                ).sum(axis=-1, keepdims=True)
                 chunk_z_lt_075 = ((selection > 0.05) & (selection < 0.95)
                                   ).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -626,7 +627,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_weighted = selection.sum(axis=-1, keepdims=True)
                 chunk_active = (selection > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (selection > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                chunk_z_sum = (selection * jnp.abs(intensity.astype(jnp.float32))
+                chunk_z_sum = (jax.nn.sigmoid(jnp.float32(50.0) * margin)
+                               * jnp.abs(intensity.astype(jnp.float32))
                                ).sum(axis=-1, keepdims=True)
                 max_gate_chunk = selection.max(axis=(0, 1))
                 mean_score_chunk = scores_f.mean(axis=(0, 1))
@@ -899,7 +901,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_strong = (selection > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((selection > 0.1) & (selection < 0.9)
                                     ).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                chunk_z_sum = (selection * jnp.abs(intensity.astype(jnp.float32))[:, :, None, :]
+                chunk_z_sum = (jax.nn.sigmoid(jnp.float32(50.0) * margin)
+                               * jnp.abs(intensity.astype(jnp.float32))[:, :, None, :]
                                ).sum(axis=-1, keepdims=True)
                 chunk_z_lt_075 = ((selection > 0.05) & (selection < 0.95)
                                   ).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -966,7 +969,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_weighted = selection.sum(axis=-1, keepdims=True)
                 chunk_active = (selection > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (selection > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
-                chunk_z_sum = (selection * jnp.abs(intensity.astype(jnp.float32))[:, :, None, :]
+                chunk_z_sum = (jax.nn.sigmoid(jnp.float32(50.0) * margin)
+                               * jnp.abs(intensity.astype(jnp.float32))[:, :, None, :]
                                ).sum(axis=-1, keepdims=True)
                 max_gate_chunk = selection.max(axis=(0, 1, 2))
                 mean_score_chunk = scores_f.mean(axis=(0, 1, 2))
@@ -1901,7 +1905,9 @@ def _srw_inference(x, h, emb_norm, tau_offset, tau_bias, w_read, w_write):
     w_n = w_write
     intensity = x @ r_n.T
     raw_out = (selection.astype(scores.dtype) * intensity) @ w_n
-    den = jnp.maximum((selection * jnp.abs(intensity)).sum(axis=-1, keepdims=True), 1.0)
+    den = jnp.maximum(
+        (jax.nn.sigmoid(jnp.float32(50.0) * margin) * jnp.abs(intensity)
+         ).sum(axis=-1, keepdims=True), 1.0)
     out = raw_out.astype(jnp.float32) / den
     return out.astype(jnp.float32)
 
@@ -1929,7 +1935,9 @@ def _srw_inference_with_gates(x, h, emb_norm, tau_offset, tau_bias, w_read, w_wr
     w_n = w_write
     intensity = x @ r_n.T
     raw_out = (selection.astype(scores.dtype) * intensity) @ w_n
-    den = jnp.maximum((selection * jnp.abs(intensity)).sum(axis=-1, keepdims=True), 1.0)
+    den = jnp.maximum(
+        (jax.nn.sigmoid(jnp.float32(50.0) * margin) * jnp.abs(intensity)
+         ).sum(axis=-1, keepdims=True), 1.0)
     out = raw_out.astype(jnp.float32) / den
     return out.astype(jnp.float32), selection, gate_norm
 
@@ -2449,7 +2457,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         intensity = x @ r_n.T
         out = (selection.astype(scores.dtype) * intensity) @ w_n
         den = jnp.maximum(
-            (selection * jnp.abs(intensity)).sum(axis=-1, keepdims=True), 1.0)
+            (jax.nn.sigmoid(jnp.float32(50.0) * margin) * jnp.abs(intensity)
+             ).sum(axis=-1, keepdims=True), 1.0)
         return (out.astype(jnp.float32) / den).astype(jnp.float32)
 
     def forward_fn(input_ids):
