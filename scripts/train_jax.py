@@ -56,7 +56,7 @@ from jax.experimental.shard_map import shard_map
 # reproduce a paper result. See models/legacy/README.md.
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
-from models.dawn_spatial_v41_exp import DAWN as DAWN_V41
+from models.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
 
 # ============================================================
 # Constants
@@ -184,7 +184,7 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v4.1': ModelSpec(
         name='spatial-r1-v4.1',
-        module_path='models.dawn_spatial_v41_exp',
+        module_path='models.dawn_spatial_v41_tau_bias_exp',
         cls=DAWN_V41,
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
