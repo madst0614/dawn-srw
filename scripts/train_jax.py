@@ -57,7 +57,7 @@ from jax.experimental.shard_map import shard_map
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
-from models.dawn_spatial_v411_tau_bias_xr_intensity_exp import DAWN as DAWN_V411
+from models.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
 
 # ============================================================
 # Constants
@@ -169,6 +169,21 @@ def _v41_sharded_kwargs(cfg):
     )
 
 
+def _v412_sharded_kwargs(cfg):
+    """v4.1.2 adds bounded scan_bias to the v4.1 gate constants."""
+    t = cfg['training']
+    return dict(
+        dead_threshold=t.get('dead_penalty_threshold', 0.01),
+        sharpness=t.get('sharpness', 500.0),
+        activation_threshold=t.get('activation_threshold', 0.5),
+        activation_cutoff=t.get('activation_cutoff', 0.01),
+        epsilon=t.get('epsilon', 1e-4),
+        max_intensity=t.get('max_intensity', 10.0),
+        scan_scale=t.get('scan_scale', 0.01),
+        scan_std_floor=t.get('scan_std_floor', 0.5),
+    )
+
+
 MODEL_REGISTRY = {
     'baseline': ModelSpec(
         name='baseline',
@@ -192,14 +207,14 @@ MODEL_REGISTRY = {
         force_sharded=True,
         sharded_kwargs=_v41_sharded_kwargs,
     ),
-    'spatial-r1-v4.1.1': ModelSpec(
-        name='spatial-r1-v4.1.1',
-        module_path='models.dawn_spatial_v411_tau_bias_xr_intensity_exp',
-        cls=DAWN_V411,
+    'spatial-r1-v4.1.2': ModelSpec(
+        name='spatial-r1-v4.1.2',
+        module_path='models.dawn_spatial_v412_scan_bias_exp',
+        cls=DAWN_V412,
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
         force_sharded=True,
-        sharded_kwargs=_v41_sharded_kwargs,
+        sharded_kwargs=_v412_sharded_kwargs,
     ),
 }
 
@@ -776,10 +791,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         drift_know_emb = (jnp.linalg.norm(_cur_know - _prev_know)
                           / (jnp.linalg.norm(_prev_know) + 1e-8))
 
-        # Tau bias (read inside jit — safe, no cross-device issue)
+        # Tau / scan biases (read inside jit — safe, no cross-device issue)
         tau_know_b = params.get('router', {}).get('tau_know', {}).get(
             'bias', jnp.zeros(1))
         tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
+            'bias', jnp.zeros(3))
+        scan_know_b = params.get('router', {}).get('scan_bias_know', {}).get(
+            'bias', jnp.zeros(1))
+        scan_attn_b = params.get('router', {}).get('scan_bias_attn', {}).get(
             'bias', jnp.zeros(3))
 
         metrics = {
@@ -831,6 +850,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
+            'scan_know_bias': scan_know_b[0],
+            'scan_attn_bias_0': scan_attn_b[0],
+            'scan_attn_bias_1': scan_attn_b[1],
+            'scan_attn_bias_2': scan_attn_b[2],
             # Output norms (REGULAR subset).
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
             # z_mean_active (kept: cheap scalar).
@@ -1545,6 +1568,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'tau_attn_bias_0': float(m.get('tau_attn_bias_0', 0.0)),
         'tau_attn_bias_1': float(m.get('tau_attn_bias_1', 0.0)),
         'tau_attn_bias_2': float(m.get('tau_attn_bias_2', 0.0)),
+        'scan_know_bias': float(m.get('scan_know_bias', 0.0)),
+        'scan_attn_bias_0': float(m.get('scan_attn_bias_0', 0.0)),
+        'scan_attn_bias_1': float(m.get('scan_attn_bias_1', 0.0)),
+        'scan_attn_bias_2': float(m.get('scan_attn_bias_2', 0.0)),
         'attn_tau_abs_mean': float(m.get('attn_tau_abs_mean', 0.0)),
         'know_tau_abs_mean': float(m.get('know_tau_abs_mean', 0.0)),
         'attn_tau_off_min': float(m.get('attn_tau_off_min', 0.0)),
@@ -1623,6 +1650,11 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.2':
+        log_message(
+            f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
+            f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
+        )
     log_message(
         f"  tau_off k[min={rec['know_tau_off_min']:+.2f} p01={rec['know_tau_off_p01']:+.2f}"
         f" p99={rec['know_tau_off_p99']:+.2f} max={rec['know_tau_off_max']:+.2f}"
@@ -2226,7 +2258,8 @@ def main():
         return any(name in path_str for name in _POOL_PARAM_NAMES)
 
     def _is_excluded(path_str):
-        if 'bias' in path_str:
+        leaf = path_str.rsplit('/', 1)[-1]
+        if leaf == 'bias':
             return True
         if 'scale' in path_str and 'norm' in path_str.lower():
             return True  # LayerNorm scale
@@ -2321,11 +2354,19 @@ def main():
         # v4.1+ gate closure constants (used when model_version registers
         # _v41_sharded_kwargs; harmless to print otherwise — they're just
         # cfg lookups with defaults).
-        print(f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
-              f"act_thr={tcfg.get('activation_threshold', 0.5)} "
-              f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
-              f"eps={tcfg.get('epsilon', 1.0e-4)} "
-              f"max_int={tcfg.get('max_intensity', 10.0)}")
+        gate_msg = (
+            f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
+            f"act_thr={tcfg.get('activation_threshold', 0.5)} "
+            f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
+            f"eps={tcfg.get('epsilon', 1.0e-4)} "
+            f"max_int={tcfg.get('max_intensity', 10.0)}"
+        )
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.2':
+            gate_msg += (
+                f" scan_scale={tcfg.get('scan_scale', 0.01)} "
+                f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
+            )
+        print(gate_msg)
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
@@ -2649,6 +2690,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
+            _uses_scan_bias = (model_version == 'spatial-r1-v4.1.2')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
@@ -2732,17 +2774,28 @@ def main():
                 h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
                 tau_all = (x @ router_p['tau_attn']['kernel']
                            + router_p['tau_attn']['bias'])
-                return h_Q, h_K, h_V, tau_all
+                if _uses_scan_bias:
+                    scan_bias_all = (x @ router_p['scan_bias_attn']['kernel']
+                                     + router_p['scan_bias_attn']['bias'])
+                else:
+                    scan_bias_all = jnp.zeros_like(tau_all)
+                return h_Q, h_K, h_V, tau_all, scan_bias_all
 
             # 3) QK fused shard_map (paired)
             @jax.jit
-            def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, qk_read, qk_write):
+            def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, scan_bias_all, qk_read, qk_write):
                 fused_paired = _sharded_fns[1]
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                results = fused_paired(
-                    x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
+                scan_bias_QK = jnp.stack(
+                    [scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
+                if _uses_scan_bias:
+                    results = fused_paired(
+                        x, h_QK, qk_norm, tau_QK, scan_bias_QK, qk_read, qk_write)
+                else:
+                    results = fused_paired(
+                        x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
                 QK_out, act = results[0], results[1]
                 return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act
 
@@ -2757,8 +2810,11 @@ def main():
 
             # 4) V shard_map (single)
             @jax.jit
-            def prof_v_sharded(x, h_V, v_norm, tau_v, v_read, v_write):
+            def prof_v_sharded(x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write):
                 fused_single = _sharded_fns[0]
+                if _uses_scan_bias:
+                    return fused_single(
+                        x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write)
                 return fused_single(
                     x, h_V, v_norm, tau_v, v_read, v_write)
 
@@ -2794,12 +2850,20 @@ def main():
                 h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
                 tau = (x @ router_p['tau_know']['kernel']
                        + router_p['tau_know']['bias'])
-                return h, tau
+                if _uses_scan_bias:
+                    scan_bias = (x @ router_p['scan_bias_know']['kernel']
+                                 + router_p['scan_bias_know']['bias'])
+                else:
+                    scan_bias = jnp.zeros_like(tau)
+                return h, tau, scan_bias
 
             # 7) Know shard_map (single)
             @jax.jit
-            def prof_know_sharded(x, h, know_norm, tau, know_read, know_write):
+            def prof_know_sharded(x, h, know_norm, tau, scan_bias, know_read, know_write):
                 fused_single = _sharded_fns[0]
+                if _uses_scan_bias:
+                    return fused_single(
+                        x, h, know_norm, tau, scan_bias, know_read, know_write)
                 return fused_single(
                     x, h, know_norm, tau, know_read, know_write)
 
@@ -2825,15 +2889,15 @@ def main():
                 block_p['norm1']['bias'])
             jax.block_until_ready(normed)
 
-            h_Q, h_K, h_V, tau_all = prof_attn_router(normed, router_p)
+            h_Q, h_K, h_V, tau_all, scan_bias_all = prof_attn_router(normed, router_p)
             jax.block_until_ready(tau_all)
 
             if _is_sharded:
                 Q, K, *_ = prof_qk_fused(
-                    normed, h_Q, h_K, qk_norm, tau_all,
+                    normed, h_Q, h_K, qk_norm, tau_all, scan_bias_all,
                     pool_p['qk_read'], pool_p['qk_write'])
                 V, *_ = prof_v_sharded(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    normed, h_V, v_norm, tau_all[:, :, 2:3], scan_bias_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write'])
             else:
                 Q, K = prof_qk_chunked(
@@ -2844,12 +2908,12 @@ def main():
                     pool_p['v_read'], pool_p['v_write'])
             jax.block_until_ready((Q, K, V))
 
-            h_know, tau_know = prof_know_router(normed, router_p)
+            h_know, tau_know, scan_bias_know = prof_know_router(normed, router_p)
             jax.block_until_ready(tau_know)
             if _is_sharded:
-                _kout, _, _, _, _, _, _, _ = prof_know_sharded(
-                    normed, h_know, know_norm, tau_know,
-                    pool_p['know_read'], pool_p['know_write'])
+                _kout = prof_know_sharded(
+                    normed, h_know, know_norm, tau_know, scan_bias_know,
+                    pool_p['know_read'], pool_p['know_write'])[0]
             else:
                 _kout, _, _, _, _, _, _, _ = prof_know_chunked(
                     normed, h_know, know_norm, tau_know,
@@ -2871,11 +2935,11 @@ def main():
 
             if _is_sharded:
                 ms, dg, pk = _t(lambda: prof_qk_fused(
-                    normed, h_Q, h_K, qk_norm, tau_all,
+                    normed, h_Q, h_K, qk_norm, tau_all, scan_bias_all,
                     pool_p['qk_read'], pool_p['qk_write']))
                 items.append(("A QK fused shard", ms, dg, pk))
                 ms, dg, pk = _t(lambda: prof_v_sharded(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3],
+                    normed, h_V, v_norm, tau_all[:, :, 2:3], scan_bias_all[:, :, 2:3],
                     pool_p['v_read'], pool_p['v_write']))
                 items.append(("A V shard", ms, dg, pk))
             else:
@@ -2902,7 +2966,7 @@ def main():
 
             if _is_sharded:
                 ms, dg, pk = _t(lambda: prof_know_sharded(
-                    normed, h_know, know_norm, tau_know,
+                    normed, h_know, know_norm, tau_know, scan_bias_know,
                     pool_p['know_read'], pool_p['know_write']))
                 items.append(("K know shard", ms, dg, pk))
             else:
@@ -3292,6 +3356,7 @@ def main():
                         's_per_it': _s_per_it,
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
+                        'model_version': model_version,
                     }
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
                     _print_regular_block(rec, ctx)
