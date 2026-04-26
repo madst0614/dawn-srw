@@ -59,6 +59,7 @@ from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.legacy.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
 from models.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
+from models.dawn_spatial_v414_competitive_den_exp import DAWN as DAWN_V414
 
 # ============================================================
 # Constants
@@ -242,6 +243,15 @@ MODEL_REGISTRY = {
         name='spatial-r1-v4.1.2',
         module_path='models.dawn_spatial_v412_scan_bias_exp',
         cls=DAWN_V412,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v412_sharded_kwargs,
+    ),
+    'spatial-r1-v4.1.4': ModelSpec(
+        name='spatial-r1-v4.1.4',
+        module_path='models.dawn_spatial_v414_competitive_den_exp',
+        cls=DAWN_V414,
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -1803,7 +1813,7 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.2':
+    if ctx.get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
@@ -2516,7 +2526,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.2':
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2855,7 +2865,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = (model_version == 'spatial-r1-v4.1.2')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.4')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",

@@ -1,0 +1,102 @@
+# DAWN Spatial-R1 v4.1.4 -- competitive denominator experiment
+#
+# Sister of train_config_spatial_r1_v4_1_40M_c4_5B.yaml.
+# train_jax.py maps model_version: "spatial-r1-v4.1.4" to:
+#   models/dawn_spatial_v414_competitive_den_exp.py
+#
+# This keeps the v4.1.2 scan-bias gate and tests a competitive
+# contribution-aware denominator:
+#   scan = scan_scale * tanh(scan_bias)
+#   tau = s_mean + tau_offset * s_std - scan / max(s_std, scan_std_floor)
+#   r_i = read_i / ||read_i||, w_i = write_i / ||write_i||
+#   a_i = activation_i * intensity_i * <x, r_i>
+#   out = sum(a_i w_i) / (1 + sum(activation_i)
+#                         + sum(sqrt(a_i^2 + epsilon^2) - epsilon))
+#
+# No scan_bias-specific L2 key is added here. scan_bias params follow the
+# existing AdamW masks: bias excluded from WD, Dense kernels use base WD,
+# neuron_pool tensors use pool_weight_decay.
+# ============================================================
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "spatial-r1-v4.1.4"
+  d_model: 384
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+  # Mild residual/attn dropout -- helps break co-adaptation without
+  # drowning the signal. 40M@5B has no overfit pressure.
+  dropout: 0.0
+  gradient_checkpointing: true
+
+  d_route: 128
+  n_qk: 1580
+  n_v: 2600
+  n_know: 25200
+  # h-level dropout. Scores = h . emb, so dropping h dims is
+  # equivalent to stochastically dimming all neuron scores along
+  # that axis -- horizontal search (area-shift) complement to
+  # tau's vertical search (water-level).
+  router_dropout: 0.02
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.00065
+  weight_decay: 0.1
+  pool_weight_decay: 0.02    # free-norm pool params (emb/read/write) softer WD
+  warmup_ratio: 0.06
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+
+  # ---- v4.1 physical constants (gate shape) ----
+  sharpness: 500.0
+  activation_threshold: 0.5
+  activation_cutoff: 0.01
+  epsilon: 1.0e-4
+  max_intensity: 100.0
+  scan_scale: 0.01
+  scan_std_floor: 0.5
+
+  # ---- Dead-only penalty ----
+  dead_penalty_weight: 0.05
+  dead_penalty_threshold: 0.01
+
+  # ---- Explore loss (v4.1+ per-token bound) ----
+  # Baseline = per-batch global-mean CE (no EMA, stateless, zero-sum).
+  # Signal = asymmetric deviation from baseline.
+  # Bounds apply per-element (per-token x per-layer x per-route):
+  #   tau <= LOWER + BOUND_EPS  AND  signal > 0  ->  off
+  #   tau >= UPPER - BOUND_EPS  AND  signal < 0  ->  off
+  #   otherwise                                  ->  normal signal
+  # tau itself is NOT clipped -- only the explore loss is bounded.
+  # CE can push tau outside the bounds if it really needs to.
+  exploration_weight: 0.001        # lambda: overall strength
+  exploration_asymmetry: 1.1       # easy-token push scale (symmetric=1.0)
+  exploration_warmup_steps: 5000   # loss off until this step
+  exploration_lower_bound: -0.5    # down-push bound
+  exploration_upper_bound: 2.0     # up-push bound
+  exploration_bound_eps: 1.0e-3    # tolerance near bounds
+
+  n_chunks_know: 1
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  checkpoint_interval: 500
+  val_interval: 500
+  # ---- 2-tier log cadence (step units) ----
+  log_interval: 100
+  log_analysis_multiplier: 20
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.4_competitive_den_40M_c4_5B_exp
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.4_competitive_den_40M_c4_5B_exp
