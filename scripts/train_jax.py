@@ -835,6 +835,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'bias', jnp.zeros(1))
         tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
             'bias', jnp.zeros(3))
+        tau_q_b = params.get('router', {}).get('tau_q', {}).get(
+            'bias', jnp.zeros(1))
+        tau_k_b = params.get('router', {}).get('tau_k', {}).get(
+            'bias', jnp.zeros(1))
+        tau_v_b = params.get('router', {}).get('tau_v', {}).get(
+            'bias', jnp.zeros(1))
         scan_know_b = params.get('router', {}).get('scan_bias_know', {}).get(
             'bias', jnp.zeros(1))
         scan_attn_b = params.get('router', {}).get('scan_bias_attn', {}).get(
@@ -863,6 +869,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
             'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
+            'attn_score_mean': result.get('attn_score_mean', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
@@ -870,6 +877,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
             'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
+            'know_score_mean': result.get('know_score_mean', jnp.float32(0.0)),
             'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
             'know_tau_abs_mean': result.get('know_tau_abs_mean', jnp.float32(0.0)),
             # Emb norm stats (REGULAR subset; *_max moved to analysis_step).
@@ -889,12 +897,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
+            'tau_q_bias': tau_q_b[0],
+            'tau_k_bias': tau_k_b[0],
+            'tau_v_bias': tau_v_b[0],
             'scan_know_bias': scan_know_b[0],
             'scan_attn_bias_0': scan_attn_b[0],
             'scan_attn_bias_1': scan_attn_b[1],
             'scan_attn_bias_2': scan_attn_b[2],
             # Output norms (REGULAR subset).
             'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
+            'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
+            'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
+            'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
             # z_mean_active (kept: cheap scalar).
             'know_z_mean_active': result.get('know_z_mean_active', jnp.float32(0.0)),
             'attn_qk_z_mean_active': result.get('attn_qk_z_mean_active', jnp.float32(0.0)),
@@ -1596,10 +1610,16 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', 0.0)),
         'know_int_max': float(m.get('know_int_max', 0.0)),
+        'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
+        'know_gate_sum': float(m.get('know_gate_sum', 0.0)),
+        'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
+        'know_active_n_mean': float(m.get('know_active_n_mean', 0.0)),
         'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
         'know_dead_count': float(m.get('know_dead_count', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
         'know_tau_mean': float(m.get('know_tau_mean', 0.0)),
+        'attn_score_mean': float(m.get('attn_score_mean', 0.0)),
+        'know_score_mean': float(m.get('know_score_mean', 0.0)),
         'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
         'know_out_norm': float(m.get('know_out_norm', 0.0)),
         # tau structure (bias + offset distribution).
@@ -1607,6 +1627,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'tau_attn_bias_0': float(m.get('tau_attn_bias_0', 0.0)),
         'tau_attn_bias_1': float(m.get('tau_attn_bias_1', 0.0)),
         'tau_attn_bias_2': float(m.get('tau_attn_bias_2', 0.0)),
+        'tau_q_bias': float(m.get('tau_q_bias', 0.0)),
+        'tau_k_bias': float(m.get('tau_k_bias', 0.0)),
+        'tau_v_bias': float(m.get('tau_v_bias', 0.0)),
         'scan_know_bias': float(m.get('scan_know_bias', 0.0)),
         'scan_attn_bias_0': float(m.get('scan_attn_bias_0', 0.0)),
         'scan_attn_bias_1': float(m.get('scan_attn_bias_1', 0.0)),
@@ -1635,6 +1658,14 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'v_emb_norm_mean': float(m.get('v_emb_norm_mean', 0.0)),
         'v_emb_norm_min': float(m.get('v_emb_norm_min', 0.0)),
         'v_emb_norm_std': float(m.get('v_emb_norm_std', 0.0)),
+        'know_read_norm': float(m.get('know_read_norm', 0.0)),
+        'know_write_norm': float(m.get('know_write_norm', 0.0)),
+        'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
+        'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
+        'know_raw_out_norm': float(m.get('know_raw_out_norm', 0.0)),
+        'know_z_mean_active': float(m.get('know_z_mean_active', 0.0)),
+        'attn_qk_z_mean_active': float(m.get('attn_qk_z_mean_active', 0.0)),
+        'attn_v_z_mean_active': float(m.get('attn_v_z_mean_active', 0.0)),
         # RPE exploration diag.
         'global_mean_ce': float(m.get('global_mean_ce', 0.0)),
         'pos_frac': float(m.get('pos_frac', 0.0)),
@@ -1674,6 +1705,44 @@ def _print_regular_block(rec, ctx):
         f" | strong: a={rec['attn_strong']*100:.1f}%"
         f" k={rec['know_strong']*100:.1f}%"
     )
+    if ctx.get('model_version') == 'rw-v4.0.2':
+        log_message(
+            f"  gate: max[a={rec['attn_raw_gate_max']:.2f} k={rec['know_raw_gate_max']:.2f}]"
+            f" gsum[a={rec['attn_gate_sum']:.1f} k={rec['know_gate_sum']:.1f}]"
+            f" active_n[a={rec['attn_active_n_mean']:.0f} k={rec['know_active_n_mean']:.0f}]"
+            f" z_act[qk={rec['attn_qk_z_mean_active']:.2f}"
+            f" v={rec['attn_v_z_mean_active']:.2f}"
+            f" k={rec['know_z_mean_active']:.2f}]"
+        )
+        log_message(
+            f"  tau: know_b={rec['tau_know_bias']:+.2f}"
+            f" qkv_b=[{rec['tau_q_bias']:+.2f} {rec['tau_k_bias']:+.2f} {rec['tau_v_bias']:+.2f}]"
+            f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
+            f" score_mean[a={rec['attn_score_mean']:+.3f} k={rec['know_score_mean']:+.3f}]"
+            f" score_std[a={rec['attn_score_std']:.2f} k={rec['know_score_std']:.2f}]"
+        )
+        log_message(
+            f"  norm: raw[qk={rec['attn_qk_raw_norm']:.3f}"
+            f" v={rec['attn_v_raw_norm']:.3f}"
+            f" k={rec['know_raw_out_norm']:.3f}]"
+            f" out[a={rec['attn_out_norm']:.2f} k={rec['know_out_norm']:.2f}]"
+            f" read/write k[{rec['know_read_norm']:.2f}/{rec['know_write_norm']:.2f}]"
+            f" drift[q={rec['drift_qk_emb']:.2e}"
+            f" v={rec['drift_v_emb']:.2e}"
+            f" k={rec['drift_know_emb']:.2e}]"
+        )
+        _pl_a = rec.get('per_layer_attn_out_norm', []) or []
+        _pl_k = rec.get('per_layer_know_out_norm', []) or []
+        if _pl_a or _pl_k:
+            log_message(
+                f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
+                f" know=[{' '.join(f'{v:.2f}' for v in _pl_k)}]"
+            )
+        log_message(
+            f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
+            f" {ctx['s_per_it']:.2f}s/it"
+        )
+        return
     log_message(
         f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
         f" k={rec['know_raw_gate_max']:.1f}]"
