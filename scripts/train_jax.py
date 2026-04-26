@@ -59,6 +59,7 @@ from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.legacy.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
 from models.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
+from models.dawn_spatial_v413_scan_bias_xr_intensity_exp import DAWN as DAWN_V413
 
 # ============================================================
 # Constants
@@ -242,6 +243,15 @@ MODEL_REGISTRY = {
         name='spatial-r1-v4.1.2',
         module_path='models.dawn_spatial_v412_scan_bias_exp',
         cls=DAWN_V412,
+        build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v412_sharded_kwargs,
+    ),
+    'spatial-r1-v4.1.3': ModelSpec(
+        name='spatial-r1-v4.1.3',
+        module_path='models.dawn_spatial_v413_scan_bias_xr_intensity_exp',
+        cls=DAWN_V413,
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -806,6 +816,39 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_norm = jnp.sqrt(
             sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
 
+        def _tree_norm(tree):
+            leaves = jax.tree.leaves(tree)
+            if not leaves:
+                return jnp.float32(0.0)
+            return jnp.sqrt(sum(jnp.sum(jnp.square(x.astype(jnp.float32)))
+                                for x in leaves) + 1e-12)
+
+        def _child_norm(tree, key):
+            return _tree_norm(tree[key]) if key in tree else jnp.float32(0.0)
+
+        _grouter = grads.get('router', {})
+        _gpool = grads.get('neuron_pool', {})
+        grad_router_proj = (
+            _child_norm(_grouter, 'proj_attn') + _child_norm(_grouter, 'proj_know'))
+        grad_router_tau = (
+            _child_norm(_grouter, 'tau_attn') + _child_norm(_grouter, 'tau_know')
+            + _child_norm(_grouter, 'tau_q') + _child_norm(_grouter, 'tau_k')
+            + _child_norm(_grouter, 'tau_v'))
+        grad_router_scan = (
+            _child_norm(_grouter, 'scan_bias_attn')
+            + _child_norm(_grouter, 'scan_bias_know'))
+        grad_pool_emb = (
+            _child_norm(_gpool, 'qk_emb') + _child_norm(_gpool, 'v_emb')
+            + _child_norm(_gpool, 'know_emb'))
+        grad_pool_read = (
+            _child_norm(_gpool, 'qk_read') + _child_norm(_gpool, 'v_read')
+            + _child_norm(_gpool, 'know_read') + _child_norm(_gpool, 'q_read')
+            + _child_norm(_gpool, 'k_read'))
+        grad_pool_write = (
+            _child_norm(_gpool, 'qk_write') + _child_norm(_gpool, 'v_write')
+            + _child_norm(_gpool, 'know_write') + _child_norm(_gpool, 'q_write')
+            + _child_norm(_gpool, 'k_write'))
+
         # Emb drift is computed inside jit so every host participates in the
         # norm collective. A host-0-only version halts the launch group on
         # multi-host meshes.
@@ -856,6 +899,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
+            'grad_router_proj': grad_router_proj,
+            'grad_router_tau': grad_router_tau,
+            'grad_router_scan': grad_router_scan,
+            'grad_pool_emb': grad_pool_emb,
+            'grad_pool_read': grad_pool_read,
+            'grad_pool_write': grad_pool_write,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
             # Core activity (v4.1).
@@ -1593,6 +1642,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         # Accuracy / training status.
         'accuracy': win_avgs['acc'],
         'grad_norm': float(m['grad_norm']),
+        'grad_router_proj': float(m.get('grad_router_proj', 0.0)),
+        'grad_router_tau': float(m.get('grad_router_tau', 0.0)),
+        'grad_router_scan': float(m.get('grad_router_scan', 0.0)),
+        'grad_pool_emb': float(m.get('grad_pool_emb', 0.0)),
+        'grad_pool_read': float(m.get('grad_pool_read', 0.0)),
+        'grad_pool_write': float(m.get('grad_pool_write', 0.0)),
         'lr': ctx['current_lr'],
         'steps_per_sec': ctx['steps_per_sec'],
         'elapsed': ctx['total_elapsed'],
@@ -1758,10 +1813,17 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.2':
+    if ctx.get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.3'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
+        )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.3':
+        log_message(
+            f"  grad_path: router[p={rec['grad_router_proj']:.2e} "
+            f"tau={rec['grad_router_tau']:.2e} scan={rec['grad_router_scan']:.2e}] "
+            f"pool[e={rec['grad_pool_emb']:.2e} r={rec['grad_pool_read']:.2e} "
+            f"w={rec['grad_pool_write']:.2e}]"
         )
     log_message(
         f"  tau_off k[min={rec['know_tau_off_min']:+.2f} p01={rec['know_tau_off_p01']:+.2f}"
@@ -2471,7 +2533,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.2':
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.3'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2810,7 +2872,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = (model_version == 'spatial-r1-v4.1.2')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.3')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
