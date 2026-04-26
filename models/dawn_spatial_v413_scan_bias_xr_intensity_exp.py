@@ -453,10 +453,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                        P('data', None, None),    # tau_offset [B,S,1]
                        P('data', None, None),    # scan_bias [B,S,1]
                        P('model', None),          # read [N_local, D]
-                       P('model', None)),         # write [N_local, D]
+                       P('model', None),          # write [N_local, D]
+                       P()),                      # sharpness_eff scalar
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw(x, h, emb_local, tau_offset, scan_bias, read_local, write_local):
+    def fused_gate_srw(x, h, emb_local, tau_offset, scan_bias,
+                       read_local, write_local, sharpness_eff):
         N_local = emb_local.shape[0]
         nc = max(1, N_local // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -472,6 +474,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         emb_bf = emb_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
+        _sharp_eff = jnp.float32(sharpness_eff)
         z1 = jnp.zeros((B, S, 1))
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
@@ -567,7 +570,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                selection = jax.nn.sigmoid(_sharp * margin)
+                selection = jax.nn.sigmoid(_sharp_eff * margin)
                 selection_bf = selection.astype(jnp.bfloat16)
                 intensity = x_bf @ rc.T
                 c_out = ((selection_bf * intensity) @ wc).astype(jnp.float32)
@@ -636,7 +639,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                selection = jax.nn.sigmoid(_sharp * margin)
+                selection = jax.nn.sigmoid(_sharp_eff * margin)
                 selection_bf = selection.astype(jnp.bfloat16)
                 intensity = x_bf @ rc.T
                 c_out = ((selection_bf * intensity) @ wc).astype(jnp.float32)
@@ -801,10 +804,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                        P('data', None, None, None),  # tau_offset [B,S,2,1]
                        P('data', None, None, None),  # scan_bias [B,S,2,1]
                        P('model', None),              # read [N_local, D]
-                       P('model', None)),             # write [N_local, D]
+                       P('model', None),              # write [N_local, D]
+                       P()),                          # sharpness_eff scalar
              out_specs=_out_specs,
              check_rep=False)
-    def fused_gate_srw_paired(x, h, emb_local, tau_offset, scan_bias, read_local, write_local):
+    def fused_gate_srw_paired(x, h, emb_local, tau_offset, scan_bias,
+                              read_local, write_local, sharpness_eff):
         N_local = emb_local.shape[0]
         nc = max(1, N_local // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
@@ -819,6 +824,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         emb_bf = emb_local.astype(jnp.bfloat16)
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
+        _sharp_eff = jnp.float32(sharpness_eff)
         z1_r = jnp.zeros((B, S, 2, 1))
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
@@ -911,7 +917,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                selection = jax.nn.sigmoid(_sharp * margin)
+                selection = jax.nn.sigmoid(_sharp_eff * margin)
                 selection_bf = selection.astype(jnp.bfloat16)
                 intensity = x_bf @ rc.T  # [B,S,N]
                 c_out = jnp.einsum('bsrn,nd->bsrd',
@@ -983,7 +989,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                selection = jax.nn.sigmoid(_sharp * margin)
+                selection = jax.nn.sigmoid(_sharp_eff * margin)
                 selection_bf = selection.astype(jnp.bfloat16)
                 intensity = x_bf @ rc.T
                 c_out = jnp.einsum('bsrn,nd->bsrd',
@@ -1168,7 +1174,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False):
+                  sharded_fns, analysis=False, sharpness_eff=SHARPNESS):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1220,7 +1226,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_QK = jnp.stack([h_Q, h_K], axis=2)
     tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
     scan_bias_QK = jnp.stack([scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
-    qk_ret = fused_paired(x, h_QK, qk_emb_unit, tau_QK, scan_bias_QK, qk_read, qk_write)
+    qk_ret = fused_paired(x, h_QK, qk_emb_unit, tau_QK, scan_bias_QK,
+                          qk_read, qk_write, sharpness_eff)
     (QK_out, qk_active, qk_raw_gmax, qk_lb, qk_sstd, qk_es, qk_anm,
      qk_strong, qk_z_act, qk_tau_abs,
      qk_dead_pen, qk_dead_cnt, qk_int_max) = qk_ret[:13]
@@ -1230,7 +1237,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
-    v_ret = fused_single(x, h_V, v_emb_unit, tau_all[:, :, 2:3], scan_bias_all[:, :, 2:3], v_read, v_write)
+    v_ret = fused_single(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
+                         scan_bias_all[:, :, 2:3], v_read, v_write,
+                         sharpness_eff)
     (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_z_act, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max) = v_ret[:13]
@@ -1334,7 +1343,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
 def _know_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False):
+                  sharded_fns, analysis=False, sharpness_eff=SHARPNESS):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -1359,7 +1368,8 @@ def _know_forward(x, pool_params, router_params, rng,
     know_scale = pool_params['know_scale']
 
     fused_single, _ = sharded_fns
-    know_ret = fused_single(x, h, know_emb_unit, tau, scan_bias, know_read, know_write)
+    know_ret = fused_single(x, h, know_emb_unit, tau, scan_bias,
+                            know_read, know_write, sharpness_eff)
     (out, active_frac, raw_gate_max, lb_loss, score_std, gate_sum, active_n_mean,
      strong_frac, z_mean_act, know_tau_abs_mean,
      know_dead_penalty, know_dead_count, know_int_max) = know_ret[:13]
@@ -1489,7 +1499,8 @@ class DAWN(nn.Module):
         self.norm = nn.LayerNorm()
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
-                 deterministic=False, sharded_fns=None, analysis=False):
+                 deterministic=False, sharded_fns=None, analysis=False,
+                 sharpness_eff=None):
         """v4.1 forward.
 
         `analysis=False` (train path): result dict contains only the
@@ -1573,6 +1584,10 @@ class DAWN(nn.Module):
                 _ = layer.norm2(x)
                 _ = layer.attn.expand_O(x)
         else:
+            if sharpness_eff is None:
+                sharpness_eff = jnp.float32(SHARPNESS)
+            else:
+                sharpness_eff = jnp.float32(sharpness_eff)
             all_params = self.variables['params']
             pool_params = all_params['neuron_pool']
             router_params = all_params['router']
@@ -1601,7 +1616,8 @@ class DAWN(nn.Module):
                     self.n_qk, self.n_v,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
-                    sharded_fns=_sharded, analysis=analysis)
+                    sharded_fns=_sharded, analysis=analysis,
+                    sharpness_eff=sharpness_eff)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -1629,7 +1645,8 @@ class DAWN(nn.Module):
                 know_ret = _know_forward(
                     normed, pool_params, router_params, rng_know,
                     self.router_dropout, self.dropout_rate, deterministic,
-                    sharded_fns=_sharded, analysis=analysis)
+                    sharded_fns=_sharded, analysis=analysis,
+                    sharpness_eff=sharpness_eff)
                 (know_out, know_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_z_act, k_tau_abs,

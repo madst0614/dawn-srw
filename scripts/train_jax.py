@@ -568,6 +568,14 @@ def _model_accepts_analysis(model):
         return False
 
 
+def _model_accepts_kwarg(model, name):
+    import inspect as _inspect
+    try:
+        return name in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
@@ -576,6 +584,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_lower_bound=-0.5,
                       exploration_upper_bound=2.0,
                       exploration_bound_eps=1.0e-3,
+                      sharpness=500.0,
+                      sharpness_start=50.0,
+                      sharpness_warmup_steps=0,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
@@ -619,11 +630,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _explore_eps = jnp.float32(exploration_bound_eps)
     _warmup_steps = jnp.int32(exploration_warmup_steps)
     _pass_analysis_kw = _model_accepts_analysis(model)
+    _pass_sharpness_eff_kw = _model_accepts_kwarg(model, 'sharpness_eff')
+    _sharp_final = jnp.float32(sharpness)
+    _sharp_start = jnp.float32(sharpness_start)
+    _sharp_warmup_steps = jnp.float32(sharpness_warmup_steps)
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
                    prev_emb_snap, step):
         labels = jnp.where(attention_mask == 1, input_ids, -100)
+        raw_sharp_p = jnp.where(
+            _sharp_warmup_steps > 0.0,
+            jnp.minimum(step.astype(jnp.float32) / _sharp_warmup_steps, 1.0),
+            1.0)
+        smooth_sharp_p = raw_sharp_p * raw_sharp_p * (3.0 - 2.0 * raw_sharp_p)
+        sharpness_eff = _sharp_start + smooth_sharp_p * (_sharp_final - _sharp_start)
 
         def loss_fn(params):
             extra_kw = {}
@@ -631,6 +652,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['sharded_fns'] = sharded_fns
             if _pass_analysis_kw:
                 extra_kw['analysis'] = False
+            if _pass_sharpness_eff_kw:
+                extra_kw['sharpness_eff'] = sharpness_eff
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -905,6 +928,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pool_emb': grad_pool_emb,
             'grad_pool_read': grad_pool_read,
             'grad_pool_write': grad_pool_write,
+            'sharpness_eff': sharpness_eff,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
             'know_aux': result.get('know_aux', jnp.float32(0.0)),
             # Core activity (v4.1).
@@ -1648,6 +1672,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_pool_emb': float(m.get('grad_pool_emb', 0.0)),
         'grad_pool_read': float(m.get('grad_pool_read', 0.0)),
         'grad_pool_write': float(m.get('grad_pool_write', 0.0)),
+        'sharpness_eff': float(m.get('sharpness_eff', 0.0)),
         'lr': ctx['current_lr'],
         'steps_per_sec': ctx['steps_per_sec'],
         'elapsed': ctx['total_elapsed'],
@@ -1823,7 +1848,7 @@ def _print_regular_block(rec, ctx):
             f"  grad_path: router[p={rec['grad_router_proj']:.2e} "
             f"tau={rec['grad_router_tau']:.2e} scan={rec['grad_router_scan']:.2e}] "
             f"pool[e={rec['grad_pool_emb']:.2e} r={rec['grad_pool_read']:.2e} "
-            f"w={rec['grad_pool_write']:.2e}]"
+            f"w={rec['grad_pool_write']:.2e}] sharp={rec['sharpness_eff']:.1f}"
         )
     log_message(
         f"  tau_off k[min={rec['know_tau_off_min']:+.2f} p01={rec['know_tau_off_p01']:+.2f}"
@@ -2058,6 +2083,9 @@ def main():
     exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
     exploration_upper_bound = tcfg.get('exploration_upper_bound', 2.0)
     exploration_bound_eps = tcfg.get('exploration_bound_eps', 1.0e-3)
+    sharpness_cfg = tcfg.get('sharpness', 500.0)
+    sharpness_start = tcfg.get('sharpness_start', sharpness_cfg)
+    sharpness_warmup_steps = tcfg.get('sharpness_warmup_steps', 0)
     # 2-tier logging cadence.
     log_interval = int(tcfg.get('log_interval', 100))
     log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
@@ -2259,6 +2287,12 @@ def main():
                 'exploration_upper_bound', exploration_upper_bound)
             exploration_bound_eps = saved_training_config.get(
                 'exploration_bound_eps', exploration_bound_eps)
+            sharpness_cfg = saved_training_config.get(
+                'sharpness', sharpness_cfg)
+            sharpness_start = saved_training_config.get(
+                'sharpness_start', sharpness_start)
+            sharpness_warmup_steps = saved_training_config.get(
+                'sharpness_warmup_steps', sharpness_warmup_steps)
             # Accept legacy log_interval_fast key so ckpts saved before the
             # 2-tier rename still resume without manual config fiddling.
             log_interval = int(saved_training_config.get(
@@ -2288,6 +2322,9 @@ def main():
         'exploration_lower_bound': exploration_lower_bound,
         'exploration_upper_bound': exploration_upper_bound,
         'exploration_bound_eps': exploration_bound_eps,
+        'sharpness': sharpness_cfg,
+        'sharpness_start': sharpness_start,
+        'sharpness_warmup_steps': sharpness_warmup_steps,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
     }
@@ -2527,12 +2564,17 @@ def main():
         # _v41_sharded_kwargs; harmless to print otherwise — they're just
         # cfg lookups with defaults).
         gate_msg = (
-            f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
+            f"  Gate (v4.1): sharpness={sharpness_cfg} "
             f"act_thr={tcfg.get('activation_threshold', 0.5)} "
             f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
+        if sharpness_warmup_steps:
+            gate_msg += (
+                f" sharpness_start={sharpness_start} "
+                f"sharpness_warmup_steps={sharpness_warmup_steps}"
+            )
         if cfg['model'].get('model_version') in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.3'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
@@ -2784,6 +2826,9 @@ def main():
         exploration_lower_bound=exploration_lower_bound,
         exploration_upper_bound=exploration_upper_bound,
         exploration_bound_eps=exploration_bound_eps,
+        sharpness=sharpness_cfg,
+        sharpness_start=sharpness_start,
+        sharpness_warmup_steps=sharpness_warmup_steps,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
@@ -2873,6 +2918,8 @@ def main():
         try:
             _is_sharded = _sharded_fns is not None
             _uses_scan_bias = model_version in ('spatial-r1-v4.1.2', 'spatial-r1-v4.1.3')
+            _uses_sharpness_eff = (model_version == 'spatial-r1-v4.1.3')
+            _prof_sharpness = jnp.float32(sharpness_cfg)
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
@@ -2973,6 +3020,12 @@ def main():
                 scan_bias_QK = jnp.stack(
                     [scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
                 if _uses_scan_bias:
+                    if _uses_sharpness_eff:
+                        results = fused_paired(
+                            x, h_QK, qk_norm, tau_QK, scan_bias_QK,
+                            qk_read, qk_write, _prof_sharpness)
+                        QK_out, act = results[0], results[1]
+                        return QK_out[:, :, 0, :], QK_out[:, :, 1, :], act
                     results = fused_paired(
                         x, h_QK, qk_norm, tau_QK, scan_bias_QK, qk_read, qk_write)
                 else:
@@ -2995,6 +3048,10 @@ def main():
             def prof_v_sharded(x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write):
                 fused_single = _sharded_fns[0]
                 if _uses_scan_bias:
+                    if _uses_sharpness_eff:
+                        return fused_single(
+                            x, h_V, v_norm, tau_v, scan_bias_v,
+                            v_read, v_write, _prof_sharpness)
                     return fused_single(
                         x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write)
                 return fused_single(
@@ -3044,6 +3101,10 @@ def main():
             def prof_know_sharded(x, h, know_norm, tau, scan_bias, know_read, know_write):
                 fused_single = _sharded_fns[0]
                 if _uses_scan_bias:
+                    if _uses_sharpness_eff:
+                        return fused_single(
+                            x, h, know_norm, tau, scan_bias,
+                            know_read, know_write, _prof_sharpness)
                     return fused_single(
                         x, h, know_norm, tau, scan_bias, know_read, know_write)
                 return fused_single(

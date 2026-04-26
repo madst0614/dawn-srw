@@ -60,6 +60,8 @@ training:
 
   # ---- v4.1 physical constants (gate shape) ----
   sharpness: 500.0
+  sharpness_start: 50.0
+  sharpness_warmup_steps: 500
   activation_threshold: 0.5
   activation_cutoff: 0.01
   epsilon: 1.0e-4
