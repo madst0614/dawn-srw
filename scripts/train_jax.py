@@ -917,6 +917,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
+            'attn_qk_strong': result.get(
+                'attn_qk_strong',
+                result.get('attn_strong', jnp.float32(0.0))),
+            'attn_v_strong': result.get(
+                'attn_v_strong',
+                result.get('attn_strong', jnp.float32(0.0))),
             'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
             'attn_score_mean': result.get('attn_score_mean', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
@@ -1660,6 +1666,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_v_active': float(m.get('attn_v_active', 0.0)),
         'know_active': float(m.get('know_active', 0.0)),
         'attn_strong': float(m.get('attn_strong', 0.0)),
+        'attn_qk_strong': float(m.get('attn_qk_strong', m.get('attn_strong', 0.0))),
+        'attn_v_strong': float(m.get('attn_v_strong', m.get('attn_strong', 0.0))),
         'know_strong': float(m.get('know_strong', 0.0)),
         'attn_raw_gate_max': float(m.get('attn_raw_gate_max', 0.0)),
         'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
@@ -1757,7 +1765,8 @@ def _print_regular_block(rec, ctx):
         f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
         f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
         f" k={_fmt_act_count(rec['know_active'], ctx['n_know_cfg'])}"
-        f" | strong: a={rec['attn_strong']*100:.1f}%"
+        f" | strong: qk={rec['attn_qk_strong']*100:.1f}%"
+        f" v={rec['attn_v_strong']*100:.1f}%"
         f" k={rec['know_strong']*100:.1f}%"
     )
     if ctx.get('model_version') == 'rw-v4.0.2':

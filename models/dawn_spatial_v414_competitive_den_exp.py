@@ -538,6 +538,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
             score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
             # Kurtosis via E[(X-關)^4] = E[X^4] - 4關E[X^3] + 6關짼?짼 + 3關??            quad_mean = global_quad / N_total
+            quad_mean = global_quad / N_total
             central_fourth = (quad_mean - 4.0 * s_mean * cube_mean
                               + 6.0 * (s_mean ** 2) * (s_std ** 2) + 3.0 * s_mean ** 4)
             score_kurt = jax.lax.stop_gradient((central_fourth / (s_std ** 4 + 1e-8)).mean())
@@ -1363,6 +1364,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_score_std, attn_gate_sum, attn_active_n_mean,
                 attn_out_norm, attn_tau_mean,
                 attn_strong,
+                qk_strong.mean(), v_strong.mean(),
                 attn_qk_z_mean_active, attn_v_z_mean_active,
                 attn_tau_abs_mean,
                 qk_emb_norm_mean, v_emb_norm_mean,
@@ -1676,6 +1678,7 @@ class DAWN(nn.Module):
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
+                 a_qk_strong, a_v_strong,
                  a_qk_z_act, a_v_z_act,
                  a_tau_abs,
                  a_qk_emb_n_mean, a_v_emb_n_mean,
@@ -1683,7 +1686,7 @@ class DAWN(nn.Module):
                  a_v_emb_n_min, a_v_emb_n_std,
                  a_dead_penalty, a_dead_count,
                  a_tau_offset,
-                 a_int_max) = attn_ret[:24]
+                 a_int_max) = attn_ret[:26]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -1693,7 +1696,7 @@ class DAWN(nn.Module):
                      a_skew, a_apt_std, a_entropy,
                      a_den_cost, a_activation_cost, a_current_cost,
                      a_qk_emb_n_max, a_v_emb_n_max,
-                     a_score_kurt, a_int_cap_frac) = attn_ret[24:]
+                     a_score_kurt, a_int_cap_frac) = attn_ret[26:]
                 x = x + attn_out
 
                 normed = _layer_norm(
@@ -1726,6 +1729,7 @@ class DAWN(nn.Module):
                            k_out_norm,
                            a_out_norm, a_tau_mean, k_tau_mean,
                            k_strong, a_strong,
+                           a_qk_strong, a_v_strong,
                            k_z_act, a_qk_z_act, a_v_z_act,
                            a_tau_abs, k_tau_abs,
                            a_qk_emb_n_mean, a_v_emb_n_mean,
@@ -1773,6 +1777,7 @@ class DAWN(nn.Module):
              know_out_norm_all,
              attn_out_norm_all, attn_tau_mean_all, know_tau_mean_all,
              know_strong_all, attn_strong_all,
+             attn_qk_strong_all, attn_v_strong_all,
              know_z_act_all, attn_qk_z_act_all, attn_v_z_act_all,
              attn_tau_abs_all, know_tau_abs_all,
              attn_qk_emb_n_mean_all, attn_v_emb_n_mean_all,
@@ -1783,7 +1788,7 @@ class DAWN(nn.Module):
              attn_dead_penalty_all, know_dead_penalty_all,
              attn_dead_count_all, know_dead_count_all,
              attn_tau_offset_all, know_tau_offset_all,
-             attn_int_max_all, know_int_max_all) = scan_ys[:43]
+             attn_int_max_all, know_int_max_all) = scan_ys[:45]
             if analysis:
                 (attn_qk_raw_norm_all, attn_v_raw_norm_all, know_raw_out_norm_all,
                  attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
@@ -1802,7 +1807,7 @@ class DAWN(nn.Module):
                  attn_qk_emb_n_max_all, attn_v_emb_n_max_all,
                  know_emb_n_max_all,
                  attn_score_kurt_all, know_score_kurt_all,
-                 attn_int_cap_frac_all, know_int_cap_frac_all) = scan_ys[43:]
+                 attn_int_cap_frac_all, know_int_cap_frac_all) = scan_ys[45:]
             # TODO(v4.2?): attn_aux???대? /3, know_aux???앹쭨 ??layer ?됯퇏 ??load balance 媛以묒튂媛
             # pool蹂?鍮꾨?移?QK/V??/3L, Know??/L, know媛 3諛?媛뺥븿). ?섎룄 ?뺤씤 ?꾩슂.
             total_aux = (attn_auxes + know_auxes).mean()
@@ -1828,6 +1833,8 @@ class DAWN(nn.Module):
             'attn_gate_sum': attn_gsum_all.mean(),
             'attn_active_n_mean': attn_active_n_mean_all.mean(),
             'attn_strong': attn_strong_all.mean(),
+            'attn_qk_strong': attn_qk_strong_all.mean(),
+            'attn_v_strong': attn_v_strong_all.mean(),
             'attn_qk_z_mean_active': attn_qk_z_act_all.mean(),
             'attn_v_z_mean_active': attn_v_z_act_all.mean(),
 
