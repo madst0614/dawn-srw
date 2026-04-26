@@ -1527,6 +1527,8 @@ class DAWN(nn.Module):
             attn_gsum_all = _z
             attn_active_n_mean_all = _z
             attn_strong_all = _z
+            attn_qk_strong_all = _z
+            attn_v_strong_all = _z
             know_z_act_all = _z
             attn_qk_z_act_all = _z
             attn_v_z_act_all = _z
