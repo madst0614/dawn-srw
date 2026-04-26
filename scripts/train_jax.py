@@ -56,6 +56,7 @@ from jax.experimental.shard_map import shard_map
 # reproduce a paper result. See models/legacy/README.md.
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
+from models.legacy.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
 from models.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
 
@@ -151,6 +152,29 @@ def _dawn_shared_kwargs(cfg):
     )
 
 
+def _rw_v402_kwargs(cfg):
+    """Init kwargs for rw-v4.0.2 direct-read routing."""
+    m = cfg['model']
+    t = cfg['training']
+    return dict(
+        vocab_size=m.get('vocab_size', 30522),
+        d_model=m.get('d_model', 384),
+        n_layers=m.get('n_layers', 12),
+        n_heads=m.get('n_heads', 6),
+        max_seq_len=m.get('max_seq_len', 512),
+        n_q=m.get('n_q', 790),
+        n_k=m.get('n_k', 790),
+        n_v=m.get('n_v', 2600),
+        n_know=m.get('n_know', 25200),
+        dropout_rate=m.get('dropout', 0.1),
+        gradient_checkpointing=m.get('gradient_checkpointing', False),
+        n_chunks_q=t.get('n_chunks_q', 1),
+        n_chunks_k=t.get('n_chunks_k', 1),
+        n_chunks_v=t.get('n_chunks_v', 1),
+        n_chunks_know=t.get('n_chunks_know', 1),
+    )
+
+
 def _v41_sharded_kwargs(cfg):
     """v4.1 two-stage gate constants passed as closure to make_sharded_srw.
 
@@ -196,6 +220,13 @@ MODEL_REGISTRY = {
         module_path='models.dawn_spatial_v394_exp',
         cls=DAWN_V394,
         build_kwargs=_dawn_shared_kwargs,
+        supports_sharded=True,
+    ),
+    'rw-v4.0.2': ModelSpec(
+        name='rw-v4.0.2',
+        module_path='models.legacy.dawn_spatial_v402_exp',
+        cls=DAWN_RW_V402,
+        build_kwargs=_rw_v402_kwargs,
         supports_sharded=True,
     ),
     'spatial-r1-v4.1': ModelSpec(
@@ -778,9 +809,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         # Emb drift is computed inside jit so every host participates in the
         # norm collective. A host-0-only version halts the launch group on
         # multi-host meshes.
-        _cur_qk = new_params['neuron_pool']['qk_emb']
-        _cur_v = new_params['neuron_pool']['v_emb']
-        _cur_know = new_params['neuron_pool']['know_emb']
+        _pool = new_params['neuron_pool']
+        if 'qk_emb' in _pool:
+            _cur_qk = _pool['qk_emb']
+            _cur_v = _pool['v_emb']
+            _cur_know = _pool['know_emb']
+        else:
+            # rw-v4.0.2 has no emb tensors; read directions are the routing
+            # basis, so use them for the same drift diagnostic slots.
+            _cur_qk = _pool['q_read']
+            _cur_v = _pool['v_read']
+            _cur_know = _pool['know_read']
         _prev_qk = prev_emb_snap['qk_emb']
         _prev_v = prev_emb_snap['v_emb']
         _prev_know = prev_emb_snap['know_emb']
@@ -2247,7 +2286,9 @@ def main():
 
     _POOL_PARAM_NAMES = (
         'qk_emb', 'v_emb', 'know_emb',
+        'q_read', 'k_read',
         'qk_read', 'v_read', 'know_read',
+        'q_write', 'k_write',
         'qk_write', 'v_write', 'know_write',
     )
 
@@ -2513,7 +2554,7 @@ def main():
 
     target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
     n_know = cfg['model'].get('n_know', 25200)
-    n_qk = cfg['model'].get('n_qk', 1580)
+    n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
     n_v = cfg['model'].get('n_v', 2600)
     # N_local = N / mesh_model (each chip's share)
     nk_local = n_know // mesh_model
@@ -2642,11 +2683,21 @@ def main():
 
         # Initial emb-drift snapshot: pytree of sharded refs matching
         # params['neuron_pool'][*_emb]. Identity here → drift=0 on first step.
-        _dummy_emb_snap = {
-            'qk_emb': params['neuron_pool']['qk_emb'],
-            'v_emb': params['neuron_pool']['v_emb'],
-            'know_emb': params['neuron_pool']['know_emb'],
-        }
+        def _drift_snap(p):
+            pool = p['neuron_pool']
+            if 'qk_emb' in pool:
+                return {
+                    'qk_emb': pool['qk_emb'],
+                    'v_emb': pool['v_emb'],
+                    'know_emb': pool['know_emb'],
+                }
+            return {
+                'qk_emb': pool['q_read'],
+                'v_emb': pool['v_read'],
+                'know_emb': pool['know_read'],
+            }
+
+        _dummy_emb_snap = _drift_snap(params)
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
@@ -3174,11 +3225,7 @@ def main():
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
     # each log event. Fed into train_step so the drift collective runs inside
     # jit on all hosts; the actual ||·|| reductions live there.
-    _prev_emb_snap = {
-        'qk_emb': params['neuron_pool']['qk_emb'],
-        'v_emb': params['neuron_pool']['v_emb'],
-        'know_emb': params['neuron_pool']['know_emb'],
-    }
+    _prev_emb_snap = _drift_snap(params)
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -3290,11 +3337,7 @@ def main():
                 # Refresh emb-drift snapshot on every host (ref reassignment
                 # only — no collective). Must run outside is_host0 so the
                 # next jit'd train_step sees a consistent snap pytree.
-                _prev_emb_snap = {
-                    'qk_emb': params['neuron_pool']['qk_emb'],
-                    'v_emb': params['neuron_pool']['v_emb'],
-                    'know_emb': params['neuron_pool']['know_emb'],
-                }
+                _prev_emb_snap = _drift_snap(params)
                 # One TPU→CPU sync for the whole window.
                 _win_vals = jax.device_get({
                     'loss': _win_loss_jax, 'ce': _win_ce_jax,
@@ -3345,7 +3388,8 @@ def main():
                         'orth_weight': orth_weight,
                         'div_weight': div_weight,
                         'dead_penalty_weight': dead_penalty_weight,
-                        'n_qk_cfg': cfg['model'].get('n_qk', 0),
+                        'n_qk_cfg': cfg['model'].get(
+                            'n_qk', cfg['model'].get('n_q', 0)),
                         'n_v_cfg': cfg['model'].get('n_v', 0),
                         'n_know_cfg': cfg['model'].get('n_know', 0),
                         'current_lr': _current_lr,
@@ -3430,7 +3474,8 @@ def main():
                             _a_elapsed = time.time() - _a_compile_start
                             if is_host0:
                                 _ctx_a = {
-                                    'n_qk_cfg': cfg['model'].get('n_qk', 0),
+                                    'n_qk_cfg': cfg['model'].get(
+                                        'n_qk', cfg['model'].get('n_q', 0)),
                                     'n_v_cfg': cfg['model'].get('n_v', 0),
                                     'n_know_cfg': cfg['model'].get('n_know', 0),
                                 }
