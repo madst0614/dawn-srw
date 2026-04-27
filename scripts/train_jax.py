@@ -2658,8 +2658,16 @@ def main():
     # two masked add_decayed_weights (base + pool — masks are disjoint so
     # each param is touched at most once), then a single scale_by_lr.
 
+    _MODEL_VERSION = cfg['model'].get('model_version', 'spatial-r1-v4.1')
+
     _POOL_PARAM_NAMES = (
         'qk_emb', 'v_emb', 'know_emb',
+        'q_read', 'k_read',
+        'qk_read', 'v_read', 'know_read',
+        'q_write', 'k_write',
+        'qk_write', 'v_write', 'know_write',
+    )
+    _RW_PARAM_NAMES = (
         'q_read', 'k_read',
         'qk_read', 'v_read', 'know_read',
         'q_write', 'k_write',
@@ -2675,6 +2683,9 @@ def main():
     def _is_sig_proj_param(path_str):
         return 'read_sig_proj' in path_str or 'write_sig_proj' in path_str
 
+    def _is_rw_param(path_str):
+        return any(name in path_str for name in _RW_PARAM_NAMES)
+
     def _is_excluded(path_str):
         leaf = path_str.rsplit('/', 1)[-1]
         if leaf == 'bias':
@@ -2686,6 +2697,8 @@ def main():
             return True  # learnable output_scale
         if _is_sig_proj_param(path_str):
             return True  # v4.1.5 fixed read/write signature projections
+        if _MODEL_VERSION == 'spatial-r1-v4.1.5' and _is_rw_param(path_str):
+            return True  # v4.1.5 forward-normalizes read/write directions
         return False
 
     def _freeze_mask_sig_proj(params):
