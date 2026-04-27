@@ -10,7 +10,7 @@
 #   tau = s_mean + tau_offset * s_std - scan / max(s_std, scan_std_floor)
 #
 # Operator signature split is config-driven:
-#   d_route = tag_dim + rw_sig_dim
+#   d_route = tag_dim + read_sig_dim + write_sig_dim
 # The fixed *_sig_proj tensors are excluded from optimizer weight decay
 # in train_jax.py; the model also stop_gradient()s them in forward.
 # ============================================================
@@ -44,8 +44,9 @@ model:
   # that axis -- horizontal search (area-shift) complement to
   # tau's vertical search (water-level).
   router_dropout: 0.02
-  tag_dim: 16
-  rw_sig_dim: 48
+  tag_dim: 0
+  read_sig_dim: 32
+  write_sig_dim: 32
 
 training:
   batch_size: 128

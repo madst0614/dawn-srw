@@ -158,15 +158,18 @@ def _dawn_v415_kwargs(cfg):
     kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
     tag_dim = m.get('tag_dim', 16)
-    rw_sig_dim = m.get('rw_sig_dim', 48)
-    d_route = m.get('d_route', tag_dim + rw_sig_dim)
-    if d_route != tag_dim + rw_sig_dim:
+    read_sig_dim = m.get('read_sig_dim', 24)
+    write_sig_dim = m.get('write_sig_dim', 24)
+    d_route = m.get('d_route', tag_dim + read_sig_dim + write_sig_dim)
+    if d_route != tag_dim + read_sig_dim + write_sig_dim:
         raise ValueError(
-            f"d_route must equal tag_dim + rw_sig_dim, got "
-            f"d_route={d_route}, tag_dim={tag_dim}, rw_sig_dim={rw_sig_dim}")
+            f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
+            f"d_route={d_route}, tag_dim={tag_dim}, "
+            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
     kw['d_route'] = d_route
     kw['tag_dim'] = tag_dim
-    kw['rw_sig_dim'] = rw_sig_dim
+    kw['read_sig_dim'] = read_sig_dim
+    kw['write_sig_dim'] = write_sig_dim
     return kw
 
 
@@ -308,7 +311,8 @@ def build_model_from_config(cfg):
         print(
             "operator route signature: "
             f"tag_dim={kwargs['tag_dim']}, "
-            f"rw_sig_dim={kwargs['rw_sig_dim']}, "
+            f"read_sig_dim={kwargs['read_sig_dim']}, "
+            f"write_sig_dim={kwargs['write_sig_dim']}, "
             f"d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -1047,12 +1051,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_act_cost_mean': result.get('know_act_cost_mean', jnp.float32(0.0)),
             'attn_current_cost_mean': result.get('attn_current_cost_mean', jnp.float32(0.0)),
             'know_current_cost_mean': result.get('know_current_cost_mean', jnp.float32(0.0)),
-            'qk_rw_sig_norm_mean': result.get('qk_rw_sig_norm_mean', jnp.float32(0.0)),
-            'qk_rw_sig_norm_std': result.get('qk_rw_sig_norm_std', jnp.float32(0.0)),
-            'v_rw_sig_norm_mean': result.get('v_rw_sig_norm_mean', jnp.float32(0.0)),
-            'v_rw_sig_norm_std': result.get('v_rw_sig_norm_std', jnp.float32(0.0)),
-            'know_rw_sig_norm_mean': result.get('know_rw_sig_norm_mean', jnp.float32(0.0)),
-            'know_rw_sig_norm_std': result.get('know_rw_sig_norm_std', jnp.float32(0.0)),
+            'qk_read_sig_norm_mean': result.get('qk_read_sig_norm_mean', jnp.float32(0.0)),
+            'qk_read_sig_norm_std': result.get('qk_read_sig_norm_std', jnp.float32(0.0)),
+            'qk_write_sig_norm_mean': result.get('qk_write_sig_norm_mean', jnp.float32(0.0)),
+            'qk_write_sig_norm_std': result.get('qk_write_sig_norm_std', jnp.float32(0.0)),
+            'v_read_sig_norm_mean': result.get('v_read_sig_norm_mean', jnp.float32(0.0)),
+            'v_read_sig_norm_std': result.get('v_read_sig_norm_std', jnp.float32(0.0)),
+            'v_write_sig_norm_mean': result.get('v_write_sig_norm_mean', jnp.float32(0.0)),
+            'v_write_sig_norm_std': result.get('v_write_sig_norm_std', jnp.float32(0.0)),
+            'know_read_sig_norm_mean': result.get('know_read_sig_norm_mean', jnp.float32(0.0)),
+            'know_read_sig_norm_std': result.get('know_read_sig_norm_std', jnp.float32(0.0)),
+            'know_write_sig_norm_mean': result.get('know_write_sig_norm_mean', jnp.float32(0.0)),
+            'know_write_sig_norm_std': result.get('know_write_sig_norm_std', jnp.float32(0.0)),
             # Emb drift (relative L2) since prev snapshot — see top of fn.
             'drift_qk_emb': drift_qk_emb,
             'drift_v_emb': drift_v_emb,
@@ -1729,12 +1739,18 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_act_cost_mean': float(m.get('know_act_cost_mean', 0.0)),
         'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
         'know_current_cost_mean': float(m.get('know_current_cost_mean', 0.0)),
-        'qk_rw_sig_norm_mean': float(m.get('qk_rw_sig_norm_mean', 0.0)),
-        'qk_rw_sig_norm_std': float(m.get('qk_rw_sig_norm_std', 0.0)),
-        'v_rw_sig_norm_mean': float(m.get('v_rw_sig_norm_mean', 0.0)),
-        'v_rw_sig_norm_std': float(m.get('v_rw_sig_norm_std', 0.0)),
-        'know_rw_sig_norm_mean': float(m.get('know_rw_sig_norm_mean', 0.0)),
-        'know_rw_sig_norm_std': float(m.get('know_rw_sig_norm_std', 0.0)),
+        'qk_read_sig_norm_mean': float(m.get('qk_read_sig_norm_mean', 0.0)),
+        'qk_read_sig_norm_std': float(m.get('qk_read_sig_norm_std', 0.0)),
+        'qk_write_sig_norm_mean': float(m.get('qk_write_sig_norm_mean', 0.0)),
+        'qk_write_sig_norm_std': float(m.get('qk_write_sig_norm_std', 0.0)),
+        'v_read_sig_norm_mean': float(m.get('v_read_sig_norm_mean', 0.0)),
+        'v_read_sig_norm_std': float(m.get('v_read_sig_norm_std', 0.0)),
+        'v_write_sig_norm_mean': float(m.get('v_write_sig_norm_mean', 0.0)),
+        'v_write_sig_norm_std': float(m.get('v_write_sig_norm_std', 0.0)),
+        'know_read_sig_norm_mean': float(m.get('know_read_sig_norm_mean', 0.0)),
+        'know_read_sig_norm_std': float(m.get('know_read_sig_norm_std', 0.0)),
+        'know_write_sig_norm_mean': float(m.get('know_write_sig_norm_mean', 0.0)),
+        'know_write_sig_norm_std': float(m.get('know_write_sig_norm_std', 0.0)),
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
         'know_gate_sum': float(m.get('know_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
@@ -1902,9 +1918,14 @@ def _print_regular_block(rec, ctx):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" k={rec['know_gate_den_sum_mean']:.1f}]"
-            f" | rw_sig qk[m={rec['qk_rw_sig_norm_mean']:.2f} s={rec['qk_rw_sig_norm_std']:.2f}]"
-            f" v[m={rec['v_rw_sig_norm_mean']:.2f} s={rec['v_rw_sig_norm_std']:.2f}]"
-            f" k[m={rec['know_rw_sig_norm_mean']:.2f} s={rec['know_rw_sig_norm_std']:.2f}]"
+            f" | read_sig qk[m={rec['qk_read_sig_norm_mean']:.2f} s={rec['qk_read_sig_norm_std']:.2f}]"
+            f" v[m={rec['v_read_sig_norm_mean']:.2f} s={rec['v_read_sig_norm_std']:.2f}]"
+            f" k[m={rec['know_read_sig_norm_mean']:.2f} s={rec['know_read_sig_norm_std']:.2f}]"
+        )
+        log_message(
+            f"  write_sig qk[m={rec['qk_write_sig_norm_mean']:.2f} s={rec['qk_write_sig_norm_std']:.2f}]"
+            f" v[m={rec['v_write_sig_norm_mean']:.2f} s={rec['v_write_sig_norm_std']:.2f}]"
+            f" k[m={rec['know_write_sig_norm_mean']:.2f} s={rec['know_write_sig_norm_std']:.2f}]"
         )
     log_message(
         f"  tau: know_b={rec['tau_know_bias']:+.2f}"
