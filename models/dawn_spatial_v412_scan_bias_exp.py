@@ -524,6 +524,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
             score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
             # Kurtosis via E[(X-關)^4] = E[X^4] - 4關E[X^3] + 6關짼?짼 + 3關??            quad_mean = global_quad / N_total
+            quad_mean = global_quad / N_total
             central_fourth = (quad_mean - 4.0 * s_mean * cube_mean
                               + 6.0 * (s_mean ** 2) * (s_std ** 2) + 3.0 * s_mean ** 4)
             score_kurt = jax.lax.stop_gradient((central_fourth / (s_std ** 4 + 1e-8)).mean())
