@@ -21,6 +21,7 @@ import sys
 import os
 import signal
 import json
+import re
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -1440,8 +1441,63 @@ def _make_legacy_opt_state_template(params, schedule, weight_decay,
     return old_optimizer.init(params)
 
 
+def _strip_sig_freeze_slots_from_opt_state(new_opt_state_template):
+    """Build a 5-slot opt_state template from the current 7-slot optimizer.
+
+    v4.1.5 added fixed signature projection guards:
+      current: (freeze_pre, clip, adam, base_wd, pool_wd, lr, freeze_post)
+      old per-group: (clip, adam, base_wd, pool_wd, lr)
+
+    This helper makes a deserialize target for checkpoints saved before
+    those guards were added, while preserving MultiSteps wrapping.
+    """
+    _MS = getattr(optax, 'MultiStepsState', None)
+    if _MS is not None and isinstance(new_opt_state_template, _MS):
+        inner = _strip_sig_freeze_slots_from_opt_state(
+            new_opt_state_template.inner_opt_state)
+        return new_opt_state_template._replace(inner_opt_state=inner)
+    if len(new_opt_state_template) != 7:
+        raise ValueError(
+            f"Current opt_state template should be a 7-tuple, "
+            f"got len={len(new_opt_state_template)}.")
+    return (
+        new_opt_state_template[1],
+        new_opt_state_template[2],
+        new_opt_state_template[3],
+        new_opt_state_template[4],
+        new_opt_state_template[5],
+    )
+
+
+def _convert_5tuple_opt_state(old_opt_state, new_opt_state_template):
+    """Convert pre-freeze-mask 5-tuple opt_state to current 7-tuple format."""
+    _MS = getattr(optax, 'MultiStepsState', None)
+    if _MS is not None and isinstance(old_opt_state, _MS) \
+            and isinstance(new_opt_state_template, _MS):
+        new_inner = _convert_5tuple_opt_state(
+            old_opt_state.inner_opt_state,
+            new_opt_state_template.inner_opt_state)
+        return old_opt_state._replace(inner_opt_state=new_inner)
+    if len(old_opt_state) != 5:
+        raise ValueError(
+            f"Old per-group opt_state should be a 5-tuple, got len={len(old_opt_state)}.")
+    if len(new_opt_state_template) != 7:
+        raise ValueError(
+            f"Current opt_state template should be a 7-tuple, "
+            f"got len={len(new_opt_state_template)}.")
+    return (
+        new_opt_state_template[0],  # new freeze_sig_proj pre-slot
+        old_opt_state[0],           # clip
+        old_opt_state[1],           # adam moments
+        old_opt_state[2],           # base WD stateless slot
+        old_opt_state[3],           # pool WD stateless slot
+        old_opt_state[4],           # LR schedule counter
+        new_opt_state_template[6],  # new freeze_sig_proj post-slot
+    )
+
+
 def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
-    """Convert pre-1d7a437 2-tuple opt_state to the current 5-tuple format.
+    """Convert pre-1d7a437 2-tuple opt_state to the current optimizer format.
 
     OLD: (clip_state, adamw_state)
          where adamw_state = (scale_by_adam_state,
@@ -1450,11 +1506,14 @@ def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
                                                            # depending on whether
                                                            # old code passed a mask
                               scale_by_lr_state)
-    NEW: (clip_state,
+    NEW since v4.1.5:
+         (freeze_sig_proj_pre,
+          clip_state,
           scale_by_adam_state,
           MaskedState(EmptyState()),   # base-WD slot (always masked)
           MaskedState(EmptyState()),   # pool-WD slot (always masked, new)
-          scale_by_lr_state)
+          scale_by_lr_state,
+          freeze_sig_proj_post)
 
     Adam moments + the LR-schedule counter survive the migration. Both
     WD slots are stateless (EmptyState wrapped or not — no numerical
@@ -1476,9 +1535,9 @@ def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
     if len(old_opt_state) != 2:
         raise ValueError(
             f"Legacy opt_state should be a 2-tuple, got len={len(old_opt_state)}.")
-    if len(new_opt_state_template) != 5:
+    if len(new_opt_state_template) not in (5, 7):
         raise ValueError(
-            f"New opt_state template should be a 5-tuple, "
+            f"New opt_state template should be a 5- or 7-tuple, "
             f"got len={len(new_opt_state_template)}.")
     clip_state = old_opt_state[0]
     adamw_state = old_opt_state[1]
@@ -1490,15 +1549,56 @@ def _convert_legacy_opt_state(old_opt_state, new_opt_state_template):
     scale_by_adam_state, _old_base_decayed, scale_by_lr_state = adamw_state
     # Both WD slots: take from the new template so the MaskedState
     # wrapper matches regardless of the old mask/no-mask path.
-    base_decayed_state = new_opt_state_template[2]
-    pool_decayed_state = new_opt_state_template[3]
+    if len(new_opt_state_template) == 5:
+        base_decayed_state = new_opt_state_template[2]
+        pool_decayed_state = new_opt_state_template[3]
+        return (
+            clip_state,
+            scale_by_adam_state,
+            base_decayed_state,
+            pool_decayed_state,
+            scale_by_lr_state,
+        )
+    base_decayed_state = new_opt_state_template[3]
+    pool_decayed_state = new_opt_state_template[4]
     return (
+        new_opt_state_template[0],
         clip_state,
         scale_by_adam_state,
         base_decayed_state,
         pool_decayed_state,
         scale_by_lr_state,
+        new_opt_state_template[6],
     )
+
+
+def _optimizer_resume_lineage(model_version):
+    """Return the opt_state lineage expected for a checkpoint version.
+
+    The live optimizer may have more slots than an older checkpoint
+    because optimizer-only transforms were added over time. We branch by
+    checkpoint/model version instead of guessing every mismatch is the
+    pre-1d7a437 2-tuple.
+    """
+    per_group_5 = {
+        'spatial-r1-v4.1',
+        'spatial-r1-v4.1.2',
+        'spatial-r1-v4.1.4',
+    }
+    if model_version in per_group_5:
+        return 'per_group_5'
+    if model_version == 'spatial-r1-v4.1.5':
+        # New checkpoints are 7-slot. Early local v4.1.5 experiments before
+        # fixed-sig freeze guards may still be 5-slot; direct load is tried
+        # before this lineage is used as fallback.
+        return 'current_or_per_group_5'
+    return 'legacy_2'
+
+
+def _infer_checkpoint_version_from_path(path, fallback):
+    """Infer model_version from run_v... folder names, with config fallback."""
+    m = re.search(r'run_v(.+?)_\d{8}_\d{6}_\d+', str(path))
+    return m.group(1) if m else fallback
 
 
 # ============================================================
@@ -2732,13 +2832,6 @@ def main():
         try:
             ckpt = load_checkpoint(resume_path, params, opt_state)
         except ValueError as e:
-            # Pre-1d7a437 checkpoints have a 2-tuple opt_state (chain(clip,
-            # adamw)); current code uses a 5-tuple (per-group WD splits
-            # adamw into its components). Detect that specific size
-            # mismatch on opt_state, reload with the legacy template, then
-            # convert. Adam moments + LR-schedule counter are preserved;
-            # the new pool-WD slot is stateless so it's filled from a
-            # fresh init.
             _msg = str(e)
             _is_opt_state_size_mismatch = (
                 'opt_state' in _msg
@@ -2746,21 +2839,49 @@ def main():
             )
             if not _is_opt_state_size_mismatch:
                 raise
+            ckpt_version = _infer_checkpoint_version_from_path(
+                resume_path,
+                cfg['model'].get('model_version', 'spatial-r1-v4.1'))
+            lineage = _optimizer_resume_lineage(ckpt_version)
             if is_host0:
                 print(f"  opt_state size mismatch detected ({_msg.strip()}).")
-                print(f"  Migrating from legacy 2-tuple optimizer "
-                      f"(chain(clip, adamw)) to current 5-tuple "
-                      f"(per-group WD).")
-            legacy_opt_state_template = _make_legacy_opt_state_template(
-                params, schedule, weight_decay,
-                grad_accum_steps=grad_accum_steps)
-            ckpt = load_checkpoint(
-                resume_path, params, legacy_opt_state_template)
-            ckpt['opt_state'] = _convert_legacy_opt_state(
-                ckpt['opt_state'], opt_state)
-            if is_host0:
-                print(f"  opt_state migration OK "
-                      f"(Adam moments + LR counter preserved).")
+                print(f"  Checkpoint optimizer lineage for {ckpt_version}: {lineage}.")
+            if lineage in ('per_group_5', 'current_or_per_group_5'):
+                if is_host0:
+                    print(f"  Migrating per-group 5-slot optimizer "
+                          f"(clip, adam, base_wd, pool_wd, lr) to current "
+                          f"7-slot optimizer with fixed-sig freeze guards.")
+                five_slot_template = _strip_sig_freeze_slots_from_opt_state(opt_state)
+                try:
+                    ckpt = load_checkpoint(resume_path, params, five_slot_template)
+                except ValueError:
+                    if lineage == 'per_group_5':
+                        raise
+                    # v4.1.5 should normally load directly as 7-slot. If a
+                    # specific v4.1.5 checkpoint is neither 7 nor 5, fall
+                    # through to the legacy path below.
+                    ckpt = None
+                if ckpt is not None:
+                    ckpt['opt_state'] = _convert_5tuple_opt_state(
+                        ckpt['opt_state'], opt_state)
+                    if is_host0:
+                        print(f"  opt_state migration OK "
+                              f"(Adam moments + LR counter preserved; "
+                              f"freeze slots initialized fresh).")
+            if lineage == 'legacy_2' or ckpt is None:
+                if is_host0:
+                    print(f"  Migrating legacy 2-tuple optimizer "
+                          f"(chain(clip, adamw)) to current optimizer.")
+                legacy_opt_state_template = _make_legacy_opt_state_template(
+                    params, schedule, weight_decay,
+                    grad_accum_steps=grad_accum_steps)
+                ckpt = load_checkpoint(
+                    resume_path, params, legacy_opt_state_template)
+                ckpt['opt_state'] = _convert_legacy_opt_state(
+                    ckpt['opt_state'], opt_state)
+                if is_host0:
+                    print(f"  opt_state migration OK "
+                          f"(Adam moments + LR counter preserved).")
         ckpt_params = _strip_legacy_process_axis(ckpt['params'], params)
         ckpt_opt_state = _strip_legacy_process_axis(ckpt['opt_state'], opt_state)
         params = ckpt_params
