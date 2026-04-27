@@ -56,7 +56,7 @@ behaviour.
     route_i = normalize(concat(normalize(tag_i),
                                normalize(unit_read_i @ Rr + unit_write_i @ Rw)))
     a_i = activation_i * intensity_i * <x, unit_read_i>
-    den = max(sum(intensity_i), 1.0)
+    den = max(sum(activation_i * intensity_i), 1.0)
 
   v4.1.5 routes on a small learned tag plus a fixed functional signature
   derived from the neuron's unit read/write operation. tag_dim and
@@ -116,7 +116,7 @@ Changelog:
   v4.1.5 operator-derived routing signature:
     routing signature = concat(small learned tag, fixed projection of unit read/write);
     tag_dim and rw_sig_dim are config-driven; routing signature dimension is d_route = tag_dim + rw_sig_dim;
-    denominator restored to simple intensity normalization;
+    denominator restored to activation-weighted intensity normalization;
     tests whether operation-derived signatures recover 4.0.2-style automatic dense-to-sparse differentiation while preserving separate read/write operations.
 
   spatial-r1-v4.1 (2026-04-21; emb forward-norm reverted 2026-04-23;
@@ -642,7 +642,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                chunk_intensity = intensity.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -715,7 +715,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                chunk_intensity = intensity.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 # 誇intensity feeds den (consumed after scan, not returned).
@@ -754,6 +754,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # 誇gate
         # v4.1 den = 誇intensity (boundary neurons get EPSILON den penalty
         # without matching numerator ??structural bimodality pressure).
+        # Effective v4.1.5 denominator: max(sum(activation * intensity), 1.0).
         global_den_cost = jax.lax.psum(total_den_cost, 'model')
         global_activation_cost = jax.lax.psum(total_activation_cost, 'model')
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
@@ -1025,7 +1026,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)           # [B,S,2,1]
-                chunk_intensity = intensity.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -1099,7 +1100,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 a = gate * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
-                chunk_intensity = intensity.sum(axis=-1, keepdims=True)
+                chunk_intensity = gate.sum(axis=-1, keepdims=True)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1, 2))
@@ -1993,11 +1994,11 @@ class DAWN(nn.Module):
             # Shapes: attn [L, B, S, 3], know [L, B, S, 1].
             'attn_tau_offset': attn_tau_offset_all,
             'know_tau_offset': know_tau_offset_all,
-            # v4.1 intensity diagnostic.
+            # v4.1.5 denominator diagnostic: sum(activation * intensity).
             'attn_int_max': attn_int_max_all.max(),
             'know_int_max': know_int_max_all.max(),
-            'attn_intensity_sum_mean': attn_den_cost_mean_all.mean(),
-            'know_intensity_sum_mean': know_den_cost_mean_all.mean(),
+            'attn_gate_den_sum_mean': attn_den_cost_mean_all.mean(),
+            'know_gate_den_sum_mean': know_den_cost_mean_all.mean(),
         }
         if not self.is_initializing():
             qk_rw_m, qk_rw_s = rw_sig_norm_stats(
@@ -2041,8 +2042,8 @@ class DAWN(nn.Module):
                 'know_active_per_token_std': know_apt_std_all.mean(),
                 'attn_gate_entropy': attn_entropy_all.mean(),
                 'know_gate_entropy': know_entropy_all.mean(),
-                'attn_intensity_sum': attn_den_cost_all.mean(),
-                'know_intensity_sum': know_den_cost_all.mean(),
+                'attn_gate_den_sum': attn_den_cost_all.mean(),
+                'know_gate_den_sum': know_den_cost_all.mean(),
                 'qk_emb_norm_max': attn_qk_emb_n_max_all.max(),
                 'v_emb_norm_max': attn_v_emb_n_max_all.max(),
                 'know_emb_norm_max': know_emb_n_max_all.max(),
@@ -2162,7 +2163,7 @@ def _srw_inference(x, h, tag, tau_offset, scan_bias, w_read, w_write,
     xr = x.astype(jnp.float32) @ r_n.T
     a = gate * xr
     raw_out = a @ w_n
-    den = jnp.maximum(intensity.sum(axis=-1, keepdims=True), 1.0)
+    den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
     out = raw_out.astype(jnp.float32) / den
     return out.astype(jnp.float32)
 
@@ -2194,7 +2195,7 @@ def _srw_inference_with_gates(x, h, tag, tau_offset, scan_bias, w_read, w_write,
     xr = x.astype(jnp.float32) @ r_n.T
     a = gate * xr
     raw_out = a @ w_n
-    den = jnp.maximum(intensity.sum(axis=-1, keepdims=True), 1.0)
+    den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
     out = raw_out.astype(jnp.float32) / den
     return out.astype(jnp.float32), gate, gate_norm
 
@@ -2746,7 +2747,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         xr = x.astype(jnp.float32) @ r_n.T
         a = gate * xr
         out = a @ w_n
-        den = jnp.maximum(intensity.sum(axis=-1, keepdims=True), 1.0)
+        den = jnp.maximum(gate.sum(axis=-1, keepdims=True), 1.0)
         return (out.astype(jnp.float32) / den).astype(jnp.float32)
 
     def forward_fn(input_ids):

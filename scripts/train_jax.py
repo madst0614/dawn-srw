@@ -1034,11 +1034,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_tau_off_p99': explore_stats['know_tau_off_p99'],
             'know_tau_off_p01': explore_stats['know_tau_off_p01'],
             'know_tau_off_neg_frac': explore_stats['know_tau_off_neg_frac'],
-            # v4.1 intensity diagnostics (int_cap_frac moved to analysis_step).
+            # v4.1 intensity / v4.1.5 gate-denominator diagnostics.
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
             'know_int_max': result.get('know_int_max', jnp.float32(0.0)),
             'attn_intensity_sum_mean': result.get('attn_intensity_sum_mean', jnp.float32(0.0)),
             'know_intensity_sum_mean': result.get('know_intensity_sum_mean', jnp.float32(0.0)),
+            'attn_gate_den_sum_mean': result.get('attn_gate_den_sum_mean', jnp.float32(0.0)),
+            'know_gate_den_sum_mean': result.get('know_gate_den_sum_mean', jnp.float32(0.0)),
             'attn_den_cost_mean': result.get('attn_den_cost_mean', jnp.float32(0.0)),
             'know_den_cost_mean': result.get('know_den_cost_mean', jnp.float32(0.0)),
             'attn_act_cost_mean': result.get('attn_act_cost_mean', jnp.float32(0.0)),
@@ -1670,6 +1672,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
+    is_v415 = ctx.get('model_version') == 'spatial-r1-v4.1.5'
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -1720,8 +1723,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', 0.0)),
         'know_int_max': float(m.get('know_int_max', 0.0)),
-        'attn_intensity_sum_mean': float(m.get('attn_intensity_sum_mean', 0.0)),
-        'know_intensity_sum_mean': float(m.get('know_intensity_sum_mean', 0.0)),
         'attn_den_cost_mean': float(m.get('attn_den_cost_mean', 0.0)),
         'know_den_cost_mean': float(m.get('know_den_cost_mean', 0.0)),
         'attn_act_cost_mean': float(m.get('attn_act_cost_mean', 0.0)),
@@ -1803,6 +1804,20 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'sig_neg_max': float(m.get('sig_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
     }
+    if is_v415:
+        rec.pop('attn_den_cost_mean', None)
+        rec.pop('know_den_cost_mean', None)
+        rec.update({
+            'attn_gate_den_sum_mean': float(m.get(
+                'attn_gate_den_sum_mean', m.get('attn_intensity_sum_mean', 0.0))),
+            'know_gate_den_sum_mean': float(m.get(
+                'know_gate_den_sum_mean', m.get('know_intensity_sum_mean', 0.0))),
+        })
+    else:
+        rec.update({
+            'attn_intensity_sum_mean': float(m.get('attn_intensity_sum_mean', 0.0)),
+            'know_intensity_sum_mean': float(m.get('know_intensity_sum_mean', 0.0)),
+        })
     # Per-layer norms (materialise lists).
     try:
         pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
@@ -1885,8 +1900,8 @@ def _print_regular_block(rec, ctx):
         )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5':
         log_message(
-            f"  intensity_sum mean[a={rec['attn_intensity_sum_mean']:.1f}"
-            f" k={rec['know_intensity_sum_mean']:.1f}]"
+            f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
+            f" k={rec['know_gate_den_sum_mean']:.1f}]"
             f" | rw_sig qk[m={rec['qk_rw_sig_norm_mean']:.2f} s={rec['qk_rw_sig_norm_std']:.2f}]"
             f" v[m={rec['v_rw_sig_norm_mean']:.2f} s={rec['v_rw_sig_norm_std']:.2f}]"
             f" k[m={rec['know_rw_sig_norm_mean']:.2f} s={rec['know_rw_sig_norm_std']:.2f}]"
@@ -1953,6 +1968,7 @@ def _build_analysis_record(base, metrics, ctx):
     those are pulled from analysis_result too.
     """
     m = metrics
+    is_v415 = ctx.get('model_version') == 'spatial-r1-v4.1.5'
     rec = dict(base)
     # tau per-route std (attn [3]) — materialise once.
     try:
@@ -2010,6 +2026,15 @@ def _build_analysis_record(base, metrics, ctx):
         'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
         'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
     })
+    if is_v415:
+        rec.pop('attn_den_cost', None)
+        rec.pop('know_den_cost', None)
+        rec.update({
+            'attn_gate_den_sum': float(m.get(
+                'attn_gate_den_sum', m.get('attn_den_cost', 0.0))),
+            'know_gate_den_sum': float(m.get(
+                'know_gate_den_sum', m.get('know_den_cost', 0.0))),
+        })
     # HBM (host-0 local device 0 snapshot).
     try:
         mem = jax.local_devices()[0].memory_stats()
@@ -2056,6 +2081,11 @@ def _print_analysis_block(rec, ctx):
             f" k={rec['know_activation_cost']:.1f}"
             f" | current a={rec['attn_current_cost']:.1f}"
             f" k={rec['know_current_cost']:.1f}"
+        )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5':
+        log_message(
+            f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
+            f" k={rec['know_gate_den_sum']:.1f}"
         )
     log_message(
         f"  tau_struct k_std={rec['know_tau_std']:.2f}"
