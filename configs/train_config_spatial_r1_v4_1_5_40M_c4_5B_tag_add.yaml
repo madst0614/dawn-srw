@@ -98,5 +98,5 @@ training:
   log_analysis_multiplier: 20
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5_operator_route_sig_40M_c4_5B_exp
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5_operator_route_sig_40M_c4_5B_exp
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5_tag_add
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5_tag_add
