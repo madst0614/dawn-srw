@@ -11,6 +11,7 @@
 #
 # Operator signature split is config-driven:
 #   d_route = tag_dim + read_sig_dim + write_sig_dim
+#             + read_norm_sig_dim + write_norm_sig_dim
 # The fixed *_sig_proj tensors are excluded from optimizer weight decay
 # in train_jax.py; the model also stop_gradient()s them in forward.
 # ============================================================
@@ -35,7 +36,7 @@ model:
   dropout: 0.0
   gradient_checkpointing: true
 
-  d_route: 64
+  d_route: 66
   n_qk: 1580
   n_v: 2600
   n_know: 25200
@@ -47,6 +48,8 @@ model:
   tag_dim: 0
   read_sig_dim: 32
   write_sig_dim: 32
+  read_norm_sig_dim: 1
+  write_norm_sig_dim: 1
 
 training:
   batch_size: 128

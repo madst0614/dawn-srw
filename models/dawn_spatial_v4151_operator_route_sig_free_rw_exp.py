@@ -334,6 +334,8 @@ SCAN_STD_FLOOR = 0.5           # caps low-std scan amplification
 DEFAULT_TAG_DIM = 16
 DEFAULT_READ_SIG_DIM = 24
 DEFAULT_WRITE_SIG_DIM = 24
+DEFAULT_READ_NORM_SIG_DIM = 1
+DEFAULT_WRITE_NORM_SIG_DIM = 1
 
 
 # ================================================================
@@ -382,7 +384,18 @@ def fixed_sig_proj_init():
     return init
 
 
-def build_route_signature(tag, read_unit, write_unit, read_sig_proj, write_sig_proj):
+def _norm_signature(x, dim):
+    if dim <= 0:
+        return jnp.zeros(x.shape[:-1] + (0,), dtype=jnp.float32)
+    n = jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True)
+    z = jnp.tanh(jnp.log(n + 1e-8))
+    powers = jnp.arange(1, dim + 1, dtype=jnp.float32)
+    return z ** powers
+
+
+def build_route_signature(tag, read_unit, write_unit, read_sig_proj, write_sig_proj,
+                          read_norm_sig_dim=DEFAULT_READ_NORM_SIG_DIM,
+                          write_norm_sig_dim=DEFAULT_WRITE_NORM_SIG_DIM):
     tag_f = tag.astype(jnp.float32)
     tag_unit = tag_f / (jnp.linalg.norm(tag_f, axis=-1, keepdims=True) + 1e-8)
     rproj = jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
@@ -391,7 +404,11 @@ def build_route_signature(tag, read_unit, write_unit, read_sig_proj, write_sig_p
     write_sig = write_unit.astype(jnp.float32) @ wproj
     read_sig = read_sig / (jnp.linalg.norm(read_sig, axis=-1, keepdims=True) + 1e-8)
     write_sig = write_sig / (jnp.linalg.norm(write_sig, axis=-1, keepdims=True) + 1e-8)
-    route = jnp.concatenate([tag_unit, read_sig, write_sig], axis=-1)
+    read_norm_sig = _norm_signature(read_unit, read_norm_sig_dim)
+    write_norm_sig = _norm_signature(write_unit, write_norm_sig_dim)
+    route = jnp.concatenate(
+        [tag_unit, read_sig, write_sig, read_norm_sig, write_norm_sig],
+        axis=-1)
     return route / (jnp.linalg.norm(route, axis=-1, keepdims=True) + 1e-8)
 
 
@@ -426,6 +443,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      max_intensity=MAX_INTENSITY,
                      scan_scale=SCAN_SCALE,
                      scan_std_floor=SCAN_STD_FLOOR,
+                     read_norm_sig_dim=DEFAULT_READ_NORM_SIG_DIM,
+                     write_norm_sig_dim=DEFAULT_WRITE_NORM_SIG_DIM,
                      analysis=False):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
@@ -536,7 +555,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
             wc_f = wc.astype(jnp.float32)
-            route = build_route_signature(tc, rc_f, wc_f, read_sig_proj, write_sig_proj)
+            route = build_route_signature(
+                tc, rc_f, wc_f, read_sig_proj, write_sig_proj,
+                read_norm_sig_dim, write_norm_sig_dim)
             return route.astype(jnp.bfloat16), rc_f.astype(jnp.bfloat16), wc_f.astype(jnp.bfloat16)
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
@@ -829,6 +850,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             max_intensity=MAX_INTENSITY,
                             scan_scale=SCAN_SCALE,
                             scan_std_floor=SCAN_STD_FLOOR,
+                            read_norm_sig_dim=DEFAULT_READ_NORM_SIG_DIM,
+                            write_norm_sig_dim=DEFAULT_WRITE_NORM_SIG_DIM,
                             analysis=False):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
@@ -921,7 +944,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
             wc_f = wc.astype(jnp.float32)
-            route = build_route_signature(tc, rc_f, wc_f, read_sig_proj, write_sig_proj)
+            route = build_route_signature(
+                tc, rc_f, wc_f, read_sig_proj, write_sig_proj,
+                read_norm_sig_dim, write_norm_sig_dim)
             return route.astype(jnp.bfloat16), rc_f.astype(jnp.bfloat16), wc_f.astype(jnp.bfloat16)
 
         # --- Pass 1: exact stats over ALL chunks (scan + checkpoint) ---
@@ -1218,13 +1243,20 @@ class NeuronPool(nn.Module):
     tag_dim: int = DEFAULT_TAG_DIM
     read_sig_dim: int = DEFAULT_READ_SIG_DIM
     write_sig_dim: int = DEFAULT_WRITE_SIG_DIM
+    read_norm_sig_dim: int = DEFAULT_READ_NORM_SIG_DIM
+    write_norm_sig_dim: int = DEFAULT_WRITE_NORM_SIG_DIM
 
     def setup(self):
-        if self.tag_dim + self.read_sig_dim + self.write_sig_dim != self.d_route:
+        expected_route = (self.tag_dim + self.read_sig_dim + self.write_sig_dim
+                          + self.read_norm_sig_dim + self.write_norm_sig_dim)
+        if expected_route != self.d_route:
             raise ValueError(
-                f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
+                f"d_route must equal tag_dim + read_sig_dim + write_sig_dim "
+                f"+ read_norm_sig_dim + write_norm_sig_dim, got "
                 f"d_route={self.d_route}, tag_dim={self.tag_dim}, "
-                f"read_sig_dim={self.read_sig_dim}, write_sig_dim={self.write_sig_dim}")
+                f"read_sig_dim={self.read_sig_dim}, write_sig_dim={self.write_sig_dim}, "
+                f"read_norm_sig_dim={self.read_norm_sig_dim}, "
+                f"write_norm_sig_dim={self.write_norm_sig_dim}")
         db = self.tag_dim
         dm = self.d_model
 
@@ -1628,10 +1660,13 @@ class DAWN(nn.Module):
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
 
-    d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
+    d_route: int = (DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
+                    + DEFAULT_READ_NORM_SIG_DIM + DEFAULT_WRITE_NORM_SIG_DIM)
     tag_dim: int = DEFAULT_TAG_DIM
     read_sig_dim: int = DEFAULT_READ_SIG_DIM
     write_sig_dim: int = DEFAULT_WRITE_SIG_DIM
+    read_norm_sig_dim: int = DEFAULT_READ_NORM_SIG_DIM
+    write_norm_sig_dim: int = DEFAULT_WRITE_NORM_SIG_DIM
     n_qk: int = 1580
     n_v: int = 2600
     n_know: int = 25200
@@ -1645,11 +1680,16 @@ class DAWN(nn.Module):
             raise ValueError(
                 f"d_model ({self.d_model}) must be divisible by "
                 f"n_heads ({self.n_heads})")
-        if self.tag_dim + self.read_sig_dim + self.write_sig_dim != self.d_route:
+        expected_route = (self.tag_dim + self.read_sig_dim + self.write_sig_dim
+                          + self.read_norm_sig_dim + self.write_norm_sig_dim)
+        if expected_route != self.d_route:
             raise ValueError(
-                f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
+                f"d_route must equal tag_dim + read_sig_dim + write_sig_dim "
+                f"+ read_norm_sig_dim + write_norm_sig_dim, got "
                 f"d_route={self.d_route}, tag_dim={self.tag_dim}, "
-                f"read_sig_dim={self.read_sig_dim}, write_sig_dim={self.write_sig_dim}")
+                f"read_sig_dim={self.read_sig_dim}, write_sig_dim={self.write_sig_dim}, "
+                f"read_norm_sig_dim={self.read_norm_sig_dim}, "
+                f"write_norm_sig_dim={self.write_norm_sig_dim}")
         self.token_emb = nn.Embed(
             self.vocab_size, self.d_model, embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(
@@ -1658,7 +1698,9 @@ class DAWN(nn.Module):
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
             d_model=self.d_model, d_route=self.d_route,
             tag_dim=self.tag_dim, read_sig_dim=self.read_sig_dim,
-            write_sig_dim=self.write_sig_dim)
+            write_sig_dim=self.write_sig_dim,
+            read_norm_sig_dim=self.read_norm_sig_dim,
+            write_norm_sig_dim=self.write_norm_sig_dim)
         self.router = Router(
             d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_know=self.n_know,
@@ -2117,6 +2159,8 @@ class DAWN(nn.Module):
             'tag_dim': self.tag_dim,
             'read_sig_dim': self.read_sig_dim,
             'write_sig_dim': self.write_sig_dim,
+            'read_norm_sig_dim': self.read_norm_sig_dim,
+            'write_norm_sig_dim': self.write_norm_sig_dim,
         }
 
     def get_model_info(self):
@@ -2125,10 +2169,14 @@ class DAWN(nn.Module):
             f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"tag_dim={self.tag_dim}, read_sig_dim={self.read_sig_dim}, "
             f"write_sig_dim={self.write_sig_dim}, "
+            f"read_norm_sig_dim={self.read_norm_sig_dim}, "
+            f"write_norm_sig_dim={self.write_norm_sig_dim}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  QK: {self.n_qk}, V: {self.n_v}, Know: {self.n_know}",
             f"  Route: tag[{self.tag_dim}] + read_sig[{self.read_sig_dim}] "
-            f"+ write_sig[{self.write_sig_dim}]",
+            f"+ write_sig[{self.write_sig_dim}] "
+            f"+ read_norm[{self.read_norm_sig_dim}] "
+            f"+ write_norm[{self.write_norm_sig_dim}]",
         ]
 
 

@@ -159,19 +159,30 @@ def _dawn_shared_kwargs(cfg):
 def _dawn_v415_kwargs(cfg):
     kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
+    version = m.get('model_version', '')
     tag_dim = m.get('tag_dim', 16)
     read_sig_dim = m.get('read_sig_dim', 24)
     write_sig_dim = m.get('write_sig_dim', 24)
-    d_route = m.get('d_route', tag_dim + read_sig_dim + write_sig_dim)
-    if d_route != tag_dim + read_sig_dim + write_sig_dim:
+    read_norm_sig_dim = m.get('read_norm_sig_dim', 0)
+    write_norm_sig_dim = m.get('write_norm_sig_dim', 0)
+    expected_route = tag_dim + read_sig_dim + write_sig_dim
+    if version == 'spatial-r1-v4.1.5.1':
+        expected_route += read_norm_sig_dim + write_norm_sig_dim
+    d_route = m.get('d_route', expected_route)
+    if d_route != expected_route:
         raise ValueError(
-            f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
+            f"d_route must equal configured route split, got "
             f"d_route={d_route}, tag_dim={tag_dim}, "
-            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
+            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}, "
+            f"read_norm_sig_dim={read_norm_sig_dim}, "
+            f"write_norm_sig_dim={write_norm_sig_dim}")
     kw['d_route'] = d_route
     kw['tag_dim'] = tag_dim
     kw['read_sig_dim'] = read_sig_dim
     kw['write_sig_dim'] = write_sig_dim
+    if version == 'spatial-r1-v4.1.5.1':
+        kw['read_norm_sig_dim'] = read_norm_sig_dim
+        kw['write_norm_sig_dim'] = write_norm_sig_dim
     return kw
 
 
@@ -229,6 +240,14 @@ def _v412_sharded_kwargs(cfg):
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
     )
+
+
+def _v4151_sharded_kwargs(cfg):
+    kw = _v412_sharded_kwargs(cfg)
+    m = cfg['model']
+    kw['read_norm_sig_dim'] = m.get('read_norm_sig_dim', 1)
+    kw['write_norm_sig_dim'] = m.get('write_norm_sig_dim', 1)
+    return kw
 
 
 MODEL_REGISTRY = {
@@ -295,7 +314,7 @@ MODEL_REGISTRY = {
         build_kwargs=_dawn_v415_kwargs,
         supports_sharded=True,
         force_sharded=True,
-        sharded_kwargs=_v412_sharded_kwargs,
+        sharded_kwargs=_v4151_sharded_kwargs,
     ),
 }
 
@@ -324,6 +343,8 @@ def build_model_from_config(cfg):
             f"tag_dim={kwargs['tag_dim']}, "
             f"read_sig_dim={kwargs['read_sig_dim']}, "
             f"write_sig_dim={kwargs['write_sig_dim']}, "
+            f"read_norm_sig_dim={kwargs.get('read_norm_sig_dim', 0)}, "
+            f"write_norm_sig_dim={kwargs.get('write_norm_sig_dim', 0)}, "
             f"d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
