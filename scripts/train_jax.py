@@ -76,6 +76,76 @@ def set_seed(seed):
     np.random.seed(seed)
 
 
+def print_xla_oom_diagnostics():
+    """Print the newest XLA dump files likely to contain HBM allocation info."""
+    dump_dir = Path(os.environ.get("XLA_DUMP_DIR", "/tmp/xla_dump_train"))
+    if not dump_dir.exists():
+        print(f"  XLA dump dir not found: {dump_dir}", flush=True)
+        print("  Set XLA_DUMP_DIR and XLA_FLAGS=--xla_dump_to=$XLA_DUMP_DIR "
+              "--xla_dump_hlo_as_text before launching Python.", flush=True)
+        return
+
+    patterns = (
+        "*memory*",
+        "*buffer*",
+        "*after_optimizations.txt",
+        "*.txt",
+    )
+    files = []
+    seen = set()
+    for pat in patterns:
+        for path in dump_dir.rglob(pat):
+            if path.is_file() and path not in seen:
+                seen.add(path)
+                files.append(path)
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    files = files[:20]
+
+    if not files:
+        print(f"  No XLA text dumps found under {dump_dir}", flush=True)
+        return
+
+    print(f"\n  === XLA OOM diagnostics ===", flush=True)
+    print(f"  Dump dir: {dump_dir}", flush=True)
+    print("  Newest relevant dump files:", flush=True)
+    for path in files[:8]:
+        try:
+            size_mb = path.stat().st_size / 1e6
+            print(f"    {path} ({size_mb:.1f} MB)", flush=True)
+        except OSError:
+            print(f"    {path}", flush=True)
+
+    needles = (
+        "Total hbm usage",
+        "Program hbm requirement",
+        "Largest program allocations",
+        "Allocation type: HLO temp",
+        "Size:",
+        "source_file=",
+        "Shape:",
+    )
+    for path in files:
+        try:
+            text = path.read_text(errors="ignore")
+        except Exception:
+            continue
+        if not any(n in text for n in needles[:3]):
+            continue
+        print(f"\n  --- XLA memory excerpt: {path} ---", flush=True)
+        lines = text.splitlines()
+        hits = [i for i, line in enumerate(lines)
+                if any(n in line for n in needles[:3])]
+        start = max(0, hits[0] - 2) if hits else 0
+        end = min(len(lines), start + 140)
+        for line in lines[start:end]:
+            if any(n in line for n in needles) or "Operator:" in line:
+                print(f"  {line[:240]}", flush=True)
+        return
+
+    print("  No memory report excerpt found yet. Inspect latest dumps above.",
+          flush=True)
+
+
 # ============================================================
 # Config
 # ============================================================
@@ -2875,7 +2945,9 @@ def main():
             # 3) QK fused shard_map (paired)
             @jax.jit
             def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, scan_bias_all, qk_read, qk_write):
-                fused_paired = _sharded_fns[1]
+                fused_paired = (_sharded_fns.get('qk_paired', _sharded_fns['paired'])
+                                if isinstance(_sharded_fns, dict)
+                                else _sharded_fns[1])
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
@@ -2902,7 +2974,9 @@ def main():
             # 4) V shard_map (single)
             @jax.jit
             def prof_v_sharded(x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write):
-                fused_single = _sharded_fns[0]
+                fused_single = (_sharded_fns.get('v_single', _sharded_fns['single'])
+                                if isinstance(_sharded_fns, dict)
+                                else _sharded_fns[0])
                 if _uses_scan_bias:
                     return fused_single(
                         x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write)
@@ -2951,7 +3025,9 @@ def main():
             # 7) Know shard_map (single)
             @jax.jit
             def prof_know_sharded(x, h, know_norm, tau, scan_bias, know_read, know_write):
-                fused_single = _sharded_fns[0]
+                fused_single = (_sharded_fns.get('know_single', _sharded_fns['single'])
+                                if isinstance(_sharded_fns, dict)
+                                else _sharded_fns[0])
                 if _uses_scan_bias:
                     return fused_single(
                         x, h, know_norm, tau, scan_bias, know_read, know_write)
@@ -3156,6 +3232,7 @@ def main():
             print(f"\n  *** OOM check FAILED: {e}")
             print(f"  The model + gradients do not fit in device memory.")
             print(f"  Try: reduce batch_size, enable gradient_checkpointing, or use a smaller model.")
+            print_xla_oom_diagnostics()
         raise
 
     # ----------------------------------------------------------

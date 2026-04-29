@@ -80,10 +80,23 @@ cd "$WORK_DIR"
 # Kill existing train session if any
 tmux kill-session -t train 2>/dev/null || true
 
+# Enable lightweight XLA dumps by default so OOM-check failures point at the
+# HLO memory report without needing to relaunch with extra env vars.
+XLA_DUMP_DIR="${XLA_DUMP_DIR:-/tmp/xla_dump_train}"
+mkdir -p "$XLA_DUMP_DIR"
+export XLA_DUMP_DIR
+export JAX_TRACEBACK_FILTERING="${JAX_TRACEBACK_FILTERING:-off}"
+export JAX_LOG_COMPILES="${JAX_LOG_COMPILES:-1}"
+if [ -z "${XLA_FLAGS:-}" ]; then
+    export XLA_FLAGS="--xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
+else
+    export XLA_FLAGS="$XLA_FLAGS --xla_dump_to=$XLA_DUMP_DIR --xla_dump_hlo_as_text"
+fi
+
 # Start new tmux session running training, tee to ~/train.log
 TRAIN_ARGS="${TRAIN_ARGS:-}"
 tmux new-session -d -s train \
-    "python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
+    "export XLA_DUMP_DIR='$XLA_DUMP_DIR'; export JAX_TRACEBACK_FILTERING='$JAX_TRACEBACK_FILTERING'; export JAX_LOG_COMPILES='$JAX_LOG_COMPILES'; export XLA_FLAGS='$XLA_FLAGS'; python3 scripts/train_jax.py --config '$CONFIG' $TRAIN_ARGS 2>&1 | tee ~/train.log; echo 'Training finished. Press enter to close.'; read"
 
 echo "  tmux session 'train' started."
 echo "  Attach:  tmux attach -t train"
