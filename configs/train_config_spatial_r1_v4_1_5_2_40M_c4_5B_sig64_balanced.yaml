@@ -46,9 +46,9 @@ model:
   gradient_checkpointing: true
 
   d_route: 128
-  n_qk: 1600
-  n_v: 4400
-  n_know: 24400
+  n_qk: 1720
+  n_v: 6068
+  n_know: 26296
   # h-level dropout. Scores = h . emb, so dropping h dims is
   # equivalent to stochastically dimming all neuron scores along
   # that axis -- horizontal search (area-shift) complement to
