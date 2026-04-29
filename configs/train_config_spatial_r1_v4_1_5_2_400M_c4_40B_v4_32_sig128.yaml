@@ -25,9 +25,9 @@ model:
   max_seq_len: 512
   dropout: 0.05
   gradient_checkpointing: true
-  layer_checkpoint_policy: "srw"
+  layer_checkpoint_policy: "full"
   attention_checkpoint: false
-  loss_checkpoint: false
+  loss_checkpoint: true
   vocab_loss_chunk_size: 3000
 
   d_route: 256

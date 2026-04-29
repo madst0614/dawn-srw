@@ -2138,6 +2138,7 @@ class DAWN(nn.Module):
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = (shift_labels != -100)
 
+            @partial(_maybe_checkpoint, enabled=self.loss_checkpoint)
             def compute_chunked_loss_and_acc(x_chunk, emb, labs, vmask):
                 chunk_size = int(self.vocab_loss_chunk_size)
                 vocab = emb.shape[0]
