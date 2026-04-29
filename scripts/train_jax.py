@@ -1299,7 +1299,7 @@ def shard_batch(batch, n_devices):
 # ============================================================
 
 def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
-             verbose=True, data_sharding_spec=None):
+             verbose=True, data_sharding_spec=None, mesh=None):
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
@@ -1324,7 +1324,13 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             input_ids = shard_to_mesh(input_ids, data_sharding_spec, gs)
             attention_mask = shard_to_mesh(attention_mask, data_sharding_spec, gs)
 
-        ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
+        if mesh is not None:
+            with mesh:
+                ce_loss, correct, valid_count = eval_step_fn(
+                    params, input_ids, attention_mask)
+        else:
+            ce_loss, correct, valid_count = eval_step_fn(
+                params, input_ids, attention_mask)
 
         total_loss_jax = total_loss_jax + ce_loss * valid_count.astype(jnp.float32)
         total_correct_jax = total_correct_jax + correct
@@ -2878,9 +2884,10 @@ def main():
 
         # First call: JIT compilation (slow)
         jit_start = time.time()
-        _dp, _do, dummy_metrics = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
-            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+        with mesh:
+            _dp, _do, dummy_metrics = train_step_fn(
+                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng,
+                _dummy_emb_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics['total_loss'])
         jit_time = time.time() - jit_start
         jit_loss = float(dummy_metrics['total_loss'])
@@ -2893,9 +2900,10 @@ def main():
         # Second call: measure actual step time (post-JIT)
         rng, dummy_step_rng2 = jax.random.split(rng)
         step_start = time.time()
-        _dp2, _do2, dummy_metrics2 = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
-            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+        with mesh:
+            _dp2, _do2, dummy_metrics2 = train_step_fn(
+                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
+                _dummy_emb_snap, jnp.asarray(0, jnp.int32))
         jax.block_until_ready(dummy_metrics2['total_loss'])
         step_time = time.time() - step_start
         if is_host0:
@@ -3465,10 +3473,11 @@ def main():
             attention_mask = shard_to_mesh(
                 attention_mask, data_sharding, (batch_size, max_seq_len))
 
-            params, opt_state, metrics = train_step_fn(
-                params, opt_state,
-                input_ids, attention_mask, step_rng, _prev_emb_snap,
-                jnp.asarray(global_step, jnp.int32))
+            with mesh:
+                params, opt_state, metrics = train_step_fn(
+                    params, opt_state,
+                    input_ids, attention_mask, step_rng, _prev_emb_snap,
+                    jnp.asarray(global_step, jnp.int32))
 
             # Scalar helper kept for log-block use (m_grad etc.).
             def _m(v):
@@ -3614,7 +3623,8 @@ def main():
                 val_loader.reset()
                 val_loss, val_acc = evaluate(
                     eval_step_fn, params, val_loader, n_local_devices,
-                    verbose=is_host0, data_sharding_spec=data_sharding)
+                    verbose=is_host0, data_sharding_spec=data_sharding,
+                    mesh=mesh)
                 if is_host0:
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
                     log_jsonl({
@@ -3648,8 +3658,9 @@ def main():
                     _a_mask = shard_to_mesh(_a_mask, data_sharding, _a_gs)
                     try:
                         _a_compile_start = time.time()
-                        analysis_result = analysis_step_fn(
-                            params, _a_ids, _a_mask)
+                        with mesh:
+                            analysis_result = analysis_step_fn(
+                                params, _a_ids, _a_mask)
                         # Force the computation so HBM usage of the
                         # analysis kernels registers now, not on the
                         # next Python line.
@@ -3766,7 +3777,8 @@ def main():
         val_loader.reset()
         val_loss, val_acc = evaluate(
             eval_step_fn, params, val_loader, n_local_devices,
-            verbose=is_host0, data_sharding_spec=data_sharding)
+            verbose=is_host0, data_sharding_spec=data_sharding,
+            mesh=mesh)
 
         is_best = val_loss < best_val_loss
         if is_best:
