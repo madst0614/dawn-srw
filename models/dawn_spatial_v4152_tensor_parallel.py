@@ -1675,8 +1675,10 @@ class DAWN(nn.Module):
     max_seq_len: int = 512
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
+    layer_checkpoint_policy: str = "full"
     attention_checkpoint: bool = True
     loss_checkpoint: bool = True
+    vocab_loss_chunk_size: int = 0
 
     d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
     tag_dim: int = DEFAULT_TAG_DIM
@@ -1940,7 +1942,8 @@ class DAWN(nn.Module):
                     a_int_cap_frac, k_int_cap_frac,
                 )
 
-            if self.gradient_checkpointing:
+            _layer_ckpt_policy = (self.layer_checkpoint_policy or "full").lower()
+            if self.gradient_checkpointing and _layer_ckpt_policy in ("full", "scan", "all", "true"):
                 scan_body = jax.checkpoint(scan_body)
 
             xs = {'params': stacked, 'rng': layer_rngs}
@@ -2135,6 +2138,73 @@ class DAWN(nn.Module):
             shift_labels = labels[:, 1:].astype(jnp.int32)
             valid_mask = (shift_labels != -100)
 
+            def compute_chunked_loss_and_acc(x_chunk, emb, labs, vmask):
+                chunk_size = int(self.vocab_loss_chunk_size)
+                vocab = emb.shape[0]
+                if chunk_size <= 0 or chunk_size >= vocab:
+                    raise ValueError("chunked vocab loss requires 0 < vocab_loss_chunk_size < vocab_size")
+                if vocab % chunk_size != 0:
+                    raise ValueError(
+                        f"vocab_size={vocab} must be divisible by "
+                        f"vocab_loss_chunk_size={chunk_size}")
+                n_chunks = vocab // chunk_size
+                safe_labs = jnp.where(vmask, labs, 0)
+                neg_inf = jnp.array(-jnp.inf, dtype=jnp.float32)
+
+                def max_step(carry, i):
+                    max_logit, best_logit, best_id = carry
+                    start = i * chunk_size
+                    emb_c = jax.lax.dynamic_slice_in_dim(
+                        emb, start, chunk_size, axis=0)
+                    logits = x_chunk @ emb_c.T
+                    logits = logits.astype(jnp.float32)
+                    chunk_max = logits.max(axis=-1)
+                    local_best = logits.argmax(axis=-1).astype(jnp.int32)
+                    local_best_logit = jnp.take_along_axis(
+                        logits, local_best[..., None], axis=-1).squeeze(-1)
+                    global_best_id = local_best + start
+                    take = local_best_logit > best_logit
+                    return (
+                        jnp.maximum(max_logit, chunk_max),
+                        jnp.where(take, local_best_logit, best_logit),
+                        jnp.where(take, global_best_id, best_id),
+                    ), None
+
+                init = (
+                    jnp.full(labs.shape, neg_inf, dtype=jnp.float32),
+                    jnp.full(labs.shape, neg_inf, dtype=jnp.float32),
+                    jnp.zeros(labs.shape, dtype=jnp.int32),
+                )
+                (max_logit, _, preds), _ = jax.lax.scan(
+                    max_step, init, jnp.arange(n_chunks))
+
+                def sum_step(carry, i):
+                    sum_exp, target_logit = carry
+                    start = i * chunk_size
+                    emb_c = jax.lax.dynamic_slice_in_dim(
+                        emb, start, chunk_size, axis=0)
+                    logits = (x_chunk @ emb_c.T).astype(jnp.float32)
+                    sum_exp = sum_exp + jnp.exp(logits - max_logit[..., None]).sum(axis=-1)
+                    in_chunk = ((safe_labs >= start)
+                                & (safe_labs < start + chunk_size)
+                                & vmask)
+                    local_idx = jnp.clip(safe_labs - start, 0, chunk_size - 1)
+                    target_c = jnp.take_along_axis(
+                        logits, local_idx[..., None], axis=-1).squeeze(-1)
+                    target_logit = jnp.where(in_chunk, target_c, target_logit)
+                    return (sum_exp, target_logit), None
+
+                (sum_exp, target_logit), _ = jax.lax.scan(
+                    sum_step,
+                    (jnp.zeros(labs.shape, dtype=jnp.float32),
+                     jnp.zeros(labs.shape, dtype=jnp.float32)),
+                    jnp.arange(n_chunks))
+                logsumexp = max_logit + jnp.log(sum_exp + 1e-8)
+                per_token_ce = (logsumexp - target_logit) * vmask
+                loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
+                correct = jnp.sum((preds == labs) & vmask)
+                return loss, per_token_ce, correct, jnp.sum(vmask)
+
             @partial(_maybe_checkpoint, enabled=self.loss_checkpoint)
             def compute_loss_and_acc(x_chunk, emb, labs, vmask):
                 logits = x_chunk @ emb.T
@@ -2149,8 +2219,12 @@ class DAWN(nn.Module):
                 correct = jnp.sum((preds == labs) & vmask)
                 return loss, per_token_ce, correct, jnp.sum(vmask)
 
-            loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
-                shift_x, embedding_matrix, shift_labels, valid_mask)
+            if self.vocab_loss_chunk_size and self.vocab_loss_chunk_size > 0:
+                loss, per_token_ce, correct, valid_count = compute_chunked_loss_and_acc(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
+            else:
+                loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
+                    shift_x, embedding_matrix, shift_labels, valid_mask)
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count

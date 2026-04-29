@@ -342,14 +342,27 @@ def build_model_from_config(cfg):
             'attention_checkpoint', t.get('attention_checkpoint', True))
         kwargs['loss_checkpoint'] = m.get(
             'loss_checkpoint', t.get('loss_checkpoint', True))
+        kwargs['layer_checkpoint_policy'] = m.get(
+            'layer_checkpoint_policy', t.get('layer_checkpoint_policy', 'full'))
+        kwargs['vocab_loss_chunk_size'] = m.get(
+            'vocab_loss_chunk_size', t.get('vocab_loss_chunk_size', 0))
     if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+        _remat_msg = ""
+        if cls is spec.tensor_cls:
+            _remat_msg = (
+                f", attention_checkpoint={kwargs.get('attention_checkpoint')}"
+                f", loss_checkpoint={kwargs.get('loss_checkpoint')}"
+                f", layer_checkpoint_policy={kwargs.get('layer_checkpoint_policy')}"
+                f", vocab_loss_chunk_size={kwargs.get('vocab_loss_chunk_size')}"
+            )
         print(
             "operator route signature: "
             f"tag_dim={kwargs['tag_dim']}, "
             f"read_sig_dim={kwargs['read_sig_dim']}, "
             f"write_sig_dim={kwargs['write_sig_dim']}, "
             f"d_route={kwargs['d_route']}"
-            f"{' parallelism=tensor' if cls is spec.tensor_cls else ''}")
+            f"{' parallelism=tensor' if cls is spec.tensor_cls else ''}"
+            f"{_remat_msg}")
     return cls(**kwargs)
 
 
@@ -2848,7 +2861,10 @@ def main():
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks qk/v/know={n_chunks_qk}/{n_chunks_v}/{n_chunks_know}"
                   f"; max_chunk qk/v/know={qk_max_chunk}/{v_max_chunk}/{know_max_chunk}"
-                  f"; analysis kernels={'on' if _supports_analysis else 'off'})")
+                  f"; analysis kernels={'on' if _supports_analysis else 'off'}"
+                  f"; srw_ckpt stats/gate="
+                  f"{_srw_base_kwargs.get('stats_checkpoint', True)}/"
+                  f"{_srw_base_kwargs.get('gate_checkpoint', True)})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
