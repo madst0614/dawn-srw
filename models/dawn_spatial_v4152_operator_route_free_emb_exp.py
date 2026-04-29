@@ -565,12 +565,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, _, _ = route_chunk(s)
                 scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
-                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
-                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
-                cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
-                quad_sum = quad_sum + (scores_f ** 4).sum(axis=-1, keepdims=True)
-                per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
+                s32 = scores.astype(jnp.float32)
+                s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
+                sq_sum = sq_sum + jnp.sum(s32 * s32, axis=-1, keepdims=True)
+                cube_sum = cube_sum + jnp.sum(s32 * s32 * s32, axis=-1, keepdims=True)
+                quad_sum = quad_sum + jnp.sum(s32 * s32 * s32 * s32, axis=-1, keepdims=True)
+                per_neuron_score = jnp.sum(s32, axis=(0, 1)) / (B * S)
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
@@ -586,10 +586,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, _, _ = route_chunk(s)
                 scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
-                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
-                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
-                per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
+                s_sum = s_sum + jnp.sum(
+                    scores.astype(jnp.float32), axis=-1, keepdims=True)
+                sq_sum = sq_sum + jnp.sum(
+                    scores.astype(jnp.float32) * scores.astype(jnp.float32),
+                    axis=-1, keepdims=True)
+                per_neuron_score = (
+                    jnp.sum(scores.astype(jnp.float32), axis=(0, 1)) / (B * S))
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, ns_sum, ns_sq), None
@@ -646,9 +649,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
+                raw = scores - tau.astype(scores.dtype)
+                margin = raw.astype(jnp.float32) - _act_thr
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
@@ -673,7 +675,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 g_safe = gate + 1e-8
                 chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1))
-                mean_score_chunk = scores_f.mean(axis=(0, 1))
+                mean_score_chunk = jnp.sum(scores.astype(jnp.float32), axis=(0, 1)) / (B * S)
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -721,9 +723,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
+                raw = scores - tau.astype(scores.dtype)
+                margin = raw.astype(jnp.float32) - _act_thr
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
@@ -739,7 +740,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 # 誇intensity feeds den (consumed after scan, not returned).
                 max_gate_chunk = gate.max(axis=(0, 1))
-                mean_score_chunk = scores_f.mean(axis=(0, 1))
+                mean_score_chunk = jnp.sum(scores.astype(jnp.float32), axis=(0, 1)) / (B * S)
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -952,12 +953,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, _, _ = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
-                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
-                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
-                cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
-                quad_sum = quad_sum + (scores_f ** 4).sum(axis=-1, keepdims=True)
-                per_neuron_score = scores_f.mean(axis=(0, 1, 2))  # [cs]
+                s32 = scores.astype(jnp.float32)
+                s_sum = s_sum + jnp.sum(s32, axis=-1, keepdims=True)
+                sq_sum = sq_sum + jnp.sum(s32 * s32, axis=-1, keepdims=True)
+                cube_sum = cube_sum + jnp.sum(s32 * s32 * s32, axis=-1, keepdims=True)
+                quad_sum = quad_sum + jnp.sum(s32 * s32 * s32 * s32, axis=-1, keepdims=True)
+                per_neuron_score = jnp.sum(s32, axis=(0, 1, 2)) / (B * S * 2)
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq), None
@@ -973,10 +974,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, _, _ = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
-                s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
-                sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
-                per_neuron_score = scores_f.mean(axis=(0, 1, 2))  # [cs]
+                s_sum = s_sum + jnp.sum(
+                    scores.astype(jnp.float32), axis=-1, keepdims=True)
+                sq_sum = sq_sum + jnp.sum(
+                    scores.astype(jnp.float32) * scores.astype(jnp.float32),
+                    axis=-1, keepdims=True)
+                per_neuron_score = (
+                    jnp.sum(scores.astype(jnp.float32), axis=(0, 1, 2)) / (B * S * 2))
                 ns_sum = ns_sum + per_neuron_score.sum()
                 ns_sq = ns_sq + (per_neuron_score ** 2).sum()
                 return (s_sum, sq_sum, ns_sum, ns_sq), None
@@ -1030,9 +1034,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
+                raw = scores - tau.astype(scores.dtype)
+                margin = raw.astype(jnp.float32) - _act_thr
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
@@ -1057,7 +1060,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 g_safe = gate + 1e-8
                 chunk_g_log_g = (gate * jnp.log(g_safe)).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1, 2))
-                mean_score_chunk = scores_f.mean(axis=(0, 1, 2))
+                mean_score_chunk = jnp.sum(scores.astype(jnp.float32), axis=(0, 1, 2)) / (B * S * 2)
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
@@ -1106,9 +1109,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
+                raw = scores - tau.astype(scores.dtype)
+                margin = raw.astype(jnp.float32) - _act_thr
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
@@ -1123,7 +1125,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1, 2))
-                mean_score_chunk = scores_f.mean(axis=(0, 1, 2))
+                mean_score_chunk = jnp.sum(scores.astype(jnp.float32), axis=(0, 1, 2)) / (B * S * 2)
                 max_gate_chunk = jax.lax.pmax(
                     jax.lax.stop_gradient(max_gate_chunk), 'data')
                 mean_score_chunk = jax.lax.pmean(mean_score_chunk, 'data')
