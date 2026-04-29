@@ -25,7 +25,7 @@ model:
   max_seq_len: 512
   dropout: 0.05
   gradient_checkpointing: true
-  attention_checkpoint: false
+  attention_checkpoint: true
   loss_checkpoint: false
 
   d_route: 256
