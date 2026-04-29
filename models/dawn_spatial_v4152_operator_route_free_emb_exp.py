@@ -1,4 +1,4 @@
-﻿"""
+"""
 DAWN-SRW v4.1.5.2: Two-stage gate with free-norm route tags
 
 ## Design philosophy
@@ -2564,47 +2564,50 @@ class DAWN(nn.Module):
                 true_logit = jnp.sum(x_flat * target_emb, axis=-1)
 
                 vocab = emb.shape[0]
-                vocab_chunk = 4096
+                # Memory-safe chunked CE.
+                # Use fori_loop with carry-only state. Do NOT return per-chunk
+                # logits/masks from scan, or XLA may materialize
+                # [n_chunks, tokens, vocab_chunk] in the backward pass.
+                # 2048 keeps per-step logits temp smaller than 4096.
+                vocab_chunk = 2048
                 pad_vocab = (-vocab) % vocab_chunk
                 emb_pad = jnp.pad(emb, ((0, pad_vocab), (0, 0)))
                 n_vocab_chunks = emb_pad.shape[0] // vocab_chunk
                 vocab_offsets = jnp.arange(vocab_chunk, dtype=jnp.int32)
 
-                def max_step(carry, i):
+                def max_body(i, carry):
                     max_logit, pred = carry
                     start = i * vocab_chunk
                     e = jax.lax.dynamic_slice(
                         emb_pad, (start, 0), (vocab_chunk, dim))
                     logits = x_flat @ e.T
                     ids = start + vocab_offsets
-                    logits = jnp.where(
-                        ids[None, :] < vocab, logits, -jnp.inf)
+                    logits = jnp.where(ids[None, :] < vocab, logits, -jnp.inf)
                     chunk_max = logits.max(axis=-1)
                     chunk_arg = logits.argmax(axis=-1).astype(jnp.int32) + start
                     better = chunk_max > max_logit
                     return (jnp.where(better, chunk_max, max_logit),
-                            jnp.where(better, chunk_arg, pred)), None
+                            jnp.where(better, chunk_arg, pred))
 
                 init_max = jnp.full((bsz * slen,), -jnp.inf, dtype=jnp.float32)
                 init_pred = jnp.zeros((bsz * slen,), dtype=jnp.int32)
-                (max_logit, preds_flat), _ = jax.lax.scan(
-                    max_step, (init_max, init_pred), jnp.arange(n_vocab_chunks))
+                max_logit, preds_flat = jax.lax.fori_loop(
+                    0, n_vocab_chunks, max_body, (init_max, init_pred))
 
-                def sumexp_step(sum_exp, i):
+                def sumexp_body(i, sum_exp):
                     start = i * vocab_chunk
                     e = jax.lax.dynamic_slice(
                         emb_pad, (start, 0), (vocab_chunk, dim))
                     logits = x_flat @ e.T
                     ids = start + vocab_offsets
-                    logits = jnp.where(
-                        ids[None, :] < vocab, logits, -jnp.inf)
+                    logits = jnp.where(ids[None, :] < vocab, logits, -jnp.inf)
                     return sum_exp + jnp.exp(
-                        logits - max_logit[:, None]).sum(axis=-1), None
+                        logits - max_logit[:, None]).sum(axis=-1)
 
-                sum_exp, _ = jax.lax.scan(
-                    sumexp_step,
-                    jnp.zeros((bsz * slen,), dtype=jnp.float32),
-                    jnp.arange(n_vocab_chunks))
+                sum_exp = jax.lax.fori_loop(
+                    0, n_vocab_chunks, sumexp_body,
+                    jnp.zeros((bsz * slen,), dtype=jnp.float32))
+
                 ce_flat = max_logit + jnp.log(sum_exp + 1e-8) - true_logit
                 ce_flat = jnp.where(valid_flat, ce_flat, 0.0)
                 loss = ce_flat.sum() / (valid_flat.sum() + 1e-8)
