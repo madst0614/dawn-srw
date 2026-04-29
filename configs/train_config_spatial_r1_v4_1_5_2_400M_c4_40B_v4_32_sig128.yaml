@@ -18,6 +18,7 @@ data:
 
 model:
   model_version: "spatial-r1-v4.1.5.2"
+  parallelism: "tensor"
   d_model: 2304
   n_layers: 18
   n_heads: 36
@@ -40,8 +41,8 @@ training:
   mesh_model: 2
   mesh_data: 8
   n_chunks_qk: 1
-  n_chunks_v: 1
-  n_chunks_know: 4
+  n_chunks_v: 2
+  n_chunks_know: 8
   gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.0003

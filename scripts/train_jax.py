@@ -57,6 +57,7 @@ from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
 from models.dawn_spatial_v4152_operator_route_free_emb_exp import DAWN as DAWN_V4152
+from models.dawn_spatial_v4152_tensor_parallel import DAWN as DAWN_V4152_TP
 
 # ============================================================
 # Constants
@@ -187,6 +188,8 @@ class ModelSpec:
     supports_sharded: bool = False
     force_sharded: bool = False
     sharded_kwargs: Optional[Callable[[dict], dict]] = None
+    tensor_cls: Any = None
+    tensor_module_path: Optional[str] = None
 
 
 def _baseline_kwargs(cfg):
@@ -292,6 +295,8 @@ MODEL_REGISTRY = {
         supports_sharded=True,
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
+        tensor_cls=DAWN_V4152_TP,
+        tensor_module_path='models.dawn_spatial_v4152_tensor_parallel',
     ),
 }
 
@@ -314,14 +319,22 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
+    cls = spec.cls
+    parallelism = cfg['model'].get('parallelism', '').lower()
+    if parallelism in ('tensor', 'tp'):
+        if spec.tensor_cls is None:
+            raise ValueError(
+                f"model_version={version!r} has no tensor-parallel backend")
+        cls = spec.tensor_cls
     if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         print(
             "operator route signature: "
             f"tag_dim={kwargs['tag_dim']}, "
             f"read_sig_dim={kwargs['read_sig_dim']}, "
             f"write_sig_dim={kwargs['write_sig_dim']}, "
-            f"d_route={kwargs['d_route']}")
-    return spec.cls(**kwargs)
+            f"d_route={kwargs['d_route']}"
+            f"{' parallelism=tensor' if cls is spec.tensor_cls else ''}")
+    return cls(**kwargs)
 
 
 # ============================================================
@@ -1160,17 +1173,40 @@ def create_mesh(mesh_data, mesh_model):
     return Mesh(device_array, ('data', 'model'))
 
 
-def get_param_shardings(params, mesh, is_baseline=False):
+def get_param_shardings(params, mesh, is_baseline=False, tensor_parallel=False):
     """Create sharding specs for params: neuron_pool N-axis on 'model', rest replicated.
     For baseline models (is_baseline=True), 2D+ params are sharded on 'data' axis (FSDP-style).
     """
     replicated = NamedSharding(mesh, P())  # no sharding
     n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
     n_sharded_3d = NamedSharding(mesh, P('model', None, None))
+    d_sharded = NamedSharding(mesh, P(None, 'model'))
+    d_vector_sharded = NamedSharding(mesh, P('model'))
+    din_sharded = NamedSharding(mesh, P('model', None))
     data_sharded = NamedSharding(mesh, P('data', None))  # FSDP: first axis on data
 
     def _get_sharding(path, value):
         path_str = '/'.join(str(p) for p in path)
+        if tensor_parallel:
+            if value.ndim == 1 and (
+                'norm' in path_str or path_str.endswith('/bias')
+            ) and value.shape[0] % mesh.shape['model'] == 0:
+                return d_vector_sharded
+            if 'token_emb' in path_str or 'pos_emb' in path_str:
+                if value.ndim == 2:
+                    return d_sharded
+            if 'neuron_pool' in path_str:
+                if '_read' in path_str or '_write' in path_str:
+                    if '_sig_proj' in path_str:
+                        return din_sharded
+                    return d_sharded
+                return replicated
+            if 'router' in path_str and value.ndim == 2:
+                if value.shape[0] % mesh.shape['model'] == 0:
+                    return din_sharded
+            if 'expand_O' in path_str and value.ndim == 2:
+                if value.shape[0] % mesh.shape['model'] == 0:
+                    return din_sharded
         # NeuronPool params: shard N axis (first dim) on 'model'
         if 'neuron_pool' in path_str:
             if value.ndim == 2:
@@ -2616,6 +2652,18 @@ def main():
     mesh = create_mesh(mesh_data, mesh_model)
     data_sharding = NamedSharding(mesh, P('data', None))
     per_device_batch = batch_size // total_devices
+    tensor_parallel = cfg['model'].get('parallelism', '').lower() in ('tensor', 'tp')
+    if tensor_parallel:
+        d_model = cfg['model']['d_model']
+        n_heads = cfg['model']['n_heads']
+        if d_model % mesh_model != 0:
+            raise ValueError(
+                f"d_model={d_model} must be divisible by mesh_model={mesh_model} "
+                "for tensor-parallel residual sharding.")
+        if n_heads % mesh_model != 0:
+            raise ValueError(
+                f"n_heads={n_heads} must be divisible by mesh_model={mesh_model} "
+                "for tensor-parallel head sharding.")
 
     # Auto n_chunks: target ~2GB per chunk (bf16)
     def auto_n_chunks(N, target_gb=2.0):
@@ -2629,15 +2677,22 @@ def main():
     n_know = cfg['model'].get('n_know', 25200)
     n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
     n_v = cfg['model'].get('n_v', 2600)
-    for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
-        if _N % mesh_model != 0:
-            raise ValueError(
-                f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
-                "for model-axis sharding.")
-    # N_local = N / mesh_model (each chip's share)
-    nk_local = n_know // mesh_model
-    nqk_local = n_qk // mesh_model
-    nv_local = n_v // mesh_model
+    if tensor_parallel:
+        # TP uses the model axis for D/head sharding; each model shard sees
+        # the full neuron pool and chunks only to bound score/gate temps.
+        nk_local = n_know
+        nqk_local = n_qk
+        nv_local = n_v
+    else:
+        for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
+            if _N % mesh_model != 0:
+                raise ValueError(
+                    f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
+                    "for model-axis sharding.")
+        # N_local = N / mesh_model (each chip's share)
+        nk_local = n_know // mesh_model
+        nqk_local = n_qk // mesh_model
+        nv_local = n_v // mesh_model
 
     n_chunks_know = cfg['training'].get('n_chunks_know',
                                          auto_n_chunks(nk_local, target_chunk_gb))
@@ -2668,7 +2723,9 @@ def main():
         print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
-    param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
+    param_shardings = get_param_shardings(
+        params, mesh, is_baseline=is_baseline,
+        tensor_parallel=tensor_parallel)
     params = shard_params_to_mesh(params, param_shardings)
 
     _is_resuming = (resume_path is not None and _file_exists(resume_path))
@@ -2702,7 +2759,11 @@ def main():
             raise RuntimeError(
                 f"model_version={model_version!r} is registered without "
                 f"supports_sharded=True but mesh_model>1 or force_sharded=True.")
-        _v3 = __import__(_spec.module_path, fromlist=['make_sharded_srw'])
+        _parallelism = cfg['model'].get('parallelism', '').lower()
+        _module_path = _spec.module_path
+        if _parallelism in ('tensor', 'tp') and _spec.tensor_module_path:
+            _module_path = _spec.tensor_module_path
+        _v3 = __import__(_module_path, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
@@ -2864,7 +2925,10 @@ def main():
                       flush=True)
 
             _v3 = __import__(
-                MODEL_REGISTRY[model_version].module_path,
+                (MODEL_REGISTRY[model_version].tensor_module_path
+                 if cfg['model'].get('parallelism', '').lower() in ('tensor', 'tp')
+                 and MODEL_REGISTRY[model_version].tensor_module_path
+                 else MODEL_REGISTRY[model_version].module_path),
                 fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
