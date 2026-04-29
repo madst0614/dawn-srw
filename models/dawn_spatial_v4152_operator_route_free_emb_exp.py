@@ -312,6 +312,15 @@ from functools import partial
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
+try:
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        BlockSizes as _SplashBlockSizes,
+        make_splash_mha as _make_splash_mha,
+    )
+except Exception:  # Splash is TPU/JAX-version dependent.
+    _SplashBlockSizes = None
+    _make_splash_mha = None
+
 
 # ================================================================
 # V4.1 physical constants (defaults; overridable via config).
@@ -1465,7 +1474,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False):
+                  sharded_fns, analysis=False, attention_head_blocks=1,
+                  attention_impl="eager", attention_weight_dropout=True,
+                  attention_splash_head_shards=1,
+                  attention_splash_q_seq_shards=1,
+                  attention_splash_interpret=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1562,13 +1575,68 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
     @jax.checkpoint
     def _attn_scores(Q, K, V, rng_drop):
-        attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+        impl = str(attention_impl).lower()
+        if impl in ("splash", "flash", "flash_attention", "pallas_splash"):
+            if _make_splash_mha is None or _SplashBlockSizes is None:
+                raise RuntimeError(
+                    "attention_impl='splash' requires "
+                    "jax.experimental.pallas.ops.tpu.splash_attention. "
+                    "Use a TPU JAX build that includes Splash Attention, "
+                    "or set attention_impl='eager'.")
+            if attention_weight_dropout and dropout_rate != 0.0 and not deterministic:
+                raise ValueError(
+                    "Splash Attention does not support this model's attention-weight "
+                    "dropout path. Set model.attention_weight_dropout=false to use "
+                    "Splash while keeping the existing output/residual dropout.")
+
+            causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
+            mask = jnp.broadcast_to(causal[None, :, :], (n_heads, S, S))
+            block_sizes = _SplashBlockSizes.get_default()
+
+            def splash_one(q, k, v):
+                splash_kernel = _make_splash_mha(
+                    mask=mask,
+                    block_sizes=block_sizes,
+                    head_shards=int(attention_splash_head_shards),
+                    q_seq_shards=int(attention_splash_q_seq_shards),
+                    interpret=bool(attention_splash_interpret),
+                )
+                return splash_kernel(q / scale, k, v)
+
+            return jax.vmap(splash_one, in_axes=(0, 0, 0))(Q, K, V)
+
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
-        attn_scores = jnp.where(causal, attn_scores,
-                                jnp.finfo(attn_scores.dtype).min)
-        attn_w = jax.nn.softmax(attn_scores, axis=-1)
-        attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
-        return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        n_hb = int(attention_head_blocks)
+        if n_hb <= 1:
+            attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
+            attn_scores = jnp.where(causal, attn_scores,
+                                    jnp.finfo(attn_scores.dtype).min)
+            attn_w = jax.nn.softmax(attn_scores, axis=-1)
+            attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
+            return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        if n_heads % n_hb != 0:
+            raise ValueError(
+                f"attention_head_blocks={n_hb} must divide n_heads={n_heads}")
+        hb = n_heads // n_hb
+
+        def head_step(out, j):
+            h0 = j * hb
+            q_h = jax.lax.dynamic_slice_in_dim(Q, h0, hb, axis=1)
+            k_h = jax.lax.dynamic_slice_in_dim(K, h0, hb, axis=1)
+            v_h = jax.lax.dynamic_slice_in_dim(V, h0, hb, axis=1)
+            scores_h = jnp.einsum('bhsd,bhtd->bhst', q_h, k_h) / scale
+            scores_h = jnp.where(causal, scores_h,
+                                 jnp.finfo(scores_h.dtype).min)
+            attn_h = jax.nn.softmax(scores_h, axis=-1)
+            rng_h = jax.random.fold_in(rng_drop, j)
+            attn_h = safe_dropout(attn_h, dropout_rate, deterministic, rng_h)
+            out_h = jnp.einsum('bhst,bhtd->bhsd', attn_h, v_h)
+            out = jax.lax.dynamic_update_slice_in_dim(out, out_h, h0, axis=1)
+            return out, None
+
+        out0 = jnp.zeros_like(V)
+        out, _ = jax.lax.scan(head_step, out0, jnp.arange(n_hb))
+        return out
 
     if analysis:
         q_norm = jnp.linalg.norm(Q, axis=-1).mean()
@@ -1789,6 +1857,12 @@ class DAWN(nn.Module):
     max_seq_len: int = 512
     dropout_rate: float = 0.1
     gradient_checkpointing: bool = False
+    attention_impl: str = "eager"
+    attention_head_blocks: int = 1
+    attention_weight_dropout: bool = True
+    attention_splash_head_shards: int = 1
+    attention_splash_q_seq_shards: int = 1
+    attention_splash_interpret: bool = False
 
     d_route: int = DEFAULT_TAG_DIM + DEFAULT_READ_SIG_DIM + DEFAULT_WRITE_SIG_DIM
     route_mode: str = "signature"
@@ -1966,7 +2040,13 @@ class DAWN(nn.Module):
                     self.n_qk, self.n_v,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
-                    sharded_fns=_sharded, analysis=analysis)
+                    sharded_fns=_sharded, analysis=analysis,
+                    attention_head_blocks=self.attention_head_blocks,
+                    attention_impl=self.attention_impl,
+                    attention_weight_dropout=self.attention_weight_dropout,
+                    attention_splash_head_shards=self.attention_splash_head_shards,
+                    attention_splash_q_seq_shards=self.attention_splash_q_seq_shards,
+                    attention_splash_interpret=self.attention_splash_interpret)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,

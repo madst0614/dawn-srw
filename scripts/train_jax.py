@@ -274,6 +274,20 @@ def _dawn_v415_kwargs(cfg):
     kw['d_route'] = d_route
     if version == 'spatial-r1-v4.1.5.2':
         kw['route_mode'] = route_mode
+        kw['attention_impl'] = str(m.get('attention_impl', 'eager')).lower()
+        kw['attention_head_blocks'] = m.get(
+            'attention_head_blocks',
+            cfg.get('training', {}).get('attention_head_blocks', 1))
+        kw['attention_weight_dropout'] = m.get('attention_weight_dropout', True)
+        kw['attention_splash_head_shards'] = m.get(
+            'attention_splash_head_shards',
+            cfg.get('training', {}).get('attention_splash_head_shards', 1))
+        kw['attention_splash_q_seq_shards'] = m.get(
+            'attention_splash_q_seq_shards',
+            cfg.get('training', {}).get('attention_splash_q_seq_shards', 1))
+        kw['attention_splash_interpret'] = m.get(
+            'attention_splash_interpret',
+            cfg.get('training', {}).get('attention_splash_interpret', False))
     kw['tag_dim'] = tag_dim
     kw['read_sig_dim'] = read_sig_dim
     kw['write_sig_dim'] = write_sig_dim
@@ -364,6 +378,15 @@ def build_model_from_config(cfg):
             'attention_checkpoint', t.get('attention_checkpoint', True))
         kwargs['loss_checkpoint'] = m.get(
             'loss_checkpoint', t.get('loss_checkpoint', True))
+        for _k in (
+            'attention_impl',
+            'attention_head_blocks',
+            'attention_weight_dropout',
+            'attention_splash_head_shards',
+            'attention_splash_q_seq_shards',
+            'attention_splash_interpret',
+        ):
+            kwargs.pop(_k, None)
     if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         print(
             "operator route signature: "
@@ -372,6 +395,7 @@ def build_model_from_config(cfg):
             f"write_sig_dim={kwargs['write_sig_dim']}, "
             f"d_route={kwargs['d_route']}, "
             f"route_mode={kwargs.get('route_mode', 'signature')}"
+            f"{', attention_impl=' + kwargs.get('attention_impl', 'eager') if version == 'spatial-r1-v4.1.5.2' else ''}"
             f"{' parallelism=tensor' if cls is spec.tensor_cls else ''}")
     return cls(**kwargs)
 
@@ -2767,6 +2791,8 @@ def main():
               f"qk={n_chunks_qk}, v={n_chunks_v}")
         if srw_token_blocks != 1:
             print(f"  SRW token blocks: {srw_token_blocks}")
+        if model_version == 'spatial-r1-v4.1.5.2':
+            print(f"  Attention impl: {cfg['model'].get('attention_impl', 'eager')}")
         chunk_mem = per_device_batch * max_seq_len * know_max_chunk * 2 / 1e9
         print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
