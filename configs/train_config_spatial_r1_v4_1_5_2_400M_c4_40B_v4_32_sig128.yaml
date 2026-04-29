@@ -42,7 +42,7 @@ model:
   router_dropout: 0.02
 
 training:
-  batch_size: 1024
+  batch_size: 512
   mesh_model: 2
   mesh_data: 8
   # Keep SRW score/gate temps below TPU v4 HBM at batch_size=1024.
@@ -53,7 +53,7 @@ training:
   srw_token_blocks: 4
   srw_stats_checkpoint: true
   srw_gate_checkpoint: true
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   num_epochs: 1
   lr: 0.0003
   weight_decay: 0.1
