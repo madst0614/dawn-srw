@@ -2553,6 +2553,11 @@ def main():
     n_know = cfg['model'].get('n_know', 25200)
     n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
     n_v = cfg['model'].get('n_v', 2600)
+    for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
+        if _N % mesh_model != 0:
+            raise ValueError(
+                f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
+                "for model-axis sharding.")
     # N_local = N / mesh_model (each chip's share)
     nk_local = n_know // mesh_model
     nqk_local = n_qk // mesh_model
@@ -2565,12 +2570,25 @@ def main():
     n_chunks_v = cfg['training'].get('n_chunks_v',
                                       auto_n_chunks(nv_local, target_chunk_gb))
 
+    def _chunk_size_from_count(name, n_local, n_chunks):
+        n_chunks = int(n_chunks)
+        if n_chunks < 1:
+            raise ValueError(f"{name} chunks must be >= 1, got {n_chunks}")
+        if n_chunks > n_local:
+            raise ValueError(
+                f"{name} chunks={n_chunks} exceeds local pool size {n_local}")
+        return max(1, int(np.ceil(n_local / n_chunks)))
+
+    qk_max_chunk = _chunk_size_from_count('qk', nqk_local, n_chunks_qk)
+    v_max_chunk = _chunk_size_from_count('v', nv_local, n_chunks_v)
+    know_max_chunk = _chunk_size_from_count('know', nk_local, n_chunks_know)
+
     if is_host0:
         print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
         print(f"  Chunks: know={n_chunks_know} (cs={nk_local // max(n_chunks_know,1)}), "
               f"qk={n_chunks_qk}, v={n_chunks_v}")
-        chunk_mem = per_device_batch * max_seq_len * (nk_local // max(n_chunks_know,1)) * 2 / 1e9
+        chunk_mem = per_device_batch * max_seq_len * know_max_chunk * 2 / 1e9
         print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
@@ -2610,17 +2628,30 @@ def main():
                 f"supports_sharded=True but mesh_model>1 or force_sharded=True.")
         _v3 = __import__(_spec.module_path, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
-        max_chunk = cfg['training'].get('max_chunk_size', 12500)
-        _srw_kwargs = {'mesh': mesh, 'max_chunk_size': max_chunk}
+        max_chunk = cfg['training'].get('max_chunk_size', None)
+        if max_chunk is not None:
+            qk_max_chunk = v_max_chunk = know_max_chunk = int(max_chunk)
+
+        _srw_base_kwargs = {'mesh': mesh}
         if _spec.sharded_kwargs is not None:
-            _srw_kwargs.update(_spec.sharded_kwargs(cfg))
+            _srw_base_kwargs.update(_spec.sharded_kwargs(cfg))
         # Slim (train) -kwargs don't set analysis, so defaults to False.
-        _sharded_single = make_sharded_srw(**_srw_kwargs)
+        _sharded_single_v = make_sharded_srw(
+            max_chunk_size=v_max_chunk, **_srw_base_kwargs)
+        _sharded_single_know = make_sharded_srw(
+            max_chunk_size=know_max_chunk, **_srw_base_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
-            _sharded_paired = _v3.make_sharded_srw_paired(**_srw_kwargs)
-            _sharded_fns = (_sharded_single, _sharded_paired)
+            _sharded_paired_qk = _v3.make_sharded_srw_paired(
+                max_chunk_size=qk_max_chunk, **_srw_base_kwargs)
+            _sharded_fns = {
+                'single': _sharded_single_v,
+                'v_single': _sharded_single_v,
+                'know_single': _sharded_single_know,
+                'paired': _sharded_paired_qk,
+                'qk_paired': _sharded_paired_qk,
+            }
         else:
-            _sharded_fns = _sharded_single
+            _sharded_fns = _sharded_single_know
         # Analysis (observation only). Factory kwargs forward analysis=True
         # only to factories that accept it -v4.1 does, earlier versions
         # silently absorb it via **kwargs or raise; only probe when the
@@ -2630,15 +2661,27 @@ def main():
             'analysis' in _inspect.signature(make_sharded_srw).parameters
         )
         if _supports_analysis:
-            _sharded_single_a = make_sharded_srw(analysis=True, **_srw_kwargs)
+            _sharded_single_v_a = make_sharded_srw(
+                analysis=True, max_chunk_size=v_max_chunk, **_srw_base_kwargs)
+            _sharded_single_know_a = make_sharded_srw(
+                analysis=True, max_chunk_size=know_max_chunk, **_srw_base_kwargs)
             if hasattr(_v3, 'make_sharded_srw_paired'):
                 _sharded_paired_a = _v3.make_sharded_srw_paired(
-                    analysis=True, **_srw_kwargs)
-                _sharded_fns_analysis = (_sharded_single_a, _sharded_paired_a)
+                    analysis=True, max_chunk_size=qk_max_chunk,
+                    **_srw_base_kwargs)
+                _sharded_fns_analysis = {
+                    'single': _sharded_single_v_a,
+                    'v_single': _sharded_single_v_a,
+                    'know_single': _sharded_single_know_a,
+                    'paired': _sharded_paired_a,
+                    'qk_paired': _sharded_paired_a,
+                }
             else:
-                _sharded_fns_analysis = _sharded_single_a
+                _sharded_fns_analysis = _sharded_single_know_a
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
+                  f"; chunks qk/v/know={n_chunks_qk}/{n_chunks_v}/{n_chunks_know}"
+                  f"; max_chunk qk/v/know={qk_max_chunk}/{v_max_chunk}/{know_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'})")
 
     train_step_fn = create_train_step(

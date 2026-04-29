@@ -517,7 +517,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     def fused_gate_srw(x, h, tag_local, tau_offset, scan_bias,
                        read_local, write_local, read_sig_proj, write_sig_proj):
         N_local = tag_local.shape[0]
-        nc = max(1, N_local // max_chunk_size)
+        nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
             nc += 1
         cs = N_local // nc
@@ -903,7 +903,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     def fused_gate_srw_paired(x, h, tag_local, tau_offset, scan_bias,
                               read_local, write_local, read_sig_proj, write_sig_proj):
         N_local = tag_local.shape[0]
-        nc = max(1, N_local // max_chunk_size)
+        nc = max(1, (N_local + max_chunk_size - 1) // max_chunk_size)
         while N_local % nc != 0 and nc < N_local:
             nc += 1
         cs = N_local // nc
@@ -1366,7 +1366,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     qk_scale = pool_params['qk_scale']
     v_scale = pool_params['v_scale']
 
-    fused_single, fused_paired = sharded_fns
+    if isinstance(sharded_fns, dict):
+        fused_paired = sharded_fns.get('qk_paired', sharded_fns['paired'])
+        fused_single_v = sharded_fns.get('v_single', sharded_fns['single'])
+    else:
+        fused_single_v, fused_paired = sharded_fns
     h_QK = jnp.stack([h_Q, h_K], axis=2)
     tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
     scan_bias_QK = jnp.stack([scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
@@ -1383,9 +1387,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
-    v_ret = fused_single(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
-                         scan_bias_all[:, :, 2:3], v_read, v_write,
-                         v_read_sig_proj, v_write_sig_proj)
+    v_ret = fused_single_v(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
+                           scan_bias_all[:, :, 2:3], v_read, v_write,
+                           v_read_sig_proj, v_write_sig_proj)
     (V, v_active, v_raw_gmax, v_lb, v_sstd, v_es, v_anm,
      v_strong, v_z_act, v_tau_abs,
      v_dead_pen, v_dead_cnt, v_int_max,
@@ -1526,7 +1530,10 @@ def _know_forward(x, pool_params, router_params, rng,
 
     know_scale = pool_params['know_scale']
 
-    fused_single, _ = sharded_fns
+    if isinstance(sharded_fns, dict):
+        fused_single = sharded_fns.get('know_single', sharded_fns['single'])
+    else:
+        fused_single, _ = sharded_fns
     know_ret = fused_single(x, h, know_emb_unit, tau, scan_bias,
                             know_read, know_write,
                             know_read_sig_proj, know_write_sig_proj)
