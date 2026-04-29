@@ -42,7 +42,7 @@ training:
   mesh_data: 8
   n_chunks_qk: 1
   n_chunks_v: 1
-  n_chunks_know: 2
+  n_chunks_know: 1
   gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.0003
