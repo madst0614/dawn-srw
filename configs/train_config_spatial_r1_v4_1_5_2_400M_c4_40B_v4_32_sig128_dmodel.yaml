@@ -18,15 +18,12 @@ data:
 
 model:
   model_version: "spatial-r1-v4.1.5.2"
-  # parallelism: "tensor"
   d_model: 1280
   n_layers: 18
   n_heads: 16
   max_seq_len: 512
-  dropout: 0.1
+  dropout: 0.0
   gradient_checkpointing: true
-  attention_checkpoint: false
-  loss_checkpoint: false
 
   d_route: 256
   tag_dim: 0
@@ -34,9 +31,9 @@ model:
   write_sig_dim: 128
 
   n_qk: 6400
-  n_v: 10400
-  n_know: 100000
-  router_dropout: 0.1
+  n_v: 22600
+  n_know: 97850
+  router_dropout: 0.02
 
 training:
   batch_size: 1024
@@ -45,8 +42,6 @@ training:
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_know: 4
-  srw_stats_checkpoint: true
-  srw_gate_checkpoint: true
   gradient_accumulation_steps: 1
   num_epochs: 1
   lr: 0.0003
