@@ -29,7 +29,7 @@ model:
   attention_impl: "splash"
   attention_weight_dropout: false  # Splash path keeps output/residual dropout, not attn-weight dropout.
   attention_head_blocks: 1         # eager fallback only
-  loss_checkpoint: false
+  loss_checkpoint: true
 
   d_route: 256
   tag_dim: 0
