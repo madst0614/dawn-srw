@@ -56,17 +56,14 @@ else
     cd dawn-spatial
 fi
 
-# 3. Verify JAX sees TPU devices
-echo "[3/4] Verifying JAX TPU setup..."
-python -c "
-import jax
-print(f'Host: {jax.process_index()}/{jax.process_count()}')
-print(f'Local devices: {jax.local_device_count()}')
-print(f'Total devices: {jax.device_count()}')
-print(f'Backend: {jax.default_backend()}')
-assert jax.default_backend() == 'tpu', 'Not running on TPU!'
-print('TPU setup verified OK')
-"
+# 3. Skip standalone JAX preflight.
+#
+# On multi-host TPU pods a short-lived standalone JAX process can initialize
+# PJRT, print device info, and then abort during teardown with:
+#   GetSliceInfo can only be invoked after a slice is built...
+# The real training process below performs the same backend/device checks and
+# keeps the slice alive, so avoid opening a throwaway slice here.
+echo "[3/4] Skipping standalone JAX TPU preflight; train_jax.py will verify devices."
 
 # 4. Launch training in tmux (survives SSH disconnect)
 echo "[4/4] Starting training in tmux session 'train'..."
