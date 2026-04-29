@@ -1592,6 +1592,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
             mask = jnp.broadcast_to(causal[None, :, :], (n_heads, S, S))
             block_sizes = _SplashBlockSizes.get_default()
+            splash_dim = ((d_head + 127) // 128) * 128
+            pad_width = splash_dim - d_head
 
             def splash_one(q, k, v):
                 splash_kernel = _make_splash_mha(
@@ -1601,7 +1603,13 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                     q_seq_shards=int(attention_splash_q_seq_shards),
                     interpret=bool(attention_splash_interpret),
                 )
-                return splash_kernel(q / scale, k, v)
+                if pad_width:
+                    pad_spec = ((0, 0), (0, 0), (0, pad_width))
+                    q = jnp.pad(q, pad_spec)
+                    k = jnp.pad(k, pad_spec)
+                    v = jnp.pad(v, pad_spec)
+                out = splash_kernel(q / scale, k, v)
+                return out[..., :d_head]
 
             return jax.vmap(splash_one, in_axes=(0, 0, 0))(Q, K, V)
 

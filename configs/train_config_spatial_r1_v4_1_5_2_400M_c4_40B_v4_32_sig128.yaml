@@ -48,7 +48,7 @@ training:
   n_chunks_qk: 1
   n_chunks_v: 2
   n_chunks_know: 4
-  srw_token_blocks: 8
+  srw_token_blocks: 4
   srw_stats_checkpoint: true
   srw_gate_checkpoint: true
   gradient_accumulation_steps: 1
