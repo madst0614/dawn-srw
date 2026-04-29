@@ -47,9 +47,9 @@ training:
   mesh_data: 8
   # Keep SRW score/gate temps below TPU v4 HBM at batch_size=1024.
   # The large compile-time OOMs here scale with chunk size.
-  n_chunks_qk: 2
-  n_chunks_v: 4
-  n_chunks_know: 8
+  n_chunks_qk: 4
+  n_chunks_v: 8
+  n_chunks_know: 16
   srw_token_blocks: 4
   srw_stats_checkpoint: true
   srw_gate_checkpoint: true
