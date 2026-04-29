@@ -41,13 +41,14 @@ model:
 training:
   batch_size: 1024
   mesh_model: 2
-  mesh_data: 8
+  mesh_neuron: 2
+  mesh_data: 4
   n_chunks_qk: 1
   n_chunks_v: 1
   n_chunks_know: 4
   srw_stats_checkpoint: true
   srw_gate_checkpoint: true
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   num_epochs: 1
   lr: 0.0003
   weight_decay: 0.1

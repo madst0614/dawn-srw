@@ -1178,19 +1178,15 @@ def create_analysis_step(model, sharded_fns=None):
 # Mesh-based sharding (model parallel + data parallel)
 # ============================================================
 
-def create_mesh(mesh_data, mesh_model, mesh_neuron=1):
-    """Create a Mesh for data + D-tensor + neuron-pool parallelism.
-
-    The 'neuron' axis may be size 1, so existing 2D configs keep working.
-    """
+def create_mesh(mesh_data, mesh_model):
+    """Create 2D Mesh for data + model parallelism."""
     devices = jax.devices()
     n_devices = len(devices)
-    expected = mesh_data * mesh_model * mesh_neuron
-    assert n_devices == expected, (
-        f"mesh_data({mesh_data}) * mesh_model({mesh_model}) "
-        f"* mesh_neuron({mesh_neuron}) = {expected} != {n_devices} devices")
-    device_array = np.array(devices).reshape(mesh_data, mesh_model, mesh_neuron)
-    return Mesh(device_array, ('data', 'model', 'neuron'))
+    assert n_devices == mesh_data * mesh_model, (
+        f"mesh_data({mesh_data}) * mesh_model({mesh_model}) = "
+        f"{mesh_data * mesh_model} != {n_devices} devices")
+    device_array = np.array(devices).reshape(mesh_data, mesh_model)
+    return Mesh(device_array, ('data', 'model'))
 
 
 def get_param_shardings(params, mesh, is_baseline=False, tensor_parallel=False):
@@ -1198,9 +1194,8 @@ def get_param_shardings(params, mesh, is_baseline=False, tensor_parallel=False):
     For baseline models (is_baseline=True), 2D+ params are sharded on 'data' axis (FSDP-style).
     """
     replicated = NamedSharding(mesh, P())  # no sharding
-    n_sharded = NamedSharding(mesh, P('neuron', None))  # N axis on neuron
-    n_d_sharded = NamedSharding(mesh, P('neuron', 'model'))  # [N, D]
-    n_sharded_3d = NamedSharding(mesh, P('neuron', None, None))
+    n_sharded = NamedSharding(mesh, P('model', None))  # N axis on model
+    n_sharded_3d = NamedSharding(mesh, P('model', None, None))
     d_sharded = NamedSharding(mesh, P(None, 'model'))
     d_vector_sharded = NamedSharding(mesh, P('model'))
     din_sharded = NamedSharding(mesh, P('model', None))
@@ -1217,12 +1212,10 @@ def get_param_shardings(params, mesh, is_baseline=False, tensor_parallel=False):
                 if value.ndim == 2:
                     return d_sharded
             if 'neuron_pool' in path_str:
-                if '_read_sig_proj' in path_str or '_write_sig_proj' in path_str:
-                    return din_sharded
                 if '_read' in path_str or '_write' in path_str:
-                    return n_d_sharded
-                if value.ndim == 2:
-                    return n_sharded
+                    if '_sig_proj' in path_str:
+                        return din_sharded
+                    return d_sharded
                 return replicated
             if 'router' in path_str and value.ndim == 2:
                 if value.shape[0] % mesh.shape['model'] == 0:
@@ -2673,13 +2666,12 @@ def main():
     is_spatial = model_version in ('spatial-r1-v3.9.4', 'spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
 
     mesh_model = cfg['training'].get('mesh_model', 1)
-    mesh_neuron = cfg['training'].get('mesh_neuron', 1)
     mesh_data = cfg['training'].get('mesh_data', 0)  # 0 = auto
     total_devices = jax.device_count()
     if mesh_data == 0:
-        mesh_data = total_devices // (mesh_model * mesh_neuron)
+        mesh_data = total_devices // mesh_model
 
-    mesh = create_mesh(mesh_data, mesh_model, mesh_neuron)
+    mesh = create_mesh(mesh_data, mesh_model)
     data_sharding = NamedSharding(mesh, P('data', None))
     per_device_batch = batch_size // total_devices
     tensor_parallel = cfg['model'].get('parallelism', '').lower() in ('tensor', 'tp')
@@ -2708,15 +2700,11 @@ def main():
     n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
     n_v = cfg['model'].get('n_v', 2600)
     if tensor_parallel:
-        # TP uses model for D/head sharding and neuron for pool-N sharding.
-        for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
-            if _N % mesh_neuron != 0:
-                raise ValueError(
-                    f"{_name}={_N} must be divisible by mesh_neuron={mesh_neuron} "
-                    "for neuron-axis sharding.")
-        nk_local = n_know // mesh_neuron
-        nqk_local = n_qk // mesh_neuron
-        nv_local = n_v // mesh_neuron
+        # TP uses the model axis for D/head sharding; each model shard sees
+        # the full neuron pool and chunks only to bound score/gate temps.
+        nk_local = n_know
+        nqk_local = n_qk
+        nv_local = n_v
     else:
         for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
             if _N % mesh_model != 0:
@@ -2749,7 +2737,7 @@ def main():
     know_max_chunk = _chunk_size_from_count('know', nk_local, n_chunks_know)
 
     if is_host0:
-        print(f"\n=== Mesh: (data={mesh_data}, model={mesh_model}, neuron={mesh_neuron}) = "
+        print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
         print(f"  Chunks: know={n_chunks_know} (cs={nk_local // max(n_chunks_know,1)}), "
               f"qk={n_chunks_qk}, v={n_chunks_v}")
@@ -2857,7 +2845,7 @@ def main():
             else:
                 _sharded_fns_analysis = _sharded_single_know_a
         if is_host0:
-            print(f"  shard_map enabled (mesh_model={mesh_model}, mesh_neuron={mesh_neuron}, QK fused"
+            print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks qk/v/know={n_chunks_qk}/{n_chunks_v}/{n_chunks_know}"
                   f"; max_chunk qk/v/know={qk_max_chunk}/{v_max_chunk}/{know_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'})")

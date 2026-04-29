@@ -485,6 +485,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     Used by analysis_step at val time only.
     """
     _data_axis_size = mesh.shape['data']
+    _neuron_axis_size = mesh.shape.get('neuron', 1)
     _dead_thresh = jnp.float32(dead_threshold)
     _sharp = jnp.float32(sharpness)
     _act_thr = jnp.float32(activation_threshold)
@@ -533,11 +534,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, 'model'), # x [B,S,D/model]
                        P('data', None, None),    # h [B,S,d_bn]
-                       P(None, None),             # tag [N, tag_dim]
+                       P('neuron', None),         # tag [N/neuron, tag_dim]
                        P('data', None, None),    # tau_offset [B,S,1]
                        P('data', None, None),    # scan_bias [B,S,1]
-                       P(None, 'model'),          # read [N, D/model]
-                       P(None, 'model'),          # write [N, D/model]
+                       P('neuron', 'model'),      # read [N/neuron, D/model]
+                       P('neuron', 'model'),     # write [N/neuron, D/model]
                        P('model', None),          # read_sig_proj [D/model,read_sig_dim]
                        P('model', None)),         # write_sig_proj [D/model,write_sig_dim]
              out_specs=_out_specs,
@@ -611,9 +612,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             (local_sum, local_sq, ns_sum, ns_sq), _ = jax.lax.scan(
                 stats_step, (z_bs1, z_bs1, z_scalar, z_scalar), jnp.arange(nc))
 
-        global_sum = local_sum
-        global_sq = local_sq
-        N_total = N_local
+        global_sum = jax.lax.psum(local_sum, 'neuron')
+        global_sq = jax.lax.psum(local_sq, 'neuron')
+        N_total = N_local * _neuron_axis_size
 
         s_mean = global_sum / N_total
         s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
@@ -621,8 +622,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         tau = s_mean + tau_offset * s_std - scan / jnp.maximum(s_std, _scan_std_floor)
 
         if analysis:
-            global_cube = local_cube
-            global_quad = local_quad
+            global_cube = jax.lax.psum(local_cube, 'neuron')
+            global_quad = jax.lax.psum(local_quad, 'neuron')
             # Skewness via E[(X-關)^3] = E[X^3] - 3關?짼 - 關쨀
             cube_mean = global_cube / N_total
             central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
@@ -636,8 +637,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
-        global_ns_sum = ns_sum
-        global_ns_sq = ns_sq
+        global_ns_sum = jax.lax.psum(ns_sum, 'neuron')
+        global_ns_sq = jax.lax.psum(ns_sq, 'neuron')
         mean_score = global_ns_sum / N_total
         var_score = global_ns_sq / N_total - mean_score ** 2
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
@@ -782,14 +783,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
                 jnp.arange(nc))
 
-        global_weighted_cost = total_weighted_cost  # 誇gate
+        # Reduce neuron-sharded partials back to full-pool semantics.
+        raw_out = jax.lax.psum(raw_out, 'neuron')
+        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'neuron')  # 誇gate
         # v4.1 den = 誇intensity (boundary neurons get EPSILON den penalty
         # without matching numerator ??structural bimodality pressure).
         # Effective v4.1.5 denominator: max(sum(activation * intensity), 1.0).
-        global_den_cost = total_den_cost
-        global_activation_cost = total_activation_cost
-        global_current_cost = total_current_cost
-        global_gate_max = jax.lax.stop_gradient(total_gate_max)
+        global_den_cost = jax.lax.psum(total_den_cost, 'neuron')
+        global_activation_cost = jax.lax.psum(total_activation_cost, 'neuron')
+        global_current_cost = jax.lax.psum(total_current_cost, 'neuron')
+        global_gate_max = jax.lax.stop_gradient(jax.lax.pmax(total_gate_max, 'neuron'))
+        total_active = jax.lax.psum(total_active, 'neuron')
+        total_strong = jax.lax.psum(total_strong, 'neuron')
+        total_dead_penalty = jax.lax.psum(total_dead_penalty, 'neuron')
+        total_dead_count = jax.lax.psum(total_dead_count, 'neuron')
+        total_int_max = jax.lax.pmax(total_int_max, 'neuron')
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den
         out = out.astype(jnp.bfloat16)
@@ -821,6 +829,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             return slim_out
 
         # --- Analysis-only extras ---
+        total_phi_binary = jax.lax.psum(total_phi_binary, 'neuron')
+        total_z_lt_075 = jax.lax.psum(total_z_lt_075, 'neuron')
+        total_z_lt_030 = jax.lax.psum(total_z_lt_030, 'neuron')
+        total_g_log_g = jax.lax.psum(total_g_log_g, 'neuron')
+        total_int_cap_count = jax.lax.psum(total_int_cap_count, 'neuron')
         phi_binary_frac = total_phi_binary / N_total
         # Safety floor ??active can collapse to 0 at init; clamp to 1.0.
         _active_denom = jnp.maximum(global_active, 1.0)
@@ -872,6 +885,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     analysis: see make_sharded_srw docstring.
     """
     _data_axis_size = mesh.shape['data']
+    _neuron_axis_size = mesh.shape.get('neuron', 1)
     _dead_thresh = jnp.float32(dead_threshold)
     _sharp = jnp.float32(sharpness)
     _act_thr = jnp.float32(activation_threshold)
@@ -918,11 +932,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, 'model'),     # x [B,S,D/model]
                        P('data', None, None, None),  # h [B,S,2,d_bn]
-                       P(None, None),                 # tag [N, tag_dim]
+                       P('neuron', None),         # tag [N/neuron, tag_dim]
                        P('data', None, None, None),  # tau_offset [B,S,2,1]
                        P('data', None, None, None),  # scan_bias [B,S,2,1]
-                       P(None, 'model'),              # read [N, D/model]
-                       P(None, 'model'),              # write [N, D/model]
+                       P('neuron', 'model'),      # read [N/neuron, D/model]
+                       P('neuron', 'model'),     # write [N/neuron, D/model]
                        P('model', None),              # read_sig_proj [D/model,read_sig_dim]
                        P('model', None)),             # write_sig_proj [D/model,write_sig_dim]
              out_specs=_out_specs,
@@ -997,9 +1011,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             (local_sum, local_sq, ns_sum, ns_sq), _ = jax.lax.scan(
                 stats_step, (z_bsr1, z_bsr1, z_scalar, z_scalar), jnp.arange(nc))
 
-        global_sum = local_sum
-        global_sq = local_sq
-        N_total = N_local
+        global_sum = jax.lax.psum(local_sum, 'neuron')
+        global_sq = jax.lax.psum(local_sq, 'neuron')
+        N_total = N_local * _neuron_axis_size
 
         s_mean = global_sum / N_total      # [B,S,2,1]
         s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
@@ -1007,8 +1021,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         tau = s_mean + tau_offset * s_std - scan / jnp.maximum(s_std, _scan_std_floor)
 
         if analysis:
-            global_cube = local_cube
-            global_quad = local_quad
+            global_cube = jax.lax.psum(local_cube, 'neuron')
+            global_quad = jax.lax.psum(local_quad, 'neuron')
             cube_mean = global_cube / N_total
             central_third = cube_mean - 3.0 * s_mean * (s_std ** 2) - s_mean ** 3
             score_skew = jax.lax.stop_gradient((central_third / (s_std ** 3 + 1e-8)).mean())
@@ -1020,8 +1034,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         # Score LB: variance of per-neuron score mean * N
         ns_sum = jax.lax.psum(ns_sum, 'data') / _data_axis_size
         ns_sq = jax.lax.psum(ns_sq, 'data') / _data_axis_size
-        global_ns_sum = ns_sum
-        global_ns_sq = ns_sq
+        global_ns_sum = jax.lax.psum(ns_sum, 'neuron')
+        global_ns_sq = jax.lax.psum(ns_sq, 'neuron')
         mean_score = global_ns_sum / N_total
         var_score = global_ns_sq / N_total - mean_score ** 2
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
@@ -1166,12 +1180,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
                 jnp.arange(nc))
 
-        # Normalize per route independently
-        global_weighted_cost = total_weighted_cost   # 誇gate (log)
-        global_den_cost = total_den_cost
-        global_activation_cost = total_activation_cost
-        global_current_cost = total_current_cost
-        global_gate_max = jax.lax.stop_gradient(total_gate_max)
+        # Normalize per route independently. Reduce neuron-sharded partials.
+        raw_out = jax.lax.psum(raw_out, 'neuron')
+        global_weighted_cost = jax.lax.psum(total_weighted_cost, 'neuron')   # 誇gate (log)
+        global_den_cost = jax.lax.psum(total_den_cost, 'neuron')
+        global_activation_cost = jax.lax.psum(total_activation_cost, 'neuron')
+        global_current_cost = jax.lax.psum(total_current_cost, 'neuron')
+        global_gate_max = jax.lax.stop_gradient(jax.lax.pmax(total_gate_max, 'neuron'))
+        total_active = jax.lax.psum(total_active, 'neuron')
+        total_strong = jax.lax.psum(total_strong, 'neuron')
+        total_dead_penalty = jax.lax.psum(total_dead_penalty, 'neuron')
+        total_dead_count = jax.lax.psum(total_dead_count, 'neuron')
+        total_int_max = jax.lax.pmax(total_int_max, 'neuron')
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den
         out = out.astype(jnp.bfloat16)
@@ -1206,6 +1226,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             return slim_out
 
         # --- Analysis-only extras ---
+        total_phi_binary = jax.lax.psum(total_phi_binary, 'neuron')
+        total_z_lt_075 = jax.lax.psum(total_z_lt_075, 'neuron')
+        total_z_lt_030 = jax.lax.psum(total_z_lt_030, 'neuron')
+        total_g_log_g = jax.lax.psum(total_g_log_g, 'neuron')
+        total_int_cap_count = jax.lax.psum(total_int_cap_count, 'neuron')
         phi_binary_frac = total_phi_binary / N_total
         phi_binary_frac_mean = phi_binary_frac.mean(axis=2)
         _active_denom = jnp.maximum(global_active, 1.0)
