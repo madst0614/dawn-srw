@@ -2867,6 +2867,7 @@ def main():
                 'know_single': _sharded_single_know,
                 'paired': _sharded_paired_qk,
                 'qk_paired': _sharded_paired_qk,
+                'mesh': mesh,
             }
         else:
             _sharded_fns = _sharded_single_know
@@ -2893,6 +2894,7 @@ def main():
                     'know_single': _sharded_single_know_a,
                     'paired': _sharded_paired_a,
                     'qk_paired': _sharded_paired_a,
+                    'mesh': mesh,
                 }
             else:
                 _sharded_fns_analysis = _sharded_single_know_a

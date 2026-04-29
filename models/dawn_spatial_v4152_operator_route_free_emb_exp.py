@@ -1533,8 +1533,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     if isinstance(sharded_fns, dict):
         fused_paired = sharded_fns.get('qk_paired', sharded_fns['paired'])
         fused_single_v = sharded_fns.get('v_single', sharded_fns['single'])
+        mesh = sharded_fns.get('mesh')
     else:
         fused_single_v, fused_paired = sharded_fns
+        mesh = None
     h_QK = jnp.stack([h_Q, h_K], axis=2)
     tau_QK = jnp.stack([tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
     scan_bias_QK = jnp.stack([scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
@@ -1588,6 +1590,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                     "Splash Attention does not support this model's attention-weight "
                     "dropout path. Set model.attention_weight_dropout=false to use "
                     "Splash while keeping the existing output/residual dropout.")
+            if mesh is None:
+                raise RuntimeError(
+                    "attention_impl='splash' must run inside shard_map with the "
+                    "training mesh. Expected sharded_fns to carry sharded_fns['mesh'].")
 
             causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
             mask = jnp.broadcast_to(causal[None, :, :], (n_heads, S, S))
@@ -1595,23 +1601,33 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             splash_dim = ((d_head + 127) // 128) * 128
             pad_width = splash_dim - d_head
 
-            def splash_one(q, k, v):
-                splash_kernel = _make_splash_mha(
-                    mask=mask,
-                    block_sizes=block_sizes,
-                    head_shards=int(attention_splash_head_shards),
-                    q_seq_shards=int(attention_splash_q_seq_shards),
-                    interpret=bool(attention_splash_interpret),
-                )
-                if pad_width:
-                    pad_spec = ((0, 0), (0, 0), (0, pad_width))
-                    q = jnp.pad(q, pad_spec)
-                    k = jnp.pad(k, pad_spec)
-                    v = jnp.pad(v, pad_spec)
-                out = splash_kernel(q / scale, k, v)
-                return out[..., :d_head]
+            splash_kernel = _make_splash_mha(
+                mask=mask,
+                block_sizes=block_sizes,
+                head_shards=int(attention_splash_head_shards),
+                q_seq_shards=int(attention_splash_q_seq_shards),
+                interpret=bool(attention_splash_interpret),
+            )
 
-            return jax.vmap(splash_one, in_axes=(0, 0, 0))(Q, K, V)
+            @partial(shard_map, mesh=mesh,
+                     in_specs=(P('data', None, None, None),
+                               P('data', None, None, None),
+                               P('data', None, None, None)),
+                     out_specs=P('data', None, None, None),
+                     check_rep=False)
+            def splash_sharded(q_all, k_all, v_all):
+                def splash_one(q, k, v):
+                    if pad_width:
+                        pad_spec = ((0, 0), (0, 0), (0, pad_width))
+                        q = jnp.pad(q, pad_spec)
+                        k = jnp.pad(k, pad_spec)
+                        v = jnp.pad(v, pad_spec)
+                    out = splash_kernel(q / scale, k, v)
+                    return out[..., :d_head]
+
+                return jax.vmap(splash_one, in_axes=(0, 0, 0))(q_all, k_all, v_all)
+
+            return splash_sharded(Q, K, V)
 
         causal = jnp.tril(jnp.ones((S, S), dtype=jnp.bool_))
         n_hb = int(attention_head_blocks)
