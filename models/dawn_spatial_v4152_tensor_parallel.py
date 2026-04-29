@@ -2143,11 +2143,12 @@ class DAWN(nn.Module):
                 vocab = emb.shape[0]
                 if chunk_size <= 0 or chunk_size >= vocab:
                     raise ValueError("chunked vocab loss requires 0 < vocab_loss_chunk_size < vocab_size")
-                if vocab % chunk_size != 0:
-                    raise ValueError(
-                        f"vocab_size={vocab} must be divisible by "
-                        f"vocab_loss_chunk_size={chunk_size}")
-                n_chunks = vocab // chunk_size
+                n_chunks = (vocab + chunk_size - 1) // chunk_size
+                padded_vocab = n_chunks * chunk_size
+                emb = jnp.pad(
+                    emb,
+                    ((0, padded_vocab - vocab), (0, 0)),
+                    mode='constant')
                 safe_labs = jnp.where(vmask, labs, 0)
                 neg_inf = jnp.array(-jnp.inf, dtype=jnp.float32)
 
@@ -2158,6 +2159,9 @@ class DAWN(nn.Module):
                         emb, start, chunk_size, axis=0)
                     logits = x_chunk @ emb_c.T
                     logits = logits.astype(jnp.float32)
+                    vocab_ids = start + jnp.arange(chunk_size)
+                    logits = jnp.where(vocab_ids[None, None, :] < vocab,
+                                       logits, neg_inf)
                     chunk_max = logits.max(axis=-1)
                     local_best = logits.argmax(axis=-1).astype(jnp.int32)
                     local_best_logit = jnp.take_along_axis(
@@ -2184,6 +2188,9 @@ class DAWN(nn.Module):
                     emb_c = jax.lax.dynamic_slice_in_dim(
                         emb, start, chunk_size, axis=0)
                     logits = (x_chunk @ emb_c.T).astype(jnp.float32)
+                    vocab_ids = start + jnp.arange(chunk_size)
+                    logits = jnp.where(vocab_ids[None, None, :] < vocab,
+                                       logits, neg_inf)
                     sum_exp = sum_exp + jnp.exp(logits - max_logit[..., None]).sum(axis=-1)
                     in_chunk = ((safe_labs >= start)
                                 & (safe_labs < start + chunk_size)
