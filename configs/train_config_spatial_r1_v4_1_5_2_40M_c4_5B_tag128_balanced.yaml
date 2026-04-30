@@ -46,17 +46,17 @@ model:
   gradient_checkpointing: true
 
   d_route: 128
-  n_qk: 1720
-  n_v: 6068
-  n_know: 26296
+  n_qk: 1580
+  n_v: 5600
+  n_know: 24100
   # h-level dropout. Scores = h . emb, so dropping h dims is
   # equivalent to stochastically dimming all neuron scores along
   # that axis -- horizontal search (area-shift) complement to
   # tau's vertical search (water-level).
   router_dropout: 0.02
-  tag_dim: 64
-  read_sig_dim: 32
-  write_sig_dim: 32
+  tag_dim: 128
+  read_sig_dim: 0
+  write_sig_dim: 0
 
 training:
   batch_size: 128
@@ -92,7 +92,7 @@ training:
   # tau itself is NOT clipped -- only the explore loss is bounded.
   # CE can push tau outside the bounds if it really needs to.
   exploration_weight: 0.001        # lambda: overall strength
-  exploration_asymmetry: 1.25       # easy-token push scale (symmetric=1.0)
+  exploration_asymmetry: 1.5       # easy-token push scale (symmetric=1.0)
   exploration_warmup_steps: 1000   # loss off until this step
   exploration_lower_bound: -0.5    # down-push bound
   exploration_upper_bound: 2.0     # up-push bound
@@ -108,5 +108,5 @@ training:
   log_analysis_multiplier: 5
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.2_tag64_sig32_40M_c4_5B_balanced
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5.2_tag64_sig32_40M_c4_5B_balanced
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.2_sig64_40M_c4_5B_balanced
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5.2_sig64_40M_c4_5B_balanced
