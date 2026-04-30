@@ -3,7 +3,7 @@
 # 400M/v4-32 scale variant of the 40M v4.1.5.2 run.
 # Restores the earlier 400M width/pool scale (d_model=1280) while keeping
 # the v4.1.5.2 d_route-only route.
-#   tag_dim=d_route, read_sig_dim=0, write_sig_dim=0
+#   route_width=d_route
 # ============================================================
 
 seed: 1

@@ -5,12 +5,12 @@
 #   models/dawn_spatial_v4152_operator_route_free_emb_exp.py
 #
 # This keeps the baseline v4.1 training hyperparameters fixed while using
-# the pre-signature route convention:
+# the d_route-only route convention:
 #   scan = scan_scale * tanh(scan_bias)
 #   tau = s_mean + tau_offset * s_std - scan / max(s_std, scan_std_floor)
 #
 # v4.1.5.2 train_jax default:
-#   tag_dim=d_route, read_sig_dim=0, write_sig_dim=0
+#   route_width=d_route
 #
 # Route interpretation:
 #   h supplies token/context magnitude and direction;

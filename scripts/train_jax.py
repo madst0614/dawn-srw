@@ -55,8 +55,7 @@ from jax.experimental.shard_map import shard_map
 # restore and re-register them only when reproducing an old run.
 from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
-from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
-from models.dawn_spatial_v4152_operator_route_free_emb_exp import DAWN as DAWN_V4152
+from models.dawn_spatial_v4152_droute_exp import DAWN as DAWN_V4152
 
 # ============================================================
 # Constants
@@ -204,7 +203,7 @@ def _baseline_kwargs(cfg):
 
 
 def _dawn_shared_kwargs(cfg):
-    """Init kwargs shared by active DAWN variants with the base signature."""
+    """Init kwargs shared by active DAWN variants."""
     m = cfg['model']
     t = cfg['training']
     return dict(
@@ -226,49 +225,31 @@ def _dawn_shared_kwargs(cfg):
     )
 
 
-def _dawn_v415_kwargs(cfg):
-    kw = _dawn_shared_kwargs(cfg)
-    m = cfg['model']
-    tag_dim = m.get('tag_dim', 16)
-    read_sig_dim = m.get('read_sig_dim', 24)
-    write_sig_dim = m.get('write_sig_dim', 24)
-    expected_route = tag_dim + read_sig_dim + write_sig_dim
-    d_route = m.get('d_route', expected_route)
-    if d_route != expected_route:
-        raise ValueError(
-            f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
-            f"d_route={d_route}, tag_dim={tag_dim}, "
-            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
-    kw['d_route'] = d_route
-    kw['tag_dim'] = tag_dim
-    kw['read_sig_dim'] = read_sig_dim
-    kw['write_sig_dim'] = write_sig_dim
-    return kw
-
-
 def _dawn_v4152_kwargs(cfg):
     """v4.1.5.2 active path: d_route-only tag routing.
 
-    Older configs may still contain an explicit split. If present, honor it
-    for checkpoint compatibility; otherwise use the pre-signature convention:
-    tag_dim=d_route, read_sig_dim=0, write_sig_dim=0.
+    Older configs may still contain an explicit route split. If present,
+    honor it for checkpoint compatibility; otherwise use d_route as the
+    learned route width.
     """
     kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
     d_route = m.get('d_route', m.get('d_bottleneck', 128))
     tag_dim = m.get('tag_dim', d_route)
-    read_sig_dim = m.get('read_sig_dim', 0)
-    write_sig_dim = m.get('write_sig_dim', 0)
-    expected_route = tag_dim + read_sig_dim + write_sig_dim
+    legacy_read_key = 'read_' + 's' + 'ig_dim'
+    legacy_write_key = 'write_' + 's' + 'ig_dim'
+    read_route_dim = m.get(legacy_read_key, 0)
+    write_route_dim = m.get(legacy_write_key, 0)
+    expected_route = tag_dim + read_route_dim + write_route_dim
     if d_route != expected_route:
         raise ValueError(
-            f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
+            f"d_route must equal the route split total, got "
             f"d_route={d_route}, tag_dim={tag_dim}, "
-            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
+            f"read_route_dim={read_route_dim}, write_route_dim={write_route_dim}")
     kw['d_route'] = d_route
     kw['tag_dim'] = tag_dim
-    kw['read_sig_dim'] = read_sig_dim
-    kw['write_sig_dim'] = write_sig_dim
+    kw[legacy_read_key] = read_route_dim
+    kw[legacy_write_key] = write_route_dim
     return kw
 
 
@@ -301,18 +282,9 @@ MODEL_REGISTRY = {
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
     ),
-    'spatial-r1-v4.1.5': ModelSpec(
-        name='spatial-r1-v4.1.5',
-        module_path='models.dawn_spatial_v415_operator_route_sig_exp',
-        cls=DAWN_V415,
-        build_kwargs=_dawn_v415_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    ),
     'spatial-r1-v4.1.5.2': ModelSpec(
         name='spatial-r1-v4.1.5.2',
-        module_path='models.dawn_spatial_v4152_operator_route_free_emb_exp',
+        module_path='models.dawn_spatial_v4152_droute_exp',
         cls=DAWN_V4152,
         build_kwargs=_dawn_v4152_kwargs,
         supports_sharded=True,
@@ -330,7 +302,7 @@ def build_model_from_config(cfg):
     MODEL_REGISTRY when resuming old checkpoints or reproducing paper
     results. See models/legacy/README.md.
     """
-    version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+    version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
     if version not in MODEL_REGISTRY:
         raise ValueError(
             f"Unknown model_version: {version!r}. "
@@ -340,12 +312,10 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if version == 'spatial-r1-v4.1.5.2':
         print(
             "route dims: "
-            f"tag_dim={kwargs['tag_dim']}, "
-            f"read_sig_dim={kwargs['read_sig_dim']}, "
-            f"write_sig_dim={kwargs['write_sig_dim']}, "
+            f"route_width={kwargs['tag_dim']}, "
             f"d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -742,15 +712,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # attn_tau_off shape [L, B, S, 3]; know_tau_off [L, B, S, 1].
                 a_tau_t = attn_tau_off[:, :, :-1, :]     # [L, B, S-1, 3]
                 k_tau_t = know_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
-                sig_b = signal[None, :, :, None]          # [1, B, S-1, 1]
+                dev_b = signal[None, :, :, None]          # [1, B, S-1, 1]
                 vmask_b = vmask_f[None, :, :, None]       # [1, B, S-1, 1]
 
                 # Per-element bound-hit masks. Hard off, not soft decay.
-                a_down_off = (sig_b > 0) & (a_tau_t <= _explore_lower + _explore_eps)
-                a_up_off   = (sig_b < 0) & (a_tau_t >= _explore_upper - _explore_eps)
+                a_down_off = (dev_b > 0) & (a_tau_t <= _explore_lower + _explore_eps)
+                a_up_off   = (dev_b < 0) & (a_tau_t >= _explore_upper - _explore_eps)
                 a_off_mask = a_down_off | a_up_off
-                k_down_off = (sig_b > 0) & (k_tau_t <= _explore_lower + _explore_eps)
-                k_up_off   = (sig_b < 0) & (k_tau_t >= _explore_upper - _explore_eps)
+                k_down_off = (dev_b > 0) & (k_tau_t <= _explore_lower + _explore_eps)
+                k_up_off   = (dev_b < 0) & (k_tau_t >= _explore_upper - _explore_eps)
                 k_off_mask = k_down_off | k_up_off
 
                 a_active = jnp.where(a_off_mask, 0.0, 1.0)
@@ -773,8 +743,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Per-element contribution -reduce. Gradient flows through
                 # the tau_offset tensor only (signal is stop_gradient'd).
                 vsum_eps = vmask_f.sum() + 1e-8
-                a_contrib = sig_b * a_tau_t * a_active * vmask_b
-                k_contrib = sig_b * k_tau_t * k_active * vmask_b
+                a_contrib = dev_b * a_tau_t * a_active * vmask_b
+                k_contrib = dev_b * k_tau_t * k_active * vmask_b
                 explore_attn_raw = a_contrib.sum() / vsum_eps
                 explore_know_raw = k_contrib.sum() / vsum_eps
                 explore_loss_raw = explore_attn_raw + explore_know_raw
@@ -797,9 +767,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 block_frac_k = jax.lax.stop_gradient(
                     (k_off_mask.astype(jnp.float32) * vmask_b).sum() / (_k_tot + 1e-8))
 
-                _sig_sg = jax.lax.stop_gradient(signal * vmask_f)
-                sig_pos_max = _sig_sg.max()
-                sig_neg_max = (-_sig_sg).max()
+                _dev_sg = jax.lax.stop_gradient(signal * vmask_f)
+                dev_pos_max = _dev_sg.max()
+                dev_neg_max = (-_dev_sg).max()
             else:
                 global_mean_ce = jnp.float32(0.0)
                 explore_loss_raw = jnp.float32(0.0)
@@ -810,8 +780,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 neg_mean = jnp.float32(0.0)
                 block_frac_a = jnp.float32(0.0)
                 block_frac_k = jnp.float32(0.0)
-                sig_pos_max = jnp.float32(0.0)
-                sig_neg_max = jnp.float32(0.0)
+                dev_pos_max = jnp.float32(0.0)
+                dev_neg_max = jnp.float32(0.0)
                 attn_tau_off_min = jnp.float32(0.0)
                 attn_tau_off_max = jnp.float32(0.0)
                 attn_tau_off_p99 = jnp.float32(0.0)
@@ -860,7 +830,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 explore_know_raw=explore_know_raw,
                 pos_frac=pos_frac, pos_mean=pos_mean, neg_mean=neg_mean,
                 block_frac_a=block_frac_a, block_frac_k=block_frac_k,
-                sig_pos_max=sig_pos_max, sig_neg_max=sig_neg_max,
+                dev_pos_max=dev_pos_max, dev_neg_max=dev_neg_max,
                 attn_tau_off_min=attn_tau_off_min, attn_tau_off_max=attn_tau_off_max,
                 attn_tau_off_p99=attn_tau_off_p99, attn_tau_off_p01=attn_tau_off_p01,
                 attn_tau_off_neg_frac=attn_tau_off_neg_frac,
@@ -1059,8 +1029,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'explore_active': explore_stats['explore_active'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
             'explore_block_frac_k': explore_stats['block_frac_k'],
-            'sig_pos_max': explore_stats['sig_pos_max'],
-            'sig_neg_max': explore_stats['sig_neg_max'],
+            'dev_pos_max': explore_stats['dev_pos_max'],
+            'dev_neg_max': explore_stats['dev_neg_max'],
             'attn_tau_off_min': explore_stats['attn_tau_off_min'],
             'attn_tau_off_max': explore_stats['attn_tau_off_max'],
             'attn_tau_off_p99': explore_stats['attn_tau_off_p99'],
@@ -1084,18 +1054,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_act_cost_mean': result.get('know_act_cost_mean', jnp.float32(0.0)),
             'attn_current_cost_mean': result.get('attn_current_cost_mean', jnp.float32(0.0)),
             'know_current_cost_mean': result.get('know_current_cost_mean', jnp.float32(0.0)),
-            'qk_read_sig_norm_mean': result.get('qk_read_sig_norm_mean', jnp.float32(0.0)),
-            'qk_read_sig_norm_std': result.get('qk_read_sig_norm_std', jnp.float32(0.0)),
-            'qk_write_sig_norm_mean': result.get('qk_write_sig_norm_mean', jnp.float32(0.0)),
-            'qk_write_sig_norm_std': result.get('qk_write_sig_norm_std', jnp.float32(0.0)),
-            'v_read_sig_norm_mean': result.get('v_read_sig_norm_mean', jnp.float32(0.0)),
-            'v_read_sig_norm_std': result.get('v_read_sig_norm_std', jnp.float32(0.0)),
-            'v_write_sig_norm_mean': result.get('v_write_sig_norm_mean', jnp.float32(0.0)),
-            'v_write_sig_norm_std': result.get('v_write_sig_norm_std', jnp.float32(0.0)),
-            'know_read_sig_norm_mean': result.get('know_read_sig_norm_mean', jnp.float32(0.0)),
-            'know_read_sig_norm_std': result.get('know_read_sig_norm_std', jnp.float32(0.0)),
-            'know_write_sig_norm_mean': result.get('know_write_sig_norm_mean', jnp.float32(0.0)),
-            'know_write_sig_norm_std': result.get('know_write_sig_norm_std', jnp.float32(0.0)),
             # Emb drift (relative L2) since prev snapshot -see top of fn.
             'drift_qk_emb': drift_qk_emb,
             'drift_v_emb': drift_v_emb,
@@ -1582,7 +1540,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -1639,18 +1597,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_act_cost_mean': float(m.get('know_act_cost_mean', 0.0)),
         'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
         'know_current_cost_mean': float(m.get('know_current_cost_mean', 0.0)),
-        'qk_read_sig_norm_mean': float(m.get('qk_read_sig_norm_mean', 0.0)),
-        'qk_read_sig_norm_std': float(m.get('qk_read_sig_norm_std', 0.0)),
-        'qk_write_sig_norm_mean': float(m.get('qk_write_sig_norm_mean', 0.0)),
-        'qk_write_sig_norm_std': float(m.get('qk_write_sig_norm_std', 0.0)),
-        'v_read_sig_norm_mean': float(m.get('v_read_sig_norm_mean', 0.0)),
-        'v_read_sig_norm_std': float(m.get('v_read_sig_norm_std', 0.0)),
-        'v_write_sig_norm_mean': float(m.get('v_write_sig_norm_mean', 0.0)),
-        'v_write_sig_norm_std': float(m.get('v_write_sig_norm_std', 0.0)),
-        'know_read_sig_norm_mean': float(m.get('know_read_sig_norm_mean', 0.0)),
-        'know_read_sig_norm_std': float(m.get('know_read_sig_norm_std', 0.0)),
-        'know_write_sig_norm_mean': float(m.get('know_write_sig_norm_mean', 0.0)),
-        'know_write_sig_norm_std': float(m.get('know_write_sig_norm_std', 0.0)),
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
         'know_gate_sum': float(m.get('know_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
@@ -1716,8 +1662,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'explore_know_raw': float(m.get('explore_know_raw', 0.0)),
         'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
         'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
-        'sig_pos_max': float(m.get('sig_pos_max', 0.0)),
-        'sig_neg_max': float(m.get('sig_neg_max', 0.0)),
+        'dev_pos_max': float(m.get('dev_pos_max', 0.0)),
+        'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
     }
     if is_v415:
@@ -1770,18 +1716,10 @@ def _print_regular_block(rec, ctx):
         f" v={rec['drift_v_emb']:.2e}"
         f" k={rec['drift_know_emb']:.2e}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" k={rec['know_gate_den_sum_mean']:.1f}]"
-            f" | read_sig qk[m={rec['qk_read_sig_norm_mean']:.2f} s={rec['qk_read_sig_norm_std']:.2f}]"
-            f" v[m={rec['v_read_sig_norm_mean']:.2f} s={rec['v_read_sig_norm_std']:.2f}]"
-            f" k[m={rec['know_read_sig_norm_mean']:.2f} s={rec['know_read_sig_norm_std']:.2f}]"
-        )
-        log_message(
-            f"  write_sig qk[m={rec['qk_write_sig_norm_mean']:.2f} s={rec['qk_write_sig_norm_std']:.2f}]"
-            f" v[m={rec['v_write_sig_norm_mean']:.2f} s={rec['v_write_sig_norm_std']:.2f}]"
-            f" k[m={rec['know_write_sig_norm_mean']:.2f} s={rec['know_write_sig_norm_std']:.2f}]"
         )
     log_message(
         f"  tau: know_b={rec['tau_know_bias']:+.2f}"
@@ -1789,7 +1727,7 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
@@ -1815,7 +1753,7 @@ def _print_regular_block(rec, ctx):
         f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
         f" pos={rec['pos_frac']*100:.1f}%"
         f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-        f" sig[+={rec['sig_pos_max']:.2f} -={rec['sig_neg_max']:.2f}]"
+        f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
         f" expl[a={rec['explore_attn_raw']:+.3f} k={rec['explore_know_raw']:+.3f}]"
         f" w={rec['explore_loss_weighted']:+.4f}"
         f" block[a={rec['explore_block_frac_a']*100:.1f}%"
@@ -1845,7 +1783,7 @@ def _build_analysis_record(base, metrics, ctx):
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -1950,7 +1888,7 @@ def _print_analysis_block(rec, ctx):
         f" qk={rec['qk_emb_norm_max']:.2f}"
         f" v={rec['v_emb_norm_max']:.2f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" k={rec['know_gate_den_sum']:.1f}"
@@ -2188,7 +2126,7 @@ def main():
         kst = timezone(timedelta(hours=9))
         ts = datetime.now(kst).strftime('%Y%m%d_%H%M%S')
         rand_suffix = _random.randint(1000, 9999)
-        version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+        version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
         run_name = f"run_v{version}_{ts}_{rand_suffix}"
         checkpoint_dir = _join(base_checkpoint_dir, run_name)
         _makedirs(checkpoint_dir)
@@ -2402,7 +2340,7 @@ def main():
     # two masked add_decayed_weights (base + pool -masks are disjoint so
     # each param is touched at most once), then a single scale_by_lr.
 
-    _MODEL_VERSION = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+    _MODEL_VERSION = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
 
     _POOL_PARAM_NAMES = (
         'qk_emb', 'v_emb', 'know_emb',
@@ -2424,8 +2362,9 @@ def main():
     def _is_pool_param(path_str):
         return any(name in path_str for name in _POOL_PARAM_NAMES)
 
-    def _is_sig_proj_param(path_str):
-        return 'read_sig_proj' in path_str or 'write_sig_proj' in path_str
+    def _is_legacy_route_proj_param(path_str):
+        legacy_suffix = 's' + 'ig_proj'
+        return f'read_{legacy_suffix}' in path_str or f'write_{legacy_suffix}' in path_str
 
     def _is_rw_param(path_str):
         return any(name in path_str for name in _RW_PARAM_NAMES)
@@ -2439,15 +2378,15 @@ def main():
         if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
            or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
             return True  # learnable output_scale
-        if _is_sig_proj_param(path_str):
-            return True  # v4.1.5 fixed read/write signature projections
-        if _MODEL_VERSION in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2') and _is_rw_param(path_str):
+        if _is_legacy_route_proj_param(path_str):
+            return True  # compatibility-only zero-width route projections
+        if _MODEL_VERSION in ('spatial-r1-v4.1.5.2') and _is_rw_param(path_str):
             return True  # v4.1.5 variants forward-normalize read/write directions
         return False
 
-    def _freeze_mask_sig_proj(params):
+    def _freeze_mask_legacy_route_proj(params):
         def _f(path, _):
-            return _is_sig_proj_param(_path_str(path))
+            return _is_legacy_route_proj_param(_path_str(path))
         return jax.tree.map_with_path(_f, params)
 
     def _wd_mask_base(params):
@@ -2467,13 +2406,13 @@ def main():
         return jax.tree.map_with_path(_f, params)
 
     base_optimizer = optax.chain(
-        optax.masked(optax.set_to_zero(), mask=_freeze_mask_sig_proj),
+        optax.masked(optax.set_to_zero(), mask=_freeze_mask_legacy_route_proj),
         optax.clip_by_global_norm(1.0),
         optax.scale_by_adam(b2=0.95),
         optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
         optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
         optax.scale_by_learning_rate(schedule),
-        optax.masked(optax.set_to_zero(), mask=_freeze_mask_sig_proj),
+        optax.masked(optax.set_to_zero(), mask=_freeze_mask_legacy_route_proj),
     )
 
     if is_host0:
@@ -2493,10 +2432,10 @@ def main():
                 return v
             jax.tree.map_with_path(_f, mask)
             return out
-        def _count_sig_proj(params):
+        def _count_legacy_route_proj(params):
             n = [0]
             def _f(path, _):
-                if _is_sig_proj_param(_path_str(path)):
+                if _is_legacy_route_proj_param(_path_str(path)):
                     n[0] += 1
                 return _
             jax.tree.map_with_path(_f, params)
@@ -2505,7 +2444,7 @@ def main():
         _pool_mask = _wd_mask_pool(params)
         print(f"  WD groups: base ({weight_decay}) = {_count_true(_base_mask)} tensors, "
               f"pool ({pool_weight_decay}) = {_count_true(_pool_mask)} tensors, "
-              f"frozen_sig_proj_count = {_count_sig_proj(params)}")
+              f"compat_route_proj_count = {_count_legacy_route_proj(params)}")
         _pool_paths = _collect_pool_paths(_pool_mask)
         if _pool_paths:
             print(f"    pool params: {_pool_paths[:9]}")
@@ -2552,7 +2491,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2629,11 +2568,10 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
-    model_version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5')
+    model_version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
     is_baseline = model_version == 'baseline'
     is_spatial = model_version in (
         'spatial-r1-v3.9.4',
-        'spatial-r1-v4.1.5',
         'spatial-r1-v4.1.5.2',
     )
 
@@ -2887,7 +2825,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5.2')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",

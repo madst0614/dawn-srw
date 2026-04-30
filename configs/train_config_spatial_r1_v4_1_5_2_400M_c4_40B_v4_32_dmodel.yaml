@@ -3,7 +3,7 @@
 # 400M/v4-32 scale variant of the 40M v4.1.5.2 run.
 # Parameter-matched to the 400M TF baseline by keeping depth fixed and
 # increasing d_model, while preserving the 40M pool ratio.
-#   tag_dim=d_route, read_sig_dim=0, write_sig_dim=0
+#   route_width=d_route
 # ============================================================
 
 seed: 1
