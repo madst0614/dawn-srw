@@ -57,7 +57,6 @@ from models.baseline_transformer_jax import VanillaTransformer
 from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
 from models.dawn_spatial_v4152_operator_route_free_emb_exp import DAWN as DAWN_V4152
-from models.dawn_spatial_v4153_factorized_routing_exp import DAWN as DAWN_V4153
 
 # ============================================================
 # Constants
@@ -247,13 +246,29 @@ def _dawn_v415_kwargs(cfg):
     return kw
 
 
-def _dawn_v4153_kwargs(cfg):
-    kw = _dawn_v415_kwargs(cfg)
+def _dawn_v4152_kwargs(cfg):
+    """v4.1.5.2 active path: d_route-only tag routing.
+
+    Older configs may still contain an explicit split. If present, honor it
+    for checkpoint compatibility; otherwise use the pre-signature convention:
+    tag_dim=d_route, read_sig_dim=0, write_sig_dim=0.
+    """
+    kw = _dawn_shared_kwargs(cfg)
     m = cfg['model']
-    kw['routing_type'] = m.get('routing_type', 'joint')
-    kw['route_tag_weight'] = m.get('route_tag_weight', 1.0)
-    kw['route_read_weight'] = m.get('route_read_weight', 1.0)
-    kw['route_write_weight'] = m.get('route_write_weight', 1.0)
+    d_route = m.get('d_route', m.get('d_bottleneck', 128))
+    tag_dim = m.get('tag_dim', d_route)
+    read_sig_dim = m.get('read_sig_dim', 0)
+    write_sig_dim = m.get('write_sig_dim', 0)
+    expected_route = tag_dim + read_sig_dim + write_sig_dim
+    if d_route != expected_route:
+        raise ValueError(
+            f"d_route must equal tag_dim + read_sig_dim + write_sig_dim, got "
+            f"d_route={d_route}, tag_dim={tag_dim}, "
+            f"read_sig_dim={read_sig_dim}, write_sig_dim={write_sig_dim}")
+    kw['d_route'] = d_route
+    kw['tag_dim'] = tag_dim
+    kw['read_sig_dim'] = read_sig_dim
+    kw['write_sig_dim'] = write_sig_dim
     return kw
 
 
@@ -270,18 +285,6 @@ def _v415_sharded_kwargs(cfg):
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
     )
-
-
-def _v4153_sharded_kwargs(cfg):
-    kw = _v415_sharded_kwargs(cfg)
-    m = cfg['model']
-    kw.update(
-        routing_type=m.get('routing_type', 'joint'),
-        route_tag_weight=m.get('route_tag_weight', 1.0),
-        route_read_weight=m.get('route_read_weight', 1.0),
-        route_write_weight=m.get('route_write_weight', 1.0),
-    )
-    return kw
 
 
 MODEL_REGISTRY = {
@@ -311,19 +314,10 @@ MODEL_REGISTRY = {
         name='spatial-r1-v4.1.5.2',
         module_path='models.dawn_spatial_v4152_operator_route_free_emb_exp',
         cls=DAWN_V4152,
-        build_kwargs=_dawn_v415_kwargs,
+        build_kwargs=_dawn_v4152_kwargs,
         supports_sharded=True,
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
-    ),
-    'spatial-r1-v4.1.5.3': ModelSpec(
-        name='spatial-r1-v4.1.5.3',
-        module_path='models.dawn_spatial_v4153_factorized_routing_exp',
-        cls=DAWN_V4153,
-        build_kwargs=_dawn_v4153_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v4153_sharded_kwargs,
     ),
 }
 
@@ -346,20 +340,13 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3'):
+    if version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         print(
-            "operator route signature: "
+            "route dims: "
             f"tag_dim={kwargs['tag_dim']}, "
             f"read_sig_dim={kwargs['read_sig_dim']}, "
             f"write_sig_dim={kwargs['write_sig_dim']}, "
             f"d_route={kwargs['d_route']}")
-        if version == 'spatial-r1-v4.1.5.3':
-            print(
-                "routing mode: "
-                f"{kwargs['routing_type']} "
-                f"(tag={kwargs['route_tag_weight']}, "
-                f"read={kwargs['route_read_weight']}, "
-                f"write={kwargs['route_write_weight']})")
     return spec.cls(**kwargs)
 
 
@@ -1595,7 +1582,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -1783,7 +1770,7 @@ def _print_regular_block(rec, ctx):
         f" v={rec['drift_v_emb']:.2e}"
         f" k={rec['drift_know_emb']:.2e}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" k={rec['know_gate_den_sum_mean']:.1f}]"
@@ -1802,7 +1789,7 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
         f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         log_message(
             f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
             f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
@@ -1858,7 +1845,7 @@ def _build_analysis_record(base, metrics, ctx):
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -1963,7 +1950,7 @@ def _print_analysis_block(rec, ctx):
         f" qk={rec['qk_emb_norm_max']:.2f}"
         f" v={rec['v_emb_norm_max']:.2f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" k={rec['know_gate_den_sum']:.1f}"
@@ -2454,7 +2441,7 @@ def main():
             return True  # learnable output_scale
         if _is_sig_proj_param(path_str):
             return True  # v4.1.5 fixed read/write signature projections
-        if _MODEL_VERSION in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3') and _is_rw_param(path_str):
+        if _MODEL_VERSION in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2') and _is_rw_param(path_str):
             return True  # v4.1.5 variants forward-normalize read/write directions
         return False
 
@@ -2565,7 +2552,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3'):
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2648,7 +2635,6 @@ def main():
         'spatial-r1-v3.9.4',
         'spatial-r1-v4.1.5',
         'spatial-r1-v4.1.5.2',
-        'spatial-r1-v4.1.5.3',
     )
 
     mesh_model = cfg['training'].get('mesh_model', 1)
@@ -2901,7 +2887,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.3')
+            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5', 'spatial-r1-v4.1.5.2')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",

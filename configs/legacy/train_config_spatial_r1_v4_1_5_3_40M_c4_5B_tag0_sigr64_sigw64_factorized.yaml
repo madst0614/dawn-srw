@@ -1,7 +1,7 @@
 # DAWN Spatial-R1 v4.1.5.3 -- factorized read/write signature routing
 #
-# train_jax.py maps model_version: "spatial-r1-v4.1.5.3" to:
-#   models/dawn_spatial_v4153_factorized_routing_exp.py
+# Archived experiment. To reproduce it, move/re-register:
+#   models/legacy/dawn_spatial_v4153_factorized_routing_exp.py
 #
 # This variant removes learned route tags and routes through separate
 # read/write operator-signature factors:

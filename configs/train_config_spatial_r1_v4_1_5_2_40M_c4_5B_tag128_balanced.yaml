@@ -1,28 +1,22 @@
-# DAWN Spatial-R1 v4.1.5.2 -- tag64 + read/write signature experiment
+# DAWN Spatial-R1 v4.1.5.2 -- d_route-only tag routing
 #
 # Sister of train_config_spatial_r1_v4_1_40M_c4_5B.yaml.
 # train_jax.py maps model_version: "spatial-r1-v4.1.5.2" to:
 #   models/dawn_spatial_v4152_operator_route_free_emb_exp.py
 #
-# This keeps the baseline v4.1 training hyperparameters fixed while
-# testing operator-derived routing signatures:
+# This keeps the baseline v4.1 training hyperparameters fixed while using
+# the pre-signature route convention:
 #   scan = scan_scale * tanh(scan_bias)
 #   tau = s_mean + tau_offset * s_std - scan / max(s_std, scan_std_floor)
 #
-# Operator signature split is config-driven. This variant keeps v4.1.5
-# read/write unit-norm behavior and gives routing a free-norm learned tag
-# plus unit-norm read/write operator signatures:
-#   tag_dim=64, read_sig_dim=32, write_sig_dim=32
-#   d_route = tag_dim + read_sig_dim + write_sig_dim
+# v4.1.5.2 train_jax default:
+#   tag_dim=d_route, read_sig_dim=0, write_sig_dim=0
 #
 # Route interpretation:
 #   h supplies token/context magnitude and direction;
-#   route keeps learned tag norm and unit operator-signature directions.
+#   route keeps learned tag norm as the routing degree of freedom.
 #
-# Operator signature split:
-#   d_route = tag_dim + read_sig_dim + write_sig_dim
-# The fixed *_sig_proj tensors are excluded from optimizer weight decay
-# in train_jax.py; the model also stop_gradient()s them in forward.
+# Only d_route is configured here; train_jax derives the internal split.
 # ============================================================
 
 seed: 1
@@ -54,9 +48,6 @@ model:
   # that axis -- horizontal search (area-shift) complement to
   # tau's vertical search (water-level).
   router_dropout: 0.02
-  tag_dim: 128
-  read_sig_dim: 0
-  write_sig_dim: 0
 
 training:
   batch_size: 128

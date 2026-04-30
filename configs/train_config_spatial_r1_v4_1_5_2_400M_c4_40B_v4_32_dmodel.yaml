@@ -1,10 +1,9 @@
-# DAWN Spatial-R1 v4.1.5.2 -- 400M no-tag + read/write signature experiment
+# DAWN Spatial-R1 v4.1.5.2 -- 400M d_route-only tag routing
 #
-# 400M/v4-32 scale variant of the 40M no-tag v4.1.5.2 run.
+# 400M/v4-32 scale variant of the 40M v4.1.5.2 run.
 # Parameter-matched to the 400M TF baseline by keeping depth fixed and
-# increasing d_model, while preserving the 40M no-tag pool ratio.
-#   route = concat(read_sig_unit, write_sig_unit)
-#   tag_dim=0, read_sig_dim=128, write_sig_dim=128, d_route=256
+# increasing d_model, while preserving the 40M pool ratio.
+#   tag_dim=d_route, read_sig_dim=0, write_sig_dim=0
 # ============================================================
 
 seed: 1
@@ -26,9 +25,6 @@ model:
   gradient_checkpointing: true
 
   d_route: 256
-  tag_dim: 0
-  read_sig_dim: 128
-  write_sig_dim: 128
 
   n_qk: 2430
   n_v: 8574
@@ -78,5 +74,5 @@ training:
   log_analysis_multiplier: 10
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.2_sig128_400M_c4_40B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5.2_sig128_400M_c4_40B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.2_400M_c4_40B_dmodel
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5.2_400M_c4_40B_dmodel
