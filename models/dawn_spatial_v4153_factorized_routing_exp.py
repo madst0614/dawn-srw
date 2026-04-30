@@ -393,10 +393,12 @@ def fixed_sig_proj_init():
 
 def build_route_signature(tag, read_unit, write_unit, read_sig_proj, write_sig_proj):
     tag_f = tag.astype(jnp.float32)
+    read_f = jax.lax.stop_gradient(read_unit.astype(jnp.float32))
+    write_f = jax.lax.stop_gradient(write_unit.astype(jnp.float32))
     rproj = jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
     wproj = jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
-    read_sig = read_unit.astype(jnp.float32) @ rproj
-    write_sig = write_unit.astype(jnp.float32) @ wproj
+    read_sig = read_f @ rproj
+    write_sig = write_f @ wproj
     read_sig = read_sig / (jnp.linalg.norm(read_sig, axis=-1, keepdims=True) + 1e-8)
     write_sig = write_sig / (jnp.linalg.norm(write_sig, axis=-1, keepdims=True) + 1e-8)
     return jnp.concatenate([tag_f, read_sig, write_sig], axis=-1)
@@ -466,7 +468,8 @@ def score_route_chunk(x, h, tag, read_unit, write_unit,
     cursor = tag_dim
     if read_sig_dim > 0 and route_read_weight != 0.0:
         rproj = jax.lax.stop_gradient(read_sig_proj.astype(jnp.float32))
-        read_sig = read_unit.astype(jnp.float32) @ rproj
+        read_f = jax.lax.stop_gradient(read_unit.astype(jnp.float32))
+        read_sig = read_f @ rproj
         read_sig = read_sig / (jnp.linalg.norm(read_sig, axis=-1, keepdims=True) + 1e-8)
         h_read = h[..., cursor:cursor + read_sig_dim].astype(jnp.float32)
         score = score + jnp.float32(route_read_weight) * _score_against_bank(h_read, read_sig)
@@ -474,7 +477,8 @@ def score_route_chunk(x, h, tag, read_unit, write_unit,
 
     if write_sig_dim > 0 and route_write_weight != 0.0:
         wproj = jax.lax.stop_gradient(write_sig_proj.astype(jnp.float32))
-        write_sig = write_unit.astype(jnp.float32) @ wproj
+        write_f = jax.lax.stop_gradient(write_unit.astype(jnp.float32))
+        write_sig = write_f @ wproj
         write_sig = write_sig / (jnp.linalg.norm(write_sig, axis=-1, keepdims=True) + 1e-8)
         h_write = h[..., cursor:cursor + write_sig_dim].astype(jnp.float32)
         score = score + jnp.float32(route_write_weight) * _score_against_bank(h_write, write_sig)
@@ -2995,4 +2999,3 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         return x @ params['token_emb']['embedding'].T
 
     return forward_fn
-
