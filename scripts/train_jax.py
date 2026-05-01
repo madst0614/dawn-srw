@@ -603,6 +603,100 @@ def _model_accepts_analysis(model):
         return False
 
 
+def _scalar0(x):
+    return jnp.asarray(x, dtype=jnp.float32).reshape(())
+
+
+def _global_norm_array(x):
+    x = jax.lax.stop_gradient(jnp.asarray(x, dtype=jnp.float32))
+    return jnp.sqrt(jnp.sum(jnp.square(x)) + 1e-12)
+
+
+def _row_norm_stats(x, prefix, full=False):
+    n = jax.lax.stop_gradient(
+        jnp.linalg.norm(jnp.asarray(x, dtype=jnp.float32), axis=-1))
+    out = {
+        f'{prefix}_mean': n.mean(),
+        f'{prefix}_std': n.std(),
+        f'{prefix}_max': n.max(),
+    }
+    if full:
+        out.update({
+            f'{prefix}_min': n.min(),
+            f'{prefix}_p50': jnp.quantile(n, 0.50),
+            f'{prefix}_p95': jnp.quantile(n, 0.95),
+            f'{prefix}_p99': jnp.quantile(n, 0.99),
+        })
+    return out
+
+
+def _op_gain_stats(read, write, prefix, full=False):
+    r = jax.lax.stop_gradient(
+        jnp.linalg.norm(jnp.asarray(read, dtype=jnp.float32), axis=-1))
+    w = jax.lax.stop_gradient(
+        jnp.linalg.norm(jnp.asarray(write, dtype=jnp.float32), axis=-1))
+    g = r * w
+    out = {
+        f'{prefix}_mean': g.mean(),
+        f'{prefix}_std': g.std(),
+        f'{prefix}_max': g.max(),
+    }
+    if full:
+        out.update({
+            f'{prefix}_min': g.min(),
+            f'{prefix}_p50': jnp.quantile(g, 0.50),
+            f'{prefix}_p95': jnp.quantile(g, 0.95),
+            f'{prefix}_p99': jnp.quantile(g, 0.99),
+        })
+    return out
+
+
+def _pool_param_diagnostics(params, full=False):
+    """Observational pool norm/gain diagnostics; never feeds loss."""
+    pool = params.get('neuron_pool', {})
+    out = {}
+    specs = (
+        ('qk', 'qk_emb', 'qk_read', 'qk_write', 'qk_scale'),
+        ('v', 'v_emb', 'v_read', 'v_write', 'v_scale'),
+        ('know', 'know_emb', 'know_read', 'know_write', 'know_scale'),
+    )
+    for name, emb_key, read_key, write_key, scale_key in specs:
+        if emb_key in pool:
+            out.update(_row_norm_stats(pool[emb_key], f'{name}_emb_norm', full))
+        if read_key in pool:
+            out.update(_row_norm_stats(pool[read_key], f'{name}_read_norm', full))
+        if write_key in pool:
+            out.update(_row_norm_stats(pool[write_key], f'{name}_write_norm', full))
+        if read_key in pool and write_key in pool:
+            out.update(_op_gain_stats(pool[read_key], pool[write_key],
+                                      f'{name}_op_gain', full))
+        if scale_key in pool:
+            out[f'{name}_pool_scale'] = _scalar0(pool[scale_key])
+    return out
+
+
+def _pool_update_diagnostics(params, grads):
+    """Approximate per-group update observability: grad_norm / param_norm."""
+    pool_p = params.get('neuron_pool', {})
+    pool_g = grads.get('neuron_pool', {})
+    out = {}
+    specs = (
+        ('qk', 'qk_emb', 'qk_read', 'qk_write'),
+        ('v', 'v_emb', 'v_read', 'v_write'),
+        ('know', 'know_emb', 'know_read', 'know_write'),
+    )
+    for name, emb_key, read_key, write_key in specs:
+        for short, key in (('emb', emb_key), ('read', read_key), ('write', write_key)):
+            p_norm = (_global_norm_array(pool_p[key])
+                      if key in pool_p else jnp.float32(0.0))
+            g_norm = (_global_norm_array(pool_g[key])
+                      if key in pool_g else jnp.float32(0.0))
+            out[f'{name}_{short}_param_norm'] = p_norm
+            out[f'{name}_{short}_grad_norm'] = g_norm
+            out[f'{name}_{short}_grad_ratio'] = g_norm / (p_norm + 1e-8)
+    return out
+
+
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
@@ -883,6 +977,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             _child_norm(_gpool, 'qk_write') + _child_norm(_gpool, 'v_write')
             + _child_norm(_gpool, 'know_write') + _child_norm(_gpool, 'q_write')
             + _child_norm(_gpool, 'k_write'))
+        pool_diag = _pool_param_diagnostics(params, full=False)
+        pool_update_diag = _pool_update_diagnostics(params, grads)
 
         # Emb drift is computed inside jit so every host participates in the
         # norm collective. A host-0-only version halts the launch group on
@@ -949,6 +1045,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
             'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
             'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
+            'know_gate_eff_n': result.get('know_gate_eff_n', jnp.float32(0.0)),
+            'know_gate_eff_ratio': result.get('know_gate_eff_ratio', jnp.float32(0.0)),
+            'know_top1_gate_frac': result.get('know_top1_gate_frac', jnp.float32(0.0)),
+            'know_top1_gate_frac_max': result.get('know_top1_gate_frac_max', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
@@ -963,6 +1063,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
             'attn_active_n_mean': result.get('attn_active_n_mean', jnp.float32(0.0)),
+            'attn_gate_eff_n': result.get('attn_gate_eff_n', jnp.float32(0.0)),
+            'attn_gate_eff_ratio': result.get('attn_gate_eff_ratio', jnp.float32(0.0)),
+            'attn_top1_gate_frac': result.get('attn_top1_gate_frac', jnp.float32(0.0)),
+            'attn_top1_gate_frac_max': result.get('attn_top1_gate_frac_max', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
@@ -1054,6 +1158,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'drift_v_emb': drift_v_emb,
             'drift_know_emb': drift_know_emb,
         }
+        metrics.update(pool_diag)
+        metrics.update(pool_update_diag)
 
         return new_params, new_opt_state, metrics
 
@@ -1119,9 +1225,59 @@ def create_analysis_step(model, sharded_fns=None):
             rngs={'dropout': eval_rng},
             **extra_kw,
         )
+        result = dict(result)
+        result.update(_pool_param_diagnostics(params, full=True))
         return result
 
     return analysis_step
+
+
+def create_geometry_step(max_sample=512):
+    """Rare, observational geometry diagnostics on a deterministic row sample."""
+    max_sample = int(max_sample)
+
+    def _geom_one(x, prefix):
+        x = jax.lax.stop_gradient(jnp.asarray(x, dtype=jnp.float32))
+        n = x.shape[0]
+        stride = max(1, n // max_sample)
+        xs = x[::stride][:max_sample]
+        xs = xs - xs.mean(axis=0, keepdims=True)
+        s = jnp.linalg.svd(xs, full_matrices=False, compute_uv=False)
+        energy = jnp.sum(jnp.square(s))
+        eff_rank = energy / (jnp.max(jnp.square(s)) + 1e-8)
+        xn = xs / (jnp.linalg.norm(xs, axis=-1, keepdims=True) + 1e-8)
+        sim = jnp.abs(xn @ xn.T)
+        mask = 1.0 - jnp.eye(sim.shape[0], dtype=jnp.float32)
+        denom = mask.sum() + 1e-8
+        sim_off = sim * mask
+        return {
+            f'{prefix}_geom_rank': eff_rank,
+            f'{prefix}_geom_cos_mean': sim_off.sum() / denom,
+            f'{prefix}_geom_cos_max': sim_off.max(),
+            f'{prefix}_geom_sv0': s[0],
+            f'{prefix}_geom_sv1': s[1],
+            f'{prefix}_geom_sv2': s[2],
+            f'{prefix}_geom_sv3': s[3],
+            f'{prefix}_geom_sv4': s[4],
+        }
+
+    @jax.jit
+    def geometry_step(params):
+        pool = params.get('neuron_pool', {})
+        out = {}
+        for name, emb_key, read_key, write_key in (
+                ('qk', 'qk_emb', 'qk_read', 'qk_write'),
+                ('v', 'v_emb', 'v_read', 'v_write'),
+                ('know', 'know_emb', 'know_read', 'know_write')):
+            if emb_key in pool:
+                out.update(_geom_one(pool[emb_key], f'{name}_emb'))
+            if read_key in pool:
+                out.update(_geom_one(pool[read_key], f'{name}_read'))
+            if write_key in pool:
+                out.update(_geom_one(pool[write_key], f'{name}_write'))
+        return out
+
+    return geometry_step
 
 
 # ============================================================
@@ -1702,6 +1858,14 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'know_gate_sum': float(m.get('know_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
         'know_active_n_mean': float(m.get('know_active_n_mean', 0.0)),
+        'attn_gate_eff_n': float(m.get('attn_gate_eff_n', 0.0)),
+        'attn_gate_eff_ratio': float(m.get('attn_gate_eff_ratio', 0.0)),
+        'attn_top1_gate_frac': float(m.get('attn_top1_gate_frac', 0.0)),
+        'attn_top1_gate_frac_max': float(m.get('attn_top1_gate_frac_max', 0.0)),
+        'know_gate_eff_n': float(m.get('know_gate_eff_n', 0.0)),
+        'know_gate_eff_ratio': float(m.get('know_gate_eff_ratio', 0.0)),
+        'know_top1_gate_frac': float(m.get('know_top1_gate_frac', 0.0)),
+        'know_top1_gate_frac_max': float(m.get('know_top1_gate_frac_max', 0.0)),
         'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
         'know_dead_count': float(m.get('know_dead_count', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
@@ -1743,11 +1907,47 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'qk_emb_norm_mean': float(m.get('qk_emb_norm_mean', 0.0)),
         'qk_emb_norm_min': float(m.get('qk_emb_norm_min', 0.0)),
         'qk_emb_norm_std': float(m.get('qk_emb_norm_std', 0.0)),
+        'qk_emb_norm_max': float(m.get('qk_emb_norm_max', 0.0)),
         'v_emb_norm_mean': float(m.get('v_emb_norm_mean', 0.0)),
         'v_emb_norm_min': float(m.get('v_emb_norm_min', 0.0)),
         'v_emb_norm_std': float(m.get('v_emb_norm_std', 0.0)),
+        'v_emb_norm_max': float(m.get('v_emb_norm_max', 0.0)),
         'know_read_norm': float(m.get('know_read_norm', 0.0)),
         'know_write_norm': float(m.get('know_write_norm', 0.0)),
+        'know_emb_norm_max': float(m.get('know_emb_norm_max', 0.0)),
+        'qk_read_norm_mean': float(m.get('qk_read_norm_mean', 0.0)),
+        'qk_read_norm_std': float(m.get('qk_read_norm_std', 0.0)),
+        'qk_read_norm_max': float(m.get('qk_read_norm_max', 0.0)),
+        'qk_write_norm_mean': float(m.get('qk_write_norm_mean', 0.0)),
+        'qk_write_norm_std': float(m.get('qk_write_norm_std', 0.0)),
+        'qk_write_norm_max': float(m.get('qk_write_norm_max', 0.0)),
+        'v_read_norm_mean': float(m.get('v_read_norm_mean', 0.0)),
+        'v_read_norm_std': float(m.get('v_read_norm_std', 0.0)),
+        'v_read_norm_max': float(m.get('v_read_norm_max', 0.0)),
+        'v_write_norm_mean': float(m.get('v_write_norm_mean', 0.0)),
+        'v_write_norm_std': float(m.get('v_write_norm_std', 0.0)),
+        'v_write_norm_max': float(m.get('v_write_norm_max', 0.0)),
+        'know_read_norm_mean': float(m.get('know_read_norm_mean', m.get('know_read_norm', 0.0))),
+        'know_read_norm_std': float(m.get('know_read_norm_std', 0.0)),
+        'know_read_norm_max': float(m.get('know_read_norm_max', 0.0)),
+        'know_write_norm_mean': float(m.get('know_write_norm_mean', m.get('know_write_norm', 0.0))),
+        'know_write_norm_std': float(m.get('know_write_norm_std', 0.0)),
+        'know_write_norm_max': float(m.get('know_write_norm_max', 0.0)),
+        'qk_op_gain_mean': float(m.get('qk_op_gain_mean', 0.0)),
+        'qk_op_gain_std': float(m.get('qk_op_gain_std', 0.0)),
+        'qk_op_gain_p99': float(m.get('qk_op_gain_p99', 0.0)),
+        'qk_op_gain_max': float(m.get('qk_op_gain_max', 0.0)),
+        'v_op_gain_mean': float(m.get('v_op_gain_mean', 0.0)),
+        'v_op_gain_std': float(m.get('v_op_gain_std', 0.0)),
+        'v_op_gain_p99': float(m.get('v_op_gain_p99', 0.0)),
+        'v_op_gain_max': float(m.get('v_op_gain_max', 0.0)),
+        'know_op_gain_mean': float(m.get('know_op_gain_mean', 0.0)),
+        'know_op_gain_std': float(m.get('know_op_gain_std', 0.0)),
+        'know_op_gain_p99': float(m.get('know_op_gain_p99', 0.0)),
+        'know_op_gain_max': float(m.get('know_op_gain_max', 0.0)),
+        'qk_pool_scale': float(m.get('qk_pool_scale', 0.0)),
+        'v_pool_scale': float(m.get('v_pool_scale', 0.0)),
+        'know_pool_scale': float(m.get('know_pool_scale', 0.0)),
         'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
         'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
         'know_raw_out_norm': float(m.get('know_raw_out_norm', 0.0)),
@@ -1767,6 +1967,17 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
     }
+    if rec['attn_top1_gate_frac'] == 0.0:
+        rec['attn_top1_gate_frac'] = rec['attn_raw_gate_max'] / max(rec['attn_gate_sum'], 1e-8)
+    if rec['know_top1_gate_frac'] == 0.0:
+        rec['know_top1_gate_frac'] = rec['know_raw_gate_max'] / max(rec['know_gate_sum'], 1e-8)
+    _lr = float(ctx.get('current_lr', 0.0))
+    for _pool in ('qk', 'v', 'know'):
+        for _part in ('emb', 'read', 'write'):
+            rec[f'{_pool}_{_part}_grad_ratio'] = float(
+                m.get(f'{_pool}_{_part}_grad_ratio', 0.0))
+            rec[f'{_pool}_{_part}_update_ratio'] = (
+                _lr * rec[f'{_pool}_{_part}_grad_ratio'])
     if is_v415:
         rec.pop('attn_den_cost_mean', None)
         rec.pop('know_den_cost_mean', None)
@@ -1817,6 +2028,16 @@ def _print_regular_block(rec, ctx):
         f" v={rec['drift_v_emb']:.2e}"
         f" k={rec['drift_know_emb']:.2e}]"
     )
+    log_message(
+        f"  gate_conc: a[eff={rec['attn_gate_eff_n']:.1f}"
+        f" ratio={rec['attn_gate_eff_ratio']:.3f}"
+        f" top1={rec['attn_top1_gate_frac']:.3f}]"
+        f" k[eff={rec['know_gate_eff_n']:.1f}"
+        f" ratio={rec['know_gate_eff_ratio']:.3f}"
+        f" top1={rec['know_top1_gate_frac']:.3f}]"
+        f" | pool_scale qk={rec['qk_pool_scale']:.3f}"
+        f" v={rec['v_pool_scale']:.3f} k={rec['know_pool_scale']:.3f}"
+    )
     if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
@@ -1844,11 +2065,33 @@ def _print_regular_block(rec, ctx):
     log_message(
         f"  score_std[a={rec['attn_score_std']:.2f} k={rec['know_score_std']:.2f}]"
         f" | emb_n k[m={rec['know_emb_norm']:.2f} s={rec['know_emb_norm_std']:.2f}"
-        f" min={rec['know_emb_norm_min']:.2f}]"
+        f" min={rec['know_emb_norm_min']:.2f} max={rec['know_emb_norm_max']:.2f}]"
         f" qk[m={rec['qk_emb_norm_mean']:.2f} s={rec['qk_emb_norm_std']:.2f}"
-        f" min={rec['qk_emb_norm_min']:.2f}]"
+        f" min={rec['qk_emb_norm_min']:.2f} max={rec['qk_emb_norm_max']:.2f}]"
         f" v[m={rec['v_emb_norm_mean']:.2f} s={rec['v_emb_norm_std']:.2f}"
-        f" min={rec['v_emb_norm_min']:.2f}]"
+        f" min={rec['v_emb_norm_min']:.2f} max={rec['v_emb_norm_max']:.2f}]"
+    )
+    log_message(
+        f"  rw_n: qk r[m={rec['qk_read_norm_mean']:.2f} s={rec['qk_read_norm_std']:.2f}"
+        f" max={rec['qk_read_norm_max']:.2f}]"
+        f" w[m={rec['qk_write_norm_mean']:.2f} s={rec['qk_write_norm_std']:.2f}"
+        f" max={rec['qk_write_norm_max']:.2f}]"
+        f" | v r[m={rec['v_read_norm_mean']:.2f} s={rec['v_read_norm_std']:.2f}"
+        f" max={rec['v_read_norm_max']:.2f}]"
+        f" w[m={rec['v_write_norm_mean']:.2f} s={rec['v_write_norm_std']:.2f}"
+        f" max={rec['v_write_norm_max']:.2f}]"
+        f" | k r[m={rec['know_read_norm_mean']:.2f} s={rec['know_read_norm_std']:.2f}"
+        f" max={rec['know_read_norm_max']:.2f}]"
+        f" w[m={rec['know_write_norm_mean']:.2f} s={rec['know_write_norm_std']:.2f}"
+        f" max={rec['know_write_norm_max']:.2f}]"
+    )
+    log_message(
+        f"  op_gain: qk[m={rec['qk_op_gain_mean']:.2f} s={rec['qk_op_gain_std']:.2f}"
+        f" max={rec['qk_op_gain_max']:.2f}]"
+        f" v[m={rec['v_op_gain_mean']:.2f} s={rec['v_op_gain_std']:.2f}"
+        f" max={rec['v_op_gain_max']:.2f}]"
+        f" k[m={rec['know_op_gain_mean']:.2f} s={rec['know_op_gain_std']:.2f}"
+        f" max={rec['know_op_gain_max']:.2f}]"
     )
     log_message(
         f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
@@ -1942,6 +2185,39 @@ def _build_analysis_record(base, metrics, ctx):
         'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
         'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
     })
+    for _pool in ('qk', 'v', 'know'):
+        for _kind in ('emb_norm', 'read_norm', 'write_norm', 'op_gain'):
+            for _stat in ('mean', 'std', 'min', 'p50', 'p95', 'p99', 'max'):
+                rec[f'{_pool}_{_kind}_{_stat}'] = float(
+                    m.get(f'{_pool}_{_kind}_{_stat}', 0.0))
+        rec[f'{_pool}_pool_scale'] = float(m.get(f'{_pool}_pool_scale', 0.0))
+    rec['attn_gate_eff_n'] = float(m.get('attn_gate_eff_n', 0.0))
+    rec['attn_gate_eff_ratio'] = float(m.get('attn_gate_eff_ratio', 0.0))
+    rec['attn_top1_gate_frac'] = float(m.get('attn_top1_gate_frac', 0.0))
+    rec['attn_top1_gate_frac_max'] = float(m.get('attn_top1_gate_frac_max', 0.0))
+    rec['know_gate_eff_n'] = float(m.get('know_gate_eff_n', 0.0))
+    rec['know_gate_eff_ratio'] = float(m.get('know_gate_eff_ratio', 0.0))
+    rec['know_top1_gate_frac'] = float(m.get('know_top1_gate_frac', 0.0))
+    rec['know_top1_gate_frac_max'] = float(m.get('know_top1_gate_frac_max', 0.0))
+    if rec['attn_top1_gate_frac'] == 0.0:
+        rec['attn_top1_gate_frac'] = (
+            float(m.get('attn_raw_gate_max', 0.0))
+            / max(float(m.get('attn_gate_sum', 0.0)), 1e-8))
+    if rec['know_top1_gate_frac'] == 0.0:
+        rec['know_top1_gate_frac'] = (
+            float(m.get('know_raw_gate_max', 0.0))
+            / max(float(m.get('know_gate_sum', 0.0)), 1e-8))
+    if rec['attn_top1_gate_frac_max'] == 0.0:
+        rec['attn_top1_gate_frac_max'] = rec['attn_top1_gate_frac']
+    if rec['know_top1_gate_frac_max'] == 0.0:
+        rec['know_top1_gate_frac_max'] = rec['know_top1_gate_frac']
+    _lr = float(ctx.get('current_lr', 0.0))
+    for _pool in ('qk', 'v', 'know'):
+        for _part in ('emb', 'read', 'write'):
+            rec[f'{_pool}_{_part}_grad_ratio'] = float(
+                m.get(f'{_pool}_{_part}_grad_ratio', 0.0))
+            rec[f'{_pool}_{_part}_update_ratio'] = (
+                _lr * rec[f'{_pool}_{_part}_grad_ratio'])
     if is_v415:
         rec.pop('attn_den_cost', None)
         rec.pop('know_den_cost', None)
@@ -1967,6 +2243,18 @@ def _build_analysis_record(base, metrics, ctx):
 
 
 def _print_analysis_block(rec, ctx):
+    def _full(prefix):
+        return (f"m={rec[f'{prefix}_mean']:.2f} s={rec[f'{prefix}_std']:.2f}"
+                f" min={rec[f'{prefix}_min']:.2f} p50={rec[f'{prefix}_p50']:.2f}"
+                f" p95={rec[f'{prefix}_p95']:.2f} p99={rec[f'{prefix}_p99']:.2f}"
+                f" max={rec[f'{prefix}_max']:.2f}")
+
+    def _emb_full(prefix):
+        return (f"m={rec[f'{prefix}_mean']:.2f} s={rec[f'{prefix}_std']:.2f}"
+                f" min={rec[f'{prefix}_min']:.2f}"
+                f" p95={rec[f'{prefix}_p95']:.2f} p99={rec[f'{prefix}_p99']:.2f}"
+                f" max={rec[f'{prefix}_max']:.2f}")
+
     log_message(
         f"  dist k[skew={rec['know_score_skew']:+.2f} kurt={rec['know_score_kurt']:.2f}"
         f" apt_std={rec['know_active_per_token_std']:.1f} ent={rec['know_gate_entropy']:.2f}]"
@@ -1988,6 +2276,36 @@ def _print_analysis_block(rec, ctx):
         f" | emb_max k={rec['know_emb_norm_max']:.2f}"
         f" qk={rec['qk_emb_norm_max']:.2f}"
         f" v={rec['v_emb_norm_max']:.2f}"
+    )
+    log_message(
+        f"  emb_full qk[{_emb_full('qk_emb_norm')}]"
+        f" v[{_emb_full('v_emb_norm')}]"
+        f" k[{_emb_full('know_emb_norm')}]"
+    )
+    log_message(
+        f"  rw_full qk_r[{_full('qk_read_norm')}]"
+        f" qk_w[{_full('qk_write_norm')}]"
+        f" v_r[{_full('v_read_norm')}]"
+        f" v_w[{_full('v_write_norm')}]"
+        f" k_r[{_full('know_read_norm')}]"
+        f" k_w[{_full('know_write_norm')}]"
+    )
+    log_message(
+        f"  op_gain_full qk[{_full('qk_op_gain')}]"
+        f" v[{_full('v_op_gain')}]"
+        f" k[{_full('know_op_gain')}]"
+    )
+    log_message(
+        f"  gate_conc a[eff={rec['attn_gate_eff_n']:.1f}"
+        f" ratio={rec['attn_gate_eff_ratio']:.3f}"
+        f" top1_m={rec['attn_top1_gate_frac']:.3f}"
+        f" top1_max={rec['attn_top1_gate_frac_max']:.3f}]"
+        f" k[eff={rec['know_gate_eff_n']:.1f}"
+        f" ratio={rec['know_gate_eff_ratio']:.3f}"
+        f" top1_m={rec['know_top1_gate_frac']:.3f}"
+        f" top1_max={rec['know_top1_gate_frac_max']:.3f}]"
+        f" | pool_scale qk={rec['qk_pool_scale']:.3f}"
+        f" v={rec['v_pool_scale']:.3f} k={rec['know_pool_scale']:.3f}"
     )
     if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
         log_message(
@@ -2017,12 +2335,37 @@ def _print_analysis_block(rec, ctx):
         f" logit_max={rec['debug_logit_max']:.1f}"
         f" o_in={rec['debug_o_input_norm']:.2f}"
     )
+    log_message(
+        f"  grad_ratio qk[emb={rec['qk_emb_grad_ratio']:.2e}"
+        f" r={rec['qk_read_grad_ratio']:.2e} w={rec['qk_write_grad_ratio']:.2e}]"
+        f" v[emb={rec['v_emb_grad_ratio']:.2e}"
+        f" r={rec['v_read_grad_ratio']:.2e} w={rec['v_write_grad_ratio']:.2e}]"
+        f" k[emb={rec['know_emb_grad_ratio']:.2e}"
+        f" r={rec['know_read_grad_ratio']:.2e} w={rec['know_write_grad_ratio']:.2e}]"
+    )
     if 'hbm_used_gb' in rec:
         log_message(
             f"  HBM: {rec['hbm_used_gb']:.2f}G / {rec['hbm_limit_gb']:.2f}G"
             f" (peak={rec['hbm_peak_gb']:.2f}G,"
             f" free={rec['hbm_limit_gb'] - rec['hbm_used_gb']:.2f}G)"
         )
+
+
+def _print_geometry_block(geom):
+    def _line(name, label):
+        sv = [float(geom.get(f'{name}_geom_sv{i}', 0.0)) for i in range(5)]
+        log_message(
+            f"  geom {label}[rank={float(geom.get(f'{name}_geom_rank', 0.0)):.1f}"
+            f" cos_m={float(geom.get(f'{name}_geom_cos_mean', 0.0)):.3f}"
+            f" cos_max={float(geom.get(f'{name}_geom_cos_max', 0.0)):.3f}"
+            f" sv5=[{' '.join(f'{v:.2f}' for v in sv)}]]"
+        )
+    for _name, _label in (
+            ('qk_emb', 'qk_emb'), ('qk_read', 'qk_r'), ('qk_write', 'qk_w'),
+            ('v_emb', 'v_emb'), ('v_read', 'v_r'), ('v_write', 'v_w'),
+            ('know_emb', 'k_emb'), ('know_read', 'k_r'), ('know_write', 'k_w')):
+        if f'{_name}_geom_rank' in geom:
+            _line(_name, _label)
 
 
 # ============================================================
@@ -2090,6 +2433,7 @@ def main():
     # 2-tier logging cadence.
     log_interval = int(tcfg.get('log_interval', 100))
     log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
+    heavy_geometry_multiplier = int(tcfg.get('heavy_geometry_multiplier', 5))
 
     max_seq_len = cfg['model'].get('max_seq_len', 512)
 
@@ -2292,6 +2636,8 @@ def main():
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
                 'log_analysis_multiplier', log_analysis_multiplier))
+            heavy_geometry_multiplier = int(saved_training_config.get(
+                'heavy_geometry_multiplier', heavy_geometry_multiplier))
             if jax.process_index() == 0:
                 print(f"  Training config restored from checkpoint (CLI overrides take precedence)")
 
@@ -2316,6 +2662,7 @@ def main():
         'exploration_bound_eps': exploration_bound_eps,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
+        'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
 
     # ----------------------------------------------------------
@@ -2833,6 +3180,10 @@ def main():
             model, sharded_fns=_sharded_fns_analysis)
     else:
         analysis_step_fn = None
+    geometry_step_fn = create_geometry_step(
+        max_sample=int(tcfg.get(
+            'geometry_max_sample',
+            tcfg.get('heavy_geometry_max_sample', 512))))
 
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
@@ -3388,9 +3739,11 @@ def main():
     # log_interval * log_analysis_multiplier steps.
     LOG_REGULAR = log_interval
     LOG_ANALYSIS = max(1, log_interval * log_analysis_multiplier)
+    LOG_GEOMETRY = max(1, LOG_ANALYSIS * heavy_geometry_multiplier)
     if is_host0:
         print(f"  Log cadence: regular={LOG_REGULAR}"
               f" analysis={LOG_ANALYSIS}"
+              f" geometry={LOG_GEOMETRY}"
               f" val={val_interval}",
               flush=True)
 
@@ -3594,6 +3947,7 @@ def main():
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
             _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)
+            _do_geometry = (global_step % LOG_GEOMETRY == 0 and global_step > 0)
             _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
             _new_best = False
 
@@ -3652,10 +4006,17 @@ def main():
                                     'n_qk', cfg['model'].get('n_q', 0)),
                                 'n_v_cfg': cfg['model'].get('n_v', 0),
                                 'n_know_cfg': cfg['model'].get('n_know', 0),
+                                'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
                             }
+                            analysis_payload = dict(analysis_result)
+                            for _pool in ('qk', 'v', 'know'):
+                                for _part in ('emb', 'read', 'write'):
+                                    _key = f'{_pool}_{_part}_grad_ratio'
+                                    analysis_payload[_key] = metrics.get(
+                                        _key, jnp.float32(0.0))
                             a_rec = _build_analysis_record(
-                                {}, analysis_result, _ctx_a)
+                                {}, analysis_payload, _ctx_a)
                             a_rec['step'] = global_step
                             a_rec['epoch'] = epoch
                             a_rec['analysis_step_sec'] = float(_a_elapsed)
@@ -3672,6 +4033,28 @@ def main():
                             pass
                         del _a_ids, _a_mask, _analysis_batch
 
+            if _do_geometry and geometry_step_fn is not None:
+                try:
+                    geom = geometry_step_fn(params)
+                    jax.block_until_ready(
+                        geom.get('qk_emb_geom_rank', jnp.float32(0.0)))
+                    if is_host0:
+                        geom_host = jax.device_get(geom)
+                        log_message("  Rare geometry diagnostics:")
+                        _print_geometry_block(geom_host)
+                        log_jsonl({
+                            'type': 'geometry',
+                            'step': global_step,
+                            'epoch': epoch,
+                            **{k: float(v) for k, v in geom_host.items()},
+                            'timestamp': datetime.now().isoformat(),
+                        })
+                        sync_logs()
+                finally:
+                    try:
+                        del geom
+                    except NameError:
+                        pass
 
             # ---- Unified save path ----
             # best_model + mid-epoch checkpoint share a single gather +
