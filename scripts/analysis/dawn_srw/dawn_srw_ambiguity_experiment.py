@@ -40,7 +40,9 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -54,10 +56,12 @@ from dawn_srw_common import (
     ensure_dir,
     find_token_index,
     import_dawn_srw,
+    is_gcs,
     load_checkpoint_params,
     load_config,
     load_tokenizer,
     model_cfg_from_config,
+    open_file,
     save_json,
 )
 from dawn_srw_decision_probe import forward_to_rst_input, compute_rst_decision
@@ -100,6 +104,36 @@ def _safe_name(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9_.-]+", "_", s)
     return s.strip("_") or "case"
+
+
+def _out_path(output_dir: str, filename: str) -> str:
+    """Join an output directory and filename without corrupting gs:// paths."""
+    return str(output_dir).rstrip("/") + "/" + filename
+
+
+def _write_matplotlib_figure(plt, output_dir: str, filename: str, dpi: int = 180) -> str:
+    """Save the current matplotlib figure to local or GCS output_dir.
+
+    pathlib normalizes ``gs://bucket`` into ``gs:/bucket``.  For GCS outputs,
+    save to a local temporary file first, then upload with open_file().
+    """
+    dest = _out_path(output_dir, filename)
+    if is_gcs(dest):
+        suffix = Path(filename).suffix or ".png"
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_name = tmp.name
+            plt.savefig(tmp_name, dpi=dpi)
+            with open(tmp_name, "rb") as src, open_file(dest, "wb") as dst:
+                dst.write(src.read())
+        finally:
+            if tmp_name and os.path.exists(tmp_name):
+                os.remove(tmp_name)
+    else:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        plt.savefig(dest, dpi=dpi)
+    return dest
 
 
 def jaccard(a: Sequence[int], b: Sequence[int]) -> float:
@@ -397,8 +431,9 @@ def run_pair(
 
 
 def _write_case_csv(case: Dict[str, object], output_dir: str) -> str:
-    path = Path(output_dir) / f"{_safe_name(case['target'])}_jaccard_by_layer.csv"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _out_path(str(output_dir), f"{_safe_name(case['target'])}_jaccard_by_layer.csv")
+    if not is_gcs(path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "target",
         "layer",
@@ -417,7 +452,7 @@ def _write_case_csv(case: Dict[str, object], output_dir: str) -> str:
         "a_attn_norm",
         "b_attn_norm",
     ]
-    with path.open("w", newline="") as f:
+    with open_file(path, "w") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for row in case["layers"]:
@@ -441,7 +476,7 @@ def _write_case_csv(case: Dict[str, object], output_dir: str) -> str:
                 "a_attn_norm": a["attention_output_norm_at_token"],
                 "b_attn_norm": b["attention_output_norm_at_token"],
             })
-    return str(path)
+    return path
 
 
 def _plot_case(case: Dict[str, object], output_dir: str):
@@ -453,8 +488,6 @@ def _plot_case(case: Dict[str, object], output_dir: str):
         print(f"  plot skipped: matplotlib unavailable ({exc})")
         return []
 
-    outdir = Path(output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
     target = str(case["target"])
     stem = _safe_name(target)
     layers = np.asarray([r["layer"] for r in case["layers"]], dtype=np.int32)
@@ -473,10 +506,9 @@ def _plot_case(case: Dict[str, object], output_dir: str):
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    p = outdir / f"{stem}_jaccard_by_layer.png"
-    plt.savefig(p, dpi=180)
+    p = _write_matplotlib_figure(plt, output_dir, f"{stem}_jaccard_by_layer.png")
     plt.close()
-    paths.append(str(p))
+    paths.append(p)
 
     # RST norm by layer.
     plt.figure(figsize=(8, 4.8))
@@ -490,10 +522,9 @@ def _plot_case(case: Dict[str, object], output_dir: str):
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    p = outdir / f"{stem}_rst_norm_by_layer.png"
-    plt.savefig(p, dpi=180)
+    p = _write_matplotlib_figure(plt, output_dir, f"{stem}_rst_norm_by_layer.png")
     plt.close()
-    paths.append(str(p))
+    paths.append(p)
 
     # Active counts by layer.
     plt.figure(figsize=(8, 4.8))
@@ -505,10 +536,9 @@ def _plot_case(case: Dict[str, object], output_dir: str):
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    p = outdir / f"{stem}_active_count_by_layer.png"
-    plt.savefig(p, dpi=180)
+    p = _write_matplotlib_figure(plt, output_dir, f"{stem}_active_count_by_layer.png")
     plt.close()
-    paths.append(str(p))
+    paths.append(p)
 
     return paths
 
@@ -534,8 +564,6 @@ def _plot_mean(results: Dict[str, object], output_dir: str):
         arr = np.asarray([[r[key] for r in c["layers"]] for c in cases], dtype=np.float64)
         return arr.mean(axis=0), arr.std(axis=0)
 
-    outdir = Path(output_dir)
-    outdir.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(8, 4.8))
     for key, label in [
         ("active_set_jaccard", "active set"),
@@ -552,10 +580,9 @@ def _plot_mean(results: Dict[str, object], output_dir: str):
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    p = outdir / "mean_jaccard_by_layer.png"
-    plt.savefig(p, dpi=180)
+    p = _write_matplotlib_figure(plt, output_dir, "mean_jaccard_by_layer.png")
     plt.close()
-    return str(p)
+    return p
 
 
 def main():
