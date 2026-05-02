@@ -3,16 +3,40 @@
 This document preserves model history that should not live inside active model
 source files. Active source files describe current behavior only.
 
-## spatial-r1-v4.1.5.5
+## dawn_srw
 
-- Active implementation: `models/dawn_spatial_v4155.py`
+- Active implementation: `models/dawn_srw.py`
+- Compatibility implementation path: `models/dawn_spatial_v4155.py`
 - Training entry point: `scripts/train_jax.py`
+- `dawn_srw` is the official model name. The former
+  `spatial-r1-v4.1.5.5` key is retained only as a legacy config/checkpoint
+  alias.
+- Terminology/API refactor:
+  - DAWN-SRW is the active model name; the implementation is described in
+    terms of SRW neurons, signature embeddings, RW operators, Attention Layer,
+    RST Layer, model decisions, and scan offsets.
+  - Pool params were renamed:
+    `qk_* -> attn_qk_*`, `v_* -> attn_v_*`, `know_* -> rst_*`.
+  - Router params were renamed:
+    `proj_know -> proj_rst`, `tau_know -> tau_rst`,
+    `scan_bias_attn -> raw_scan_offset_attn`, and
+    `scan_bias_know -> raw_scan_offset_rst`.
+  - Forward helpers were renamed:
+    `AttentionCircuit -> AttentionLayer`,
+    `_know_forward -> _rst_forward`, and
+    `_know_forward_inference -> _rst_forward_inference`.
+  - Public metrics now use primary `rst_*`, `attn_qk_*`, and `attn_v_*`
+    names; temporary legacy aliases are returned for `train_jax.py` logging.
+  - Legacy checkpoint migration is exposed as
+    `migrate_legacy_v4155_params(params)` and preserves already-migrated
+    values when old and new keys both exist.
 - Functional change from v4.1.5.2: read/write vectors are used raw in SRW;
-  their norms are learnable operator gain axes.
+  their magnitudes are natural vector magnitudes.
 - Gate and denominator are unchanged from v4.1.5.2:
   `gate = activation * intensity`, `den = max(sum(gate), 1.0)`.
-- Weight decay: `qk_emb`, `v_emb`, `know_emb`, and raw read/write vectors
-  all receive `pool_weight_decay`; only v4.1.5.2 excludes read/write WD.
+- Weight decay: `attn_qk_emb`, `attn_v_emb`, `rst_emb`, and raw read/write
+  vectors all receive `pool_weight_decay`; only v4.1.5.2 excludes read/write
+  WD.
 
 ## spatial-r1-v4.1.5.4
 
@@ -203,9 +227,8 @@ source files. Active source files describe current behavior only.
 
 ## spatial-r1-v3.9.4
 
-- Implementation moved to `models/legacy/dawn_spatial_v394_exp.py`.
-- `models/dawn_spatial_v394_exp.py` remains as a compatibility entry point
-  so existing training registry entries and configs keep working.
+- Implementation lives in `models/legacy/dawn_spatial_v394_exp.py`.
+- Training registry entries import the legacy module directly.
 - Removed `tanh(gate_max)` output heuristic.
 - Used gate-sum normalization with fixed output scale.
 - Let `x @ read` naturally modulate per-token output magnitude.

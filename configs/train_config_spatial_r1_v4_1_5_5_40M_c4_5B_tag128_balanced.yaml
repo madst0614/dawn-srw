@@ -1,8 +1,8 @@
-# DAWN Spatial-R1 v4.1.5.5 -- d_route-only tag routing
+# DAWN-SRW -- d_route-only tag routing
 #
 # Sister of train_config_spatial_r1_v4_1_40M_c4_5B.yaml.
-# train_jax.py maps model_version: "spatial-r1-v4.1.5.5" to:
-#   models/dawn_spatial_v4155.py
+# train_jax.py maps model_version: "dawn_srw" to:
+#   models/dawn_srw.py
 #
 # This keeps the baseline v4.1 training hyperparameters fixed while using
 # the d_route-only route convention:
@@ -29,7 +29,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v4.1.5.5"
+  model_version: "dawn_srw"
   d_model: 384
   n_layers: 12
   n_heads: 6
@@ -100,5 +100,5 @@ training:
   heavy_geometry_multiplier: 10
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.5_40M_c4_5B_tag128_balanced
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_spatial_r1v4.1.5.5_40M_c4_5B_tag128_balanced
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_tag128_balanced
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_40M_c4_5B_tag128_balanced

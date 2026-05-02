@@ -54,9 +54,12 @@ from jax.experimental.shard_map import shard_map
 # Model registry imports. Legacy DAWN experiments live in models/legacy/;
 # restore and re-register them only when reproducing an old run.
 from models.baseline_transformer_jax import VanillaTransformer
-from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
+from models.legacy.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.dawn_spatial_v4152 import DAWN as DAWN_V4152
-from models.dawn_spatial_v4155 import DAWN as DAWN_V4155
+from models.dawn_srw import (
+    DAWN as DAWN_SRW,
+    migrate_legacy_v4155_params,
+)
 
 # ============================================================
 # Constants
@@ -242,6 +245,18 @@ def _dawn_v4152_kwargs(cfg):
     return kw
 
 
+def _dawn_srw_kwargs(cfg):
+    """Official DAWN-SRW path; accepts n_rst while preserving n_know configs."""
+    kw = _dawn_v4152_kwargs(cfg)
+    m = cfg['model']
+    t = cfg['training']
+    if 'n_rst' in m:
+        kw['n_rst'] = m['n_rst']
+        kw['n_know'] = m.get('n_know', None)
+    kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
+    return kw
+
+
 def _v415_sharded_kwargs(cfg):
     """Gate constants for the active v4.1.5 sharded SRW path."""
     t = cfg['training']
@@ -266,7 +281,7 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v3.9.4': ModelSpec(
         name='spatial-r1-v3.9.4',
-        module_path='models.dawn_spatial_v394_exp',
+        module_path='models.legacy.dawn_spatial_v394_exp',
         cls=DAWN_V394,
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
@@ -280,11 +295,21 @@ MODEL_REGISTRY = {
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
     ),
+    'dawn_srw': ModelSpec(
+        name='dawn_srw',
+        module_path='models.dawn_srw',
+        cls=DAWN_SRW,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    ),
+    # Legacy model_version alias for existing configs/checkpoints.
     'spatial-r1-v4.1.5.5': ModelSpec(
-        name='spatial-r1-v4.1.5.5',
-        module_path='models.dawn_spatial_v4155',
-        cls=DAWN_V4155,
-        build_kwargs=_dawn_v4152_kwargs,
+        name='dawn_srw',
+        module_path='models.dawn_srw',
+        cls=DAWN_SRW,
+        build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
@@ -300,7 +325,7 @@ def build_model_from_config(cfg):
     MODEL_REGISTRY when resuming old checkpoints or reproducing paper
     results. See models/legacy/README.md.
     """
-    version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
+    version = cfg['model'].get('model_version', 'dawn_srw')
     if version not in MODEL_REGISTRY:
         raise ValueError(
             f"Unknown model_version: {version!r}. "
@@ -310,7 +335,8 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
+    if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+                   'dawn_srw'):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -656,9 +682,9 @@ def _pool_param_diagnostics(params, full=False):
     pool = params.get('neuron_pool', {})
     out = {}
     specs = (
-        ('qk', 'qk_emb', 'qk_read', 'qk_write', 'qk_scale'),
-        ('v', 'v_emb', 'v_read', 'v_write', 'v_scale'),
-        ('know', 'know_emb', 'know_read', 'know_write', 'know_scale'),
+        ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write', 'attn_qk_scale'),
+        ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write', 'attn_v_scale'),
+        ('rst', 'rst_emb', 'rst_read', 'rst_write', 'rst_scale'),
     )
     for name, emb_key, read_key, write_key, scale_key in specs:
         if emb_key in pool:
@@ -681,9 +707,9 @@ def _pool_update_diagnostics(params, grads):
     pool_g = grads.get('neuron_pool', {})
     out = {}
     specs = (
-        ('qk', 'qk_emb', 'qk_read', 'qk_write'),
-        ('v', 'v_emb', 'v_read', 'v_write'),
-        ('know', 'know_emb', 'know_read', 'know_write'),
+        ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write'),
+        ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write'),
+        ('rst', 'rst_emb', 'rst_read', 'rst_write'),
     )
     for name, emb_key, read_key, write_key in specs:
         for short, key in (('emb', emb_key), ('read', read_key), ('write', write_key)):
@@ -777,11 +803,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_offset', None)
-            know_tau_off = result.get('know_tau_offset', None)
+            rst_tau_off = result.get('rst_tau_offset', None)
             valid_mask = result.get('valid_mask', None)
             have_explore = (per_token_ce is not None
                             and attn_tau_off is not None
-                            and know_tau_off is not None
+                            and rst_tau_off is not None
                             and valid_mask is not None
                             and _global_mean_reducer is not None)
             if have_explore:
@@ -798,9 +824,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # NOT clipped (CE keeps full gradient); only the explore-loss
                 # contribution is turned off per-element when further push in
                 # that direction would breach [lower, upper].
-                # attn_tau_off shape [L, B, S, 3]; know_tau_off [L, B, S, 1].
+                # attn_tau_off shape [L, B, S, 3]; rst_tau_off [L, B, S, 1].
                 a_tau_t = attn_tau_off[:, :, :-1, :]     # [L, B, S-1, 3]
-                k_tau_t = know_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
+                k_tau_t = rst_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
                 dev_b = signal[None, :, :, None]          # [1, B, S-1, 1]
                 vmask_b = vmask_f[None, :, :, None]       # [1, B, S-1, 1]
 
@@ -817,17 +843,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
                 # tau_offset distribution diagnostics (stop_gradient, obs-only).
                 _a_tau_flat = jax.lax.stop_gradient(attn_tau_off)
-                _k_tau_flat = jax.lax.stop_gradient(know_tau_off)
+                _k_tau_flat = jax.lax.stop_gradient(rst_tau_off)
                 attn_tau_off_min = _a_tau_flat.min()
                 attn_tau_off_max = _a_tau_flat.max()
                 attn_tau_off_p99 = jnp.quantile(_a_tau_flat, 0.99)
                 attn_tau_off_p01 = jnp.quantile(_a_tau_flat, 0.01)
                 attn_tau_off_neg_frac = (_a_tau_flat < 0).astype(jnp.float32).mean()
-                know_tau_off_min = _k_tau_flat.min()
-                know_tau_off_max = _k_tau_flat.max()
-                know_tau_off_p99 = jnp.quantile(_k_tau_flat, 0.99)
-                know_tau_off_p01 = jnp.quantile(_k_tau_flat, 0.01)
-                know_tau_off_neg_frac = (_k_tau_flat < 0).astype(jnp.float32).mean()
+                rst_tau_off_min = _k_tau_flat.min()
+                rst_tau_off_max = _k_tau_flat.max()
+                rst_tau_off_p99 = jnp.quantile(_k_tau_flat, 0.99)
+                rst_tau_off_p01 = jnp.quantile(_k_tau_flat, 0.01)
+                rst_tau_off_neg_frac = (_k_tau_flat < 0).astype(jnp.float32).mean()
 
                 # Per-element contribution -reduce. Gradient flows through
                 # the tau_offset tensor only (signal is stop_gradient'd).
@@ -835,8 +861,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 a_contrib = dev_b * a_tau_t * a_active * vmask_b
                 k_contrib = dev_b * k_tau_t * k_active * vmask_b
                 explore_attn_raw = a_contrib.sum() / vsum_eps
-                explore_know_raw = k_contrib.sum() / vsum_eps
-                explore_loss_raw = explore_attn_raw + explore_know_raw
+                explore_rst_raw = k_contrib.sum() / vsum_eps
+                explore_loss_raw = explore_attn_raw + explore_rst_raw
 
                 # Observational stats (same interface as before).
                 pos_mask = (deviation > 0).astype(jnp.float32) * vmask_f
@@ -863,7 +889,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 global_mean_ce = jnp.float32(0.0)
                 explore_loss_raw = jnp.float32(0.0)
                 explore_attn_raw = jnp.float32(0.0)
-                explore_know_raw = jnp.float32(0.0)
+                explore_rst_raw = jnp.float32(0.0)
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
                 neg_mean = jnp.float32(0.0)
@@ -876,11 +902,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 attn_tau_off_p99 = jnp.float32(0.0)
                 attn_tau_off_p01 = jnp.float32(0.0)
                 attn_tau_off_neg_frac = jnp.float32(0.0)
-                know_tau_off_min = jnp.float32(0.0)
-                know_tau_off_max = jnp.float32(0.0)
-                know_tau_off_p99 = jnp.float32(0.0)
-                know_tau_off_p01 = jnp.float32(0.0)
-                know_tau_off_neg_frac = jnp.float32(0.0)
+                rst_tau_off_min = jnp.float32(0.0)
+                rst_tau_off_max = jnp.float32(0.0)
+                rst_tau_off_p99 = jnp.float32(0.0)
+                rst_tau_off_p01 = jnp.float32(0.0)
+                rst_tau_off_neg_frac = jnp.float32(0.0)
             # Warmup gate: zero out explore loss until warmup_steps has passed.
             # W_sense needs time to settle before exploration signals become
             # meaningful; early CE-dominated learning keeps tau gradient clean.
@@ -916,16 +942,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 global_mean_ce=global_mean_ce,
                 explore_loss_raw=explore_loss_raw,
                 explore_attn_raw=explore_attn_raw,
-                explore_know_raw=explore_know_raw,
+                explore_rst_raw=explore_rst_raw,
                 pos_frac=pos_frac, pos_mean=pos_mean, neg_mean=neg_mean,
                 block_frac_a=block_frac_a, block_frac_k=block_frac_k,
                 dev_pos_max=dev_pos_max, dev_neg_max=dev_neg_max,
                 attn_tau_off_min=attn_tau_off_min, attn_tau_off_max=attn_tau_off_max,
                 attn_tau_off_p99=attn_tau_off_p99, attn_tau_off_p01=attn_tau_off_p01,
                 attn_tau_off_neg_frac=attn_tau_off_neg_frac,
-                know_tau_off_min=know_tau_off_min, know_tau_off_max=know_tau_off_max,
-                know_tau_off_p99=know_tau_off_p99, know_tau_off_p01=know_tau_off_p01,
-                know_tau_off_neg_frac=know_tau_off_neg_frac,
+                rst_tau_off_min=rst_tau_off_min, rst_tau_off_max=rst_tau_off_max,
+                rst_tau_off_p99=rst_tau_off_p99, rst_tau_off_p01=rst_tau_off_p01,
+                rst_tau_off_neg_frac=rst_tau_off_neg_frac,
                 explore_active=explore_active,
                 step_in_train=step,
             )
@@ -958,25 +984,26 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _grouter = grads.get('router', {})
         _gpool = grads.get('neuron_pool', {})
         grad_router_proj = (
-            _child_norm(_grouter, 'proj_attn') + _child_norm(_grouter, 'proj_know'))
+            _child_norm(_grouter, 'proj_attn')
+            + _child_norm(_grouter, 'proj_rst'))
         grad_router_tau = (
-            _child_norm(_grouter, 'tau_attn') + _child_norm(_grouter, 'tau_know')
-            + _child_norm(_grouter, 'tau_q') + _child_norm(_grouter, 'tau_k')
-            + _child_norm(_grouter, 'tau_v'))
+            _child_norm(_grouter, 'tau_attn')
+            + _child_norm(_grouter, 'tau_rst'))
         grad_router_scan = (
-            _child_norm(_grouter, 'scan_bias_attn')
-            + _child_norm(_grouter, 'scan_bias_know'))
+            _child_norm(_grouter, 'raw_scan_offset_attn')
+            + _child_norm(_grouter, 'raw_scan_offset_rst'))
         grad_pool_emb = (
-            _child_norm(_gpool, 'qk_emb') + _child_norm(_gpool, 'v_emb')
-            + _child_norm(_gpool, 'know_emb'))
+            _child_norm(_gpool, 'attn_qk_emb')
+            + _child_norm(_gpool, 'attn_v_emb')
+            + _child_norm(_gpool, 'rst_emb'))
         grad_pool_read = (
-            _child_norm(_gpool, 'qk_read') + _child_norm(_gpool, 'v_read')
-            + _child_norm(_gpool, 'know_read') + _child_norm(_gpool, 'q_read')
-            + _child_norm(_gpool, 'k_read'))
+            _child_norm(_gpool, 'attn_qk_read')
+            + _child_norm(_gpool, 'attn_v_read')
+            + _child_norm(_gpool, 'rst_read'))
         grad_pool_write = (
-            _child_norm(_gpool, 'qk_write') + _child_norm(_gpool, 'v_write')
-            + _child_norm(_gpool, 'know_write') + _child_norm(_gpool, 'q_write')
-            + _child_norm(_gpool, 'k_write'))
+            _child_norm(_gpool, 'attn_qk_write')
+            + _child_norm(_gpool, 'attn_v_write')
+            + _child_norm(_gpool, 'rst_write'))
         pool_diag = _pool_param_diagnostics(params, full=False)
         pool_update_diag = _pool_update_diagnostics(params, grads)
 
@@ -984,29 +1011,34 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         # norm collective. A host-0-only version halts the launch group on
         # multi-host meshes.
         _pool = new_params['neuron_pool']
-        if 'qk_emb' in _pool:
+        if 'attn_qk_emb' in _pool:
+            _cur_qk = _pool['attn_qk_emb']
+            _cur_v = _pool['attn_v_emb']
+            _cur_rst = _pool['rst_emb']
+        elif 'qk_emb' in _pool:
             _cur_qk = _pool['qk_emb']
             _cur_v = _pool['v_emb']
-            _cur_know = _pool['know_emb']
+            _cur_rst = _pool['rst_emb']
         else:
             # Some archived pool variants expose read tensors instead of emb
             # tensors; keep the diagnostic slots comparable when resuming them.
             _cur_qk = _pool['q_read']
             _cur_v = _pool['v_read']
-            _cur_know = _pool['know_read']
-        _prev_qk = prev_emb_snap['qk_emb']
-        _prev_v = prev_emb_snap['v_emb']
-        _prev_know = prev_emb_snap['know_emb']
-        drift_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
+            _cur_rst = _pool['rst_read']
+        _prev_qk = prev_emb_snap['attn_qk_emb']
+        _prev_v = prev_emb_snap['attn_v_emb']
+        _prev_rst = prev_emb_snap['rst_emb']
+        drift_attn_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
                         / (jnp.linalg.norm(_prev_qk) + 1e-8))
-        drift_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
+        drift_attn_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
                        / (jnp.linalg.norm(_prev_v) + 1e-8))
-        drift_know_emb = (jnp.linalg.norm(_cur_know - _prev_know)
-                          / (jnp.linalg.norm(_prev_know) + 1e-8))
+        drift_rst_emb = (jnp.linalg.norm(_cur_rst - _prev_rst)
+                          / (jnp.linalg.norm(_prev_rst) + 1e-8))
 
-        # Tau / scan biases (read inside jit -safe, no cross-device issue)
-        tau_know_b = params.get('router', {}).get('tau_know', {}).get(
-            'bias', jnp.zeros(1))
+        # Tau / scan-offset parameters (read inside jit -safe, no cross-device issue)
+        tau_rst_b = params.get('router', {}).get(
+            'tau_rst', params.get('router', {}).get('tau_rst', {})).get(
+                'bias', jnp.zeros(1))
         tau_attn_b = params.get('router', {}).get('tau_attn', {}).get(
             'bias', jnp.zeros(3))
         tau_q_b = params.get('router', {}).get('tau_q', {}).get(
@@ -1015,10 +1047,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'bias', jnp.zeros(1))
         tau_v_b = params.get('router', {}).get('tau_v', {}).get(
             'bias', jnp.zeros(1))
-        scan_know_b = params.get('router', {}).get('scan_bias_know', {}).get(
-            'bias', jnp.zeros(1))
-        scan_attn_b = params.get('router', {}).get('scan_bias_attn', {}).get(
-            'bias', jnp.zeros(3))
+        raw_scan_offset_rst_b = params.get('router', {}).get(
+            'raw_scan_offset_rst',
+            params.get('router', {}).get('raw_scan_offset_rst', {})).get(
+                'bias', jnp.zeros(1))
+        raw_scan_offset_attn_b = params.get('router', {}).get(
+            'raw_scan_offset_attn',
+            params.get('router', {}).get('raw_scan_offset_attn', {})).get(
+                'bias', jnp.zeros(3))
 
         metrics = {
             'total_loss': total_loss,
@@ -1037,18 +1073,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pool_read': grad_pool_read,
             'grad_pool_write': grad_pool_write,
             'attn_aux': result.get('attn_aux', jnp.float32(0.0)),
-            'know_aux': result.get('know_aux', jnp.float32(0.0)),
+            'rst_aux': result.get('rst_aux', jnp.float32(0.0)),
             # Core activity (v4.1).
-            'know_active': result.get('know_active', jnp.float32(0.0)),
-            'know_strong': result.get('know_strong', jnp.float32(0.0)),
-            'know_score_std': result.get('know_score_std', jnp.float32(0.0)),
-            'know_raw_gate_max': result.get('know_raw_gate_max', jnp.float32(0.0)),
-            'know_gate_sum': result.get('know_gate_sum', jnp.float32(0.0)),
-            'know_active_n_mean': result.get('know_active_n_mean', jnp.float32(0.0)),
-            'know_gate_eff_n': result.get('know_gate_eff_n', jnp.float32(0.0)),
-            'know_gate_eff_ratio': result.get('know_gate_eff_ratio', jnp.float32(0.0)),
-            'know_top1_gate_frac': result.get('know_top1_gate_frac', jnp.float32(0.0)),
-            'know_top1_gate_frac_max': result.get('know_top1_gate_frac_max', jnp.float32(0.0)),
+            'rst_active': result.get('rst_active', jnp.float32(0.0)),
+            'rst_strong': result.get('rst_strong', jnp.float32(0.0)),
+            'rst_score_std': result.get('rst_score_std', jnp.float32(0.0)),
+            'rst_raw_gate_max': result.get('rst_raw_gate_max', jnp.float32(0.0)),
+            'rst_gate_sum': result.get('rst_gate_sum', jnp.float32(0.0)),
+            'rst_active_n_mean': result.get('rst_active_n_mean', jnp.float32(0.0)),
+            'rst_gate_eff_n': result.get('rst_gate_eff_n', jnp.float32(0.0)),
+            'rst_gate_eff_ratio': result.get('rst_gate_eff_ratio', jnp.float32(0.0)),
+            'rst_top1_gate_frac': result.get('rst_top1_gate_frac', jnp.float32(0.0)),
+            'rst_top1_gate_frac_max': result.get('rst_top1_gate_frac_max', jnp.float32(0.0)),
             'attn_qk_active': result.get('attn_qk_active', jnp.float32(0.0)),
             'attn_v_active': result.get('attn_v_active', jnp.float32(0.0)),
             'attn_strong': result.get('attn_strong', jnp.float32(0.0)),
@@ -1070,52 +1106,52 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
-            'know_tau_mean': result.get('know_tau_mean', jnp.float32(0.0)),
-            'know_score_mean': result.get('know_score_mean', jnp.float32(0.0)),
+            'rst_tau_mean': result.get('rst_tau_mean', jnp.float32(0.0)),
+            'rst_score_mean': result.get('rst_score_mean', jnp.float32(0.0)),
             'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
-            'know_tau_abs_mean': result.get('know_tau_abs_mean', jnp.float32(0.0)),
+            'rst_tau_abs_mean': result.get('rst_tau_abs_mean', jnp.float32(0.0)),
             # Emb norm stats (REGULAR subset; *_max moved to analysis_step).
-            'know_emb_norm': result.get('know_emb_norm', jnp.float32(0.0)),
-            'know_emb_norm_min': result.get('know_emb_norm_min', jnp.float32(0.0)),
-            'know_emb_norm_std': result.get('know_emb_norm_std', jnp.float32(0.0)),
-            'qk_emb_norm_mean': result.get('qk_emb_norm_mean', jnp.float32(0.0)),
-            'qk_emb_norm_min': result.get('qk_emb_norm_min', jnp.float32(0.0)),
-            'qk_emb_norm_std': result.get('qk_emb_norm_std', jnp.float32(0.0)),
-            'v_emb_norm_mean': result.get('v_emb_norm_mean', jnp.float32(0.0)),
-            'v_emb_norm_min': result.get('v_emb_norm_min', jnp.float32(0.0)),
-            'v_emb_norm_std': result.get('v_emb_norm_std', jnp.float32(0.0)),
-            'know_read_norm': result.get('know_read_norm', jnp.float32(0.0)),
-            'know_write_norm': result.get('know_write_norm', jnp.float32(0.0)),
+            'rst_emb_norm': result.get('rst_emb_norm', jnp.float32(0.0)),
+            'rst_emb_norm_min': result.get('rst_emb_norm_min', jnp.float32(0.0)),
+            'rst_emb_norm_std': result.get('rst_emb_norm_std', jnp.float32(0.0)),
+            'attn_qk_emb_norm_mean': result.get('attn_qk_emb_norm_mean', jnp.float32(0.0)),
+            'attn_qk_emb_norm_min': result.get('attn_qk_emb_norm_min', jnp.float32(0.0)),
+            'attn_qk_emb_norm_std': result.get('attn_qk_emb_norm_std', jnp.float32(0.0)),
+            'attn_v_emb_norm_mean': result.get('attn_v_emb_norm_mean', jnp.float32(0.0)),
+            'attn_v_emb_norm_min': result.get('attn_v_emb_norm_min', jnp.float32(0.0)),
+            'attn_v_emb_norm_std': result.get('attn_v_emb_norm_std', jnp.float32(0.0)),
+            'rst_read_norm': result.get('rst_read_norm', jnp.float32(0.0)),
+            'rst_write_norm': result.get('rst_write_norm', jnp.float32(0.0)),
             # tau bias (scalar learned params).
-            'tau_know_bias': tau_know_b[0],
+            'tau_rst_bias': tau_rst_b[0],
             'tau_attn_bias_0': tau_attn_b[0],
             'tau_attn_bias_1': tau_attn_b[1],
             'tau_attn_bias_2': tau_attn_b[2],
             'tau_q_bias': tau_q_b[0],
             'tau_k_bias': tau_k_b[0],
             'tau_v_bias': tau_v_b[0],
-            'scan_know_bias': scan_know_b[0],
-            'scan_attn_bias_0': scan_attn_b[0],
-            'scan_attn_bias_1': scan_attn_b[1],
-            'scan_attn_bias_2': scan_attn_b[2],
+            'raw_scan_offset_rst_bias': raw_scan_offset_rst_b[0],
+            'raw_scan_offset_attn_bias_0': raw_scan_offset_attn_b[0],
+            'raw_scan_offset_attn_bias_1': raw_scan_offset_attn_b[1],
+            'raw_scan_offset_attn_bias_2': raw_scan_offset_attn_b[2],
             # Output norms (REGULAR subset).
-            'know_out_norm': result.get('know_out_norm', jnp.float32(0.0)),
+            'rst_out_norm': result.get('rst_out_norm', jnp.float32(0.0)),
             'attn_qk_raw_norm': result.get('attn_qk_raw_norm', jnp.float32(0.0)),
             'attn_v_raw_norm': result.get('attn_v_raw_norm', jnp.float32(0.0)),
-            'know_raw_out_norm': result.get('know_raw_out_norm', jnp.float32(0.0)),
+            'rst_raw_out_norm': result.get('rst_raw_out_norm', jnp.float32(0.0)),
             # z_mean_active (kept: cheap scalar).
-            'know_z_mean_active': result.get('know_z_mean_active', jnp.float32(0.0)),
+            'rst_z_mean_active': result.get('rst_z_mean_active', jnp.float32(0.0)),
             'attn_qk_z_mean_active': result.get('attn_qk_z_mean_active', jnp.float32(0.0)),
             'attn_v_z_mean_active': result.get('attn_v_z_mean_active', jnp.float32(0.0)),
             # Per-layer diagnostics.
             'per_layer_attn_out_norm': result.get('per_layer_attn_out_norm', jnp.zeros(1)),
-            'per_layer_know_out_norm': result.get('per_layer_know_out_norm', jnp.zeros(1)),
+            'per_layer_rst_out_norm': result.get('per_layer_rst_out_norm', jnp.zeros(1)),
             # Dead-only penalty.
             'dead_penalty': dead_penalty,
             'attn_dead_penalty': result.get('attn_dead_penalty', jnp.float32(0.0)),
-            'know_dead_penalty': result.get('know_dead_penalty', jnp.float32(0.0)),
+            'rst_dead_penalty': result.get('rst_dead_penalty', jnp.float32(0.0)),
             'attn_dead_count': result.get('attn_dead_count', jnp.float32(0.0)),
-            'know_dead_count': result.get('know_dead_count', jnp.float32(0.0)),
+            'rst_dead_count': result.get('rst_dead_count', jnp.float32(0.0)),
             # v4.1 RPE exploration + diagnostics.
             'global_mean_ce': explore_stats['global_mean_ce'],
             'pos_frac': explore_stats['pos_frac'],
@@ -1123,7 +1159,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'neg_mean': explore_stats['neg_mean'],
             'explore_loss_raw': explore_stats['explore_loss_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
-            'explore_know_raw': explore_stats['explore_know_raw'],
+            'explore_rst_raw': explore_stats['explore_rst_raw'],
             'explore_loss_weighted': exploration_weight * explore_stats['explore_loss_raw'] * explore_stats['explore_active'],
             'explore_active': explore_stats['explore_active'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
@@ -1135,28 +1171,28 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_tau_off_p99': explore_stats['attn_tau_off_p99'],
             'attn_tau_off_p01': explore_stats['attn_tau_off_p01'],
             'attn_tau_off_neg_frac': explore_stats['attn_tau_off_neg_frac'],
-            'know_tau_off_min': explore_stats['know_tau_off_min'],
-            'know_tau_off_max': explore_stats['know_tau_off_max'],
-            'know_tau_off_p99': explore_stats['know_tau_off_p99'],
-            'know_tau_off_p01': explore_stats['know_tau_off_p01'],
-            'know_tau_off_neg_frac': explore_stats['know_tau_off_neg_frac'],
+            'rst_tau_off_min': explore_stats['rst_tau_off_min'],
+            'rst_tau_off_max': explore_stats['rst_tau_off_max'],
+            'rst_tau_off_p99': explore_stats['rst_tau_off_p99'],
+            'rst_tau_off_p01': explore_stats['rst_tau_off_p01'],
+            'rst_tau_off_neg_frac': explore_stats['rst_tau_off_neg_frac'],
             # v4.1 intensity / v4.1.5 gate-denominator diagnostics.
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
-            'know_int_max': result.get('know_int_max', jnp.float32(0.0)),
+            'rst_int_max': result.get('rst_int_max', jnp.float32(0.0)),
             'attn_intensity_sum_mean': result.get('attn_intensity_sum_mean', jnp.float32(0.0)),
-            'know_intensity_sum_mean': result.get('know_intensity_sum_mean', jnp.float32(0.0)),
+            'rst_intensity_sum_mean': result.get('rst_intensity_sum_mean', jnp.float32(0.0)),
             'attn_gate_den_sum_mean': result.get('attn_gate_den_sum_mean', jnp.float32(0.0)),
-            'know_gate_den_sum_mean': result.get('know_gate_den_sum_mean', jnp.float32(0.0)),
+            'rst_gate_den_sum_mean': result.get('rst_gate_den_sum_mean', jnp.float32(0.0)),
             'attn_den_cost_mean': result.get('attn_den_cost_mean', jnp.float32(0.0)),
-            'know_den_cost_mean': result.get('know_den_cost_mean', jnp.float32(0.0)),
+            'rst_den_cost_mean': result.get('rst_den_cost_mean', jnp.float32(0.0)),
             'attn_act_cost_mean': result.get('attn_act_cost_mean', jnp.float32(0.0)),
-            'know_act_cost_mean': result.get('know_act_cost_mean', jnp.float32(0.0)),
+            'rst_act_cost_mean': result.get('rst_act_cost_mean', jnp.float32(0.0)),
             'attn_current_cost_mean': result.get('attn_current_cost_mean', jnp.float32(0.0)),
-            'know_current_cost_mean': result.get('know_current_cost_mean', jnp.float32(0.0)),
+            'rst_current_cost_mean': result.get('rst_current_cost_mean', jnp.float32(0.0)),
             # Emb drift (relative L2) since prev snapshot -see top of fn.
-            'drift_qk_emb': drift_qk_emb,
-            'drift_v_emb': drift_v_emb,
-            'drift_know_emb': drift_know_emb,
+            'drift_attn_qk_emb': drift_attn_qk_emb,
+            'drift_attn_v_emb': drift_attn_v_emb,
+            'drift_rst_emb': drift_rst_emb,
         }
         metrics.update(pool_diag)
         metrics.update(pool_update_diag)
@@ -1266,9 +1302,9 @@ def create_geometry_step(max_sample=512):
         pool = params.get('neuron_pool', {})
         out = {}
         for name, emb_key, read_key, write_key in (
-                ('qk', 'qk_emb', 'qk_read', 'qk_write'),
-                ('v', 'v_emb', 'v_read', 'v_write'),
-                ('know', 'know_emb', 'know_read', 'know_write')):
+                ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write'),
+                ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write'),
+                ('rst', 'rst_emb', 'rst_read', 'rst_write')):
             if emb_key in pool:
                 out.update(_geom_one(pool[emb_key], f'{name}_emb'))
             if read_key in pool:
@@ -1531,10 +1567,12 @@ def _migrate_v4152_route_params(raw, target):
         x = np.asarray(x, dtype=np.float32)
         return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
 
-    for name in ('qk', 'v', 'know'):
-        emb_key = f'{name}_emb'
-        read_key = f'{name}_read'
-        write_key = f'{name}_write'
+    specs = (
+        ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write'),
+        ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write'),
+        ('rst', 'rst_emb', 'rst_read', 'rst_write'),
+    )
+    for name, emb_key, read_key, write_key in specs:
         read_proj_key = f'{name}_read_{old_suffix}'
         write_proj_key = f'{name}_write_{old_suffix}'
         if emb_key not in pool or emb_key not in target_pool:
@@ -1611,6 +1649,7 @@ def load_checkpoint(path, target_params, target_opt_state):
         'training_config': {},
     }
     raw = serialization.msgpack_restore(bytes_data)
+    raw = migrate_legacy_v4155_params(raw)
     migrated = _migrate_v4152_route_params(raw, target)
     ckpt = serialization.from_state_dict(target, migrated)
     if jax.process_index() == 0:
@@ -1797,7 +1836,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -1815,7 +1854,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         # Dead-only penalty.
         'dead_penalty': float(m.get('dead_penalty', 0.0)),
         'attn_dead_penalty': float(m.get('attn_dead_penalty', 0.0)),
-        'know_dead_penalty': float(m.get('know_dead_penalty', 0.0)),
+        'rst_dead_penalty': float(m.get('rst_dead_penalty', 0.0)),
         'dead_penalty_weighted': ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)),
         # Explore loss (RPE).
         'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
@@ -1833,125 +1872,125 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'steps_per_sec': ctx['steps_per_sec'],
         'elapsed': ctx['total_elapsed'],
         # Drift (reduced inside train_step).
-        'drift_qk_emb': float(m.get('drift_qk_emb', 0.0)),
-        'drift_v_emb': float(m.get('drift_v_emb', 0.0)),
-        'drift_know_emb': float(m.get('drift_know_emb', 0.0)),
+        'drift_attn_qk_emb': float(m.get('drift_attn_qk_emb', 0.0)),
+        'drift_attn_v_emb': float(m.get('drift_attn_v_emb', 0.0)),
+        'drift_rst_emb': float(m.get('drift_rst_emb', 0.0)),
         # Core activity.
         'attn_qk_active': float(m.get('attn_qk_active', 0.0)),
         'attn_v_active': float(m.get('attn_v_active', 0.0)),
-        'know_active': float(m.get('know_active', 0.0)),
+        'rst_active': float(m.get('rst_active', 0.0)),
         'attn_strong': float(m.get('attn_strong', 0.0)),
         'attn_qk_strong': float(m.get('attn_qk_strong', m.get('attn_strong', 0.0))),
         'attn_v_strong': float(m.get('attn_v_strong', m.get('attn_strong', 0.0))),
-        'know_strong': float(m.get('know_strong', 0.0)),
+        'rst_strong': float(m.get('rst_strong', 0.0)),
         'attn_raw_gate_max': float(m.get('attn_raw_gate_max', 0.0)),
-        'know_raw_gate_max': float(m.get('know_raw_gate_max', 0.0)),
+        'rst_raw_gate_max': float(m.get('rst_raw_gate_max', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', 0.0)),
-        'know_int_max': float(m.get('know_int_max', 0.0)),
+        'rst_int_max': float(m.get('rst_int_max', 0.0)),
         'attn_den_cost_mean': float(m.get('attn_den_cost_mean', 0.0)),
-        'know_den_cost_mean': float(m.get('know_den_cost_mean', 0.0)),
+        'rst_den_cost_mean': float(m.get('rst_den_cost_mean', 0.0)),
         'attn_act_cost_mean': float(m.get('attn_act_cost_mean', 0.0)),
-        'know_act_cost_mean': float(m.get('know_act_cost_mean', 0.0)),
+        'rst_act_cost_mean': float(m.get('rst_act_cost_mean', 0.0)),
         'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
-        'know_current_cost_mean': float(m.get('know_current_cost_mean', 0.0)),
+        'rst_current_cost_mean': float(m.get('rst_current_cost_mean', 0.0)),
         'attn_gate_sum': float(m.get('attn_gate_sum', 0.0)),
-        'know_gate_sum': float(m.get('know_gate_sum', 0.0)),
+        'rst_gate_sum': float(m.get('rst_gate_sum', 0.0)),
         'attn_active_n_mean': float(m.get('attn_active_n_mean', 0.0)),
-        'know_active_n_mean': float(m.get('know_active_n_mean', 0.0)),
+        'rst_active_n_mean': float(m.get('rst_active_n_mean', 0.0)),
         'attn_gate_eff_n': float(m.get('attn_gate_eff_n', 0.0)),
         'attn_gate_eff_ratio': float(m.get('attn_gate_eff_ratio', 0.0)),
         'attn_top1_gate_frac': float(m.get('attn_top1_gate_frac', 0.0)),
         'attn_top1_gate_frac_max': float(m.get('attn_top1_gate_frac_max', 0.0)),
-        'know_gate_eff_n': float(m.get('know_gate_eff_n', 0.0)),
-        'know_gate_eff_ratio': float(m.get('know_gate_eff_ratio', 0.0)),
-        'know_top1_gate_frac': float(m.get('know_top1_gate_frac', 0.0)),
-        'know_top1_gate_frac_max': float(m.get('know_top1_gate_frac_max', 0.0)),
+        'rst_gate_eff_n': float(m.get('rst_gate_eff_n', 0.0)),
+        'rst_gate_eff_ratio': float(m.get('rst_gate_eff_ratio', 0.0)),
+        'rst_top1_gate_frac': float(m.get('rst_top1_gate_frac', 0.0)),
+        'rst_top1_gate_frac_max': float(m.get('rst_top1_gate_frac_max', 0.0)),
         'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
-        'know_dead_count': float(m.get('know_dead_count', 0.0)),
+        'rst_dead_count': float(m.get('rst_dead_count', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
-        'know_tau_mean': float(m.get('know_tau_mean', 0.0)),
+        'rst_tau_mean': float(m.get('rst_tau_mean', 0.0)),
         'attn_score_mean': float(m.get('attn_score_mean', 0.0)),
-        'know_score_mean': float(m.get('know_score_mean', 0.0)),
+        'rst_score_mean': float(m.get('rst_score_mean', 0.0)),
         'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
-        'know_out_norm': float(m.get('know_out_norm', 0.0)),
+        'rst_out_norm': float(m.get('rst_out_norm', 0.0)),
         # tau structure (bias + offset distribution).
-        'tau_know_bias': float(m.get('tau_know_bias', 0.0)),
+        'tau_rst_bias': float(m.get('tau_rst_bias', 0.0)),
         'tau_attn_bias_0': float(m.get('tau_attn_bias_0', 0.0)),
         'tau_attn_bias_1': float(m.get('tau_attn_bias_1', 0.0)),
         'tau_attn_bias_2': float(m.get('tau_attn_bias_2', 0.0)),
         'tau_q_bias': float(m.get('tau_q_bias', 0.0)),
         'tau_k_bias': float(m.get('tau_k_bias', 0.0)),
         'tau_v_bias': float(m.get('tau_v_bias', 0.0)),
-        'scan_know_bias': float(m.get('scan_know_bias', 0.0)),
-        'scan_attn_bias_0': float(m.get('scan_attn_bias_0', 0.0)),
-        'scan_attn_bias_1': float(m.get('scan_attn_bias_1', 0.0)),
-        'scan_attn_bias_2': float(m.get('scan_attn_bias_2', 0.0)),
+        'raw_scan_offset_rst_bias': float(m.get('raw_scan_offset_rst_bias', 0.0)),
+        'raw_scan_offset_attn_bias_0': float(m.get('raw_scan_offset_attn_bias_0', 0.0)),
+        'raw_scan_offset_attn_bias_1': float(m.get('raw_scan_offset_attn_bias_1', 0.0)),
+        'raw_scan_offset_attn_bias_2': float(m.get('raw_scan_offset_attn_bias_2', 0.0)),
         'attn_tau_abs_mean': float(m.get('attn_tau_abs_mean', 0.0)),
-        'know_tau_abs_mean': float(m.get('know_tau_abs_mean', 0.0)),
+        'rst_tau_abs_mean': float(m.get('rst_tau_abs_mean', 0.0)),
         'attn_tau_off_min': float(m.get('attn_tau_off_min', 0.0)),
         'attn_tau_off_max': float(m.get('attn_tau_off_max', 0.0)),
         'attn_tau_off_p99': float(m.get('attn_tau_off_p99', 0.0)),
         'attn_tau_off_p01': float(m.get('attn_tau_off_p01', 0.0)),
         'attn_tau_off_neg_frac': float(m.get('attn_tau_off_neg_frac', 0.0)),
-        'know_tau_off_min': float(m.get('know_tau_off_min', 0.0)),
-        'know_tau_off_max': float(m.get('know_tau_off_max', 0.0)),
-        'know_tau_off_p99': float(m.get('know_tau_off_p99', 0.0)),
-        'know_tau_off_p01': float(m.get('know_tau_off_p01', 0.0)),
-        'know_tau_off_neg_frac': float(m.get('know_tau_off_neg_frac', 0.0)),
+        'rst_tau_off_min': float(m.get('rst_tau_off_min', 0.0)),
+        'rst_tau_off_max': float(m.get('rst_tau_off_max', 0.0)),
+        'rst_tau_off_p99': float(m.get('rst_tau_off_p99', 0.0)),
+        'rst_tau_off_p01': float(m.get('rst_tau_off_p01', 0.0)),
+        'rst_tau_off_neg_frac': float(m.get('rst_tau_off_neg_frac', 0.0)),
         'attn_score_std': float(m.get('attn_score_std', 0.0)),
-        'know_score_std': float(m.get('know_score_std', 0.0)),
+        'rst_score_std': float(m.get('rst_score_std', 0.0)),
         # Emb norm stats.
-        'know_emb_norm': float(m.get('know_emb_norm', 0.0)),
-        'know_emb_norm_min': float(m.get('know_emb_norm_min', 0.0)),
-        'know_emb_norm_std': float(m.get('know_emb_norm_std', 0.0)),
-        'qk_emb_norm_mean': float(m.get('qk_emb_norm_mean', 0.0)),
-        'qk_emb_norm_min': float(m.get('qk_emb_norm_min', 0.0)),
-        'qk_emb_norm_std': float(m.get('qk_emb_norm_std', 0.0)),
-        'qk_emb_norm_max': float(m.get('qk_emb_norm_max', 0.0)),
-        'v_emb_norm_mean': float(m.get('v_emb_norm_mean', 0.0)),
-        'v_emb_norm_min': float(m.get('v_emb_norm_min', 0.0)),
-        'v_emb_norm_std': float(m.get('v_emb_norm_std', 0.0)),
-        'v_emb_norm_max': float(m.get('v_emb_norm_max', 0.0)),
-        'know_read_norm': float(m.get('know_read_norm', 0.0)),
-        'know_write_norm': float(m.get('know_write_norm', 0.0)),
-        'know_emb_norm_max': float(m.get('know_emb_norm_max', 0.0)),
-        'qk_read_norm_mean': float(m.get('qk_read_norm_mean', 0.0)),
-        'qk_read_norm_std': float(m.get('qk_read_norm_std', 0.0)),
-        'qk_read_norm_max': float(m.get('qk_read_norm_max', 0.0)),
-        'qk_write_norm_mean': float(m.get('qk_write_norm_mean', 0.0)),
-        'qk_write_norm_std': float(m.get('qk_write_norm_std', 0.0)),
-        'qk_write_norm_max': float(m.get('qk_write_norm_max', 0.0)),
-        'v_read_norm_mean': float(m.get('v_read_norm_mean', 0.0)),
-        'v_read_norm_std': float(m.get('v_read_norm_std', 0.0)),
-        'v_read_norm_max': float(m.get('v_read_norm_max', 0.0)),
-        'v_write_norm_mean': float(m.get('v_write_norm_mean', 0.0)),
-        'v_write_norm_std': float(m.get('v_write_norm_std', 0.0)),
-        'v_write_norm_max': float(m.get('v_write_norm_max', 0.0)),
-        'know_read_norm_mean': float(m.get('know_read_norm_mean', m.get('know_read_norm', 0.0))),
-        'know_read_norm_std': float(m.get('know_read_norm_std', 0.0)),
-        'know_read_norm_max': float(m.get('know_read_norm_max', 0.0)),
-        'know_write_norm_mean': float(m.get('know_write_norm_mean', m.get('know_write_norm', 0.0))),
-        'know_write_norm_std': float(m.get('know_write_norm_std', 0.0)),
-        'know_write_norm_max': float(m.get('know_write_norm_max', 0.0)),
-        'qk_op_gain_mean': float(m.get('qk_op_gain_mean', 0.0)),
-        'qk_op_gain_std': float(m.get('qk_op_gain_std', 0.0)),
-        'qk_op_gain_p99': float(m.get('qk_op_gain_p99', 0.0)),
-        'qk_op_gain_max': float(m.get('qk_op_gain_max', 0.0)),
-        'v_op_gain_mean': float(m.get('v_op_gain_mean', 0.0)),
-        'v_op_gain_std': float(m.get('v_op_gain_std', 0.0)),
-        'v_op_gain_p99': float(m.get('v_op_gain_p99', 0.0)),
-        'v_op_gain_max': float(m.get('v_op_gain_max', 0.0)),
-        'know_op_gain_mean': float(m.get('know_op_gain_mean', 0.0)),
-        'know_op_gain_std': float(m.get('know_op_gain_std', 0.0)),
-        'know_op_gain_p99': float(m.get('know_op_gain_p99', 0.0)),
-        'know_op_gain_max': float(m.get('know_op_gain_max', 0.0)),
-        'qk_pool_scale': float(m.get('qk_pool_scale', 0.0)),
-        'v_pool_scale': float(m.get('v_pool_scale', 0.0)),
-        'know_pool_scale': float(m.get('know_pool_scale', 0.0)),
+        'rst_emb_norm': float(m.get('rst_emb_norm', 0.0)),
+        'rst_emb_norm_min': float(m.get('rst_emb_norm_min', 0.0)),
+        'rst_emb_norm_std': float(m.get('rst_emb_norm_std', 0.0)),
+        'attn_qk_emb_norm_mean': float(m.get('attn_qk_emb_norm_mean', 0.0)),
+        'attn_qk_emb_norm_min': float(m.get('attn_qk_emb_norm_min', 0.0)),
+        'attn_qk_emb_norm_std': float(m.get('attn_qk_emb_norm_std', 0.0)),
+        'attn_qk_emb_norm_max': float(m.get('attn_qk_emb_norm_max', 0.0)),
+        'attn_v_emb_norm_mean': float(m.get('attn_v_emb_norm_mean', 0.0)),
+        'attn_v_emb_norm_min': float(m.get('attn_v_emb_norm_min', 0.0)),
+        'attn_v_emb_norm_std': float(m.get('attn_v_emb_norm_std', 0.0)),
+        'attn_v_emb_norm_max': float(m.get('attn_v_emb_norm_max', 0.0)),
+        'rst_read_norm': float(m.get('rst_read_norm', 0.0)),
+        'rst_write_norm': float(m.get('rst_write_norm', 0.0)),
+        'rst_emb_norm_max': float(m.get('rst_emb_norm_max', 0.0)),
+        'attn_qk_read_norm_mean': float(m.get('attn_qk_read_norm_mean', 0.0)),
+        'attn_qk_read_norm_std': float(m.get('attn_qk_read_norm_std', 0.0)),
+        'attn_qk_read_norm_max': float(m.get('attn_qk_read_norm_max', 0.0)),
+        'attn_qk_write_norm_mean': float(m.get('attn_qk_write_norm_mean', 0.0)),
+        'attn_qk_write_norm_std': float(m.get('attn_qk_write_norm_std', 0.0)),
+        'attn_qk_write_norm_max': float(m.get('attn_qk_write_norm_max', 0.0)),
+        'attn_v_read_norm_mean': float(m.get('attn_v_read_norm_mean', 0.0)),
+        'attn_v_read_norm_std': float(m.get('attn_v_read_norm_std', 0.0)),
+        'attn_v_read_norm_max': float(m.get('attn_v_read_norm_max', 0.0)),
+        'attn_v_write_norm_mean': float(m.get('attn_v_write_norm_mean', 0.0)),
+        'attn_v_write_norm_std': float(m.get('attn_v_write_norm_std', 0.0)),
+        'attn_v_write_norm_max': float(m.get('attn_v_write_norm_max', 0.0)),
+        'rst_read_norm_mean': float(m.get('rst_read_norm_mean', m.get('rst_read_norm', 0.0))),
+        'rst_read_norm_std': float(m.get('rst_read_norm_std', 0.0)),
+        'rst_read_norm_max': float(m.get('rst_read_norm_max', 0.0)),
+        'rst_write_norm_mean': float(m.get('rst_write_norm_mean', m.get('rst_write_norm', 0.0))),
+        'rst_write_norm_std': float(m.get('rst_write_norm_std', 0.0)),
+        'rst_write_norm_max': float(m.get('rst_write_norm_max', 0.0)),
+        'attn_qk_op_gain_mean': float(m.get('attn_qk_op_gain_mean', 0.0)),
+        'attn_qk_op_gain_std': float(m.get('attn_qk_op_gain_std', 0.0)),
+        'attn_qk_op_gain_p99': float(m.get('attn_qk_op_gain_p99', 0.0)),
+        'attn_qk_op_gain_max': float(m.get('attn_qk_op_gain_max', 0.0)),
+        'attn_v_op_gain_mean': float(m.get('attn_v_op_gain_mean', 0.0)),
+        'attn_v_op_gain_std': float(m.get('attn_v_op_gain_std', 0.0)),
+        'attn_v_op_gain_p99': float(m.get('attn_v_op_gain_p99', 0.0)),
+        'attn_v_op_gain_max': float(m.get('attn_v_op_gain_max', 0.0)),
+        'rst_op_gain_mean': float(m.get('rst_op_gain_mean', 0.0)),
+        'rst_op_gain_std': float(m.get('rst_op_gain_std', 0.0)),
+        'rst_op_gain_p99': float(m.get('rst_op_gain_p99', 0.0)),
+        'rst_op_gain_max': float(m.get('rst_op_gain_max', 0.0)),
+        'attn_qk_pool_scale': float(m.get('attn_qk_pool_scale', 0.0)),
+        'attn_v_pool_scale': float(m.get('attn_v_pool_scale', 0.0)),
+        'rst_pool_scale': float(m.get('rst_pool_scale', 0.0)),
         'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
         'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
-        'know_raw_out_norm': float(m.get('know_raw_out_norm', 0.0)),
-        'know_z_mean_active': float(m.get('know_z_mean_active', 0.0)),
+        'rst_raw_out_norm': float(m.get('rst_raw_out_norm', 0.0)),
+        'rst_z_mean_active': float(m.get('rst_z_mean_active', 0.0)),
         'attn_qk_z_mean_active': float(m.get('attn_qk_z_mean_active', 0.0)),
         'attn_v_z_mean_active': float(m.get('attn_v_z_mean_active', 0.0)),
         # RPE exploration diag.
@@ -1960,7 +1999,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'pos_mean': float(m.get('pos_mean', 0.0)),
         'neg_mean': float(m.get('neg_mean', 0.0)),
         'explore_attn_raw': float(m.get('explore_attn_raw', 0.0)),
-        'explore_know_raw': float(m.get('explore_know_raw', 0.0)),
+        'explore_rst_raw': float(m.get('explore_rst_raw', 0.0)),
         'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
         'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
         'dev_pos_max': float(m.get('dev_pos_max', 0.0)),
@@ -1969,8 +2008,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     }
     if rec['attn_top1_gate_frac'] == 0.0:
         rec['attn_top1_gate_frac'] = rec['attn_raw_gate_max'] / max(rec['attn_gate_sum'], 1e-8)
-    if rec['know_top1_gate_frac'] == 0.0:
-        rec['know_top1_gate_frac'] = rec['know_raw_gate_max'] / max(rec['know_gate_sum'], 1e-8)
+    if rec['rst_top1_gate_frac'] == 0.0:
+        rec['rst_top1_gate_frac'] = rec['rst_raw_gate_max'] / max(rec['rst_gate_sum'], 1e-8)
     _lr = float(ctx.get('current_lr', 0.0))
     for _pool in ('qk', 'v', 'know'):
         for _part in ('emb', 'read', 'write'):
@@ -1980,26 +2019,26 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
                 _lr * rec[f'{_pool}_{_part}_grad_ratio'])
     if is_v415:
         rec.pop('attn_den_cost_mean', None)
-        rec.pop('know_den_cost_mean', None)
+        rec.pop('rst_den_cost_mean', None)
         rec.update({
             'attn_gate_den_sum_mean': float(m.get(
                 'attn_gate_den_sum_mean', m.get('attn_intensity_sum_mean', 0.0))),
-            'know_gate_den_sum_mean': float(m.get(
-                'know_gate_den_sum_mean', m.get('know_intensity_sum_mean', 0.0))),
+            'rst_gate_den_sum_mean': float(m.get(
+                'rst_gate_den_sum_mean', m.get('rst_intensity_sum_mean', 0.0))),
         })
     else:
         rec.update({
             'attn_intensity_sum_mean': float(m.get('attn_intensity_sum_mean', 0.0)),
-            'know_intensity_sum_mean': float(m.get('know_intensity_sum_mean', 0.0)),
+            'rst_intensity_sum_mean': float(m.get('rst_intensity_sum_mean', 0.0)),
         })
     # Per-layer norms (materialise lists).
     try:
         pl_a = jax.device_get(m['per_layer_attn_out_norm']).tolist()
-        pl_k = jax.device_get(m['per_layer_know_out_norm']).tolist()
+        pl_k = jax.device_get(m['per_layer_rst_out_norm']).tolist()
     except Exception:
         pl_a, pl_k = [], []
     rec['per_layer_attn_out_norm'] = pl_a
-    rec['per_layer_know_out_norm'] = pl_k
+    rec['per_layer_rst_out_norm'] = pl_k
     return rec
 
 
@@ -2012,99 +2051,99 @@ def _print_regular_block(rec, ctx):
         f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
     )
     log_message(
-        f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
-        f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
-        f" k={_fmt_act_count(rec['know_active'], ctx['n_know_cfg'])}"
-        f" | strong: qk={rec['attn_qk_strong']*100:.1f}%"
-        f" v={rec['attn_v_strong']*100:.1f}%"
-        f" k={rec['know_strong']*100:.1f}%"
+        f"  act: attn_qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
+        f" attn_v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
+        f" rst={_fmt_act_count(rec['rst_active'], ctx['n_rst_cfg'])}"
+        f" | strong: attn_qk={rec['attn_qk_strong']*100:.1f}%"
+        f" attn_v={rec['attn_v_strong']*100:.1f}%"
+        f" rst={rec['rst_strong']*100:.1f}%"
     )
     log_message(
         f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
-        f" k={rec['know_raw_gate_max']:.1f}]"
-        f" int_max[a={rec['attn_int_max']:.1f} k={rec['know_int_max']:.1f}]"
-        f" dead[a={int(rec['attn_dead_count'])} k={int(rec['know_dead_count'])}]"
-        f" drift[qk={rec['drift_qk_emb']:.2e}"
-        f" v={rec['drift_v_emb']:.2e}"
-        f" k={rec['drift_know_emb']:.2e}]"
+        f" rst={rec['rst_raw_gate_max']:.1f}]"
+        f" int_max[a={rec['attn_int_max']:.1f} rst={rec['rst_int_max']:.1f}]"
+        f" dead[a={int(rec['attn_dead_count'])} rst={int(rec['rst_dead_count'])}]"
+        f" drift[qk={rec['drift_attn_qk_emb']:.2e}"
+        f" attn_v={rec['drift_attn_v_emb']:.2e}"
+        f" rst={rec['drift_rst_emb']:.2e}]"
     )
     log_message(
         f"  gate_conc: a[eff={rec['attn_gate_eff_n']:.1f}"
         f" ratio={rec['attn_gate_eff_ratio']:.3f}"
         f" top1={rec['attn_top1_gate_frac']:.3f}]"
-        f" k[eff={rec['know_gate_eff_n']:.1f}"
-        f" ratio={rec['know_gate_eff_ratio']:.3f}"
-        f" top1={rec['know_top1_gate_frac']:.3f}]"
-        f" | pool_scale qk={rec['qk_pool_scale']:.3f}"
-        f" v={rec['v_pool_scale']:.3f} k={rec['know_pool_scale']:.3f}"
+        f" k[eff={rec['rst_gate_eff_n']:.1f}"
+        f" ratio={rec['rst_gate_eff_ratio']:.3f}"
+        f" top1={rec['rst_top1_gate_frac']:.3f}]"
+        f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
+        f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
-            f" k={rec['know_gate_den_sum_mean']:.1f}]"
+            f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
         )
     log_message(
-        f"  tau: know_b={rec['tau_know_bias']:+.2f}"
+        f"  tau: rst_b={rec['tau_rst_bias']:+.2f}"
         f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
-        f" | tau_mean[a={rec['attn_tau_mean']:+.3f} k={rec['know_tau_mean']:+.3f}]"
-        f" abs[a={rec['attn_tau_abs_mean']:.3f} k={rec['know_tau_abs_mean']:.3f}]"
+        f" | tau_mean[attn={rec['attn_tau_mean']:+.3f} rst={rec['rst_tau_mean']:+.3f}]"
+        f" abs[attn={rec['attn_tau_abs_mean']:.3f} rst={rec['rst_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
         log_message(
-            f"  scan_bias: know={rec['scan_know_bias']:+.3f}"
-            f" attn=[{rec['scan_attn_bias_0']:+.3f} {rec['scan_attn_bias_1']:+.3f} {rec['scan_attn_bias_2']:+.3f}]"
+            f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
+            f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
         )
     log_message(
-        f"  tau_off k[min={rec['know_tau_off_min']:+.2f} p01={rec['know_tau_off_p01']:+.2f}"
-        f" p99={rec['know_tau_off_p99']:+.2f} max={rec['know_tau_off_max']:+.2f}"
-        f" neg={rec['know_tau_off_neg_frac']*100:.1f}%]"
-        f" a[min={rec['attn_tau_off_min']:+.2f} p01={rec['attn_tau_off_p01']:+.2f}"
+        f"  tau_off rst[min={rec['rst_tau_off_min']:+.2f} p01={rec['rst_tau_off_p01']:+.2f}"
+        f" p99={rec['rst_tau_off_p99']:+.2f} max={rec['rst_tau_off_max']:+.2f}"
+        f" neg={rec['rst_tau_off_neg_frac']*100:.1f}%]"
+        f" attn[min={rec['attn_tau_off_min']:+.2f} p01={rec['attn_tau_off_p01']:+.2f}"
         f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
         f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
     )
     log_message(
-        f"  score_std[a={rec['attn_score_std']:.2f} k={rec['know_score_std']:.2f}]"
-        f" | emb_n k[m={rec['know_emb_norm']:.2f} s={rec['know_emb_norm_std']:.2f}"
-        f" min={rec['know_emb_norm_min']:.2f} max={rec['know_emb_norm_max']:.2f}]"
-        f" qk[m={rec['qk_emb_norm_mean']:.2f} s={rec['qk_emb_norm_std']:.2f}"
-        f" min={rec['qk_emb_norm_min']:.2f} max={rec['qk_emb_norm_max']:.2f}]"
-        f" v[m={rec['v_emb_norm_mean']:.2f} s={rec['v_emb_norm_std']:.2f}"
-        f" min={rec['v_emb_norm_min']:.2f} max={rec['v_emb_norm_max']:.2f}]"
+        f"  score_std[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
+        f" | emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
+        f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
+        f" attn_qk[m={rec['attn_qk_emb_norm_mean']:.2f} s={rec['attn_qk_emb_norm_std']:.2f}"
+        f" min={rec['attn_qk_emb_norm_min']:.2f} max={rec['attn_qk_emb_norm_max']:.2f}]"
+        f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
+        f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
     )
     log_message(
-        f"  rw_n: qk r[m={rec['qk_read_norm_mean']:.2f} s={rec['qk_read_norm_std']:.2f}"
-        f" max={rec['qk_read_norm_max']:.2f}]"
-        f" w[m={rec['qk_write_norm_mean']:.2f} s={rec['qk_write_norm_std']:.2f}"
-        f" max={rec['qk_write_norm_max']:.2f}]"
-        f" | v r[m={rec['v_read_norm_mean']:.2f} s={rec['v_read_norm_std']:.2f}"
-        f" max={rec['v_read_norm_max']:.2f}]"
-        f" w[m={rec['v_write_norm_mean']:.2f} s={rec['v_write_norm_std']:.2f}"
-        f" max={rec['v_write_norm_max']:.2f}]"
-        f" | k r[m={rec['know_read_norm_mean']:.2f} s={rec['know_read_norm_std']:.2f}"
-        f" max={rec['know_read_norm_max']:.2f}]"
-        f" w[m={rec['know_write_norm_mean']:.2f} s={rec['know_write_norm_std']:.2f}"
-        f" max={rec['know_write_norm_max']:.2f}]"
+        f"  rw_n: attn_qk r[m={rec['attn_qk_read_norm_mean']:.2f} s={rec['attn_qk_read_norm_std']:.2f}"
+        f" max={rec['attn_qk_read_norm_max']:.2f}]"
+        f" w[m={rec['attn_qk_write_norm_mean']:.2f} s={rec['attn_qk_write_norm_std']:.2f}"
+        f" max={rec['attn_qk_write_norm_max']:.2f}]"
+        f" | attn_v r[m={rec['attn_v_read_norm_mean']:.2f} s={rec['attn_v_read_norm_std']:.2f}"
+        f" max={rec['attn_v_read_norm_max']:.2f}]"
+        f" w[m={rec['attn_v_write_norm_mean']:.2f} s={rec['attn_v_write_norm_std']:.2f}"
+        f" max={rec['attn_v_write_norm_max']:.2f}]"
+        f" | k r[m={rec['rst_read_norm_mean']:.2f} s={rec['rst_read_norm_std']:.2f}"
+        f" max={rec['rst_read_norm_max']:.2f}]"
+        f" w[m={rec['rst_write_norm_mean']:.2f} s={rec['rst_write_norm_std']:.2f}"
+        f" max={rec['rst_write_norm_max']:.2f}]"
     )
     log_message(
-        f"  op_gain: qk[m={rec['qk_op_gain_mean']:.2f} s={rec['qk_op_gain_std']:.2f}"
-        f" max={rec['qk_op_gain_max']:.2f}]"
-        f" v[m={rec['v_op_gain_mean']:.2f} s={rec['v_op_gain_std']:.2f}"
-        f" max={rec['v_op_gain_max']:.2f}]"
-        f" k[m={rec['know_op_gain_mean']:.2f} s={rec['know_op_gain_std']:.2f}"
-        f" max={rec['know_op_gain_max']:.2f}]"
+        f"  op_gain: attn_qk[m={rec['attn_qk_op_gain_mean']:.2f} s={rec['attn_qk_op_gain_std']:.2f}"
+        f" max={rec['attn_qk_op_gain_max']:.2f}]"
+        f" attn_v[m={rec['attn_v_op_gain_mean']:.2f} s={rec['attn_v_op_gain_std']:.2f}"
+        f" max={rec['attn_v_op_gain_max']:.2f}]"
+        f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
+        f" max={rec['rst_op_gain_max']:.2f}]"
     )
     log_message(
         f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
         f" pos={rec['pos_frac']*100:.1f}%"
         f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
         f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-        f" expl[a={rec['explore_attn_raw']:+.3f} k={rec['explore_know_raw']:+.3f}]"
+        f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
         f" w={rec['explore_loss_weighted']:+.4f}"
         f" block[a={rec['explore_block_frac_a']*100:.1f}%"
-        f" k={rec['explore_block_frac_k']*100:.1f}%]"
+        f" rst={rec['explore_block_frac_k']*100:.1f}%]"
     )
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
-    _pl_k = rec.get('per_layer_know_out_norm', []) or []
+    _pl_k = rec.get('per_layer_rst_out_norm', []) or []
     if _pl_a or _pl_k:
         log_message(
             f"  per_layer out: attn=[{' '.join(f'{v:.2f}' for v in _pl_a)}]"
@@ -2123,11 +2162,11 @@ def _build_analysis_record(base, metrics, ctx):
     run at val ticks), not by train_step. `base` is an empty dict on the
     new path -kept for back-compat. All ANALYSIS fields come from
     `metrics`, which is the dict returned by analysis_step. Needs
-    `attn_out_norm` / `know_out_norm` for the raw_n print line, so
+    `attn_out_norm` / `rst_out_norm` for the raw_n print line, so
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5')
+    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -2138,44 +2177,44 @@ def _build_analysis_record(base, metrics, ctx):
         a_tau_s = np.zeros(3, dtype=np.float32)
     rec.update({
         'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
-        'know_out_norm': float(m.get('know_out_norm', 0.0)),
+        'rst_out_norm': float(m.get('rst_out_norm', 0.0)),
         'attn_score_skew': float(m.get('attn_score_skew', 0.0)),
-        'know_score_skew': float(m.get('know_score_skew', 0.0)),
+        'rst_score_skew': float(m.get('rst_score_skew', 0.0)),
         'attn_score_kurt': float(m.get('attn_score_kurt', 0.0)),
-        'know_score_kurt': float(m.get('know_score_kurt', 0.0)),
+        'rst_score_kurt': float(m.get('rst_score_kurt', 0.0)),
         'attn_active_per_token_std': float(m.get('attn_active_per_token_std', 0.0)),
-        'know_active_per_token_std': float(m.get('know_active_per_token_std', 0.0)),
+        'rst_active_per_token_std': float(m.get('rst_active_per_token_std', 0.0)),
         'attn_gate_entropy': float(m.get('attn_gate_entropy', 0.0)),
-        'know_gate_entropy': float(m.get('know_gate_entropy', 0.0)),
+        'rst_gate_entropy': float(m.get('rst_gate_entropy', 0.0)),
         'attn_qk_phi_binary': float(m.get('attn_qk_phi_binary', 0.0)),
         'attn_v_phi_binary': float(m.get('attn_v_phi_binary', 0.0)),
-        'know_phi_binary': float(m.get('know_phi_binary', 0.0)),
+        'rst_phi_binary': float(m.get('rst_phi_binary', 0.0)),
         'attn_z_lt_075': float(m.get('attn_z_lt_075', 0.0)),
-        'know_z_lt_075': float(m.get('know_z_lt_075', 0.0)),
+        'rst_z_lt_075': float(m.get('rst_z_lt_075', 0.0)),
         'attn_z_lt_030': float(m.get('attn_z_lt_030', 0.0)),
-        'know_z_lt_030': float(m.get('know_z_lt_030', 0.0)),
+        'rst_z_lt_030': float(m.get('rst_z_lt_030', 0.0)),
         'attn_int_cap_frac': float(m.get('attn_int_cap_frac', 0.0)),
-        'know_int_cap_frac': float(m.get('know_int_cap_frac', 0.0)),
-        'qk_emb_norm_max': float(m.get('qk_emb_norm_max', 0.0)),
-        'v_emb_norm_max': float(m.get('v_emb_norm_max', 0.0)),
-        'know_emb_norm_max': float(m.get('know_emb_norm_max', 0.0)),
+        'rst_int_cap_frac': float(m.get('rst_int_cap_frac', 0.0)),
+        'attn_qk_emb_norm_max': float(m.get('attn_qk_emb_norm_max', 0.0)),
+        'attn_v_emb_norm_max': float(m.get('attn_v_emb_norm_max', 0.0)),
+        'rst_emb_norm_max': float(m.get('rst_emb_norm_max', 0.0)),
         'attn_tau_std_q': float(a_tau_s[0]),
         'attn_tau_std_k': float(a_tau_s[1]),
         'attn_tau_std_v': float(a_tau_s[2]),
-        'know_tau_std': float(m.get('know_tau_std', 0.0)),
+        'rst_tau_std': float(m.get('rst_tau_std', 0.0)),
         'attn_tau_kernel_norm': float(m.get('attn_tau_kernel_norm', 0.0)),
-        'know_tau_kernel_norm': float(m.get('know_tau_kernel_norm', 0.0)),
+        'rst_tau_kernel_norm': float(m.get('rst_tau_kernel_norm', 0.0)),
         'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
         'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
-        'know_raw_out_norm': float(m.get('know_raw_out_norm', 0.0)),
+        'rst_raw_out_norm': float(m.get('rst_raw_out_norm', 0.0)),
         'attn_z_sum': float(m.get('attn_z_sum', 0.0)),
-        'know_z_sum': float(m.get('know_z_sum', 0.0)),
+        'rst_z_sum': float(m.get('rst_z_sum', 0.0)),
         'attn_den_cost': float(m.get('attn_den_cost', 0.0)),
-        'know_den_cost': float(m.get('know_den_cost', 0.0)),
+        'rst_den_cost': float(m.get('rst_den_cost', 0.0)),
         'attn_activation_cost': float(m.get('attn_activation_cost', 0.0)),
-        'know_activation_cost': float(m.get('know_activation_cost', 0.0)),
+        'rst_activation_cost': float(m.get('rst_activation_cost', 0.0)),
         'attn_current_cost': float(m.get('attn_current_cost', 0.0)),
-        'know_current_cost': float(m.get('know_current_cost', 0.0)),
+        'rst_current_cost': float(m.get('rst_current_cost', 0.0)),
         'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
         'debug_emb_norm': float(m.get('debug_emb_norm', 0.0)),
         'debug_o_proj_norm': float(m.get('debug_o_proj_norm', 0.0)),
@@ -2195,22 +2234,22 @@ def _build_analysis_record(base, metrics, ctx):
     rec['attn_gate_eff_ratio'] = float(m.get('attn_gate_eff_ratio', 0.0))
     rec['attn_top1_gate_frac'] = float(m.get('attn_top1_gate_frac', 0.0))
     rec['attn_top1_gate_frac_max'] = float(m.get('attn_top1_gate_frac_max', 0.0))
-    rec['know_gate_eff_n'] = float(m.get('know_gate_eff_n', 0.0))
-    rec['know_gate_eff_ratio'] = float(m.get('know_gate_eff_ratio', 0.0))
-    rec['know_top1_gate_frac'] = float(m.get('know_top1_gate_frac', 0.0))
-    rec['know_top1_gate_frac_max'] = float(m.get('know_top1_gate_frac_max', 0.0))
+    rec['rst_gate_eff_n'] = float(m.get('rst_gate_eff_n', 0.0))
+    rec['rst_gate_eff_ratio'] = float(m.get('rst_gate_eff_ratio', 0.0))
+    rec['rst_top1_gate_frac'] = float(m.get('rst_top1_gate_frac', 0.0))
+    rec['rst_top1_gate_frac_max'] = float(m.get('rst_top1_gate_frac_max', 0.0))
     if rec['attn_top1_gate_frac'] == 0.0:
         rec['attn_top1_gate_frac'] = (
             float(m.get('attn_raw_gate_max', 0.0))
             / max(float(m.get('attn_gate_sum', 0.0)), 1e-8))
-    if rec['know_top1_gate_frac'] == 0.0:
-        rec['know_top1_gate_frac'] = (
-            float(m.get('know_raw_gate_max', 0.0))
-            / max(float(m.get('know_gate_sum', 0.0)), 1e-8))
+    if rec['rst_top1_gate_frac'] == 0.0:
+        rec['rst_top1_gate_frac'] = (
+            float(m.get('rst_raw_gate_max', 0.0))
+            / max(float(m.get('rst_gate_sum', 0.0)), 1e-8))
     if rec['attn_top1_gate_frac_max'] == 0.0:
         rec['attn_top1_gate_frac_max'] = rec['attn_top1_gate_frac']
-    if rec['know_top1_gate_frac_max'] == 0.0:
-        rec['know_top1_gate_frac_max'] = rec['know_top1_gate_frac']
+    if rec['rst_top1_gate_frac_max'] == 0.0:
+        rec['rst_top1_gate_frac_max'] = rec['rst_top1_gate_frac']
     _lr = float(ctx.get('current_lr', 0.0))
     for _pool in ('qk', 'v', 'know'):
         for _part in ('emb', 'read', 'write'):
@@ -2220,12 +2259,12 @@ def _build_analysis_record(base, metrics, ctx):
                 _lr * rec[f'{_pool}_{_part}_grad_ratio'])
     if is_v415:
         rec.pop('attn_den_cost', None)
-        rec.pop('know_den_cost', None)
+        rec.pop('rst_den_cost', None)
         rec.update({
             'attn_gate_den_sum': float(m.get(
                 'attn_gate_den_sum', m.get('attn_den_cost', 0.0))),
-            'know_gate_den_sum': float(m.get(
-                'know_gate_den_sum', m.get('know_den_cost', 0.0))),
+            'rst_gate_den_sum': float(m.get(
+                'rst_gate_den_sum', m.get('rst_den_cost', 0.0))),
         })
     # HBM (host-0 local device 0 snapshot).
     try:
@@ -2256,82 +2295,82 @@ def _print_analysis_block(rec, ctx):
                 f" max={rec[f'{prefix}_max']:.2f}")
 
     log_message(
-        f"  dist k[skew={rec['know_score_skew']:+.2f} kurt={rec['know_score_kurt']:.2f}"
-        f" apt_std={rec['know_active_per_token_std']:.1f} ent={rec['know_gate_entropy']:.2f}]"
+        f"  dist k[skew={rec['rst_score_skew']:+.2f} kurt={rec['rst_score_kurt']:.2f}"
+        f" apt_std={rec['rst_active_per_token_std']:.1f} ent={rec['rst_gate_entropy']:.2f}]"
         f" a[skew={rec['attn_score_skew']:+.2f} kurt={rec['attn_score_kurt']:.2f}"
         f" apt_std={rec['attn_active_per_token_std']:.1f} ent={rec['attn_gate_entropy']:.2f}]"
     )
     log_message(
-        f"  boundary k[phi={rec['know_phi_binary']*100:.1f}%"
-        f" z<075={rec['know_z_lt_075']*100:.1f}%"
-        f" z<030={rec['know_z_lt_030']*100:.1f}%]"
+        f"  boundary k[phi={rec['rst_phi_binary']*100:.1f}%"
+        f" z<075={rec['rst_z_lt_075']*100:.1f}%"
+        f" z<030={rec['rst_z_lt_030']*100:.1f}%]"
         f" a_qk[phi={rec['attn_qk_phi_binary']*100:.1f}%]"
         f" a_v[phi={rec['attn_v_phi_binary']*100:.1f}%]"
-        f" a[z<075={rec['attn_z_lt_075']*100:.1f}%"
+        f" attn[z<075={rec['attn_z_lt_075']*100:.1f}%"
         f" z<030={rec['attn_z_lt_030']*100:.1f}%]"
     )
     log_message(
-        f"  saturation cap[a={rec['attn_int_cap_frac']*100:.1f}%"
-        f" k={rec['know_int_cap_frac']*100:.1f}%]"
-        f" | emb_max k={rec['know_emb_norm_max']:.2f}"
-        f" qk={rec['qk_emb_norm_max']:.2f}"
-        f" v={rec['v_emb_norm_max']:.2f}"
+        f"  saturation cap[attn={rec['attn_int_cap_frac']*100:.1f}%"
+        f" rst={rec['rst_int_cap_frac']*100:.1f}%]"
+        f" | emb_max rst={rec['rst_emb_norm_max']:.2f}"
+        f" attn_qk={rec['attn_qk_emb_norm_max']:.2f}"
+        f" attn_v={rec['attn_v_emb_norm_max']:.2f}"
     )
     log_message(
-        f"  emb_full qk[{_emb_full('qk_emb_norm')}]"
-        f" v[{_emb_full('v_emb_norm')}]"
-        f" k[{_emb_full('know_emb_norm')}]"
+        f"  emb_full qk[{_emb_full('attn_qk_emb_norm')}]"
+        f" v[{_emb_full('attn_v_emb_norm')}]"
+        f" k[{_emb_full('rst_emb_norm')}]"
     )
     log_message(
-        f"  rw_full qk_r[{_full('qk_read_norm')}]"
-        f" qk_w[{_full('qk_write_norm')}]"
-        f" v_r[{_full('v_read_norm')}]"
-        f" v_w[{_full('v_write_norm')}]"
-        f" k_r[{_full('know_read_norm')}]"
-        f" k_w[{_full('know_write_norm')}]"
+        f"  rw_full qk_r[{_full('attn_qk_read_norm')}]"
+        f" qk_w[{_full('attn_qk_write_norm')}]"
+        f" v_r[{_full('attn_v_read_norm')}]"
+        f" v_w[{_full('attn_v_write_norm')}]"
+        f" k_r[{_full('rst_read_norm')}]"
+        f" k_w[{_full('rst_write_norm')}]"
     )
     log_message(
-        f"  op_gain_full qk[{_full('qk_op_gain')}]"
-        f" v[{_full('v_op_gain')}]"
-        f" k[{_full('know_op_gain')}]"
+        f"  op_gain_full qk[{_full('attn_qk_op_gain')}]"
+        f" v[{_full('attn_v_op_gain')}]"
+        f" k[{_full('rst_op_gain')}]"
     )
     log_message(
         f"  gate_conc a[eff={rec['attn_gate_eff_n']:.1f}"
         f" ratio={rec['attn_gate_eff_ratio']:.3f}"
         f" top1_m={rec['attn_top1_gate_frac']:.3f}"
         f" top1_max={rec['attn_top1_gate_frac_max']:.3f}]"
-        f" k[eff={rec['know_gate_eff_n']:.1f}"
-        f" ratio={rec['know_gate_eff_ratio']:.3f}"
-        f" top1_m={rec['know_top1_gate_frac']:.3f}"
-        f" top1_max={rec['know_top1_gate_frac_max']:.3f}]"
-        f" | pool_scale qk={rec['qk_pool_scale']:.3f}"
-        f" v={rec['v_pool_scale']:.3f} k={rec['know_pool_scale']:.3f}"
+        f" k[eff={rec['rst_gate_eff_n']:.1f}"
+        f" ratio={rec['rst_gate_eff_ratio']:.3f}"
+        f" top1_m={rec['rst_top1_gate_frac']:.3f}"
+        f" top1_max={rec['rst_top1_gate_frac_max']:.3f}]"
+        f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
+        f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
-            f" k={rec['know_gate_den_sum']:.1f}"
+            f" rst={rec['rst_gate_den_sum']:.1f}"
         )
     log_message(
-        f"  tau_struct k_std={rec['know_tau_std']:.2f}"
+        f"  tau_struct k_std={rec['rst_tau_std']:.2f}"
         f" a_std=[{rec['attn_tau_std_q']:.2f} {rec['attn_tau_std_k']:.2f} {rec['attn_tau_std_v']:.2f}]"
-        f" k_kern={rec['know_tau_kernel_norm']:.1f}"
+        f" k_kern={rec['rst_tau_kernel_norm']:.1f}"
         f" a_kern={rec['attn_tau_kernel_norm']:.1f}"
     )
     log_message(
-        f"  raw_n qk={rec['attn_qk_raw_norm']:.2f}"
-        f" v={rec['attn_v_raw_norm']:.2f}"
-        f" k={rec['know_raw_out_norm']:.2f}"
+        f"  raw_n attn_qk={rec['attn_qk_raw_norm']:.2f}"
+        f" attn_v={rec['attn_v_raw_norm']:.2f}"
+        f" rst={rec['rst_raw_out_norm']:.2f}"
         f" | out_n a={rec['attn_out_norm']:.2f}"
-        f" k={rec['know_out_norm']:.2f}"
+        f" rst={rec['rst_out_norm']:.2f}"
     )
     log_message(
         f"  debug resid={rec['debug_residual_norm']:.2f}"
         f" emb={rec['debug_emb_norm']:.2f}"
         f" o_proj={rec['debug_o_proj_norm']:.2f}"
         f" q={rec['debug_q_norm']:.2f}"
-        f" k={rec['debug_k_norm']:.2f}"
-        f" v={rec['debug_v_norm']:.2f}"
+        f" rst={rec['debug_k_norm']:.2f}"
+        f" attn_v={rec['debug_v_norm']:.2f}"
         f" logit_max={rec['debug_logit_max']:.1f}"
         f" o_in={rec['debug_o_input_norm']:.2f}"
     )
@@ -2340,8 +2379,8 @@ def _print_analysis_block(rec, ctx):
         f" r={rec['qk_read_grad_ratio']:.2e} w={rec['qk_write_grad_ratio']:.2e}]"
         f" v[emb={rec['v_emb_grad_ratio']:.2e}"
         f" r={rec['v_read_grad_ratio']:.2e} w={rec['v_write_grad_ratio']:.2e}]"
-        f" k[emb={rec['know_emb_grad_ratio']:.2e}"
-        f" r={rec['know_read_grad_ratio']:.2e} w={rec['know_write_grad_ratio']:.2e}]"
+        f" k[emb={rec['rst_emb_grad_ratio']:.2e}"
+        f" r={rec['rst_read_grad_ratio']:.2e} w={rec['rst_write_grad_ratio']:.2e}]"
     )
     if 'hbm_used_gb' in rec:
         log_message(
@@ -2361,9 +2400,9 @@ def _print_geometry_block(geom):
             f" sv5=[{' '.join(f'{v:.2f}' for v in sv)}]]"
         )
     for _name, _label in (
-            ('qk_emb', 'qk_emb'), ('qk_read', 'qk_r'), ('qk_write', 'qk_w'),
-            ('v_emb', 'v_emb'), ('v_read', 'v_r'), ('v_write', 'v_w'),
-            ('know_emb', 'k_emb'), ('know_read', 'k_r'), ('know_write', 'k_w')):
+            ('attn_qk_emb', 'attn_qk_emb'), ('attn_qk_read', 'attn_qk_r'), ('attn_qk_write', 'attn_qk_w'),
+            ('v_emb', 'v_emb'), ('attn_v_read', 'attn_v_r'), ('attn_v_write', 'attn_v_w'),
+            ('rst_emb', 'k_emb'), ('rst_read', 'k_r'), ('rst_write', 'k_w')):
         if f'{_name}_geom_rank' in geom:
             _line(_name, _label)
 
@@ -2779,7 +2818,7 @@ def main():
         end_value=lr * 0.1,
     )
 
-    # v4.1 per-group WD: pool tensors (qk/v/know emb/read/write) get
+    # v4.1 per-group WD: pool tensors (attn-qk/attn-v/RST emb/read/write) get
     # pool_weight_decay; dense kernels get weight_decay. Bias / LayerNorm /
     # learnable *_scale excluded from both groups.
     #
@@ -2788,20 +2827,25 @@ def main():
     # two masked add_decayed_weights (base + pool -masks are disjoint so
     # each param is touched at most once), then a single scale_by_lr.
 
-    _MODEL_VERSION = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
+    _MODEL_VERSION = cfg['model'].get('model_version', 'dawn_srw')
 
     _POOL_PARAM_NAMES = (
-        'qk_emb', 'v_emb', 'know_emb',
+        'attn_qk_emb', 'attn_v_emb', 'rst_emb',
+        'qk_emb', 'v_emb', 'rst_emb',
         'q_read', 'k_read',
-        'qk_read', 'v_read', 'know_read',
+        'attn_qk_read', 'attn_v_read', 'rst_read',
+        'qk_read', 'v_read', 'rst_read',
         'q_write', 'k_write',
-        'qk_write', 'v_write', 'know_write',
+        'attn_qk_write', 'attn_v_write', 'rst_write',
+        'qk_write', 'v_write', 'rst_write',
     )
     _RW_PARAM_NAMES = (
         'q_read', 'k_read',
-        'qk_read', 'v_read', 'know_read',
+        'attn_qk_read', 'attn_v_read', 'rst_read',
+        'qk_read', 'v_read', 'rst_read',
         'q_write', 'k_write',
-        'qk_write', 'v_write', 'know_write',
+        'attn_qk_write', 'attn_v_write', 'rst_write',
+        'qk_write', 'v_write', 'rst_write',
     )
 
     def _path_str(path):
@@ -2820,7 +2864,10 @@ def main():
         if 'scale' in path_str and 'norm' in path_str.lower():
             return True  # LayerNorm scale
         if path_str.endswith('_scale') or path_str.endswith('/qk_scale') \
-           or path_str.endswith('/v_scale') or path_str.endswith('/know_scale'):
+           or path_str.endswith('/v_scale') or path_str.endswith('/rst_scale') \
+           or path_str.endswith('/attn_qk_scale') \
+           or path_str.endswith('/attn_v_scale') \
+           or path_str.endswith('/rst_scale'):
             return True  # learnable output_scale
         if _MODEL_VERSION == 'spatial-r1-v4.1.5.2' and _is_rw_param(path_str):
             return True  # v4.1.5.2 forward-normalizes read/write directions
@@ -2922,7 +2969,7 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5'):
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -2999,12 +3046,13 @@ def main():
     # ----------------------------------------------------------
     n_feature_qk = cfg['model'].get('n_feature_qk', 56)
     n_restore_qk = cfg['model'].get('n_restore_qk', 56)
-    model_version = cfg['model'].get('model_version', 'spatial-r1-v4.1.5.2')
+    model_version = cfg['model'].get('model_version', 'dawn_srw')
     is_baseline = model_version == 'baseline'
     is_spatial = model_version in (
         'spatial-r1-v3.9.4',
         'spatial-r1-v4.1.5.2',
         'spatial-r1-v4.1.5.5',
+        'dawn_srw',
     )
 
     mesh_model = cfg['training'].get('mesh_model', 1)
@@ -3026,21 +3074,21 @@ def main():
         return min(nc, N)
 
     target_chunk_gb = cfg['training'].get('target_chunk_gb', 2.0)
-    n_know = cfg['model'].get('n_know', 25200)
+    n_rst = cfg['model'].get('n_rst', cfg['model'].get('n_know', 25200))
     n_qk = cfg['model'].get('n_qk', cfg['model'].get('n_q', 1580))
     n_v = cfg['model'].get('n_v', 2600)
-    for _name, _N in (('n_know', n_know), ('n_qk', n_qk), ('n_v', n_v)):
+    for _name, _N in (('n_rst', n_rst), ('n_qk', n_qk), ('n_v', n_v)):
         if _N % mesh_model != 0:
             raise ValueError(
                 f"{_name}={_N} must be divisible by mesh_model={mesh_model} "
                 "for model-axis sharding.")
     # N_local = N / mesh_model (each chip's share)
-    nk_local = n_know // mesh_model
+    nrst_local = n_rst // mesh_model
     nqk_local = n_qk // mesh_model
     nv_local = n_v // mesh_model
 
-    n_chunks_know = cfg['training'].get('n_chunks_know',
-                                         auto_n_chunks(nk_local, target_chunk_gb))
+    n_chunks_rst = cfg['training'].get('n_chunks_rst',
+                                         auto_n_chunks(nrst_local, target_chunk_gb))
     n_chunks_qk = cfg['training'].get('n_chunks_qk',
                                        auto_n_chunks(nqk_local, target_chunk_gb))
     n_chunks_v = cfg['training'].get('n_chunks_v',
@@ -3055,17 +3103,17 @@ def main():
                 f"{name} chunks={n_chunks} exceeds local pool size {n_local}")
         return max(1, int(np.ceil(n_local / n_chunks)))
 
-    qk_max_chunk = _chunk_size_from_count('qk', nqk_local, n_chunks_qk)
-    v_max_chunk = _chunk_size_from_count('v', nv_local, n_chunks_v)
-    know_max_chunk = _chunk_size_from_count('know', nk_local, n_chunks_know)
+    attn_qk_max_chunk = _chunk_size_from_count('attn_qk', nqk_local, n_chunks_qk)
+    attn_v_max_chunk = _chunk_size_from_count('attn_v', nv_local, n_chunks_v)
+    rst_max_chunk = _chunk_size_from_count('rst', nrst_local, n_chunks_rst)
 
     if is_host0:
         print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
-        print(f"  Chunks: know={n_chunks_know} (cs={nk_local // max(n_chunks_know,1)}), "
-              f"qk={n_chunks_qk}, v={n_chunks_v}")
-        chunk_mem = per_device_batch * max_seq_len * know_max_chunk * 2 / 1e9
-        print(f"  Est chunk mem (know): {chunk_mem:.2f}GB bf16")
+        print(f"  Chunks: rst={n_chunks_rst} (cs={nrst_local // max(n_chunks_rst,1)}), "
+              f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
+        chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
+        print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
     param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
@@ -3106,28 +3154,28 @@ def main():
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', None)
         if max_chunk is not None:
-            qk_max_chunk = v_max_chunk = know_max_chunk = int(max_chunk)
+            attn_qk_max_chunk = attn_v_max_chunk = rst_max_chunk = int(max_chunk)
 
         _srw_base_kwargs = {'mesh': mesh}
         if _spec.sharded_kwargs is not None:
             _srw_base_kwargs.update(_spec.sharded_kwargs(cfg))
         # Slim (train) -kwargs don't set analysis, so defaults to False.
         _sharded_single_v = make_sharded_srw(
-            max_chunk_size=v_max_chunk, **_srw_base_kwargs)
-        _sharded_single_know = make_sharded_srw(
-            max_chunk_size=know_max_chunk, **_srw_base_kwargs)
+            max_chunk_size=attn_v_max_chunk, **_srw_base_kwargs)
+        _sharded_single_rst = make_sharded_srw(
+            max_chunk_size=rst_max_chunk, **_srw_base_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
-            _sharded_paired_qk = _v3.make_sharded_srw_paired(
-                max_chunk_size=qk_max_chunk, **_srw_base_kwargs)
+            _sharded_paired_attn_qk = _v3.make_sharded_srw_paired(
+                max_chunk_size=attn_qk_max_chunk, **_srw_base_kwargs)
             _sharded_fns = {
                 'single': _sharded_single_v,
-                'v_single': _sharded_single_v,
-                'know_single': _sharded_single_know,
-                'paired': _sharded_paired_qk,
-                'qk_paired': _sharded_paired_qk,
+                'attn_v_single': _sharded_single_v,
+                'rst_single': _sharded_single_rst,
+                'paired': _sharded_paired_attn_qk,
+                'attn_qk_paired': _sharded_paired_attn_qk,
             }
         else:
-            _sharded_fns = _sharded_single_know
+            _sharded_fns = _sharded_single_rst
         # Analysis (observation only). Factory kwargs forward analysis=True
         # only to factories that accept it -v4.1 does, earlier versions
         # silently absorb it via **kwargs or raise; only probe when the
@@ -3138,26 +3186,26 @@ def main():
         )
         if _supports_analysis:
             _sharded_single_v_a = make_sharded_srw(
-                analysis=True, max_chunk_size=v_max_chunk, **_srw_base_kwargs)
-            _sharded_single_know_a = make_sharded_srw(
-                analysis=True, max_chunk_size=know_max_chunk, **_srw_base_kwargs)
+                analysis=True, max_chunk_size=attn_v_max_chunk, **_srw_base_kwargs)
+            _sharded_single_rst_a = make_sharded_srw(
+                analysis=True, max_chunk_size=rst_max_chunk, **_srw_base_kwargs)
             if hasattr(_v3, 'make_sharded_srw_paired'):
                 _sharded_paired_a = _v3.make_sharded_srw_paired(
-                    analysis=True, max_chunk_size=qk_max_chunk,
+                    analysis=True, max_chunk_size=attn_qk_max_chunk,
                     **_srw_base_kwargs)
                 _sharded_fns_analysis = {
                     'single': _sharded_single_v_a,
-                    'v_single': _sharded_single_v_a,
-                    'know_single': _sharded_single_know_a,
+                    'attn_v_single': _sharded_single_v_a,
+                    'rst_single': _sharded_single_rst_a,
                     'paired': _sharded_paired_a,
-                    'qk_paired': _sharded_paired_a,
+                    'attn_qk_paired': _sharded_paired_a,
                 }
             else:
-                _sharded_fns_analysis = _sharded_single_know_a
+                _sharded_fns_analysis = _sharded_single_rst_a
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
-                  f"; chunks qk/v/know={n_chunks_qk}/{n_chunks_v}/{n_chunks_know}"
-                  f"; max_chunk qk/v/know={qk_max_chunk}/{v_max_chunk}/{know_max_chunk}"
+                  f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
+                  f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'})")
 
     train_step_fn = create_train_step(
@@ -3205,16 +3253,22 @@ def main():
         # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
         def _drift_snap(p):
             pool = p['neuron_pool']
+            if 'attn_qk_emb' in pool:
+                return {
+                    'attn_qk_emb': pool['attn_qk_emb'],
+                    'attn_v_emb': pool['attn_v_emb'],
+                    'rst_emb': pool['rst_emb'],
+                }
             if 'qk_emb' in pool:
                 return {
-                    'qk_emb': pool['qk_emb'],
-                    'v_emb': pool['v_emb'],
-                    'know_emb': pool['know_emb'],
+                    'attn_qk_emb': pool['qk_emb'],
+                    'attn_v_emb': pool['v_emb'],
+                    'rst_emb': pool['rst_emb'],
                 }
             return {
-                'qk_emb': pool['q_read'],
-                'v_emb': pool['v_read'],
-                'know_emb': pool['know_read'],
+                'attn_qk_emb': pool['q_read'],
+                'attn_v_emb': pool['v_read'],
+                'rst_emb': pool['rst_read'],
             }
 
         _dummy_emb_snap = _drift_snap(params)
@@ -3261,7 +3315,7 @@ def main():
         # Only print statements are guarded by is_host0.
         try:
             _is_sharded = _sharded_fns is not None
-            _uses_scan_bias = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5')
+            _uses_scan_offset = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
@@ -3269,8 +3323,8 @@ def main():
 
             _v3 = __import__(
                 MODEL_REGISTRY[model_version].module_path,
-                fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
-            _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
+                fromlist=['_layer_norm', '_attn_forward', '_rst_forward', '_srw_chunked'])
+            _layer_norm, _attn_forward, _rst_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._rst_forward, _v3._srw_chunked
 
             # Use actual sharded params (no device_get)
             pool_p = params['neuron_pool']
@@ -3328,6 +3382,8 @@ def main():
                 return (elapsed, hbm_after - hbm_before, peak)
 
             # --- Jit-compiled component functions for profiling ---
+            def _get_param(container, new_key, legacy_key):
+                return container[new_key] if new_key in container else container[legacy_key]
 
             # 1) LayerNorm
             @jax.jit
@@ -3345,27 +3401,28 @@ def main():
                 h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
                 tau_all = (x @ router_p['tau_attn']['kernel']
                            + router_p['tau_attn']['bias'])
-                if _uses_scan_bias:
-                    scan_bias_all = (x @ router_p['scan_bias_attn']['kernel']
-                                     + router_p['scan_bias_attn']['bias'])
+                if _uses_scan_offset:
+                    scan_p = _get_param(
+                        router_p, 'raw_scan_offset_attn', 'raw_scan_offset_attn')
+                    raw_scan_offset_all = (x @ scan_p['kernel'] + scan_p['bias'])
                 else:
-                    scan_bias_all = jnp.zeros_like(tau_all)
-                return h_Q, h_K, h_V, tau_all, scan_bias_all
+                    raw_scan_offset_all = jnp.zeros_like(tau_all)
+                return h_Q, h_K, h_V, tau_all, raw_scan_offset_all
 
             # 3) QK fused shard_map (paired)
             @jax.jit
-            def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, scan_bias_all, qk_read, qk_write):
-                fused_paired = (_sharded_fns.get('qk_paired', _sharded_fns['paired'])
+            def prof_qk_fused(x, h_Q, h_K, qk_norm, tau_all, raw_scan_offset_all, qk_read, qk_write):
+                fused_paired = (_sharded_fns.get('attn_qk_paired', _sharded_fns['paired'])
                                 if isinstance(_sharded_fns, dict)
                                 else _sharded_fns[1])
                 h_QK = jnp.stack([h_Q, h_K], axis=2)
                 tau_QK = jnp.stack(
                     [tau_all[:, :, 0:1], tau_all[:, :, 1:2]], axis=2)
-                scan_bias_QK = jnp.stack(
-                    [scan_bias_all[:, :, 0:1], scan_bias_all[:, :, 1:2]], axis=2)
-                if _uses_scan_bias:
+                raw_scan_offset_QK = jnp.stack(
+                    [raw_scan_offset_all[:, :, 0:1], raw_scan_offset_all[:, :, 1:2]], axis=2)
+                if _uses_scan_offset:
                     results = fused_paired(
-                        x, h_QK, qk_norm, tau_QK, scan_bias_QK, qk_read, qk_write)
+                        x, h_QK, qk_norm, tau_QK, raw_scan_offset_QK, qk_read, qk_write)
                 else:
                     results = fused_paired(
                         x, h_QK, qk_norm, tau_QK, qk_read, qk_write)
@@ -3383,13 +3440,13 @@ def main():
 
             # 4) V shard_map (single)
             @jax.jit
-            def prof_v_sharded(x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write):
-                fused_single = (_sharded_fns.get('v_single', _sharded_fns['single'])
+            def prof_v_sharded(x, h_V, v_norm, tau_v, raw_scan_offset_v, v_read, v_write):
+                fused_single = (_sharded_fns.get('attn_v_single', _sharded_fns['single'])
                                 if isinstance(_sharded_fns, dict)
                                 else _sharded_fns[0])
-                if _uses_scan_bias:
+                if _uses_scan_offset:
                     return fused_single(
-                        x, h_V, v_norm, tau_v, scan_bias_v, v_read, v_write)
+                        x, h_V, v_norm, tau_v, raw_scan_offset_v, v_read, v_write)
                 return fused_single(
                     x, h_V, v_norm, tau_v, v_read, v_write)
 
@@ -3419,82 +3476,89 @@ def main():
 
             # 6) Know router
             @jax.jit
-            def prof_know_router(x, router_p):
-                h = (x @ router_p['proj_know']['kernel']
-                     + router_p['proj_know']['bias'])
+            def prof_rst_router(x, router_p):
+                proj_p = _get_param(router_p, 'proj_rst', 'proj_know')
+                h = (x @ proj_p['kernel'] + proj_p['bias'])
                 h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-8)
-                tau = (x @ router_p['tau_know']['kernel']
-                       + router_p['tau_know']['bias'])
-                if _uses_scan_bias:
-                    scan_bias = (x @ router_p['scan_bias_know']['kernel']
-                                 + router_p['scan_bias_know']['bias'])
+                tau_p = _get_param(router_p, 'tau_rst', 'tau_rst')
+                tau = (x @ tau_p['kernel'] + tau_p['bias'])
+                if _uses_scan_offset:
+                    scan_p = _get_param(
+                        router_p, 'raw_scan_offset_rst', 'raw_scan_offset_rst')
+                    raw_scan_offset = (x @ scan_p['kernel'] + scan_p['bias'])
                 else:
-                    scan_bias = jnp.zeros_like(tau)
-                return h, tau, scan_bias
+                    raw_scan_offset = jnp.zeros_like(tau)
+                return h, tau, raw_scan_offset
 
             # 7) Know shard_map (single)
             @jax.jit
-            def prof_know_sharded(x, h, know_norm, tau, scan_bias, know_read, know_write):
-                fused_single = (_sharded_fns.get('know_single', _sharded_fns['single'])
+            def prof_rst_sharded(x, h, rst_norm, tau, raw_scan_offset, rst_read, rst_write):
+                fused_single = (_sharded_fns.get('rst_single', _sharded_fns['single'])
                                 if isinstance(_sharded_fns, dict)
                                 else _sharded_fns[0])
-                if _uses_scan_bias:
+                if _uses_scan_offset:
                     return fused_single(
-                        x, h, know_norm, tau, scan_bias, know_read, know_write)
+                        x, h, rst_norm, tau, raw_scan_offset, rst_read, rst_write)
                 return fused_single(
-                    x, h, know_norm, tau, know_read, know_write)
+                    x, h, rst_norm, tau, rst_read, rst_write)
 
             # 7b) Know non-sharded fallback
             @jax.jit
-            def prof_know_chunked(x, h, know_norm, tau, know_read, know_write):
-                return _srw_chunked(x, h, know_norm, tau,
-                                    know_read, know_write, n_chunks_know)
+            def prof_rst_chunked(x, h, rst_norm, tau, rst_read, rst_write):
+                return _srw_chunked(x, h, rst_norm, tau,
+                                    rst_read, rst_write, n_chunks_rst)
 
             # --- Prepare intermediate values ---
-            qk_emb = pool_p['qk_emb']
-            v_emb = pool_p['v_emb']
-            know_emb = pool_p['know_emb']
+            qk_emb = _get_param(pool_p, 'attn_qk_emb', 'qk_emb')
+            v_emb = _get_param(pool_p, 'attn_v_emb', 'v_emb')
+            rst_emb = _get_param(pool_p, 'rst_emb', 'rst_emb')
+            qk_read = _get_param(pool_p, 'attn_qk_read', 'qk_read')
+            qk_write = _get_param(pool_p, 'attn_qk_write', 'qk_write')
+            v_read = _get_param(pool_p, 'attn_v_read', 'v_read')
+            v_write = _get_param(pool_p, 'attn_v_write', 'v_write')
+            rst_read = _get_param(pool_p, 'rst_read', 'rst_read')
+            rst_write = _get_param(pool_p, 'rst_write', 'rst_write')
             qk_norm = qk_emb / (jnp.linalg.norm(
                 qk_emb, axis=-1, keepdims=True) + 1e-8)
             v_norm = v_emb / (jnp.linalg.norm(
                 v_emb, axis=-1, keepdims=True) + 1e-8)
-            know_norm = know_emb / (jnp.linalg.norm(
-                know_emb, axis=-1, keepdims=True) + 1e-8)
+            rst_norm = rst_emb / (jnp.linalg.norm(
+                rst_emb, axis=-1, keepdims=True) + 1e-8)
 
             normed = prof_layernorm(
                 dummy_x, block_p['norm1']['scale'],
                 block_p['norm1']['bias'])
             jax.block_until_ready(normed)
 
-            h_Q, h_K, h_V, tau_all, scan_bias_all = prof_attn_router(normed, router_p)
+            h_Q, h_K, h_V, tau_all, raw_scan_offset_all = prof_attn_router(normed, router_p)
             jax.block_until_ready(tau_all)
 
             if _is_sharded:
                 Q, K, *_ = prof_qk_fused(
-                    normed, h_Q, h_K, qk_norm, tau_all, scan_bias_all,
-                    pool_p['qk_read'], pool_p['qk_write'])
+                    normed, h_Q, h_K, qk_norm, tau_all, raw_scan_offset_all,
+                    qk_read, qk_write)
                 V, *_ = prof_v_sharded(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3], scan_bias_all[:, :, 2:3],
-                    pool_p['v_read'], pool_p['v_write'])
+                    normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+                    v_read, v_write)
             else:
                 Q, K = prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
-                    pool_p['qk_read'], pool_p['qk_write'])
+                    qk_read, qk_write)
                 V, *_ = prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
-                    pool_p['v_read'], pool_p['v_write'])
+                    v_read, v_write)
             jax.block_until_ready((Q, K, V))
 
-            h_know, tau_know, scan_bias_know = prof_know_router(normed, router_p)
-            jax.block_until_ready(tau_know)
+            h_rst, tau_rst, raw_scan_offset_rst = prof_rst_router(normed, router_p)
+            jax.block_until_ready(tau_rst)
             if _is_sharded:
-                _kout = prof_know_sharded(
-                    normed, h_know, know_norm, tau_know, scan_bias_know,
-                    pool_p['know_read'], pool_p['know_write'])[0]
+                _kout = prof_rst_sharded(
+                    normed, h_rst, rst_norm, tau_rst, raw_scan_offset_rst,
+                    rst_read, rst_write)[0]
             else:
-                _kout, _, _, _, _, _, _, _ = prof_know_chunked(
-                    normed, h_know, know_norm, tau_know,
-                    pool_p['know_read'], pool_p['know_write'])
+                _kout, _, _, _, _, _, _, _ = prof_rst_chunked(
+                    normed, h_rst, rst_norm, tau_rst,
+                    rst_read, rst_write)
             jax.block_until_ready(_kout)
 
             # --- Timed + memory measurements ---
@@ -3512,21 +3576,21 @@ def main():
 
             if _is_sharded:
                 ms, dg, pk = _t(lambda: prof_qk_fused(
-                    normed, h_Q, h_K, qk_norm, tau_all, scan_bias_all,
-                    pool_p['qk_read'], pool_p['qk_write']))
+                    normed, h_Q, h_K, qk_norm, tau_all, raw_scan_offset_all,
+                    qk_read, qk_write))
                 items.append(("A QK fused shard", ms, dg, pk))
                 ms, dg, pk = _t(lambda: prof_v_sharded(
-                    normed, h_V, v_norm, tau_all[:, :, 2:3], scan_bias_all[:, :, 2:3],
-                    pool_p['v_read'], pool_p['v_write']))
+                    normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
+                    v_read, v_write))
                 items.append(("A V shard", ms, dg, pk))
             else:
                 ms, dg, pk = _t(lambda: prof_qk_chunked(
                     normed, h_Q, h_K, qk_norm, tau_all,
-                    pool_p['qk_read'], pool_p['qk_write']))
+                    qk_read, qk_write))
                 items.append(("A QK chunked(x2)", ms, dg, pk))
                 ms, dg, pk = _t(lambda: prof_v_chunked(
                     normed, h_V, v_norm, tau_all[:, :, 2:3],
-                    pool_p['v_read'], pool_p['v_write']))
+                    v_read, v_write))
                 items.append(("A V chunked", ms, dg, pk))
 
             Ok = block_p['attn']['expand_O']['kernel']
@@ -3538,18 +3602,18 @@ def main():
                 block_p['norm2']['bias']))
             items.append(("LayerNorm (know)", ms, dg, pk))
 
-            ms, dg, pk = _t(lambda: prof_know_router(normed, router_p))
+            ms, dg, pk = _t(lambda: prof_rst_router(normed, router_p))
             items.append(("K router(proj+tau)", ms, dg, pk))
 
             if _is_sharded:
-                ms, dg, pk = _t(lambda: prof_know_sharded(
-                    normed, h_know, know_norm, tau_know, scan_bias_know,
-                    pool_p['know_read'], pool_p['know_write']))
+                ms, dg, pk = _t(lambda: prof_rst_sharded(
+                    normed, h_rst, rst_norm, tau_rst, raw_scan_offset_rst,
+                    rst_read, rst_write))
                 items.append(("K know shard", ms, dg, pk))
             else:
-                ms, dg, pk = _t(lambda: prof_know_chunked(
-                    normed, h_know, know_norm, tau_know,
-                    pool_p['know_read'], pool_p['know_write']))
+                ms, dg, pk = _t(lambda: prof_rst_chunked(
+                    normed, h_rst, rst_norm, tau_rst,
+                    rst_read, rst_write))
                 items.append(("K know chunked", ms, dg, pk))
 
             # --- Print breakdown (time + memory) --- host0 only
@@ -3581,13 +3645,13 @@ def main():
 
                 # Group summaries
                 attn_ms = sum(ms for n, ms, _, _ in items if n.startswith('A '))
-                know_ms = sum(ms for n, ms, _, _ in items if n.startswith('K '))
+                rst_ms = sum(ms for n, ms, _, _ in items if n.startswith('K '))
                 norm_ms = sum(ms for n, ms, _, _ in items if n.startswith('LayerNorm'))
                 print(f"    {'-'*22} {'-'*8}", flush=True)
                 print(f"    {'Attention total':22s} {attn_ms:7.1f}ms "
                       f"{attn_ms/total_ms*100:.0f}%", flush=True)
-                print(f"    {'Knowledge total':22s} {know_ms:7.1f}ms "
-                      f"{know_ms/total_ms*100:.0f}%", flush=True)
+                print(f"    {'Knowledge total':22s} {rst_ms:7.1f}ms "
+                      f"{rst_ms/total_ms*100:.0f}%", flush=True)
                 print(f"    {'LayerNorm total':22s} {norm_ms:7.1f}ms "
                       f"{norm_ms/total_ms*100:.0f}%", flush=True)
                 print(f"    {'Layer total':22s} {total_ms:7.1f}ms", flush=True)
@@ -3613,7 +3677,7 @@ def main():
                           flush=True)
 
             del normed, h_Q, h_K, h_V, tau_all, Q, K, V
-            del h_know, tau_know, _kout, dummy_x
+            del h_rst, tau_rst, _kout, dummy_x
         except Exception as e:
             if is_host0:
                 import traceback
@@ -3916,7 +3980,7 @@ def main():
                         'n_qk_cfg': cfg['model'].get(
                             'n_qk', cfg['model'].get('n_q', 0)),
                         'n_v_cfg': cfg['model'].get('n_v', 0),
-                        'n_know_cfg': cfg['model'].get('n_know', 0),
+                        'n_rst_cfg': cfg['model'].get('n_know', 0),
                         'current_lr': _current_lr,
                         'steps_per_sec': _steps_per_sec,
                         'total_elapsed': _total_elapsed,
@@ -4005,7 +4069,7 @@ def main():
                                 'n_qk_cfg': cfg['model'].get(
                                     'n_qk', cfg['model'].get('n_q', 0)),
                                 'n_v_cfg': cfg['model'].get('n_v', 0),
-                                'n_know_cfg': cfg['model'].get('n_know', 0),
+                                'n_rst_cfg': cfg['model'].get('n_know', 0),
                                 'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
                             }
