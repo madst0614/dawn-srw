@@ -18,8 +18,26 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2] if len(Path(__file__).resolve().parents) >= 3 else Path.cwd()
-sys.path.insert(0, str(PROJECT_ROOT))
+def _find_project_root() -> Path:
+    """Find repo root containing models/dawn_srw.py.
+
+    This lets the analysis scripts run from scripts/analysis/dawn_srw/
+    without requiring PYTHONPATH to be set manually.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "models" / "dawn_srw.py").exists():
+            return parent
+    # Standard repo layout fallback:
+    # scripts/analysis/dawn_srw/dawn_srw_common.py -> repo root is parents[3].
+    if len(here.parents) > 3:
+        return here.parents[3]
+    return Path.cwd().resolve()
+
+
+PROJECT_ROOT = _find_project_root()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import jax
 import jax.numpy as jnp
