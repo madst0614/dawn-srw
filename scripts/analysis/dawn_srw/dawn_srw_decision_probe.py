@@ -112,7 +112,28 @@ def forward_to_rst_input(mod, params, model_cfg, input_ids, layer_index: int):
     }
 
 
-def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, sort_by: str = "gate"):
+def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, sort_by: str = "projection"):
+    """Extract an implementation-faithful RST model-decision trace.
+
+    DAWN-SRW's RST output is a vector sum, not a scalar ranking:
+
+        c_i = gate_i * <x, r_i>
+        v_i = (rst_scale / den) * c_i * w_i
+        rst_output = sum_i v_i
+
+    Therefore the probe reports multiple axes:
+      - score: signature matching strength.
+      - activation/intensity/gate: Select decision strength.
+      - contribution_norm: ||v_i||, the magnitude of the RW contribution vector.
+      - signed_projection_on_rst: projection of v_i onto the final RST output
+        direction. Positive values construct the final transition direction;
+        negative values oppose it.
+      - abs_projection_on_rst: absolute directional contribution.
+
+    For paper figures, `sort_by=projection` or `sort_by=contribution` is usually
+    more informative than `sort_by=gate`, because gate alone ignores the read
+    scalar and write vector.
+    """
     pp = params["neuron_pool"]
     x = state["rst_input_normed"][0, token_index, :].astype(jnp.float32)
     h = state["rst_route_query"][0, token_index, :].astype(jnp.float32)
@@ -121,7 +142,9 @@ def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, 
     emb = pp["rst_emb"].astype(jnp.float32)
     read = pp["rst_read"].astype(jnp.float32)
     write = pp["rst_write"].astype(jnp.float32)
+    rst_scale = jnp.asarray(pp.get("rst_scale", jnp.asarray([1.0])), dtype=jnp.float32).reshape(() if jnp.asarray(pp.get("rst_scale", jnp.asarray([1.0]))).shape == () else (-1,))[0]
 
+    # Select: route query -> signature matching -> relative tau -> gate.
     scores = h @ emb.T
     s_mean = scores.mean()
     s_std = jnp.sqrt(jnp.mean(jnp.square(scores - s_mean))) + 1e-8
@@ -133,17 +156,50 @@ def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, 
     active_margin = jnp.maximum(margin - mod.ACTIVATION_CUTOFF, 0.0)
     intensity = mod.EPSILON + jnp.minimum(active_margin, mod.MAX_INTENSITY)
     gate = activation * intensity
+
+    # RW operator contribution exactly follows the implementation:
+    #   O_i^RW(x) = <x, r_i> w_i
+    #   out = sum_i gate_i * O_i^RW(x) / max(sum_i gate_i, 1.0)
+    # and the RST pool scale is applied after SRW composition.
     read_value = read @ x
     coeff = gate * read_value
-    write_norm = jnp.linalg.norm(write, axis=-1)
-    contribution_norm_raw = jnp.abs(coeff) * write_norm
     den = jnp.maximum(gate.sum(), 1.0)
-    contribution_norm = contribution_norm_raw / den
+    scaled_coeff = rst_scale * coeff / den
+    contribution_vectors = scaled_coeff[:, None] * write
+    contribution_norm = jnp.linalg.norm(contribution_vectors, axis=-1)
+    write_norm = jnp.linalg.norm(write, axis=-1)
 
-    if sort_by == "contribution":
+    rst_output_vec = state["rst_output"][0, token_index, :].astype(jnp.float32)
+    rst_output_norm = jnp.linalg.norm(rst_output_vec) + 1e-8
+    rst_unit = rst_output_vec / rst_output_norm
+    signed_projection = contribution_vectors @ rst_unit
+    abs_projection = jnp.abs(signed_projection)
+    alignment_cosine = signed_projection / (contribution_norm + 1e-8)
+
+    gate_mass_fraction = gate / (gate.sum() + 1e-8)
+    contribution_mass_fraction = contribution_norm / (contribution_norm.sum() + 1e-8)
+    abs_projection_fraction = abs_projection / (abs_projection.sum() + 1e-8)
+    signed_projection_fraction_of_rst = signed_projection / rst_output_norm
+
+    # Ranking modes.
+    # - gate: selectedness only.
+    # - score: signature match only.
+    # - intensity: above-threshold margin strength.
+    # - contribution/contribution_norm: magnitude of actual RW vector contribution.
+    # - projection/abs_projection: directional contribution to the final RST output.
+    # - positive_projection: constructive contribution only.
+    if sort_by in ("contribution", "contribution_norm"):
         order_metric = contribution_norm
     elif sort_by == "score":
         order_metric = scores
+    elif sort_by == "intensity":
+        order_metric = intensity
+    elif sort_by == "positive_projection":
+        order_metric = signed_projection
+    elif sort_by in ("projection", "abs_projection"):
+        order_metric = abs_projection
+    elif sort_by == "alignment":
+        order_metric = alignment_cosine
     else:
         order_metric = gate
     k = min(top_k, int(gate.shape[0]))
@@ -156,10 +212,18 @@ def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, 
         "activation": activation[top_idx],
         "intensity": intensity[top_idx],
         "gate": gate[top_idx],
+        "gate_mass_fraction": gate_mass_fraction[top_idx],
         "read_value": read_value[top_idx],
         "coeff": coeff[top_idx],
+        "scaled_coeff": scaled_coeff[top_idx],
         "write_norm": write_norm[top_idx],
         "contribution_norm": contribution_norm[top_idx],
+        "contribution_mass_fraction": contribution_mass_fraction[top_idx],
+        "signed_projection_on_rst": signed_projection[top_idx],
+        "abs_projection_on_rst": abs_projection[top_idx],
+        "abs_projection_fraction": abs_projection_fraction[top_idx],
+        "signed_projection_fraction_of_rst": signed_projection_fraction_of_rst[top_idx],
+        "alignment_cosine": alignment_cosine[top_idx],
         "top_idx": top_idx,
         "top_metric": top_vals,
         "s_mean": s_mean,
@@ -169,8 +233,13 @@ def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, 
         "scan_offset": scan_offset,
         "tau": tau,
         "gate_sum": gate.sum(),
+        "denominator": den,
+        "rst_scale": rst_scale,
         "active_count": (activation > 0.5).sum(),
+        "intensity_cap_count": (intensity >= (mod.MAX_INTENSITY + mod.EPSILON - 1e-3)).sum(),
         "gate_entropy": -(gate / (gate.sum() + 1e-8) * jnp.log(gate / (gate.sum() + 1e-8) + 1e-8)).sum(),
+        "sum_contribution_norm": contribution_norm.sum(),
+        "sum_abs_projection": abs_projection.sum(),
         "rst_output_norm": jnp.linalg.norm(state["rst_output"][0, token_index, :]),
         "attn_output_norm": jnp.linalg.norm(state["attention_output"][0, token_index, :]),
     })
@@ -186,10 +255,18 @@ def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, 
             "activation": float(arrays["activation"][rank]),
             "intensity": float(arrays["intensity"][rank]),
             "gate": float(arrays["gate"][rank]),
+            "gate_mass_fraction": float(arrays["gate_mass_fraction"][rank]),
             "read_value": float(arrays["read_value"][rank]),
             "coefficient_gate_times_read": float(arrays["coeff"][rank]),
+            "scaled_coefficient_after_den_and_pool_scale": float(arrays["scaled_coeff"][rank]),
             "write_norm": float(arrays["write_norm"][rank]),
             "contribution_norm": float(arrays["contribution_norm"][rank]),
+            "contribution_mass_fraction": float(arrays["contribution_mass_fraction"][rank]),
+            "signed_projection_on_rst": float(arrays["signed_projection_on_rst"][rank]),
+            "abs_projection_on_rst": float(arrays["abs_projection_on_rst"][rank]),
+            "abs_projection_fraction": float(arrays["abs_projection_fraction"][rank]),
+            "signed_projection_fraction_of_rst": float(arrays["signed_projection_fraction_of_rst"][rank]),
+            "alignment_cosine": float(arrays["alignment_cosine"][rank]),
             "sort_metric": float(arrays["top_metric"][rank]),
         })
 
@@ -201,13 +278,18 @@ def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, 
         "scan_offset": float(arrays["scan_offset"]),
         "tau": float(arrays["tau"]),
         "gate_sum": float(arrays["gate_sum"]),
+        "denominator": float(arrays["denominator"]),
+        "rst_scale": float(arrays["rst_scale"]),
         "active_count_activation_gt_0_5": int(arrays["active_count"]),
+        "intensity_cap_count": int(arrays["intensity_cap_count"]),
         "gate_entropy": float(arrays["gate_entropy"]),
+        "sum_contribution_norm": float(arrays["sum_contribution_norm"]),
+        "sum_abs_projection": float(arrays["sum_abs_projection"]),
         "attention_output_norm_at_token": float(arrays["attn_output_norm"]),
         "rst_output_norm_at_token": float(arrays["rst_output_norm"]),
+        "ranking_mode": sort_by,
     }
     return summary, top
-
 
 def run_probe(config_path, checkpoint, prompt, target_token, layer, top_k, sort_by, tokenizer_name, output_dir):
     cfg = load_config(config_path)
@@ -240,10 +322,10 @@ def run_probe(config_path, checkpoint, prompt, target_token, layer, top_k, sort_
         }
         results.append(item)
         print(f"\nLayer {li} token[{token_index}]={tokens[token_index]!r}")
-        print(f"  active={summary['active_count_activation_gt_0_5']} gate_sum={summary['gate_sum']:.4f} entropy={summary['gate_entropy']:.4f}")
-        print(f"  attn_norm={summary['attention_output_norm_at_token']:.4f} rst_norm={summary['rst_output_norm_at_token']:.4f}")
+        print(f"  active={summary['active_count_activation_gt_0_5']} cap={summary.get('intensity_cap_count', 0)} gate_sum={summary['gate_sum']:.4f} entropy={summary['gate_entropy']:.4f}")
+        print(f"  attn_norm={summary['attention_output_norm_at_token']:.4f} rst_norm={summary['rst_output_norm_at_token']:.4f} rst_scale={summary.get('rst_scale', 1.0):.4f}")
         for row in top[:min(8, len(top))]:
-            print(f"  #{row['rank']:02d} neuron={row['neuron_id']:5d} gate={row['gate']:.5f} contrib={row['contribution_norm']:.5f} score={row['score']:.4f}")
+            print(f"  #{row['rank']:02d} neuron={row['neuron_id']:5d} score={row['score']:.3f} act={row['activation']:.3f} int={row['intensity']:.3f} gate={row['gate']:.3f} read={row['read_value']:.3f} contrib={row['contribution_norm']:.5f} proj={row['signed_projection_on_rst']:.5f} cos={row['alignment_cosine']:.3f}")
 
     ensure_dir(output_dir)
     path = save_json(results, output_dir, "rst_decision_trace.json")
@@ -259,7 +341,7 @@ def main():
     ap.add_argument("--target-token", default=None)
     ap.add_argument("--layer", default="all", help="Layer index or 'all'")
     ap.add_argument("--top-k", type=int, default=20)
-    ap.add_argument("--sort-by", choices=["gate", "contribution", "score"], default="gate")
+    ap.add_argument("--sort-by", choices=["gate", "score", "intensity", "contribution", "contribution_norm", "projection", "abs_projection", "positive_projection", "alignment"], default="projection")
     ap.add_argument("--tokenizer", default="bert-base-uncased")
     ap.add_argument("--output", default="results/dawn_srw_decision_probe")
     args = ap.parse_args()
