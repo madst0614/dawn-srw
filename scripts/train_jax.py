@@ -2241,12 +2241,29 @@ def _build_analysis_record(base, metrics, ctx):
         'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
         'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
     })
-    for _pool in ('qk', 'v', 'know'):
+    # Full pool diagnostics emitted by _pool_param_diagnostics() use the
+    # current SRW names: attn_qk_*, attn_v_*, rst_*.  Older analysis code
+    # copied only legacy qk/v/know names, which made _print_analysis_block()
+    # crash with KeyError at validation time.  Copy both name families and
+    # provide a conservative fallback to the non-full scalar names.
+    def _copy_full_pool_stats(dst_prefix, src_prefix=None):
+        src_prefix = src_prefix or dst_prefix
         for _kind in ('emb_norm', 'read_norm', 'write_norm', 'op_gain'):
+            base_key = f'{src_prefix}_{_kind}'
             for _stat in ('mean', 'std', 'min', 'p50', 'p95', 'p99', 'max'):
-                rec[f'{_pool}_{_kind}_{_stat}'] = float(
-                    m.get(f'{_pool}_{_kind}_{_stat}', 0.0))
-        rec[f'{_pool}_pool_scale'] = float(m.get(f'{_pool}_pool_scale', 0.0))
+                key = f'{base_key}_{_stat}'
+                # Some regular-path metrics use e.g. rst_emb_norm as the mean
+                # instead of rst_emb_norm_mean.  Use that as a mean fallback.
+                fallback = m.get(base_key, 0.0) if _stat == 'mean' else 0.0
+                rec[f'{dst_prefix}_{_kind}_{_stat}'] = float(m.get(key, fallback))
+        rec[f'{dst_prefix}_pool_scale'] = float(m.get(f'{src_prefix}_pool_scale', 0.0))
+
+    for _pool in ('attn_qk', 'attn_v', 'rst'):
+        _copy_full_pool_stats(_pool)
+
+    # Keep legacy aliases populated for old JSONL consumers / archived models.
+    for _dst, _src in (('qk', 'attn_qk'), ('v', 'attn_v'), ('know', 'rst')):
+        _copy_full_pool_stats(_dst, _src)
     rec['attn_gate_eff_n'] = float(m.get('attn_gate_eff_n', 0.0))
     rec['attn_gate_eff_ratio'] = float(m.get('attn_gate_eff_ratio', 0.0))
     rec['attn_top1_gate_frac'] = float(m.get('attn_top1_gate_frac', 0.0))
@@ -2268,20 +2285,27 @@ def _build_analysis_record(base, metrics, ctx):
     if rec['rst_top1_gate_frac_max'] == 0.0:
         rec['rst_top1_gate_frac_max'] = rec['rst_top1_gate_frac']
     _lr = float(ctx.get('current_lr', 0.0))
-    for _pool in ('qk', 'v', 'know'):
+    # Gradient ratios come from train_step metrics, not analysis_step.  The
+    # current SRW names are attn_qk/attn_v/rst; keep qk/v aliases for display.
+    for _dst, _src in (('qk', 'attn_qk'), ('v', 'attn_v'), ('rst', 'rst'),
+                       ('know', 'rst')):
         for _part in ('emb', 'read', 'write'):
-            rec[f'{_pool}_{_part}_grad_ratio'] = float(
-                m.get(f'{_pool}_{_part}_grad_ratio', 0.0))
-            rec[f'{_pool}_{_part}_update_ratio'] = (
-                _lr * rec[f'{_pool}_{_part}_grad_ratio'])
+            _val = float(m.get(f'{_dst}_{_part}_grad_ratio',
+                               m.get(f'{_src}_{_part}_grad_ratio', 0.0)))
+            rec[f'{_dst}_{_part}_grad_ratio'] = _val
+            rec[f'{_dst}_{_part}_update_ratio'] = _lr * _val
     if is_v415:
         rec.pop('attn_den_cost', None)
         rec.pop('rst_den_cost', None)
         rec.update({
             'attn_gate_den_sum': float(m.get(
-                'attn_gate_den_sum', m.get('attn_den_cost', 0.0))),
+                'attn_gate_den_sum',
+                m.get('attn_gate_den_sum_mean',
+                      m.get('attn_den_cost', 0.0)))),
             'rst_gate_den_sum': float(m.get(
-                'rst_gate_den_sum', m.get('rst_den_cost', 0.0))),
+                'rst_gate_den_sum',
+                m.get('rst_gate_den_sum_mean',
+                      m.get('rst_den_cost', 0.0)))),
         })
     # HBM (host-0 local device 0 snapshot).
     try:
@@ -2299,17 +2323,22 @@ def _build_analysis_record(base, metrics, ctx):
 
 
 def _print_analysis_block(rec, ctx):
+    # Analysis logging must never kill a run.  Missing optional fields are
+    # printed as 0.0 instead of raising KeyError.
+    def _g(key, default=0.0):
+        return float(rec.get(key, default))
+
     def _full(prefix):
-        return (f"m={rec[f'{prefix}_mean']:.2f} s={rec[f'{prefix}_std']:.2f}"
-                f" min={rec[f'{prefix}_min']:.2f} p50={rec[f'{prefix}_p50']:.2f}"
-                f" p95={rec[f'{prefix}_p95']:.2f} p99={rec[f'{prefix}_p99']:.2f}"
-                f" max={rec[f'{prefix}_max']:.2f}")
+        return (f"m={_g(f'{prefix}_mean'):.2f} s={_g(f'{prefix}_std'):.2f}"
+                f" min={_g(f'{prefix}_min'):.2f} p50={_g(f'{prefix}_p50'):.2f}"
+                f" p95={_g(f'{prefix}_p95'):.2f} p99={_g(f'{prefix}_p99'):.2f}"
+                f" max={_g(f'{prefix}_max'):.2f}")
 
     def _emb_full(prefix):
-        return (f"m={rec[f'{prefix}_mean']:.2f} s={rec[f'{prefix}_std']:.2f}"
-                f" min={rec[f'{prefix}_min']:.2f}"
-                f" p95={rec[f'{prefix}_p95']:.2f} p99={rec[f'{prefix}_p99']:.2f}"
-                f" max={rec[f'{prefix}_max']:.2f}")
+        return (f"m={_g(f'{prefix}_mean'):.2f} s={_g(f'{prefix}_std'):.2f}"
+                f" min={_g(f'{prefix}_min'):.2f}"
+                f" p95={_g(f'{prefix}_p95'):.2f} p99={_g(f'{prefix}_p99'):.2f}"
+                f" max={_g(f'{prefix}_max'):.2f}")
 
     log_message(
         f"  dist k[skew={rec['rst_score_skew']:+.2f} kurt={rec['rst_score_kurt']:.2f}"
