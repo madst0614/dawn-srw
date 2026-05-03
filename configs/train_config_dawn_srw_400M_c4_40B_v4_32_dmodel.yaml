@@ -26,9 +26,9 @@ model:
 
   d_route: 256
 
-  n_qk: 2460
-  n_v: 15300
-  n_know: 30400
+  n_qk: 2390
+  n_v: 14840
+  n_know: 29470
   router_dropout: 0.02
 
 training:
