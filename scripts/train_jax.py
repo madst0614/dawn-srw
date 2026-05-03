@@ -565,50 +565,67 @@ def compute_knowledge_diversity_loss(params):
 
 
 def compute_spatial_diversity_loss(params):
-    """Compute neuron diversity loss for rank-1 spatial neurons.
+    """Compute neuron diversity loss for rank-1 spatial/SRW neurons.
 
     Penalizes high cosine similarity between neurons in each pool.
     Replaces orthogonality + knowledge diversity for spatial-r1.
     For large pools (>4096), uses deterministic strided sampling to avoid O(N^2).
+    Supports current DAWN-SRW pool param names and legacy spatial-r1 names.
     """
     pool = params['neuron_pool']
 
     def _pool_div(neurons, max_sample=4096):
         N = neurons.shape[0]
         if N > max_sample:
-            stride = N // max_sample
+            stride = max(1, N // max_sample)
             neurons = neurons[::stride][:max_sample]
         n = neurons / (jnp.linalg.norm(neurons, axis=-1, keepdims=True) + 1e-8)
         sim = jnp.matmul(n, n.T)
         mask = ~jnp.eye(sim.shape[0], dtype=jnp.bool_)
-        return jnp.abs(sim * mask).sum() / mask.sum()
+        denom = mask.sum()
+        return jnp.where(
+            denom > 0,
+            jnp.abs(sim * mask).sum() / denom,
+            jnp.float32(0.0),
+        )
 
-    # Support both v2 (qk_neurons) and v3.2 (qk_emb/qk_w) param names
     def _get_pool_arrays(pool):
-        """Return list of neuron arrays from pool params."""
+        """Return list of neuron arrays from current or legacy pool params."""
         arrays = []
-        # v4.0.2 (rw): separate q/k pools, read/write only
-        for prefix in ('q', 'k', 'v', 'know'):
-            if f'{prefix}_read' in pool:
-                arrays.append(pool[f'{prefix}_read'])
-                arrays.append(pool[f'{prefix}_write'])
+
+        # Current DAWN-SRW / v4.1.5.x names.
+        for prefix in ('attn_qk', 'attn_v', 'rst'):
+            for suffix in ('emb', 'read', 'write'):
+                key = f'{prefix}_{suffix}'
+                if key in pool:
+                    arrays.append(pool[key])
         if arrays:
             return arrays
-        # v3/v4.0.1: shared qk pool
+
+        # v4.0.2 legacy rw names: separate q/k/v/know read-write pools.
+        for prefix in ('q', 'k', 'v', 'know'):
+            read_key = f'{prefix}_read'
+            write_key = f'{prefix}_write'
+            if read_key in pool:
+                arrays.append(pool[read_key])
+            if write_key in pool:
+                arrays.append(pool[write_key])
+        if arrays:
+            return arrays
+
+        # v3 / v4.0.1 legacy names: qk/v/know neurons, emb, w, read/write.
         for prefix in ('qk', 'v', 'know'):
-            if f'{prefix}_neurons' in pool:
-                arrays.append(pool[f'{prefix}_neurons'])
-            else:
-                if f'{prefix}_emb' in pool:
-                    arrays.append(pool[f'{prefix}_emb'])
-                if f'{prefix}_w' in pool:
-                    arrays.append(pool[f'{prefix}_w'])
-                if f'{prefix}_read' in pool:
-                    arrays.append(pool[f'{prefix}_read'])
-                    arrays.append(pool[f'{prefix}_write'])
+            for suffix in ('neurons', 'emb', 'w', 'read', 'write'):
+                key = f'{prefix}_{suffix}'
+                if key in pool:
+                    arrays.append(pool[key])
         return arrays
 
     pool_arrays = _get_pool_arrays(pool)
+    if not pool_arrays:
+        # Some experimental variants may not expose a recognized neuron pool.
+        # Keep compile/OOM checks from misreporting a naming mismatch as OOM.
+        return jnp.float32(0.0)
     return sum(_pool_div(a) for a in pool_arrays) / len(pool_arrays)
 
 
@@ -3703,10 +3720,20 @@ def main():
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
     except Exception as e:
         if is_host0:
-            print(f"\n  *** OOM check FAILED: {e}")
-            print(f"  The model + gradients do not fit in device memory.")
-            print(f"  Try: reduce batch_size, enable gradient_checkpointing, or use a smaller model.")
-            print_xla_oom_diagnostics()
+            msg = str(e)
+            is_oom = (
+                'RESOURCE_EXHAUSTED' in msg
+                or 'out of memory' in msg.lower()
+                or 'oom' in msg.lower()
+            )
+            if is_oom:
+                print(f"\n  *** OOM check FAILED: {e}")
+                print(f"  The model + gradients do not fit in device memory.")
+                print(f"  Try: reduce batch_size, enable gradient_checkpointing, or use a smaller model.")
+                print_xla_oom_diagnostics()
+            else:
+                print(f"\n  *** train_step check FAILED: {type(e).__name__}: {e}")
+                print("  This is not necessarily OOM; it is a code/runtime error during the dummy train_step.")
         raise
 
     # ----------------------------------------------------------
