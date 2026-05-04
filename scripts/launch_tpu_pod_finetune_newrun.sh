@@ -1,18 +1,14 @@
 #!/bin/bash
-# =============================================================================
-# TPU Pod Launcher for fine-tune/new-run
-# Force-pulls the requested branch on every worker before launching.
-# =============================================================================
 set -euo pipefail
 
-TPU_NAME=""
+TPU_NAME="baseline-400M"
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
 BRANCH="main"
 CONFIG=""
-GH_TOKEN="${GH_TOKEN:-}"
 INIT_FROM=""
 RESUME_FROM=""
+GH_TOKEN=""
 TRAIN_ARGS=""
 
 while [[ $# -gt 0 ]]; do
@@ -22,19 +18,28 @@ while [[ $# -gt 0 ]]; do
     --project) PROJECT="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
     --config) CONFIG="$2"; shift 2 ;;
-    --token) GH_TOKEN="$2"; shift 2 ;;
     --init-from) INIT_FROM="$2"; shift 2 ;;
     --resume-from) RESUME_FROM="$2"; shift 2 ;;
-    --train-args) TRAIN_ARGS="$2"; shift 2 ;;
+    --token) GH_TOKEN="$2"; shift 2 ;;
+    --from-scratch) TRAIN_ARGS="$TRAIN_ARGS --from-scratch"; shift ;;
+    --load-opt-state) TRAIN_ARGS="$TRAIN_ARGS --load-opt-state"; shift ;;
+    --preserve-step) TRAIN_ARGS="$TRAIN_ARGS --preserve-step"; shift ;;
     -h|--help)
-      echo "Usage: $0 --tpu NAME --branch BRANCH --config CONFIG [--init-from GCS_OR_FILE | --resume-from RUN_OR_CKPT]"
-      exit 0 ;;
-    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+      echo "Usage: $0 --tpu NAME --zone ZONE --project PROJECT --branch BRANCH --config CONFIG [--init-from PATH|--resume-from PATH]"
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1" >&2
+      exit 1
+      ;;
   esac
 done
 
-if [[ -z "$TPU_NAME" ]]; then echo "ERROR: --tpu is required" >&2; exit 1; fi
-if [[ -z "$CONFIG" ]]; then echo "ERROR: --config is required" >&2; exit 1; fi
+if [[ -z "$CONFIG" ]]; then
+  echo "ERROR: --config required" >&2
+  exit 1
+fi
+
 if [[ -n "$INIT_FROM" && -n "$RESUME_FROM" ]]; then
   echo "ERROR: use only one of --init-from or --resume-from" >&2
   exit 1
@@ -46,17 +51,22 @@ else
   REPO_URL="https://github.com/madst0614/dawn-spatial.git"
 fi
 
-echo "============================================"
-echo "Launching TPU Pod fine-tune/new-run"
-echo "  TPU:       $TPU_NAME"
-echo "  Zone:      $ZONE"
-echo "  Project:   $PROJECT"
-echo "  Branch:    $BRANCH"
-echo "  Config:    $CONFIG"
-echo "  Init from: ${INIT_FROM:-<none>}"
-echo "  Resume:    ${RESUME_FROM:-<none>}"
-echo "============================================"
+TRAIN_SCRIPT="scripts/train_jax_finetune_newrun.py"
 
+printf '%s\n' "============================================"
+printf '%s\n' "Launching TPU Pod finetune-newrun training"
+printf '%s\n' "  TPU:          $TPU_NAME"
+printf '%s\n' "  Zone:         $ZONE"
+printf '%s\n' "  Project:      $PROJECT"
+printf '%s\n' "  Branch:       $BRANCH"
+printf '%s\n' "  Config:       $CONFIG"
+printf '%s\n' "  Init from:    ${INIT_FROM:-<none>}"
+printf '%s\n' "  Resume from:  ${RESUME_FROM:-<none>}"
+printf '%s\n' "  Train script: $TRAIN_SCRIPT"
+printf '%s\n' "  Args:         $TRAIN_ARGS"
+printf '%s\n' "============================================"
+
+echo "Checking TPU status..."
 gcloud compute tpus tpu-vm describe "$TPU_NAME" \
   --zone="$ZONE" \
   --project="$PROJECT" \
@@ -64,45 +74,46 @@ gcloud compute tpus tpu-vm describe "$TPU_NAME" \
 
 read -r -d '' REMOTE_CMD <<EOFCMD || true
 set -euo pipefail
+
 REPO_URL='${REPO_URL}'
 BRANCH='${BRANCH}'
 CONFIG='${CONFIG}'
-GH_TOKEN='${GH_TOKEN}'
 INIT_FROM='${INIT_FROM}'
 RESUME_FROM='${RESUME_FROM}'
+GH_TOKEN='${GH_TOKEN}'
 TRAIN_ARGS='${TRAIN_ARGS}'
-export BRANCH CONFIG GH_TOKEN INIT_FROM RESUME_FROM TRAIN_ARGS
-WORK_DIR="\$HOME/dawn-spatial"
+TRAIN_SCRIPT='${TRAIN_SCRIPT}'
 
-echo "[remote] force-sync repo branch: \$BRANCH"
-if [ -d "\$WORK_DIR/.git" ]; then
-  cd "\$WORK_DIR"
-  git remote set-url origin "\$REPO_URL" || true
+export BRANCH CONFIG INIT_FROM RESUME_FROM GH_TOKEN TRAIN_ARGS TRAIN_SCRIPT
+
+if [ -d "\$HOME/dawn-spatial/.git" ]; then
+  cd "\$HOME/dawn-spatial"
   git fetch origin "\$BRANCH" --depth 1
   git checkout -B "\$BRANCH" FETCH_HEAD
   git reset --hard FETCH_HEAD
   git clean -fd
 else
-  rm -rf "\$WORK_DIR"
-  git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" "\$WORK_DIR"
-  cd "\$WORK_DIR"
+  rm -rf "\$HOME/dawn-spatial"
+  git clone -b "\$BRANCH" --single-branch --depth 1 "\$REPO_URL" "\$HOME/dawn-spatial"
+  cd "\$HOME/dawn-spatial"
 fi
 
-echo "[remote] HEAD: \$(git rev-parse --short HEAD) \$(git log -1 --oneline)"
-
-# Hard guard: this launcher must never call the broken init-newrun path.
-if grep -R "train_jax_init_newrun" scripts/launch_tpu_pod_finetune_newrun.sh scripts/setup_and_run_tpu_pod_finetune_newrun.sh 2>/dev/null; then
-  echo "ERROR: finetune launcher/setup still references train_jax_init_newrun.py" >&2
+if [ ! -f "\$TRAIN_SCRIPT" ]; then
+  echo "ERROR: missing train script: \$TRAIN_SCRIPT" >&2
+  ls -l scripts >&2 || true
   exit 2
 fi
 
-test -f scripts/train_jax_finetune_newrun.py
+if [ ! -f "scripts/setup_and_run_tpu_pod_finetune_newrun.sh" ]; then
+  echo "ERROR: missing setup script" >&2
+  ls -l scripts >&2 || true
+  exit 2
+fi
 
-echo "[remote] verified finetune script exists; launching setup"
 bash scripts/setup_and_run_tpu_pod_finetune_newrun.sh
 EOFCMD
 
-echo "Sending force-sync + launch command to all workers..."
+echo "Sending bootstrap+training command to all workers..."
 gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
   --zone="$ZONE" \
   --project="$PROJECT" \
@@ -111,5 +122,7 @@ gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
   2>&1 | tee "launch_${TPU_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
 echo ""
-echo "Launch command sent. Check worker 0:"
-echo "  gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='pgrep -af train_jax; tail -f ~/train.log'"
+echo "Launch complete."
+echo "  Log:    gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tail -f ~/train.log'"
+echo "  Attach: gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=0 --command='tmux attach -t train'"
+echo "  Kill:   gcloud compute tpus tpu-vm ssh $TPU_NAME --zone=$ZONE --project=$PROJECT --worker=all --command='tmux kill-session -t train'"
