@@ -3630,6 +3630,36 @@ def main():
         """
         return jax.device_get(process_allgather(x, tiled=True))
 
+    def _drift_snap(p):
+        """Return the DAWN/SRW pool snapshot used for drift diagnostics.
+
+        Baseline Transformer has no neuron_pool, so return scalar zeros.
+        The train step also checks is_baseline and keeps drift metrics at zero,
+        but the loop still needs a valid prev_emb_snap pytree argument.
+        """
+        if 'neuron_pool' not in p:
+            z = jnp.float32(0.0)
+            return {'attn_qk_emb': z, 'attn_v_emb': z, 'rst_emb': z}
+
+        pool = p['neuron_pool']
+        if 'attn_qk_emb' in pool:
+            return {
+                'attn_qk_emb': pool['attn_qk_emb'],
+                'attn_v_emb': pool['attn_v_emb'],
+                'rst_emb': pool['rst_emb'],
+            }
+        if 'qk_emb' in pool:
+            return {
+                'attn_qk_emb': pool['qk_emb'],
+                'attn_v_emb': pool['v_emb'],
+                'rst_emb': pool['rst_emb'] if 'rst_emb' in pool else pool['know_emb'],
+            }
+        return {
+            'attn_qk_emb': pool['q_read'],
+            'attn_v_emb': pool['v_read'],
+            'rst_emb': pool['rst_read'],
+        }
+
     signal.signal(signal.SIGTERM, handle_preemption)
     if is_host0:
         print("  SIGTERM handler registered (spot preemption safety)")
