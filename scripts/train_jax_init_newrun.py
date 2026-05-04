@@ -1708,12 +1708,44 @@ def _migrate_v4152_route_params(raw, target):
     return raw
 
 
-def load_checkpoint(path, target_params, target_opt_state):
-    """Load checkpoint using flax serialization. Supports local and GCS paths."""
+def load_checkpoint(path, target_params, target_opt_state, load_opt_state=True):
+    """Load checkpoint using flax serialization. Supports local and GCS paths.
+
+    Fine-tuning/new-run init normally needs *params only*.  Do not restore the
+    optimizer state in that mode: optimizer transform stacks often change
+    between pretraining and fine-tuning configs, which makes Flax fail with
+    errors like "got 7 and 2 at path ./opt_state".
+    """
     import flax.serialization as serialization
     with _open_file(path, 'rb') as f:
         bytes_data = f.read()
-    target = {
+
+    raw = serialization.msgpack_restore(bytes_data)
+
+    # Some very old checkpoints may be just a params tree.  Normal checkpoints
+    # are dicts containing params/opt_state/step/etc.
+    if not isinstance(raw, dict) or 'params' not in raw:
+        params = serialization.from_state_dict(target_params, raw)
+        ckpt = {
+            'params': params,
+            'opt_state': target_opt_state,
+            'epoch': 0,
+            'step': 0,
+            'step_in_epoch': 0,
+            'steps_per_epoch': 0,
+            'best_val_loss': float('inf'),
+            'config': {},
+            'training_config': {},
+        }
+        if jax.process_index() == 0:
+            print(f"  Params-only checkpoint loaded: {path}")
+        return ckpt
+
+    raw = migrate_legacy_v4155_params(raw)
+
+    # Target with opt_state is still useful for legacy param migration because
+    # some migrations inspect target shapes.
+    migration_target = {
         'params': target_params,
         'opt_state': target_opt_state,
         'epoch': 0,
@@ -1724,12 +1756,31 @@ def load_checkpoint(path, target_params, target_opt_state):
         'config': {},
         'training_config': {},
     }
-    raw = serialization.msgpack_restore(bytes_data)
-    raw = migrate_legacy_v4155_params(raw)
-    migrated = _migrate_v4152_route_params(raw, target)
-    ckpt = serialization.from_state_dict(target, migrated)
+    migrated = _migrate_v4152_route_params(raw, migration_target)
+
+    if load_opt_state:
+        target = migration_target
+        ckpt = serialization.from_state_dict(target, migrated)
+    else:
+        # Params-only init: restore only params and copy scalar metadata.
+        # Crucially, ignore any source opt_state so a pretraining optimizer
+        # cannot be accidentally loaded into a fine-tuning/new-run job.
+        params = serialization.from_state_dict(target_params, migrated['params'])
+        ckpt = {
+            'params': params,
+            'opt_state': target_opt_state,
+            'epoch': migrated.get('epoch', 0),
+            'step': migrated.get('step', 0),
+            'step_in_epoch': migrated.get('step_in_epoch', 0),
+            'steps_per_epoch': migrated.get('steps_per_epoch', 0),
+            'best_val_loss': migrated.get('best_val_loss', float('inf')),
+            'config': migrated.get('config', {}),
+            'training_config': migrated.get('training_config', {}),
+        }
+
     if jax.process_index() == 0:
-        print(f"  Checkpoint loaded: {path}")
+        opt_msg = "params+opt_state" if load_opt_state else "params only"
+        print(f"  Checkpoint loaded ({opt_msg}): {path}")
     return ckpt
 
 
@@ -3174,7 +3225,10 @@ def main():
         if is_host0:
             mode_msg = "Initializing new run from" if cli_args.init_from else "Resuming from"
             print(f"\n{mode_msg}: {resume_path}")
-        ckpt = load_checkpoint(resume_path, params, opt_state)
+        ckpt = load_checkpoint(
+            resume_path, params, opt_state,
+            load_opt_state=((not cli_args.init_from) or cli_args.load_opt_state),
+        )
         params = ckpt['params']
 
         if cli_args.init_from:
