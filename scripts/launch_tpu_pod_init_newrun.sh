@@ -13,7 +13,7 @@ TPU_NAME="dawn-400m-v4-64"
 ZONE="us-central2-b"
 PROJECT="dawn-486218"
 BRANCH="main"
-CONFIG="configs/train_config_baseline_tpu_400M_c4_40B_v4_32_stable.yaml"
+CONFIG="configs/train_config_tf_400m_init_newrun.yaml"
 INIT_FROM=""
 TRAIN_SCRIPT="scripts/train_jax_init_newrun.py"
 GH_TOKEN=""
@@ -56,11 +56,11 @@ Common:
 
 Examples:
   # Transformer baseline
-  $0 --config configs/train_config_baseline_tpu_400M_c4_40B_v4_32_stable.yaml \\
+  $0 --config configs/train_config_tf_400m_init_newrun.yaml \\
      --init-from gs://BUCKET/tf_400m/run_xxx
 
   # DAWN v3.9.4 legacy
-  $0 --config configs/train_config_spatial_r1_v3.9.4_400M_c4_40B_v4_32_stable.yaml \\
+  $0 --config configs/train_config_v394_400m_init_newrun.yaml \\
      --init-from gs://BUCKET/dawn394_400m/run_xxx
 EOF
             exit 0 ;;

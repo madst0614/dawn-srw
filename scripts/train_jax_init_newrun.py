@@ -1415,8 +1415,14 @@ def shard_to_mesh(data, sharding, global_shape):
         stop = batch_slice.stop or global_shape[0]
         local_start = start - host_id * per_host
         local_stop = stop - host_id * per_host
-        if 0 <= local_start < per_host:
-            return np.array(data[local_start:local_stop])
+        expected_shape = (stop - start,) + tuple(global_shape[1:])
+        if 0 <= local_start and local_stop <= per_host:
+            out = np.array(data[local_start:local_stop])
+            if out.shape != expected_shape:
+                raise RuntimeError(
+                    f"shard_to_mesh: callback returned shape {out.shape}, "
+                    f"expected {expected_shape} for global index [{start}, {stop}).")
+            return out
         # Previously returned silent zeros -that corrupts training with
         # a zero-batch whenever the mesh's host locality doesn't match
         # the data partition. Fail loud instead so the misconfiguration
@@ -1428,6 +1434,53 @@ def shard_to_mesh(data, sharding, global_shape):
             f"host locality. Check create_mesh() device order.")
 
     return jax.make_array_from_callback(global_shape, sharding, data_callback)
+
+
+def normalize_local_batch(input_ids, attention_mask, per_host_batch, max_seq_len,
+                          pad_token_id=0):
+    """Return fixed-shape int32 batch and a clean 0/1 attention mask.
+
+    This prevents two common TPU/JAX issues:
+      1. partial final batches creating new shapes / recompiles or callback
+         shape errors;
+      2. padded tokens carrying arbitrary ids while the mask says they are pad.
+
+    All padded rows/tokens receive attention_mask=0, so train/eval labels become
+    -100 and do not contribute to loss or accuracy.
+    """
+    ids = np.asarray(input_ids, dtype=np.int32)
+    mask = np.asarray(attention_mask, dtype=np.int32)
+    if ids.ndim != 2 or mask.ndim != 2:
+        raise ValueError(
+            f"Expected rank-2 input_ids/attention_mask, got {ids.shape} and {mask.shape}")
+    if ids.shape != mask.shape:
+        raise ValueError(
+            f"input_ids and attention_mask shape mismatch: {ids.shape} vs {mask.shape}")
+
+    bsz, seqlen = ids.shape
+    if seqlen > max_seq_len:
+        ids = ids[:, :max_seq_len]
+        mask = mask[:, :max_seq_len]
+    elif seqlen < max_seq_len:
+        pad_w = max_seq_len - seqlen
+        ids = np.pad(ids, ((0, 0), (0, pad_w)),
+                     constant_values=pad_token_id)
+        mask = np.pad(mask, ((0, 0), (0, pad_w)),
+                      constant_values=0)
+
+    if bsz > per_host_batch:
+        raise ValueError(
+            f"Local batch larger than expected per_host_batch: {bsz} > {per_host_batch}")
+    elif bsz < per_host_batch:
+        pad_b = per_host_batch - bsz
+        ids = np.pad(ids, ((0, pad_b), (0, 0)),
+                     constant_values=pad_token_id)
+        mask = np.pad(mask, ((0, pad_b), (0, 0)),
+                      constant_values=0)
+
+    mask = (mask > 0).astype(np.int32)
+    ids = np.where(mask == 1, ids, np.int32(pad_token_id)).astype(np.int32)
+    return ids, mask
 
 
 # ============================================================
@@ -1451,7 +1504,8 @@ def shard_batch(batch, n_devices):
 # ============================================================
 
 def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
-             verbose=True, data_sharding_spec=None):
+             verbose=True, data_sharding_spec=None, per_host_batch=None,
+             max_seq_len=None, pad_token_id=0):
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
@@ -1469,6 +1523,11 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
     for batch_idx, (input_ids, attention_mask) in enumerate(val_loader):
         if batch_idx >= max_batches:
             break
+
+        if per_host_batch is not None and max_seq_len is not None:
+            input_ids, attention_mask = normalize_local_batch(
+                input_ids, attention_mask, per_host_batch, max_seq_len,
+                pad_token_id)
 
         if data_sharding_spec is not None:
             gb = input_ids.shape[0] * jax.process_count()
@@ -2513,15 +2572,16 @@ def main():
                 raise FileNotFoundError(f"--init-from checkpoint not found: {src}")
             return src, _parent_dir(src)
 
-        # Folder mode: prefer latest checkpoint_step*.flax, then best_model.flax,
-        # then any .flax. This avoids accidentally selecting best_model over the
-        # latest step when both exist.
-        step_ckpts = _list_files(src, 'checkpoint_step*.flax')
-        if step_ckpts:
-            return step_ckpts[-1], src
+        # Folder mode: prefer best_model.flax first. For fine-tune/new-run
+        # initialization we usually want the best validation checkpoint, not the
+        # numerically latest training step. If best_model is absent, fall back to
+        # the latest checkpoint_step*.flax, then any .flax.
         best_ckpts = _list_files(src, 'best_model.flax')
         if best_ckpts:
             return best_ckpts[-1], src
+        step_ckpts = _list_files(src, 'checkpoint_step*.flax')
+        if step_ckpts:
+            return step_ckpts[-1], src
         any_ckpts = _list_files(src, '*.flax')
         if any_ckpts:
             return any_ckpts[-1], src
@@ -2888,8 +2948,10 @@ def main():
         n_hosts=n_hosts,
         host_id=host_id,
     )
+    pad_token_id = int(cfg.get('data', {}).get('pad_token_id', 0))
     if is_host0:
         print(f"Vocab size: {vocab_size}")
+        print(f"Pad token id: {pad_token_id}")
         print(f"Train batches: {len(train_loader)}")
         print(f"Val batches: {len(val_loader)}")
 
@@ -4036,6 +4098,12 @@ def main():
                     print("Preemption requested -- exiting training loop.", flush=True)
                 break
 
+            # Normalize/pad before sharding. Partial final batches and any
+            # padded tokens become attention_mask=0, hence labels=-100.
+            input_ids, attention_mask = normalize_local_batch(
+                input_ids, attention_mask, per_host_batch, max_seq_len,
+                pad_token_id)
+
             # Shard data and run train step
             rng, step_rng = jax.random.split(rng)
             step_rng = jax.random.fold_in(step_rng, host_id)  # per-host dropout
@@ -4194,7 +4262,9 @@ def main():
                 val_loader.reset()
                 val_loss, val_acc = evaluate(
                     eval_step_fn, params, val_loader, n_local_devices,
-                    verbose=is_host0, data_sharding_spec=data_sharding)
+                    verbose=is_host0, data_sharding_spec=data_sharding,
+                    per_host_batch=per_host_batch, max_seq_len=max_seq_len,
+                    pad_token_id=pad_token_id)
                 if is_host0:
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
                     log_jsonl({
@@ -4222,8 +4292,10 @@ def main():
                     break
                 if _analysis_batch is not None:
                     _a_ids, _a_mask = _analysis_batch
-                    _a_gb = _a_ids.shape[0] * jax.process_count()
-                    _a_gs = (_a_gb, _a_ids.shape[1])
+                    _a_ids, _a_mask = normalize_local_batch(
+                        _a_ids, _a_mask, per_host_batch, max_seq_len,
+                        pad_token_id)
+                    _a_gs = (batch_size, max_seq_len)
                     _a_ids = shard_to_mesh(_a_ids, data_sharding, _a_gs)
                     _a_mask = shard_to_mesh(_a_mask, data_sharding, _a_gs)
                     try:
@@ -4375,7 +4447,9 @@ def main():
         val_loader.reset()
         val_loss, val_acc = evaluate(
             eval_step_fn, params, val_loader, n_local_devices,
-            verbose=is_host0, data_sharding_spec=data_sharding)
+            verbose=is_host0, data_sharding_spec=data_sharding,
+            per_host_batch=per_host_batch, max_seq_len=max_seq_len,
+            pad_token_id=pad_token_id)
 
         is_best = val_loss < best_val_loss
         if is_best:
