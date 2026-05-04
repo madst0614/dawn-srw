@@ -465,17 +465,51 @@ def restore_params_only(path: str, params):
     return restored['params']
 
 
+def _host_numpy_leaf(x):
+    """Materialize a possibly global-sharded JAX array on every host.
+
+    Flax serialization calls np.array(x). On multi-host TPU this fails when x is a
+    global jax.Array spanning non-addressable devices. process_allgather must be
+    called by all hosts, then host0 can serialize/write the resulting host arrays.
+    """
+    if isinstance(x, jax.Array):
+        try:
+            if getattr(x, 'is_fully_addressable', False):
+                return np.asarray(jax.device_get(x))
+        except Exception:
+            pass
+        return np.asarray(process_allgather(x, tiled=True))
+    return x
+
+
+def _materialize_for_checkpoint(tree):
+    return jax.tree_util.tree_map(_host_numpy_leaf, tree)
+
+
 def save_downstream_checkpoint(path: str, params, opt_state, step: int, best_metric: float, cfg: Dict[str, Any], extra=None):
-    if not is_host0():
-        return
+    # IMPORTANT: all hosts must participate in materialization collectives.
     model_cfg = cfg.get('model', {})
     train_cfg = dict(cfg.get('training', {}))
     train_cfg['downstream'] = cfg.get('downstream', {})
     if extra:
         train_cfg['extra'] = extra
-    tj.save_checkpoint(path, params, opt_state, epoch=0, step=step, best_val_loss=-best_metric,
-                       model_config=model_cfg, step_in_epoch=0, steps_per_epoch=0,
-                       training_config=train_cfg)
+
+    ckpt = {
+        'params': params,
+        'opt_state': opt_state,
+        'epoch': 0,
+        'step': step,
+        'step_in_epoch': 0,
+        'steps_per_epoch': 0,
+        'best_val_loss': -best_metric,
+        'config': model_cfg,
+        'training_config': train_cfg,
+    }
+    ckpt = _materialize_for_checkpoint(ckpt)
+
+    if is_host0():
+        bytes_data = serialization.to_bytes(ckpt)
+        tj._write_checkpoint_bytes(path, bytes_data)
 
 
 # -----------------------------
