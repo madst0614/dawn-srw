@@ -372,16 +372,95 @@ def local_slice(global_arr: np.ndarray) -> np.ndarray:
 # Checkpoints
 # -----------------------------
 
+def _copy_dict_tree(x):
+    if isinstance(x, dict):
+        return {k: _copy_dict_tree(v) for k, v in x.items()}
+    return x
+
+
+def _adapt_checkpoint_params_to_target(raw_params, target_params):
+    """Adapt known DAWN checkpoint naming variants to the instantiated target.
+
+    Important: do NOT blindly call train_jax.migrate_legacy_v4155_params().
+    That migration is for loading legacy params into the *new* dawn_srw model.
+    For v3.9.4 downstream the target still expects qk/v/know keys, so applying
+    the migration first turns the checkpoint into attn_qk/attn_v/rst and breaks
+    restore with missing qk_* keys.
+    """
+    if not isinstance(raw_params, dict) or not isinstance(target_params, dict):
+        return raw_params
+
+    target_pool = target_params.get('neuron_pool', {})
+    raw_pool = raw_params.get('neuron_pool', {})
+    if not isinstance(target_pool, dict) or not isinstance(raw_pool, dict):
+        return raw_params
+
+    target_keys = set(target_pool.keys())
+    raw_keys = set(raw_pool.keys())
+
+    legacy_pool_keys = {'qk_emb', 'qk_read', 'qk_write',
+                        'v_emb', 'v_read', 'v_write',
+                        'know_emb', 'know_read', 'know_write'}
+    modern_pool_keys = {'attn_qk_emb', 'attn_qk_read', 'attn_qk_write',
+                        'attn_v_emb', 'attn_v_read', 'attn_v_write',
+                        'rst_emb', 'rst_read', 'rst_write'}
+
+    # Modern/SRW checkpoint -> legacy v3.9.4 target.
+    if legacy_pool_keys.issubset(target_keys) and not legacy_pool_keys.issubset(raw_keys) and modern_pool_keys.intersection(raw_keys):
+        rp = _copy_dict_tree(raw_params)
+        pool = rp.setdefault('neuron_pool', {})
+        pool_map = {
+            'attn_qk_emb': 'qk_emb', 'attn_qk_read': 'qk_read', 'attn_qk_write': 'qk_write',
+            'attn_v_emb': 'v_emb', 'attn_v_read': 'v_read', 'attn_v_write': 'v_write',
+            'rst_emb': 'know_emb', 'rst_read': 'know_read', 'rst_write': 'know_write',
+        }
+        for src, dst in pool_map.items():
+            if src in pool and dst not in pool:
+                pool[dst] = pool[src]
+
+        router = rp.get('router', {})
+        if isinstance(router, dict):
+            if 'proj_rst' in router and 'proj_know' not in router:
+                router['proj_know'] = router['proj_rst']
+            if 'tau_rst' in router and 'tau_know' not in router:
+                router['tau_know'] = router['tau_rst']
+        return rp
+
+    # Legacy checkpoint -> modern dawn_srw target. Only then use train_jax migration.
+    if modern_pool_keys.issubset(target_keys) and not modern_pool_keys.issubset(raw_keys) and legacy_pool_keys.intersection(raw_keys):
+        if hasattr(tj, 'migrate_legacy_v4155_params'):
+            migrated = tj.migrate_legacy_v4155_params({'params': raw_params})
+            if isinstance(migrated, dict) and 'params' in migrated:
+                return migrated['params']
+
+    return raw_params
+
+
+def _summarize_param_key_mismatch(raw_params, target_params) -> str:
+    lines = []
+    for section in ('neuron_pool', 'router'):
+        raw_s = raw_params.get(section, {}) if isinstance(raw_params, dict) else {}
+        tgt_s = target_params.get(section, {}) if isinstance(target_params, dict) else {}
+        if isinstance(raw_s, dict) and isinstance(tgt_s, dict):
+            lines.append(f'{section}: target={sorted(tgt_s.keys())[:30]} raw={sorted(raw_s.keys())[:30]}')
+    return '\n'.join(lines)
+
+
 def restore_params_only(path: str, params):
     import flax.serialization as serialization
     with tj._open_file(path, 'rb') as f:
         data = f.read()
     raw = serialization.msgpack_restore(data)
-    if hasattr(tj, 'migrate_legacy_v4155_params'):
-        raw = tj.migrate_legacy_v4155_params(raw)
     if not isinstance(raw, dict) or 'params' not in raw:
         raise ValueError(f'Checkpoint does not contain params: {path}')
-    restored = serialization.from_state_dict({'params': params}, {'params': raw['params']})
+
+    raw_params = _adapt_checkpoint_params_to_target(raw['params'], params)
+    try:
+        restored = serialization.from_state_dict({'params': params}, {'params': raw_params})
+    except ValueError as e:
+        detail = _summarize_param_key_mismatch(raw_params, params)
+        raise ValueError(f'Failed to restore params from {path}. Key summary after adapter:\n{detail}') from e
+
     log(f'[ckpt] params-only loaded: {path}')
     return restored['params']
 
