@@ -1024,33 +1024,41 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         pool_diag = _pool_param_diagnostics(params, full=False)
         pool_update_diag = _pool_update_diagnostics(params, grads)
 
-        # Emb drift is computed inside jit so every host participates in the
-        # norm collective. A host-0-only version halts the launch group on
-        # multi-host meshes.
-        _pool = new_params['neuron_pool']
-        if 'attn_qk_emb' in _pool:
-            _cur_qk = _pool['attn_qk_emb']
-            _cur_v = _pool['attn_v_emb']
-            _cur_rst = _pool['rst_emb']
-        elif 'qk_emb' in _pool:
-            _cur_qk = _pool['qk_emb']
-            _cur_v = _pool['v_emb']
-            _cur_rst = _pool['rst_emb'] if 'rst_emb' in _pool else _pool['know_emb']
+        # Emb drift is DAWN/SRW-specific.  Baseline Transformer has no
+        # neuron_pool, so keep these diagnostics at zero instead of indexing a
+        # missing subtree during OOM/JIT checks or normal train steps.
+        if is_baseline:
+            drift_attn_qk_emb = jnp.float32(0.0)
+            drift_attn_v_emb = jnp.float32(0.0)
+            drift_rst_emb = jnp.float32(0.0)
         else:
-            # Some archived pool variants expose read tensors instead of emb
-            # tensors; keep the diagnostic slots comparable when resuming them.
-            _cur_qk = _pool['q_read']
-            _cur_v = _pool['v_read']
-            _cur_rst = _pool['rst_read']
-        _prev_qk = prev_emb_snap['attn_qk_emb']
-        _prev_v = prev_emb_snap['attn_v_emb']
-        _prev_rst = prev_emb_snap['rst_emb']
-        drift_attn_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
-                        / (jnp.linalg.norm(_prev_qk) + 1e-8))
-        drift_attn_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
-                       / (jnp.linalg.norm(_prev_v) + 1e-8))
-        drift_rst_emb = (jnp.linalg.norm(_cur_rst - _prev_rst)
-                          / (jnp.linalg.norm(_prev_rst) + 1e-8))
+            # Emb drift is computed inside jit so every host participates in the
+            # norm collective. A host-0-only version halts the launch group on
+            # multi-host meshes.
+            _pool = new_params['neuron_pool']
+            if 'attn_qk_emb' in _pool:
+                _cur_qk = _pool['attn_qk_emb']
+                _cur_v = _pool['attn_v_emb']
+                _cur_rst = _pool['rst_emb']
+            elif 'qk_emb' in _pool:
+                _cur_qk = _pool['qk_emb']
+                _cur_v = _pool['v_emb']
+                _cur_rst = _pool['rst_emb'] if 'rst_emb' in _pool else _pool['know_emb']
+            else:
+                # Some archived pool variants expose read tensors instead of emb
+                # tensors; keep the diagnostic slots comparable when resuming them.
+                _cur_qk = _pool['q_read']
+                _cur_v = _pool['v_read']
+                _cur_rst = _pool['rst_read']
+            _prev_qk = prev_emb_snap['attn_qk_emb']
+            _prev_v = prev_emb_snap['attn_v_emb']
+            _prev_rst = prev_emb_snap['rst_emb']
+            drift_attn_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
+                            / (jnp.linalg.norm(_prev_qk) + 1e-8))
+            drift_attn_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
+                           / (jnp.linalg.norm(_prev_v) + 1e-8))
+            drift_rst_emb = (jnp.linalg.norm(_cur_rst - _prev_rst)
+                              / (jnp.linalg.norm(_prev_rst) + 1e-8))
 
         # Tau / scan-offset parameters (read inside jit -safe, no cross-device issue)
         tau_rst_b = params.get('router', {}).get(
@@ -3375,17 +3383,29 @@ def main():
     if is_host0:
         print(f"\n=== Mesh: ({mesh_data}, {mesh_model}) = "
               f"{total_devices} devices, per_device_batch={per_device_batch} ===")
-        print(f"  Chunks: rst={n_chunks_rst} (cs={nrst_local // max(n_chunks_rst,1)}), "
-              f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
-        chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
-        print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
+        if is_baseline:
+            print("  Baseline Transformer: no SRW neuron chunks.")
+        else:
+            print(f"  Chunks: rst={n_chunks_rst} (cs={nrst_local // max(n_chunks_rst,1)}), "
+                  f"qk={n_chunks_qk}, attn_v={n_chunks_v}")
+            chunk_mem = per_device_batch * max_seq_len * rst_max_chunk * 2 / 1e9
+            print(f"  Est chunk mem (rst): {chunk_mem:.2f}GB bf16")
 
     # Shard params: neuron_pool N-axis on 'model', rest replicated
     param_shardings = get_param_shardings(params, mesh, is_baseline=is_baseline)
     params = shard_params_to_mesh(params, param_shardings)
 
-    _is_resuming = (resume_path is not None and _file_exists(resume_path))
-    if _is_resuming:
+    # Shard/initialize optimizer state *after* params have their final mesh
+    # sharding.  For init-newrun fine-tuning, `resume_path` is present but the
+    # source optimizer must be ignored unless --load-opt-state was explicitly
+    # requested.  Otherwise a fresh optimizer state is created for the sharded
+    # params.
+    _should_restore_opt_state = (
+        resume_path is not None
+        and _file_exists(resume_path)
+        and ((not cli_args.init_from) or cli_args.load_opt_state)
+    )
+    if _should_restore_opt_state:
         _opt_template = optimizer.init(params)
         def _restore_leaf(restored_val, template_val):
             # template_val is already correctly sharded across all devices.
@@ -3398,6 +3418,8 @@ def main():
             print(f"  Optimizer state restored from checkpoint and sharded to mesh")
     else:
         opt_state = optimizer.init(params)
+        if is_host0 and cli_args.init_from:
+            print(f"  Fresh optimizer initialized on mesh for init-newrun")
 
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path (v4.1 removed its non-sharded fallback).
@@ -3531,6 +3553,9 @@ def main():
         # Initial emb-drift snapshot: pytree of sharded refs matching
         # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
         def _drift_snap(p):
+            if 'neuron_pool' not in p:
+                z = jnp.float32(0.0)
+                return {'attn_qk_emb': z, 'attn_v_emb': z, 'rst_emb': z}
             pool = p['neuron_pool']
             if 'attn_qk_emb' in pool:
                 return {
@@ -3593,6 +3618,10 @@ def main():
         # NOTE: runs on ALL hosts -shard_map/psum require collective participation.
         # Only print statements are guarded by is_host0.
         try:
+            if is_baseline:
+                if is_host0:
+                    print("  Step-time breakdown skipped for baseline Transformer.", flush=True)
+                raise RuntimeError("_SKIP_BASELINE_BREAKDOWN_")
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
             if is_host0:
@@ -3958,7 +3987,7 @@ def main():
             del normed, h_Q, h_K, h_V, tau_all, Q, K, V
             del h_rst, tau_rst, _kout, dummy_x
         except Exception as e:
-            if is_host0:
+            if is_host0 and str(e) != "_SKIP_BASELINE_BREAKDOWN_":
                 import traceback
                 print(f"  Breakdown failed: {e}", flush=True)
                 traceback.print_exc()
