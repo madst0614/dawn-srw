@@ -765,13 +765,28 @@ def main():
                     best_acc = ev['accuracy']
                     save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
 
-        if global_step % save_every == 0 or global_step == total_steps:
+        # Save periodic resume checkpoints only during training.
+        # Do NOT force a final full checkpoint at task end: on multi-host TPU
+        # that can leave non-host0 workers exiting/starting the next task while
+        # host0 is still writing a 4.7GB checkpoint, which stalls the sequence.
+        # best_model.flax is still saved whenever eval improves.
+        if save_every and save_every > 0 and (global_step % save_every == 0) and (global_step < total_steps):
             save_downstream_checkpoint(join_path(run_dir, f'checkpoint_step{global_step}.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
 
     if is_host0():
         final_msg = f'[done] task={task} best_acc={best_acc:.4f} step={global_step} run_dir={run_dir}'
         record(final_msg)
         write_text(summary_path, final_msg + '\n')
+
+    # Explicit end-of-task barrier.  The outer sequence script starts the next
+    # Python process independently on each worker, so all hosts must leave this
+    # task together.  Without this, fast non-host0 workers can start the next
+    # config while host0 is still writing logs/checkpoints, causing hangs.
+    if n_hosts > 1:
+        done = np.array([global_step], dtype=np.int32)
+        gathered_done = np.asarray(process_allgather(done)).reshape(-1)
+        if not np.all(gathered_done == global_step):
+            raise RuntimeError(f'end-of-task step mismatch across hosts: {gathered_done.tolist()}')
 
 
 if __name__ == '__main__':

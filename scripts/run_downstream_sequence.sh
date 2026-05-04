@@ -20,14 +20,22 @@ if [[ ${#CONFIGS[@]} -eq 0 ]]; then
   exit 1
 fi
 
+i=0
 for CFG in "${CONFIGS[@]}"; do
+  i=$((i + 1))
   echo "============================================================"
-  echo "Running downstream config: $CFG"
-  echo "Common init-from: ${INIT_FROM:-<none>}"
+  echo "[sequence] START ${i}/${#CONFIGS[@]} config: $CFG"
+  echo "[sequence] common init-from: ${INIT_FROM:-<none>}"
+  echo "[sequence] time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
   echo "============================================================"
   if [[ -n "$INIT_FROM" ]]; then
     python3 scripts/downstream_finetune_jax.py --config "$CFG" --init-from "$INIT_FROM"
   else
     python3 scripts/downstream_finetune_jax.py --config "$CFG"
   fi
+  echo "============================================================"
+  echo "[sequence] DONE ${i}/${#CONFIGS[@]} config: $CFG"
+  echo "[sequence] time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+  echo "============================================================"
 done
+echo "[sequence] ALL DONE (${#CONFIGS[@]} configs)"
