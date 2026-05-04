@@ -20,13 +20,18 @@ cd "$WORK_DIR"
 echo "[1/4] Installing dependencies..."
 python3 -m pip install --upgrade pip -q
 python3 -m pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
-python3 -m pip install -U flax optax numpy pyyaml gcsfs datasets transformers sentencepiece pyarrow fsspec huggingface_hub -q
+python3 -m pip install -U flax optax numpy pyyaml gcsfs transformers sentencepiece fsspec huggingface_hub -q
+# Pin datasets/pyarrow to a compatible pair. New pyarrow removed PyExtensionType,
+# which older datasets imports at startup.
+python3 -m pip install --force-reinstall --no-cache-dir "pyarrow==20.0.0" "datasets==2.19.2" -q
 python3 - <<'PYCHK'
 import sys
 import datasets
 import transformers
+import pyarrow as pa
 print(f"  Python: {sys.executable}", flush=True)
 print(f"  datasets: {datasets.__version__}", flush=True)
+print(f"  pyarrow: {pa.__version__}", flush=True)
 print(f"  transformers: {transformers.__version__}", flush=True)
 PYCHK
 
