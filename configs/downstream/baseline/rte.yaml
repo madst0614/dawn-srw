@@ -1,0 +1,36 @@
+seed: 1
+tokenizer: bert-base-uncased
+training:
+  batch_size: 64
+  eval_batch_size: 64
+  num_epochs: 3
+  lr: 2.0e-05
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  min_lr_ratio: 0.1
+  max_grad_norm: 1.0
+  aux_weight: 0.0
+  tau_weight: 0.0
+  checkpoint_interval: 500
+  log_interval: 20
+  mesh_model: 1
+  mesh_data: 0
+  max_steps: 600
+  eval_interval: 100
+downstream:
+  source: hf
+  max_seq_len: 512
+  add_eos: false
+  task: rte
+model:
+  model_version: baseline
+  vocab_size: 30522
+  d_model: 1280
+  d_ff: 5120
+  n_layers: 18
+  n_heads: 16
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+checkpoint_dir: gs://dawn-tpu-data-c4/downstream_runs/baseline_400M/rte
+run_name: baseline_400M_rte
