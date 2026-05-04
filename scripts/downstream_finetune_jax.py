@@ -512,9 +512,13 @@ def evaluate(params, score_step, eval_rows, batch_size: int, max_seq_len: int, p
         ids = tj.shard_to_mesh(l_ids, data_sharding, gs)
         sm = tj.shard_to_mesh(l_mask, data_sharding, gs)
         am = tj.shard_to_mesh(l_attn, data_sharding, gs)
-        sc = np.asarray(jax.device_get(score_step(params, ids, sm, am)))[:valid_n]
+        sc_arr = score_step(params, ids, sm, am)
+        # Multi-host SPMD arrays can span non-addressable devices; do not
+        # jax.device_get() them directly. Gather the global candidate scores
+        # across hosts, then only host 0 materializes/records metrics.
+        sc_global = np.asarray(process_allgather(sc_arr, tiled=True)).reshape(-1)[:valid_n]
         if is_host0():
-            for s, mi in zip(sc, idxs[:valid_n]):
+            for s, mi in zip(sc_global, idxs[:valid_n]):
                 ex_id, cand_id, gold = meta[mi]
                 scores_by_ex.setdefault(ex_id, []).append((cand_id, float(s)))
                 gold_by_ex[ex_id] = gold
@@ -713,7 +717,9 @@ def main():
         global_step += 1
 
         if global_step % log_every == 0 or global_step == 1:
-            m = jax.device_get(metrics)
+            # Metrics may be global sharded arrays in multi-host mode. Gather
+            # each scalar and print only on host 0.
+            m = jax.tree.map(lambda x: np.asarray(process_allgather(x)).reshape(-1)[0], metrics)
             if is_host0():
                 elapsed = time.time() - t0
                 tok = global_step * batch_size * max_seq_len
