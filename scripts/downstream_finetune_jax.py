@@ -114,6 +114,15 @@ def write_text(path: str, text: str):
         f.write(text)
 
 
+def append_text(path: str, text: str):
+    # GCS does not support normal append reliably; rewrite small log file.
+    old = ''
+    if tj._file_exists(path):
+        with tj._open_file(path, 'r') as f:
+            old = f.read()
+    write_text(path, old + text)
+
+
 def write_json(path: str, obj: Any):
     write_text(path, json.dumps(obj, indent=2, ensure_ascii=False, default=str))
 
@@ -606,19 +615,38 @@ def main():
     ckpt_root = cfg.get('checkpoint_dir') or ds_cfg.get('checkpoint_dir')
     if not ckpt_root:
         raise ValueError('Config must set checkpoint_dir')
-    run_name = cfg.get('run_name') or f"{model_version}_{task}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    run_dir = join_path(ckpt_root, run_name) if not resume_from else str(resume_from).rstrip('/')
+    # train_jax-style run directory: never write directly into a fixed run_name.
+    # Treat cfg.run_name as a human-readable prefix only, then append timestamp+pid.
+    # This prevents reruns from overwriting the same downstream folder.
+    if resume_from:
+        run_dir = str(resume_from).rstrip('/')
+        run_name = run_dir.rstrip('/').rsplit('/', 1)[-1]
+    else:
+        run_prefix = cfg.get('run_name') or f"{model_version}_{task}"
+        if not str(run_prefix).startswith('run_'):
+            run_name = f"run_v{run_prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+        else:
+            run_name = f"{run_prefix}_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+        run_dir = join_path(ckpt_root, run_name)
+    train_log_path = join_path(run_dir, 'training_log.txt')
+    metrics_csv_path = join_path(run_dir, 'metrics.csv')
+    summary_path = join_path(run_dir, 'results_summary.txt')
+
+    def record(msg: str):
+        if is_host0():
+            print(msg, flush=True)
+            append_text(train_log_path, msg + '\n')
 
     if is_host0():
-        print('=' * 60)
-        print(f'Downstream fine-tune: model={model_version} task={task}')
-        print(f'Hosts={n_hosts} devices={total_devices} local_devices={jax.local_device_count()} host_id={host}')
-        print(f'batch={batch_size} eval_batch={eval_batch_size} max_seq_len={max_seq_len}')
-        print(f'train_rows={len(train_rows)} eval_rows={len(eval_rows)} total_steps={total_steps}')
-        print(f'init_from={init_from or "<none>"}')
-        print(f'resume_from={resume_from or "<none>"}')
-        print(f'run_dir={run_dir}')
-        print('=' * 60)
+        record('=' * 60)
+        record(f'Downstream fine-tune: model={model_version} task={task}')
+        record(f'Hosts={n_hosts} devices={total_devices} local_devices={jax.local_device_count()} host_id={host}')
+        record(f'batch={batch_size} eval_batch={eval_batch_size} max_seq_len={max_seq_len}')
+        record(f'train_rows={len(train_rows)} eval_rows={len(eval_rows)} total_steps={total_steps}')
+        record(f'init_from={init_from or "<none>"}')
+        record(f'resume_from={resume_from or "<none>"}')
+        record(f'run_dir={run_dir}')
+        record('=' * 60)
 
     # Initialize params.
     key = jax.random.PRNGKey(seed)
@@ -669,9 +697,11 @@ def main():
             raise RuntimeError(f'global_step mismatch across hosts: {all_steps.tolist()}')
         log(f'[verified] global_step={global_step} consistent across {n_hosts} hosts')
 
-    # Save run config.
+    # TrainJAX-style run metadata: config.json plus append-only text/csv logs.
+    # Do not write per-eval JSON files.
     if is_host0():
-        write_json(join_path(run_dir, 'downstream_config.json'), cfg)
+        write_json(join_path(run_dir, 'config.json'), cfg)
+        write_text(metrics_csv_path, 'phase,step,loss,lm_loss,acc,grad_norm,tokens,eval_acc,total,best_acc,elapsed_sec\n')
 
     train_step = make_train_step(model, optimizer, sharded_fns,
                                  float(tcfg.get('aux_weight', 0.0)), float(tcfg.get('tau_weight', 0.0)))
@@ -681,12 +711,11 @@ def main():
     ev = evaluate(params, score_step, eval_rows, eval_batch_size, max_seq_len, pad_id, data_sharding)
     if is_host0():
         ev['step'] = global_step
-        print(f"[eval] step={global_step} acc={ev['accuracy']:.4f} total={ev['total']}", flush=True)
-        write_json(join_path(run_dir, f'eval_step{global_step}.json'), ev)
+        record(f"[eval] step={global_step} acc={ev['accuracy']:.4f} total={ev['total']}")
+        append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev['accuracy']},{ev['total']},{max(best_acc, ev['accuracy']):.6f},0.0\n")
         if ev['accuracy'] > best_acc:
             best_acc = ev['accuracy']
             save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
-            write_json(join_path(run_dir, 'best_eval.json'), ev)
 
     # Training.
     rng = jax.random.PRNGKey(seed + 1000 + global_step)
@@ -723,24 +752,26 @@ def main():
             if is_host0():
                 elapsed = time.time() - t0
                 tok = global_step * batch_size * max_seq_len
-                print(f"[train] step={global_step}/{total_steps} loss={float(m['lm_loss']):.4f} acc={float(m['acc']):.4f} grad={float(m['grad_norm']):.3f} tokens={tok} time={elapsed:.1f}s", flush=True)
+                record(f"[train] step={global_step}/{total_steps} loss={float(m['lm_loss']):.4f} acc={float(m['acc']):.4f} grad={float(m['grad_norm']):.3f} tokens={tok} time={elapsed:.1f}s")
+                append_text(metrics_csv_path, f"train,{global_step},{float(m['loss']):.6f},{float(m['lm_loss']):.6f},{float(m['acc']):.6f},{float(m['grad_norm']):.6f},{tok},,,{best_acc:.6f},{elapsed:.3f}\n")
 
         if global_step % eval_every == 0 or global_step == total_steps:
             ev = evaluate(params, score_step, eval_rows, eval_batch_size, max_seq_len, pad_id, data_sharding)
             if is_host0():
                 ev['step'] = global_step
-                print(f"[eval] step={global_step} acc={ev['accuracy']:.4f} total={ev['total']}", flush=True)
-                write_json(join_path(run_dir, f'eval_step{global_step}.json'), ev)
-                append_csv(join_path(run_dir, 'metrics.csv'), {'step': global_step, 'accuracy': ev['accuracy'], 'total': ev['total']}, ['step', 'accuracy', 'total'])
+                record(f"[eval] step={global_step} acc={ev['accuracy']:.4f} total={ev['total']}")
+                append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev['accuracy']},{ev['total']},{max(best_acc, ev['accuracy']):.6f},{time.time() - t0:.3f}\n")
                 if ev['accuracy'] > best_acc:
                     best_acc = ev['accuracy']
                     save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
-                    write_json(join_path(run_dir, 'best_eval.json'), ev)
 
         if global_step % save_every == 0 or global_step == total_steps:
             save_downstream_checkpoint(join_path(run_dir, f'checkpoint_step{global_step}.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
 
-    log(f'[done] task={task} best_acc={best_acc:.4f} step={global_step} run_dir={run_dir}')
+    if is_host0():
+        final_msg = f'[done] task={task} best_acc={best_acc:.4f} step={global_step} run_dir={run_dir}'
+        record(final_msg)
+        write_text(summary_path, final_msg + '\n')
 
 
 if __name__ == '__main__':
