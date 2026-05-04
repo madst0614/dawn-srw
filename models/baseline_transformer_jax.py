@@ -104,7 +104,7 @@ class VanillaTransformer(nn.Module):
                                   embedding_init=scaled_normal(0.02))
         self.pos_emb = nn.Embed(self.max_seq_len, self.d_model,
                                 embedding_init=scaled_normal(0.02))
-        LayerCls = nn.remat(TransformerLayer) if self.gradient_checkpointing else TransformerLayer
+        LayerCls = nn.remat(TransformerLayer, static_argnums=(2,)) if self.gradient_checkpointing else TransformerLayer
         self.layers = [
             LayerCls(self.d_model, self.n_heads, self.d_ff,
                      self.dropout_rate, name=f'layer_{i}')
