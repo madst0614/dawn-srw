@@ -487,7 +487,9 @@ def _materialize_for_checkpoint(tree):
 
 
 def save_downstream_checkpoint(path: str, params, opt_state, step: int, best_metric: float, cfg: Dict[str, Any], extra=None):
-    # IMPORTANT: all hosts must participate in materialization collectives.
+    # IMPORTANT: this function MUST be called by every host at the same program
+    # point.  It gathers sharded params/opt_state like train_jax; only host0
+    # writes the serialized bytes.
     model_cfg = cfg.get('model', {})
     train_cfg = dict(cfg.get('training', {}))
     train_cfg['downstream'] = cfg.get('downstream', {})
@@ -820,15 +822,38 @@ def main():
                                  float(tcfg.get('aux_weight', 0.0)), float(tcfg.get('tau_weight', 0.0)))
     score_step = make_score_step(model, sharded_fns)
 
+    def _sync_eval_decision(ev: Dict[str, Any], current_best: float):
+        """Broadcast host0 eval accuracy and new-best decision to all hosts.
+
+        evaluate() materializes metrics only on host0, but checkpoint saving must
+        be entered by every host because save_downstream_checkpoint gathers
+        sharded params/opt_state using multi-host collectives.  This mirrors
+        train_jax: all hosts participate in the gather, host0 writes bytes.
+        """
+        if is_host0():
+            acc = float(ev.get('accuracy', 0.0))
+            total = float(ev.get('total', 0))
+            flag = 1.0 if acc > current_best else 0.0
+            local = np.array([flag, acc, total], dtype=np.float32)
+        else:
+            local = np.zeros((3,), dtype=np.float32)
+        if jax.process_count() > 1:
+            gathered = np.asarray(process_allgather(local, tiled=True)).reshape(-1, 3)
+            # process_index 0 is the logging/writing leader.
+            flag, acc, total = gathered[0].tolist()
+        else:
+            flag, acc, total = local.tolist()
+        return bool(flag > 0.5), float(acc), int(total)
+
     # Initial eval.
     ev = evaluate(params, score_step, eval_rows, eval_batch_size, max_seq_len, pad_id, data_sharding)
+    new_best, ev_acc, ev_total = _sync_eval_decision(ev, best_acc)
     if is_host0():
-        ev['step'] = global_step
-        record(f"[eval] step={global_step} acc={ev['accuracy']:.4f} total={ev['total']}")
-        append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev['accuracy']},{ev['total']},{max(best_acc, ev['accuracy']):.6f},0.0\n")
-        if ev['accuracy'] > best_acc:
-            best_acc = ev['accuracy']
-            save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
+        record(f"[eval] step={global_step} acc={ev_acc:.4f} total={ev_total}")
+        append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev_acc},{ev_total},{max(best_acc, ev_acc):.6f},0.0\n")
+    if new_best:
+        best_acc = ev_acc
+        save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
 
     # Training.
     rng = jax.random.PRNGKey(seed + 1000 + global_step)
@@ -870,13 +895,13 @@ def main():
 
         if global_step % eval_every == 0 or global_step == total_steps:
             ev = evaluate(params, score_step, eval_rows, eval_batch_size, max_seq_len, pad_id, data_sharding)
+            new_best, ev_acc, ev_total = _sync_eval_decision(ev, best_acc)
             if is_host0():
-                ev['step'] = global_step
-                record(f"[eval] step={global_step} acc={ev['accuracy']:.4f} total={ev['total']}")
-                append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev['accuracy']},{ev['total']},{max(best_acc, ev['accuracy']):.6f},{time.time() - t0:.3f}\n")
-                if ev['accuracy'] > best_acc:
-                    best_acc = ev['accuracy']
-                    save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
+                record(f"[eval] step={global_step} acc={ev_acc:.4f} total={ev_total}")
+                append_text(metrics_csv_path, f"eval,{global_step},,,,,,{ev_acc},{ev_total},{max(best_acc, ev_acc):.6f},{time.time() - t0:.3f}\n")
+            if new_best:
+                best_acc = ev_acc
+                save_downstream_checkpoint(join_path(run_dir, 'best_model.flax'), params, opt_state, global_step, best_acc, cfg, {'task': task})
 
         # Save periodic resume checkpoints only during training.
         # Do NOT force a final full checkpoint at task end: on multi-host TPU
