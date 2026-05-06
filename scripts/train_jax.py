@@ -55,7 +55,7 @@ from jax.experimental.shard_map import shard_map
 # restore and re-register them only when reproducing an old run.
 from models.baseline_transformer_jax import VanillaTransformer
 from models.legacy.dawn_spatial_v394_exp import DAWN as DAWN_V394
-from models.dawn_spatial_v4152 import DAWN as DAWN_V4152
+from models.legacy.dawn_spatial_v4152 import DAWN as DAWN_V4152
 from models.dawn_srw import (
     DAWN as DAWN_SRW,
     migrate_legacy_v4155_params,
@@ -288,7 +288,7 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v4.1.5.2': ModelSpec(
         name='spatial-r1-v4.1.5.2',
-        module_path='models.dawn_spatial_v4152',
+        module_path='models.legacy.dawn_spatial_v4152',
         cls=DAWN_V4152,
         build_kwargs=_dawn_v4152_kwargs,
         supports_sharded=True,

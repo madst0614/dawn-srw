@@ -50,19 +50,19 @@ baseline: Vanilla Transformer for fair comparison
 # Lazy imports — PyTorch models loaded only when accessed (allows torch-free JAX usage)
 def __getattr__(name):
     _torch_models = {
-        'DAWN_v18_5': ('.model_v18_5', 'DAWN'),
-        'DAWN_v18_4': ('.model_v18_4', 'DAWN'),
-        'DAWN_v18_3': ('.model_v18_3', 'DAWN'),
-        'DAWN_v18_2': ('.model_v18_2', 'DAWN'),
-        'DAWN_v18_1': ('.model_v18_1', 'DAWN'),
-        'DAWN_v18': ('.model_v18', 'DAWN'),
-        'DAWN_v17_1': ('.model_v17_1', 'DAWN'),
-        'DAWN_v17_1_TPU': ('.model_v17_1_tpu', 'DAWN'),
-        'DAWN_v17_1_TPU_MemOpt': ('.model_v17_1_tpu_memopt', 'DAWN'),
-        'DAWN_v17_2': ('.model_v17_2', 'DAWN'),
+        'DAWN_v18_5': ('.legacy.model_v18_5', 'DAWN'),
+        'DAWN_v18_4': ('.legacy.model_v18_4', 'DAWN'),
+        'DAWN_v18_3': ('.legacy.model_v18_3', 'DAWN'),
+        'DAWN_v18_2': ('.legacy.model_v18_2', 'DAWN'),
+        'DAWN_v18_1': ('.legacy.model_v18_1', 'DAWN'),
+        'DAWN_v18': ('.legacy.model_v18', 'DAWN'),
+        'DAWN_v17_1': ('.legacy.model_v17_1', 'DAWN'),
+        'DAWN_v17_1_TPU': ('.legacy.model_v17_1_tpu', 'DAWN'),
+        'DAWN_v17_1_TPU_MemOpt': ('.legacy.model_v17_1_tpu_memopt', 'DAWN'),
+        'DAWN_v17_2': ('.legacy.model_v17_2', 'DAWN'),
         'DAWN_SRW': ('.dawn_srw', 'DAWN'),
-        'DAWN_Spatial': ('.dawn_spatial', 'DAWN'),
-        'DAWN': ('.model_v17_1', 'DAWN'),
+        'DAWN_Spatial': ('.legacy.dawn_spatial', 'DAWN'),
+        'DAWN': ('.legacy.model_v17_1', 'DAWN'),
         'VanillaTransformer': ('.baseline_transformer', 'VanillaTransformer'),
     }
     _registry_names = {

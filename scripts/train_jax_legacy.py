@@ -51,19 +51,16 @@ from typing import Any, Callable, Optional
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental.shard_map import shard_map
 
-# Model registry imports. Legacy versions (v2 .. v4.0.6, v3.9.x except
-# v3.9.4, rw-v4.0.2) live in models/legacy/ — restore from there and
-# add a ModelSpec entry if you need to resume an old checkpoint or
-# reproduce a paper result. See models/legacy/README.md.
+# Model registry imports. Legacy spatial-r1 experiments live in models/legacy/.
 from models.baseline_transformer_jax import VanillaTransformer
-from models.dawn_spatial_v394_exp import DAWN as DAWN_V394
+from models.legacy.dawn_spatial_v394_exp import DAWN as DAWN_V394
 from models.legacy.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
 from models.legacy.dawn_spatial_v41_tau_bias_exp import DAWN as DAWN_V41
 from models.legacy.dawn_spatial_v412_scan_bias_exp import DAWN as DAWN_V412
 from models.legacy.dawn_spatial_v414_competitive_den_exp import DAWN as DAWN_V414
-from models.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
+from models.legacy.dawn_spatial_v415_operator_route_sig_exp import DAWN as DAWN_V415
 from models.legacy.dawn_spatial_v4151_operator_route_sig_free_rw_exp import DAWN as DAWN_V4151
-from models.dawn_spatial_v4152 import DAWN as DAWN_V4152
+from models.legacy.dawn_spatial_v4152 import DAWN as DAWN_V4152
 
 # ============================================================
 # Constants
@@ -260,7 +257,7 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v3.9.4': ModelSpec(
         name='spatial-r1-v3.9.4',
-        module_path='models.dawn_spatial_v394_exp',
+        module_path='models.legacy.dawn_spatial_v394_exp',
         cls=DAWN_V394,
         build_kwargs=_dawn_shared_kwargs,
         supports_sharded=True,
@@ -301,7 +298,7 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v4.1.5': ModelSpec(
         name='spatial-r1-v4.1.5',
-        module_path='models.dawn_spatial_v415_operator_route_sig_exp',
+        module_path='models.legacy.dawn_spatial_v415_operator_route_sig_exp',
         cls=DAWN_V415,
         build_kwargs=_dawn_v415_kwargs,
         supports_sharded=True,
@@ -319,7 +316,7 @@ MODEL_REGISTRY = {
     ),
     'spatial-r1-v4.1.5.2': ModelSpec(
         name='spatial-r1-v4.1.5.2',
-        module_path='models.dawn_spatial_v4152',
+        module_path='models.legacy.dawn_spatial_v4152',
         cls=DAWN_V4152,
         build_kwargs=_dawn_v415_kwargs,
         supports_sharded=True,

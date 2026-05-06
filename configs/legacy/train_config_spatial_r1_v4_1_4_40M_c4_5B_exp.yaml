@@ -2,7 +2,7 @@
 #
 # Sister of train_config_spatial_r1_v4_1_40M_c4_5B.yaml.
 # train_jax.py maps model_version: "spatial-r1-v4.1.4" to:
-#   models/dawn_spatial_v414_competitive_den_exp.py
+#   models/legacy/dawn_spatial_v414_competitive_den_exp.py
 #
 # This keeps the v4.1.2 scan-bias gate and tests a competitive
 # contribution-aware denominator:

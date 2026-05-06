@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot paper-output analysis for the 400M spatial-r1-v3.9.4 pilot.
+"""One-shot data extraction for the 400M spatial-r1-v3.9.4 pilot.
 
 Inputs:
   --tf-checkpoint       dense Transformer checkpoint file or run directory
@@ -10,7 +10,7 @@ Inputs:
 Default behavior:
   - Parse downstream logs.
   - Resolve/load checkpoint bytes and report checkpoint metadata/param counts.
-  - Print copyable paper tables and appendix wording to stdout.
+  - Print copyable data tables and diagnostics to stdout.
   - Do not write CSV/TeX/Markdown files.
 
 Optional:
@@ -25,9 +25,12 @@ import csv
 import io
 import json
 import math
+import os
 import re
+import socket
 import sys
-import textwrap
+import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -45,17 +48,7 @@ DOWNSTREAM_LOGS = (
     "dawn_random.txt",
 )
 
-LIMITATION_TEXT = (
-    "v3.9.4 is an earlier SRW-family implementation. We include it as evidence "
-    "that SRW-style rank-1 operator composition can be trained at 400M scale "
-    "and can produce transferable representations. We do not use this experiment "
-    "as the main evidence for the final v4.1.5.5 sparse operator-selection mechanism."
-)
-
-UTIL_NOTE = (
-    "Because v3.9.4 uses an earlier ReLU/gate-sum-normalized router, these "
-    "utilization statistics are not used as the primary sparsity evidence for DAWN-SRW."
-)
+UTIL_NOTE = "diagnostic_only_earlier_relu_gate_sum_router_not_primary_sparsity_evidence"
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +110,6 @@ def task_label(task: str) -> str:
     }.get(task.lower(), task.upper())
 
 
-def section(title: str) -> str:
-    return f"\n{'=' * 78}\n{title}\n{'=' * 78}"
-
-
 def is_primary_host() -> bool:
     """Return True only on JAX host 0, falling back to True off TPU/JAX."""
     try:
@@ -132,10 +121,70 @@ def is_primary_host() -> bool:
 
 
 def emit(*args: Any, **kwargs: Any) -> None:
-    """Print paper-ready output once in multi-host TPU runs."""
+    """Print final data output once in multi-host TPU runs."""
     if is_primary_host():
         kwargs.setdefault("flush", True)
         print(*args, **kwargs)
+
+
+def format_seconds(seconds: Optional[float]) -> str:
+    if seconds is None or not math.isfinite(seconds):
+        return "--:--:--"
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def process_label() -> str:
+    host = socket.gethostname()
+    if "jax" in sys.modules:
+        try:
+            import jax
+
+            return f"host={jax.process_index()}/{jax.process_count()} {host}"
+        except Exception:
+            pass
+    return host
+
+
+class ProgressTracker:
+    def __init__(self, total_units: int) -> None:
+        self.total_units = max(1, int(total_units))
+        self.done_units = 0
+        self.start_time = time.time()
+        self.last_percent = -1.0
+
+    def update(self, message: str, units: int = 0) -> None:
+        self.done_units = min(self.total_units, self.done_units + max(0, int(units)))
+        percent = 100.0 * self.done_units / self.total_units
+        elapsed = time.time() - self.start_time
+        eta = None
+        if self.done_units > 0:
+            eta = elapsed * (self.total_units - self.done_units) / self.done_units
+        stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(
+            f"[progress] {percent:6.2f}% ETA {format_seconds(eta)} elapsed {format_seconds(elapsed)} "
+            f"{stamp} [{process_label()}] {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+_PROGRESS: Optional[ProgressTracker] = None
+
+
+def set_progress_total(total_units: int) -> None:
+    global _PROGRESS
+    _PROGRESS = ProgressTracker(total_units)
+
+
+def progress(message: str, units: int = 0) -> None:
+    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    if _PROGRESS is not None:
+        _PROGRESS.update(message, units=units)
+    else:
+        print(f"[progress]   0.00% ETA --:--:-- elapsed 00:00:00 {stamp} [{process_label()}] {message}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -388,12 +437,19 @@ def parse_downstream_log(path: str) -> List[Dict[str, Any]]:
 def parse_downstream_results(results_dir: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     results_dir = normalize_path(results_dir)
+    progress(f"downstream: scanning {results_dir}")
     for name in DOWNSTREAM_LOGS:
         path = join_ref(results_dir, name)
+        progress(f"downstream: checking {name}")
         if file_exists(path):
-            rows.extend(parse_downstream_log(path))
+            parsed = parse_downstream_log(path)
+            rows.extend(parsed)
+            progress(f"downstream: parsed {len(parsed)} run(s) from {name}", units=1)
+        else:
+            progress(f"downstream: missing {name}", units=1)
     if not rows:
         raise FileNotFoundError(f"No downstream logs found in {results_dir}; expected {', '.join(DOWNSTREAM_LOGS)}")
+    progress(f"downstream: total parsed runs={len(rows)}")
     return sorted(rows, key=lambda r: (r["task"], r["model"], r["init_type"]))
 
 
@@ -474,11 +530,14 @@ def load_checkpoint_metadata(label: str, checkpoint: str, estimated_params: int,
         from flax import serialization
         import scripts.train_jax as tj
 
+        progress(f"checkpoint: resolving {label}")
         resolved = resolve_checkpoint(normalize_path(checkpoint))
+        progress(f"checkpoint: loading {label}")
         with tj._open_file(resolved, "rb") as f:
             raw = serialization.msgpack_restore(f.read())
         params = raw.get("params", {}) if isinstance(raw, dict) else {}
         count = raw_param_count(params) or estimated_params
+        progress(f"checkpoint: loaded {label}; params={count:,}", units=1)
         return {
             "model": label,
             "loaded": True,
@@ -491,6 +550,7 @@ def load_checkpoint_metadata(label: str, checkpoint: str, estimated_params: int,
             "_resolved": resolved,
         }
     except Exception as exc:
+        progress(f"checkpoint: failed {label}: {type(exc).__name__}: {exc}", units=1)
         return {
             "model": label,
             "loaded": False,
@@ -582,15 +642,18 @@ def run_forward_analysis(
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
     if not checkpoint_meta.get("loaded"):
+        progress(f"forward: skipped {label}; checkpoint not loaded", units=6)
         return {"forward_error": "checkpoint not loaded"}
 
     import jax
     import jax.numpy as jnp
     import scripts.train_jax as tj
 
+    progress(f"forward: building model {label}", units=1)
     model = tj.build_model_from_config(cfg)
     seed = int(cfg.get("seed", 1))
     init_len = int(cfg.get("model", {}).get("max_seq_len", 512))
+    progress(f"forward: reading validation batch {label}; batch={batch_size} seq_len={seq_len}", units=1)
     global_batch_np = read_validation_batch(val_data, batch_size, seq_len)
 
     sharded_fns = None
@@ -608,8 +671,12 @@ def run_forward_analysis(
             from scripts.downstream_finetune_jax import build_sharded_fns_if_needed
 
             sharded_fns = build_sharded_fns_if_needed(cfg, mesh)
+        progress(f"forward: mesh ready {label}; mesh_data={mesh_data} mesh_model={mesh_model}", units=1)
+    else:
+        progress(f"forward: single-device path ready {label}", units=1)
 
     def _init_restore_and_apply():
+        progress(f"forward: initializing/restoring params {label}", units=1)
         variables = model.init(
             {"params": jax.random.PRNGKey(seed), "dropout": jax.random.PRNGKey(seed + 1)},
             jnp.ones((1, init_len), dtype=jnp.int32),
@@ -626,6 +693,7 @@ def run_forward_analysis(
             batch = jnp.asarray(global_batch_np)
 
         kwargs = {"sharded_fns": sharded_fns} if sharded_fns is not None else {}
+        progress(f"forward: running apply {label}", units=1)
         return model.apply(
             {"params": params},
             batch,
@@ -688,6 +756,7 @@ def run_forward_analysis(
                 / 2.0,
             }
         )
+    progress(f"forward: metrics ready {label}", units=1)
     return result
 
 
@@ -757,11 +826,6 @@ def lm_head_flops(cfg: Dict[str, Any]) -> float:
 
 def latex_downstream_table(rows: List[Dict[str, Any]]) -> str:
     lines = [
-        r"\begin{table}[t]",
-        r"\centering",
-        r"\small",
-        r"\caption{Downstream transfer for the 400M v3.9.4 pilot. Accuracy entries are best validation accuracies in percent. Delta columns are percentage-point differences.}",
-        r"\label{tab:v394_downstream}",
         r"\begin{tabular}{lrrrrrrr}",
         r"\toprule",
         r"Task & DAWN pre. & DAWN rand. & DAWN $\Delta$ & Dense pre. & Dense rand. & Dense $\Delta$ & DAWN-Dense \\",
@@ -773,7 +837,22 @@ def latex_downstream_table(rows: List[Dict[str, Any]]) -> str:
             f"{pp(row['dawn_delta'])} & {pct(row['tf_pre'])} & {pct(row['tf_random'])} & "
             f"{pp(row['tf_delta'])} & {pp(row['dawn_minus_tf'])} \\\\"
         )
-    lines.extend([r"\bottomrule", r"\end{tabular}", r"\end{table}"])
+    lines.extend([r"\bottomrule", r"\end{tabular}"])
+    return "\n".join(lines)
+
+
+def raw_downstream_table(rows: List[Dict[str, Any]]) -> str:
+    lines = [
+        "| task | model | init | train_rows | eval_rows | total_steps | step0_acc | final_acc | best_acc | best_step | wall_clock_final_s | run_dir |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {task_label(row.get('task', ''))} | {row.get('model', '--')} | {row.get('init_type', '--')} | "
+            f"{num(row.get('train_rows'), 0)} | {num(row.get('eval_rows'), 0)} | {num(row.get('total_steps'), 0)} | "
+            f"{pct(row.get('step0_acc'))} | {pct(row.get('final_acc'))} | {pct(row.get('best_acc'))} | "
+            f"{num(row.get('best_step'), 0)} | {num(row.get('wall_clock_final_s'), 2)} | {row.get('run_dir', '--')} |"
+        )
     return "\n".join(lines)
 
 
@@ -845,9 +924,10 @@ def compute_table(dawn_cfg: Dict[str, Any], tf_cfg: Dict[str, Any], seq_len: int
 def utilization_block(dawn_forward: Dict[str, Any]) -> str:
     if "qk_active_fraction" not in dawn_forward:
         return (
-            "Utilization diagnostics were not run. To populate them, rerun with --run-forward "
-            "and a validation .bin path if the config default is not accessible.\n\n"
-            + UTIL_NOTE
+            "| metric | value |\n"
+            "|---|---:|\n"
+            f"| status | not_run |\n"
+            f"| diagnostic_note | {UTIL_NOTE} |"
         )
     return "\n".join(
         [
@@ -862,33 +942,9 @@ def utilization_block(dawn_forward: Dict[str, Any]) -> str:
             f"gate_conc mean: {num(dawn_forward.get('gate_conc_mean'), 4)}",
             f"score_std mean: {num(dawn_forward.get('score_std_mean'), 4)}",
             "",
-            UTIL_NOTE,
+            f"diagnostic_note: {UTIL_NOTE}",
         ]
     )
-
-
-def appendix_text() -> str:
-    return textwrap.dedent(
-        f"""
-        \\subsection{{400M Pilot with an Earlier SRW Variant}}
-        This appendix reports the 400M spatial-r1-v3.9.4 experiment as an earlier SRW-family scaling and downstream-transfer pilot. The comparison uses the v3.9.4 DAWN run, a dense Transformer baseline at the same nominal scale, and matched downstream fine-tuning runs from pretrained and random initialization.
-
-        \\paragraph{{Language-modeling scaling result.}}
-        The checkpoint-derived summary reports the available model scale, token-budget, step, and validation metadata. Missing final validation-loss or throughput entries should be filled from the original pretraining logs rather than inferred from downstream transfer.
-
-        \\paragraph{{Downstream transfer.}}
-        v3.9.4 shows clear transfer over random initialization and is competitive with the dense Transformer baseline, but task-level results vary.
-
-        \\paragraph{{Utilization diagnostics.}}
-        {UTIL_NOTE}
-
-        \\paragraph{{Compute discussion.}}
-        The compute estimate separates the dense Transformer baseline, the implemented v3.9.4 computation with full routing over the operator pools, and an idealized active-operator view using measured active counts when available. We do not claim wall-clock FLOPs reduction unless the implemented computation supports it.
-
-        \\paragraph{{Limitations.}}
-        {LIMITATION_TEXT}
-        """
-    ).strip()
 
 
 def parse_args() -> argparse.Namespace:
@@ -911,9 +967,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    total_units = 1 + len(DOWNSTREAM_LOGS) + 2 + (12 if args.run_forward else 0) + 1
+    set_progress_total(total_units)
+    progress("analysis: start")
     results_dir = normalize_path(args.results)
+    progress("config: loading yaml files")
     dawn_cfg = load_yaml(args.dawn394_config)
     tf_cfg = load_yaml(args.tf_config)
+    progress("config: loaded yaml files", units=1)
     downstream = parse_downstream_results(results_dir)
 
     dawn_est = dawn394_param_estimate(dawn_cfg["model"])
@@ -933,57 +994,59 @@ def main() -> None:
             )
         else:
             forward["DAWN v3.9.4 400M"] = {"forward_error": "no validation data path"}
+            progress("forward: skipped DAWN v3.9.4 400M; no validation data path", units=6)
         if tf_val:
             forward["dense Transformer 400M"] = run_forward_analysis(
                 "dense Transformer 400M", tf_meta, tf_cfg, str(tf_val), args.batch_size, args.seq_len, is_dawn=False, args=args
             )
         else:
             forward["dense Transformer 400M"] = {"forward_error": "no validation data path"}
+            progress("forward: skipped dense Transformer 400M; no validation data path", units=6)
 
-    emit(section("COPYABLE PAPER OUTPUT: v3.9.4 400M PILOT"))
-    emit("Use this as an earlier SRW-family 400M scaling/downstream-transfer pilot only.")
-    emit("Do not present v3.9.4 as evidence for the final v4.1.5.5 sparsity mechanism.")
-
-    emit(section("1. CLAIM SENTENCE"))
-    emit("v3.9.4 shows clear transfer over random initialization and is competitive with the dense Transformer baseline, but task-level results vary.")
-
-    emit(section("2. CHECKPOINT / PRETRAINING SETUP TABLE"))
+    emit("checkpoint_pretraining_setup_markdown")
     emit(pretraining_setup_table(dawn_cfg, tf_cfg, dawn_meta, tf_meta))
     failed = [m for m in (dawn_meta, tf_meta) if not m.get("loaded")]
     if failed:
-        emit("\nCheckpoint load warnings:")
+        emit("")
+        emit("checkpoint_load_warnings")
         for meta in failed:
             emit(f"- {meta['model']}: {meta.get('error')}")
 
-    emit(section("3. CHECKPOINT-DERIVED METRICS TABLE"))
+    emit("")
+    emit("checkpoint_metrics_markdown")
     emit(checkpoint_table([dawn_meta, tf_meta], forward))
     if not args.run_forward:
-        emit("\nForward metrics are blank because --run-forward was not used.")
+        emit("")
+        emit("forward_status: not_run")
 
-    emit(section("4. DOWNSTREAM MAIN TABLE (MARKDOWN)"))
+    emit("")
+    emit("downstream_raw_runs_markdown")
+    emit(raw_downstream_table(downstream))
+
+    emit("")
+    emit("downstream_best_accuracy_markdown")
     emit(markdown_downstream_table(downstream))
 
-    emit(section("5. DOWNSTREAM MAIN TABLE (LATEX)"))
+    emit("")
+    emit("downstream_best_accuracy_latex_tabular")
     emit(latex_downstream_table(downstream))
 
-    emit(section("6. UTILIZATION DIAGNOSTICS"))
+    emit("")
+    emit("utilization_diagnostics")
     emit(utilization_block(forward.get("DAWN v3.9.4 400M", {})))
 
-    emit(section("7. FLOPS / COMPUTE ESTIMATE"))
+    emit("")
+    emit("compute_estimate_markdown")
     emit(compute_table(dawn_cfg, tf_cfg, args.seq_len, forward.get("DAWN v3.9.4 400M", {})))
-    emit("\nCompute note: implemented compute and ideal active-operator compute are separate. Do not claim wall-clock FLOPs reduction from the idealized row.")
-
-    emit(section("8. APPENDIX DRAFT TEXT"))
-    emit(appendix_text())
-
-    emit(section("9. LIMITATION TO INCLUDE VERBATIM"))
-    emit(LIMITATION_TEXT)
+    emit("compute_note: implemented_compute_and_ideal_active_compute_are_separate")
 
     if args.show_paths:
-        emit(section("10. PATHS USED"))
+        emit("")
+        emit("paths_used")
         emit(f"results: {results_dir}")
         emit(f"dawn394 checkpoint: {dawn_meta.get('checkpoint_file')}")
         emit(f"tf checkpoint: {tf_meta.get('checkpoint_file')}")
+    progress("analysis: final data output emitted", units=1)
 
 
 if __name__ == "__main__":

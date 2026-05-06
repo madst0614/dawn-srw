@@ -3,4 +3,4 @@
 Official implementation: models.dawn_srw.
 """
 
-from .dawn_srw import *  # noqa: F401,F403
+from ..dawn_srw import *  # noqa: F401,F403

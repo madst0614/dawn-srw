@@ -22,11 +22,11 @@ context, not an ad-hoc `rm`.
 2. Re-import and register in `scripts/train_jax.py` next to the
    other `MODEL_REGISTRY` entries:
    ```python
-   from models.dawn_spatial_vXXX_exp import DAWN as DAWN_VXXX
+   from models.legacy.dawn_spatial_vXXX_exp import DAWN as DAWN_VXXX
    # ...
    'spatial-r1-vX.X.X': ModelSpec(
        name='spatial-r1-vX.X.X',
-       module_path='models.dawn_spatial_vXXX_exp',
+       module_path='models.legacy.dawn_spatial_vXXX_exp',
        cls=DAWN_VXXX,
        build_kwargs=_dawn_shared_kwargs,  # or a version-specific builder
        supports_sharded=True,             # if the module defines make_sharded_srw

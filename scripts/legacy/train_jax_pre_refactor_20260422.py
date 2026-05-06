@@ -41,28 +41,28 @@ from functools import partial
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental.shard_map import shard_map
 
-from models.model_v17_1_jax import DAWN
-from models.dawn_spatial import DAWN as DAWN_Spatial
-from models.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
-from models.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
-from models.dawn_spatial_v3_baseline import DAWN as DAWN_SpatialV3Baseline
-from models.dawn_spatial_v3_exp import DAWN as DAWN_SpatialV3Exp
-from models.dawn_spatial_v394_exp import DAWN as DAWN_SpatialV394Exp
-from models.dawn_spatial_v395_exp import DAWN as DAWN_SpatialV395Exp
-from models.dawn_spatial_v396_exp import DAWN as DAWN_SpatialV396Exp
-from models.dawn_spatial_v397_exp import DAWN as DAWN_SpatialV397Exp
-from models.dawn_spatial_v3971_exp import DAWN as DAWN_SpatialV3971Exp
-from models.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
-from models.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
-from models.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
-from models.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
-from models.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
-from models.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
-from models.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
-from models.dawn_spatial_v404_exp import DAWN as DAWN_SpatialV404Exp
-from models.dawn_spatial_v405_exp import DAWN as DAWN_SpatialV405Exp
-from models.dawn_spatial_v406_exp import DAWN as DAWN_SpatialV406Exp
-from models.dawn_spatial_v41_exp import DAWN as DAWN_SpatialV41Exp
+from models.legacy.model_v17_1_jax import DAWN
+from models.legacy.dawn_spatial import DAWN as DAWN_Spatial
+from models.legacy.dawn_spatial_v2 import DAWN as DAWN_SpatialV2
+from models.legacy.dawn_spatial_v3 import DAWN as DAWN_SpatialV3
+from models.legacy.dawn_spatial_v3_baseline import DAWN as DAWN_SpatialV3Baseline
+from models.legacy.dawn_spatial_v3_exp import DAWN as DAWN_SpatialV3Exp
+from models.legacy.dawn_spatial_v394_exp import DAWN as DAWN_SpatialV394Exp
+from models.legacy.dawn_spatial_v395_exp import DAWN as DAWN_SpatialV395Exp
+from models.legacy.dawn_spatial_v396_exp import DAWN as DAWN_SpatialV396Exp
+from models.legacy.dawn_spatial_v397_exp import DAWN as DAWN_SpatialV397Exp
+from models.legacy.dawn_spatial_v3971_exp import DAWN as DAWN_SpatialV3971Exp
+from models.legacy.dawn_spatial_v398_exp import DAWN as DAWN_SpatialV398Exp
+from models.legacy.dawn_spatial_v3981_exp import DAWN as DAWN_SpatialV3981Exp
+from models.legacy.dawn_spatial_v399_exp import DAWN as DAWN_SpatialV399Exp
+from models.legacy.dawn_spatial_v400_exp import DAWN as DAWN_SpatialV400Exp
+from models.legacy.dawn_spatial_v401_exp import DAWN as DAWN_SpatialV401Exp
+from models.legacy.dawn_spatial_v402_exp import DAWN as DAWN_RW_V402
+from models.legacy.dawn_spatial_v403_exp import DAWN as DAWN_SpatialV403Exp
+from models.legacy.dawn_spatial_v404_exp import DAWN as DAWN_SpatialV404Exp
+from models.legacy.dawn_spatial_v405_exp import DAWN as DAWN_SpatialV405Exp
+from models.legacy.dawn_spatial_v406_exp import DAWN as DAWN_SpatialV406Exp
+from models.legacy.dawn_spatial_v41_exp import DAWN as DAWN_SpatialV41Exp
 from models.baseline_transformer_jax import VanillaTransformer
 
 # ============================================================
@@ -1957,7 +1957,7 @@ def main():
     _force_sharded = model_version in ('spatial-r1-v4.0.4', 'spatial-r1-v4.0.5',
                                         'spatial-r1-v4.0.6', 'spatial-r1-v4.1')
     if mesh_model > 1 or _force_sharded:
-        _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
+        _v3_mod = {'spatial-r1-v3.9.1': 'models.legacy.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.legacy.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.legacy.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.legacy.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.legacy.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.legacy.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.legacy.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.legacy.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.legacy.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.legacy.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.legacy.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.legacy.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.legacy.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.legacy.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.legacy.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.legacy.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.legacy.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.legacy.dawn_spatial_v41_exp'}.get(model_version, 'models.legacy.dawn_spatial_v3')
         _v3 = __import__(_v3_mod, fromlist=['make_sharded_srw'])
         make_sharded_srw = _v3.make_sharded_srw
         max_chunk = cfg['training'].get('max_chunk_size', 12500)
@@ -2073,7 +2073,7 @@ def main():
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
                       flush=True)
 
-            _v3_mod = {'spatial-r1-v3.9.1': 'models.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.dawn_spatial_v41_exp'}.get(model_version, 'models.dawn_spatial_v3')
+            _v3_mod = {'spatial-r1-v3.9.1': 'models.legacy.dawn_spatial_v3_baseline', 'spatial-r1-v3.9.3': 'models.legacy.dawn_spatial_v3_exp', 'spatial-r1-v3.9.4': 'models.legacy.dawn_spatial_v394_exp', 'spatial-r1-v3.9.5': 'models.legacy.dawn_spatial_v395_exp', 'spatial-r1-v3.9.6': 'models.legacy.dawn_spatial_v396_exp', 'spatial-r1-v3.9.7': 'models.legacy.dawn_spatial_v397_exp', 'spatial-r1-v3.9.7.1': 'models.legacy.dawn_spatial_v3971_exp', 'spatial-r1-v3.9.8': 'models.legacy.dawn_spatial_v398_exp', 'spatial-r1-v3.9.8.1': 'models.legacy.dawn_spatial_v3981_exp', 'spatial-r1-v3.9.9': 'models.legacy.dawn_spatial_v399_exp', 'spatial-r1-v4.0.0': 'models.legacy.dawn_spatial_v400_exp', 'spatial-r1-v4.0.1': 'models.legacy.dawn_spatial_v401_exp', 'rw-v4.0.2': 'models.legacy.dawn_spatial_v402_exp', 'spatial-r1-v4.0.3': 'models.legacy.dawn_spatial_v403_exp', 'spatial-r1-v4.0.4': 'models.legacy.dawn_spatial_v404_exp', 'spatial-r1-v4.0.5': 'models.legacy.dawn_spatial_v405_exp', 'spatial-r1-v4.0.6': 'models.legacy.dawn_spatial_v406_exp', 'spatial-r1-v4.1': 'models.legacy.dawn_spatial_v41_exp'}.get(model_version, 'models.legacy.dawn_spatial_v3')
             _v3 = __import__(_v3_mod, fromlist=['_layer_norm', '_attn_forward', '_know_forward', '_srw_chunked'])
             _layer_norm, _attn_forward, _know_forward, _srw_chunked = _v3._layer_norm, _v3._attn_forward, _v3._know_forward, _v3._srw_chunked
 
@@ -3185,7 +3185,7 @@ def main():
                     _params_cpu = _gather_for_save(params)
                     if is_host0:
                         try:
-                            from models.dawn_spatial_v402_exp import diagnose_dead_neurons as _diag_dead
+                            from models.legacy.dawn_spatial_v402_exp import diagnose_dead_neurons as _diag_dead
                             _diag_cfg = {
                                 'd_model': cfg['model']['d_model'],
                                 'n_layers': cfg['model']['n_layers'],

@@ -2,7 +2,7 @@
 #
 # Sister of train_config_spatial_r1_v4_1_40M_c4_5B.yaml.
 # This routes through:
-#   models/dawn_spatial_v411_tau_bias_xr_intensity_exp.py
+#   models/legacy/dawn_spatial_v411_tau_bias_xr_intensity_exp.py
 #
 # This keeps the baseline v4.1 training hyperparameters fixed while
 # testing additive tau_bias plus score-as-selector routing:

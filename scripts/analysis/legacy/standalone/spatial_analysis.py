@@ -53,7 +53,7 @@ import functools
 
 _MODEL_MODULE = None
 
-def get_model_module(model_file="models.dawn_spatial_v3"):
+def get_model_module(model_file="models.legacy.dawn_spatial_v3"):
     global _MODEL_MODULE
     if _MODEL_MODULE is None:
         _MODEL_MODULE = importlib.import_module(model_file)
@@ -98,7 +98,7 @@ def _list_dir(path):
 # Model + checkpoint loading
 # ============================================================
 
-def build_model(cfg, model_file="models.dawn_spatial_v3"):
+def build_model(cfg, model_file="models.legacy.dawn_spatial_v3"):
     mod = get_model_module(model_file)
     mcfg = cfg['model']
     # Check if model has gate_norm_mode attribute
@@ -6443,7 +6443,7 @@ def analyze_z_distribution(params, cfg, val_tokens, output_dir,
 # ============================================================
 
 def analyze_tau_gradient_split(params, cfg, val_tokens, output_dir,
-                                model_file="models.dawn_spatial_v401_exp",
+                                model_file="models.legacy.dawn_spatial_v401_exp",
                                 n_batches=2, batch_size=4):
     """Phase 5: jax.grad(task_loss, tau_*) vs jax.grad(aux_loss, tau_*).
     Reports Frobenius norm of tau_attn / tau_know gradients from each path."""
@@ -6945,8 +6945,8 @@ def main():
     parser.add_argument("--prompt", default="The meaning of life is")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--model_file", default="models.dawn_spatial_v3",
-                        help="Model module path (e.g. models.dawn_spatial_v3981_exp)")
+    parser.add_argument("--model_file", default="models.legacy.dawn_spatial_v3",
+                        help="Model module path (e.g. models.legacy.dawn_spatial_v3981_exp)")
     parser.add_argument("--n_batches", type=int, default=None,
                         help="Override n_batches for D6/D8/D10/R.1/R.4/P2/P3/P5/P6")
     parser.add_argument("--r2_sentences", type=int, default=5000,
