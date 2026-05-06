@@ -121,6 +121,23 @@ def section(title: str) -> str:
     return f"\n{'=' * 78}\n{title}\n{'=' * 78}"
 
 
+def is_primary_host() -> bool:
+    """Return True only on JAX host 0, falling back to True off TPU/JAX."""
+    try:
+        import jax
+
+        return int(jax.process_index()) == 0
+    except Exception:
+        return True
+
+
+def emit(*args: Any, **kwargs: Any) -> None:
+    """Print paper-ready output once in multi-host TPU runs."""
+    if is_primary_host():
+        kwargs.setdefault("flush", True)
+        print(*args, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Config and parameter estimates
 # ---------------------------------------------------------------------------
@@ -170,6 +187,26 @@ def token_budget(cfg: Dict[str, Any]) -> Optional[int]:
         return int(value)
     except Exception:
         return None
+
+
+def infer_dataset_and_budget(cfg: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, Optional[int]]:
+    text = " ".join(
+        str(part)
+        for part in (
+            cfg.get("data", {}).get("bin_train", ""),
+            meta.get("_resolved", ""),
+            meta.get("checkpoint_file", ""),
+        )
+    ).lower()
+    dataset = "C4" if "c4" in text else "unknown"
+    budget = token_budget(cfg)
+    if budget is None:
+        match = re.search(r"c4[_-](\d+(?:\.\d+)?)([bmk])\b", text)
+        if match:
+            value = float(match.group(1))
+            scale = {"b": 1_000_000_000, "m": 1_000_000, "k": 1_000}[match.group(2)]
+            budget = int(value * scale)
+    return dataset, budget
 
 
 def total_steps_estimate(cfg: Dict[str, Any]) -> Optional[int]:
@@ -468,7 +505,6 @@ def load_checkpoint_metadata(label: str, checkpoint: str, estimated_params: int,
 
 def read_validation_batch(path: str, batch_size: int, seq_len: int) -> Any:
     import numpy as np
-    import jax.numpy as jnp
     import scripts.train_jax as tj
 
     need = batch_size * seq_len
@@ -481,7 +517,7 @@ def read_validation_batch(path: str, batch_size: int, seq_len: int) -> Any:
         arr = np.memmap(path, dtype=np.uint16, mode="r")[:need].astype(np.int32)
     if arr.size < need:
         raise ValueError(f"validation data has {arr.size} tokens, need {need}: {path}")
-    return jnp.asarray(arr.reshape(batch_size, seq_len))
+    return np.asarray(arr.reshape(batch_size, seq_len), dtype=np.int32)
 
 
 def restore_params_for_forward(raw: Dict[str, Any], target_params: Dict[str, Any]) -> Dict[str, Any]:
@@ -493,6 +529,48 @@ def restore_params_for_forward(raw: Dict[str, Any], target_params: Dict[str, Any
     return serialization.from_state_dict({"params": target_params}, {"params": raw_params})["params"]
 
 
+def infer_mesh_shape(cfg: Dict[str, Any], args: argparse.Namespace, is_dawn: bool) -> Tuple[int, int]:
+    import jax
+
+    n_devices = jax.device_count()
+    if n_devices <= 1:
+        return 1, 1
+
+    if args.mesh_model is not None:
+        mesh_model = int(args.mesh_model)
+    else:
+        mesh_model = int(cfg.get("training", {}).get("mesh_model", 1) or 1)
+        if not is_dawn:
+            mesh_model = 1
+
+    if args.mesh_data is not None:
+        mesh_data = int(args.mesh_data)
+    else:
+        cfg_mesh_data = int(cfg.get("training", {}).get("mesh_data", 0) or 0)
+        mesh_data = cfg_mesh_data if cfg_mesh_data > 0 and is_dawn else max(1, n_devices // mesh_model)
+
+    if mesh_data * mesh_model != n_devices:
+        raise ValueError(
+            f"mesh_data({mesh_data}) * mesh_model({mesh_model}) must equal "
+            f"jax.device_count()({n_devices}). Pass --mesh-data/--mesh-model explicitly."
+        )
+    return mesh_data, mesh_model
+
+
+def host_local_batch(global_batch: Any) -> Any:
+    import jax
+
+    n_hosts = jax.process_count()
+    host_id = jax.process_index()
+    if global_batch.shape[0] % n_hosts != 0:
+        raise ValueError(
+            f"--batch-size must be divisible by the number of hosts. "
+            f"batch_size={global_batch.shape[0]}, hosts={n_hosts}"
+        )
+    per_host = global_batch.shape[0] // n_hosts
+    return global_batch[host_id * per_host:(host_id + 1) * per_host]
+
+
 def run_forward_analysis(
     label: str,
     checkpoint_meta: Dict[str, Any],
@@ -501,6 +579,7 @@ def run_forward_analysis(
     batch_size: int,
     seq_len: int,
     is_dawn: bool,
+    args: argparse.Namespace,
 ) -> Dict[str, Any]:
     if not checkpoint_meta.get("loaded"):
         return {"forward_error": "checkpoint not loaded"}
@@ -512,21 +591,57 @@ def run_forward_analysis(
     model = tj.build_model_from_config(cfg)
     seed = int(cfg.get("seed", 1))
     init_len = int(cfg.get("model", {}).get("max_seq_len", 512))
-    variables = model.init(
-        {"params": jax.random.PRNGKey(seed), "dropout": jax.random.PRNGKey(seed + 1)},
-        jnp.ones((1, init_len), dtype=jnp.int32),
-        deterministic=True,
-    )
-    params = restore_params_for_forward(checkpoint_meta["_raw"], variables["params"])
-    batch = read_validation_batch(val_data, batch_size, seq_len)
-    out = model.apply(
-        {"params": params},
-        batch,
-        labels=batch,
-        attention_mask=jnp.ones_like(batch),
-        deterministic=True,
-        rngs={"dropout": jax.random.PRNGKey(seed + 2)},
-    )
+    global_batch_np = read_validation_batch(val_data, batch_size, seq_len)
+
+    sharded_fns = None
+    data_sharding = None
+    mesh = None
+    use_mesh = (not args.single_device_forward) and jax.device_count() > 1
+
+    if use_mesh:
+        mesh_data, mesh_model = infer_mesh_shape(cfg, args, is_dawn)
+        mesh = tj.create_mesh(mesh_data, mesh_model)
+        from jax.sharding import NamedSharding, PartitionSpec as P
+
+        data_sharding = NamedSharding(mesh, P("data", None))
+        if is_dawn:
+            from scripts.downstream_finetune_jax import build_sharded_fns_if_needed
+
+            sharded_fns = build_sharded_fns_if_needed(cfg, mesh)
+
+    def _init_restore_and_apply():
+        variables = model.init(
+            {"params": jax.random.PRNGKey(seed), "dropout": jax.random.PRNGKey(seed + 1)},
+            jnp.ones((1, init_len), dtype=jnp.int32),
+            deterministic=True,
+        )
+        params = restore_params_for_forward(checkpoint_meta["_raw"], variables["params"])
+
+        if use_mesh:
+            param_shardings = tj.get_param_shardings(params, mesh, is_baseline=not is_dawn)
+            params = tj.shard_params_to_mesh(params, param_shardings)
+            local = host_local_batch(global_batch_np)
+            batch = tj.shard_to_mesh(local, data_sharding, (batch_size, seq_len))
+        else:
+            batch = jnp.asarray(global_batch_np)
+
+        kwargs = {"sharded_fns": sharded_fns} if sharded_fns is not None else {}
+        return model.apply(
+            {"params": params},
+            batch,
+            labels=batch,
+            attention_mask=jnp.ones_like(batch),
+            deterministic=True,
+            rngs={"dropout": jax.random.PRNGKey(seed + 2)},
+            **kwargs,
+        )
+
+    if mesh is not None:
+        with mesh:
+            out = _init_restore_and_apply()
+    else:
+        out = _init_restore_and_apply()
+
     valid = float(jax.device_get(out["valid_count"]))
     loss = float(jax.device_get(out["loss"]))
     correct = float(jax.device_get(out["correct"]))
@@ -701,8 +816,7 @@ def pretraining_setup_table(dawn_cfg: Dict[str, Any], tf_cfg: Dict[str, Any], da
         "|---|---:|---|---:|---:|---:|",
     ]
     for label, cfg, meta in rows:
-        dataset = "C4" if "c4" in str(cfg.get("data", {}).get("bin_train", "")).lower() else "unknown"
-        budget = token_budget(cfg)
+        dataset, budget = infer_dataset_and_budget(cfg, meta)
         budget_text = f"{dataset}, {budget:,} tokens" if budget else dataset
         lines.append(
             f"| {label} | {num(meta.get('parameter_count'), 0)} | {budget_text} | "
@@ -786,8 +900,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dawn394-config", default=DEFAULT_DAWN_CONFIG, help="DAWN v3.9.4 model/pretraining config.")
     parser.add_argument("--run-forward", action="store_true", help="Run validation forward pass and DAWN utilization diagnostics.")
     parser.add_argument("--val-data", default=None, help="Validation .bin path. Defaults to each config's data.bin_val when present.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Forward-analysis batch size.")
+    parser.add_argument("--batch-size", type=int, default=16, help="Global forward-analysis batch size. On multi-host TPU this must be divisible by host count.")
     parser.add_argument("--seq-len", type=int, default=512, help="Forward-analysis sequence length and compute-estimate context length.")
+    parser.add_argument("--mesh-data", type=int, default=None, help="Forward-analysis data mesh size. Defaults to config for DAWN and inferred data-only mesh for baseline.")
+    parser.add_argument("--mesh-model", type=int, default=None, help="Forward-analysis model mesh size. Defaults to config for DAWN and 1 for baseline.")
+    parser.add_argument("--single-device-forward", action="store_true", help="Disable mesh sharding for forward analysis even when multiple devices are visible.")
     parser.add_argument("--show-paths", action="store_true", help="Print checkpoint/log paths in the output. Off by default to avoid leaking internal paths.")
     return parser.parse_args()
 
@@ -812,61 +929,61 @@ def main() -> None:
         tf_val = normalize_path(args.val_data) if args.val_data else tf_cfg.get("data", {}).get("bin_val")
         if dawn_val:
             forward["DAWN v3.9.4 400M"] = run_forward_analysis(
-                "DAWN v3.9.4 400M", dawn_meta, dawn_cfg, str(dawn_val), args.batch_size, args.seq_len, is_dawn=True
+                "DAWN v3.9.4 400M", dawn_meta, dawn_cfg, str(dawn_val), args.batch_size, args.seq_len, is_dawn=True, args=args
             )
         else:
             forward["DAWN v3.9.4 400M"] = {"forward_error": "no validation data path"}
         if tf_val:
             forward["dense Transformer 400M"] = run_forward_analysis(
-                "dense Transformer 400M", tf_meta, tf_cfg, str(tf_val), args.batch_size, args.seq_len, is_dawn=False
+                "dense Transformer 400M", tf_meta, tf_cfg, str(tf_val), args.batch_size, args.seq_len, is_dawn=False, args=args
             )
         else:
             forward["dense Transformer 400M"] = {"forward_error": "no validation data path"}
 
-    print(section("COPYABLE PAPER OUTPUT: v3.9.4 400M PILOT"))
-    print("Use this as an earlier SRW-family 400M scaling/downstream-transfer pilot only.")
-    print("Do not present v3.9.4 as evidence for the final v4.1.5.5 sparsity mechanism.")
+    emit(section("COPYABLE PAPER OUTPUT: v3.9.4 400M PILOT"))
+    emit("Use this as an earlier SRW-family 400M scaling/downstream-transfer pilot only.")
+    emit("Do not present v3.9.4 as evidence for the final v4.1.5.5 sparsity mechanism.")
 
-    print(section("1. CLAIM SENTENCE"))
-    print("v3.9.4 shows clear transfer over random initialization and is competitive with the dense Transformer baseline, but task-level results vary.")
+    emit(section("1. CLAIM SENTENCE"))
+    emit("v3.9.4 shows clear transfer over random initialization and is competitive with the dense Transformer baseline, but task-level results vary.")
 
-    print(section("2. CHECKPOINT / PRETRAINING SETUP TABLE"))
-    print(pretraining_setup_table(dawn_cfg, tf_cfg, dawn_meta, tf_meta))
+    emit(section("2. CHECKPOINT / PRETRAINING SETUP TABLE"))
+    emit(pretraining_setup_table(dawn_cfg, tf_cfg, dawn_meta, tf_meta))
     failed = [m for m in (dawn_meta, tf_meta) if not m.get("loaded")]
     if failed:
-        print("\nCheckpoint load warnings:")
+        emit("\nCheckpoint load warnings:")
         for meta in failed:
-            print(f"- {meta['model']}: {meta.get('error')}")
+            emit(f"- {meta['model']}: {meta.get('error')}")
 
-    print(section("3. CHECKPOINT-DERIVED METRICS TABLE"))
-    print(checkpoint_table([dawn_meta, tf_meta], forward))
+    emit(section("3. CHECKPOINT-DERIVED METRICS TABLE"))
+    emit(checkpoint_table([dawn_meta, tf_meta], forward))
     if not args.run_forward:
-        print("\nForward metrics are blank because --run-forward was not used.")
+        emit("\nForward metrics are blank because --run-forward was not used.")
 
-    print(section("4. DOWNSTREAM MAIN TABLE (MARKDOWN)"))
-    print(markdown_downstream_table(downstream))
+    emit(section("4. DOWNSTREAM MAIN TABLE (MARKDOWN)"))
+    emit(markdown_downstream_table(downstream))
 
-    print(section("5. DOWNSTREAM MAIN TABLE (LATEX)"))
-    print(latex_downstream_table(downstream))
+    emit(section("5. DOWNSTREAM MAIN TABLE (LATEX)"))
+    emit(latex_downstream_table(downstream))
 
-    print(section("6. UTILIZATION DIAGNOSTICS"))
-    print(utilization_block(forward.get("DAWN v3.9.4 400M", {})))
+    emit(section("6. UTILIZATION DIAGNOSTICS"))
+    emit(utilization_block(forward.get("DAWN v3.9.4 400M", {})))
 
-    print(section("7. FLOPS / COMPUTE ESTIMATE"))
-    print(compute_table(dawn_cfg, tf_cfg, args.seq_len, forward.get("DAWN v3.9.4 400M", {})))
-    print("\nCompute note: implemented compute and ideal active-operator compute are separate. Do not claim wall-clock FLOPs reduction from the idealized row.")
+    emit(section("7. FLOPS / COMPUTE ESTIMATE"))
+    emit(compute_table(dawn_cfg, tf_cfg, args.seq_len, forward.get("DAWN v3.9.4 400M", {})))
+    emit("\nCompute note: implemented compute and ideal active-operator compute are separate. Do not claim wall-clock FLOPs reduction from the idealized row.")
 
-    print(section("8. APPENDIX DRAFT TEXT"))
-    print(appendix_text())
+    emit(section("8. APPENDIX DRAFT TEXT"))
+    emit(appendix_text())
 
-    print(section("9. LIMITATION TO INCLUDE VERBATIM"))
-    print(LIMITATION_TEXT)
+    emit(section("9. LIMITATION TO INCLUDE VERBATIM"))
+    emit(LIMITATION_TEXT)
 
     if args.show_paths:
-        print(section("10. PATHS USED"))
-        print(f"results: {results_dir}")
-        print(f"dawn394 checkpoint: {dawn_meta.get('checkpoint_file')}")
-        print(f"tf checkpoint: {tf_meta.get('checkpoint_file')}")
+        emit(section("10. PATHS USED"))
+        emit(f"results: {results_dir}")
+        emit(f"dawn394 checkpoint: {dawn_meta.get('checkpoint_file')}")
+        emit(f"tf checkpoint: {tf_meta.get('checkpoint_file')}")
 
 
 if __name__ == "__main__":
