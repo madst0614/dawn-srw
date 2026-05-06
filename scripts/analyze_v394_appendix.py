@@ -25,12 +25,9 @@ import csv
 import io
 import json
 import math
-import os
 import re
-import socket
 import sys
 import time
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -40,6 +37,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 DEFAULT_DAWN_CONFIG = "configs/legacy/train_config_spatial_r1_v3.9.4_400M_c4_40B_v4_32.yaml"
 DEFAULT_TF_CONFIG = "configs/downstream/baseline/sst2.yaml"
+DEFAULT_DOWNSTREAM_CONFIG_ROOT = "configs/downstream"
 
 DOWNSTREAM_LOGS = (
     "baseline.txt",
@@ -133,18 +131,6 @@ def format_seconds(seconds: Optional[float]) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def process_label() -> str:
-    host = socket.gethostname()
-    if "jax" in sys.modules:
-        try:
-            import jax
-
-            return f"host={jax.process_index()}/{jax.process_count()} {host}"
-        except Exception:
-            pass
-    return host
-
-
 class ProgressTracker:
     def __init__(self, total_units: int) -> None:
         self.total_units = max(1, int(total_units))
@@ -153,19 +139,20 @@ class ProgressTracker:
         self.last_percent = -1.0
 
     def update(self, message: str, units: int = 0) -> None:
+        if not is_primary_host():
+            return
         self.done_units = min(self.total_units, self.done_units + max(0, int(units)))
         percent = 100.0 * self.done_units / self.total_units
         elapsed = time.time() - self.start_time
         eta = None
         if self.done_units > 0:
             eta = elapsed * (self.total_units - self.done_units) / self.done_units
-        stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(
-            f"[progress] {percent:6.2f}% ETA {format_seconds(eta)} elapsed {format_seconds(elapsed)} "
-            f"{stamp} [{process_label()}] {message}",
-            file=sys.stderr,
-            flush=True,
-        )
+        line = f"\r[progress] {percent:6.2f}% ETA {format_seconds(eta)} elapsed {format_seconds(elapsed)}  {progress_stage(message):<18}"
+        sys.stderr.write(line)
+        sys.stderr.flush()
+        if self.done_units >= self.total_units:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
 
 
 _PROGRESS: Optional[ProgressTracker] = None
@@ -177,11 +164,34 @@ def set_progress_total(total_units: int) -> None:
 
 
 def progress(message: str, units: int = 0) -> None:
-    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    if not is_primary_host():
+        return
     if _PROGRESS is not None:
         _PROGRESS.update(message, units=units)
     else:
-        print(f"[progress]   0.00% ETA --:--:-- elapsed 00:00:00 {stamp} [{process_label()}] {message}", file=sys.stderr, flush=True)
+        sys.stderr.write(f"\r[progress]   0.00% ETA --:--:-- elapsed 00:00:00  {progress_stage(message):<18}")
+        sys.stderr.flush()
+
+
+def progress_stage(message: str) -> str:
+    text = message.lower()
+    if "final" in text or "done" in text:
+        return "done"
+    if "dense transformer" in text or "dense" in text:
+        return "dense forward"
+    if "dawn" in text and "forward" in text:
+        return "dawn forward"
+    if "forward" in text:
+        return "forward"
+    if "checkpoint" in text:
+        return "checkpoints"
+    if "downstream" in text:
+        return "downstream"
+    if "config" in text:
+        return "config"
+    if "analysis" in text:
+        return "analysis"
+    return "running"
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +204,62 @@ def load_yaml(path: str) -> Dict[str, Any]:
 
     with open(path, "r") as f:
         return yaml.safe_load(f) or {}
+
+
+def fmt_config_value(value: Any) -> str:
+    if value is None:
+        return "--"
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def unique_config_value(values: Iterable[Any]) -> str:
+    clean = sorted({fmt_config_value(v) for v in values if v is not None})
+    if not clean:
+        return "--"
+    return clean[0] if len(clean) == 1 else "/".join(clean)
+
+
+def downstream_config_paths(root: str) -> List[Path]:
+    base = Path(root)
+    if not base.exists():
+        return []
+    return sorted(p for p in base.rglob("*.yaml") if p.is_file())
+
+
+def downstream_finetune_hparams(root: str) -> Dict[str, Any]:
+    configs: List[Dict[str, Any]] = []
+    for path in downstream_config_paths(root):
+        cfg = load_yaml(str(path))
+        if cfg.get("training") and cfg.get("downstream"):
+            configs.append(cfg)
+
+    seeds = [cfg.get("seed") for cfg in configs]
+    training = [cfg.get("training", {}) for cfg in configs]
+    downstream = [cfg.get("downstream", {}) for cfg in configs]
+
+    eval_by_interval: Dict[str, set] = {}
+    for cfg in configs:
+        task = task_label(str(cfg.get("downstream", {}).get("task", "")))
+        interval = fmt_config_value(cfg.get("training", {}).get("eval_interval"))
+        if task and interval != "--":
+            eval_by_interval.setdefault(interval, set()).add(task)
+    eval_interval = "; ".join(
+        f"{interval}: {'/'.join(sorted(tasks))}"
+        for interval, tasks in sorted(eval_by_interval.items(), key=lambda item: float(item[0]))
+    ) or "--"
+
+    return {
+        "optimizer": "AdamW",
+        "learning_rate": unique_config_value(t.get("lr", t.get("learning_rate")) for t in training),
+        "warmup": "warmup_ratio=" + unique_config_value(t.get("warmup_ratio", t.get("warmup_steps")) for t in training),
+        "weight_decay": unique_config_value(t.get("weight_decay") for t in training),
+        "batch_size": unique_config_value(t.get("batch_size") for t in training),
+        "max_seq_len": unique_config_value(d.get("max_seq_len") for d in downstream),
+        "eval_interval": eval_interval,
+        "number_of_seeds": str(len({s for s in seeds if s is not None}) or 0),
+    }
 
 
 def baseline_param_estimate(model_cfg: Dict[str, Any]) -> int:
@@ -821,6 +887,18 @@ def lm_head_flops(cfg: Dict[str, Any]) -> float:
 # ---------------------------------------------------------------------------
 
 
+def finetune_hparams_table(hparams: Dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "| optimizer | learning_rate | warmup | weight_decay | batch_size | max_seq_len | eval_interval | number_of_seeds |",
+            "|---|---:|---|---:|---:|---:|---|---:|",
+            f"| {hparams.get('optimizer', '--')} | {hparams.get('learning_rate', '--')} | {hparams.get('warmup', '--')} | "
+            f"{hparams.get('weight_decay', '--')} | {hparams.get('batch_size', '--')} | {hparams.get('max_seq_len', '--')} | "
+            f"{hparams.get('eval_interval', '--')} | {hparams.get('number_of_seeds', '--')} |",
+        ]
+    )
+
+
 def latex_downstream_table(rows: List[Dict[str, Any]]) -> str:
     lines = [
         r"\begin{tabular}{lrrrrrrr}",
@@ -944,6 +1022,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tf-checkpoint", required=True, help="Dense Transformer checkpoint file or run directory.")
     parser.add_argument("--dawn394-checkpoint", required=True, help="DAWN spatial-r1-v3.9.4 checkpoint file or run directory.")
     parser.add_argument("--results", default="results", help="Directory with baseline/dawn downstream .txt logs.")
+    parser.add_argument("--downstream-config-root", default=DEFAULT_DOWNSTREAM_CONFIG_ROOT, help="Directory with downstream fine-tuning YAML configs.")
     parser.add_argument("--tf-config", default=DEFAULT_TF_CONFIG, help="Dense Transformer model config used for shape/compute.")
     parser.add_argument("--dawn394-config", default=DEFAULT_DAWN_CONFIG, help="DAWN v3.9.4 model/pretraining config.")
     parser.add_argument("--run-forward", action="store_true", help="Run validation forward pass and DAWN utilization diagnostics.")
@@ -966,6 +1045,7 @@ def main() -> None:
     progress("config: loading yaml files")
     dawn_cfg = load_yaml(args.dawn394_config)
     tf_cfg = load_yaml(args.tf_config)
+    finetune_hparams = downstream_finetune_hparams(args.downstream_config_root)
     progress("config: loaded yaml files", units=1)
     downstream = parse_downstream_results(results_dir)
 
@@ -995,6 +1075,12 @@ def main() -> None:
             forward["dense Transformer 400M"] = {"forward_error": "no validation data path"}
             progress("forward: skipped dense Transformer 400M; no validation data path", units=6)
 
+    emit("downstream_finetuning_hyperparameters_markdown")
+    emit(finetune_hparams_table(finetune_hparams))
+    if finetune_hparams.get("number_of_seeds") == "1":
+        emit("All downstream results are single-run evaluations.")
+
+    emit("")
     emit("checkpoint_pretraining_setup_markdown")
     emit(pretraining_setup_table(dawn_cfg, tf_cfg, dawn_meta, tf_meta))
     failed = [m for m in (dawn_meta, tf_meta) if not m.get("loaded")]
