@@ -48,9 +48,6 @@ DOWNSTREAM_LOGS = (
     "dawn_random.txt",
 )
 
-UTIL_NOTE = "diagnostic_only_earlier_relu_gate_sum_router_not_primary_sparsity_evidence"
-
-
 # ---------------------------------------------------------------------------
 # Small formatting helpers
 # ---------------------------------------------------------------------------
@@ -912,37 +909,32 @@ def compute_table(dawn_cfg: Dict[str, Any], tf_cfg: Dict[str, Any], seq_len: int
     dawn_lm = lm_head_flops(dawn_cfg)
     ideal = dawn_ideal_active_flops(dawn_cfg, seq_len, dawn_forward)
     lines = [
-        "| compute view | core FLOPs/token | total incl. LM head | note |",
-        "|---|---:|---:|---|",
-        f"| dense Transformer baseline | {sci(tf_core)} | {sci(tf_core + tf_lm)} | approximate dense Transformer forward compute |",
-        f"| implemented v3.9.4 full routing | {sci(dawn_core)} | {sci(dawn_core + dawn_lm)} | includes full routing over qk, v, know pools |",
-        f"| idealized active-operator v3.9.4 | {sci(ideal)} | {sci(None if ideal is None else ideal + dawn_lm)} | diagnostic only; do not claim wall-clock reduction from this row |",
+        "| compute_view | core_flops_per_token | total_flops_per_token_incl_lm_head |",
+        "|---|---:|---:|",
+        f"| dense_transformer_baseline | {sci(tf_core)} | {sci(tf_core + tf_lm)} |",
+        f"| implemented_v394_full_routing | {sci(dawn_core)} | {sci(dawn_core + dawn_lm)} |",
+        f"| idealized_v394_active_operator | {sci(ideal)} | {sci(None if ideal is None else ideal + dawn_lm)} |",
     ]
     return "\n".join(lines)
 
 
 def utilization_block(dawn_forward: Dict[str, Any]) -> str:
     if "qk_active_fraction" not in dawn_forward:
-        return (
-            "| metric | value |\n"
-            "|---|---:|\n"
-            f"| status | not_run |\n"
-            f"| diagnostic_note | {UTIL_NOTE} |"
-        )
+        return "| metric | value |\n|---|---:|\n| status | not_run |"
     return "\n".join(
         [
-            "| pool | active fraction | active neurons/token |",
+            "| pool | active_fraction | active_neurons_per_token |",
             "|---|---:|---:|",
             f"| qk | {num(dawn_forward.get('qk_active_fraction'), 4)} | {num(dawn_forward.get('qk_active_neurons_per_token'), 2)} |",
             f"| v | {num(dawn_forward.get('v_active_fraction'), 4)} | {num(dawn_forward.get('v_active_neurons_per_token'), 2)} |",
             f"| know | {num(dawn_forward.get('know_active_fraction'), 4)} | {num(dawn_forward.get('know_active_neurons_per_token'), 2)} |",
             "",
-            f"gate_sum mean: {num(dawn_forward.get('gate_sum_mean'), 4)}",
-            f"gate_max mean: {num(dawn_forward.get('gate_max_mean'), 4)}",
-            f"gate_conc mean: {num(dawn_forward.get('gate_conc_mean'), 4)}",
-            f"score_std mean: {num(dawn_forward.get('score_std_mean'), 4)}",
-            "",
-            f"diagnostic_note: {UTIL_NOTE}",
+            "| metric | value |",
+            "|---|---:|",
+            f"| gate_sum_mean | {num(dawn_forward.get('gate_sum_mean'), 4)} |",
+            f"| gate_max_mean | {num(dawn_forward.get('gate_max_mean'), 4)} |",
+            f"| gate_conc_mean | {num(dawn_forward.get('gate_conc_mean'), 4)} |",
+            f"| score_std_mean | {num(dawn_forward.get('score_std_mean'), 4)} |",
         ]
     )
 
@@ -1038,7 +1030,6 @@ def main() -> None:
     emit("")
     emit("compute_estimate_markdown")
     emit(compute_table(dawn_cfg, tf_cfg, args.seq_len, forward.get("DAWN v3.9.4 400M", {})))
-    emit("compute_note: implemented_compute_and_ideal_active_compute_are_separate")
 
     if args.show_paths:
         emit("")
