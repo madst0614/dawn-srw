@@ -1,0 +1,84 @@
+# DAWN-SRW 1B config for fair comparison with the TF 1B baseline on v4-64.
+#
+# Fair-comparison anchors copied from the TF 1B config:
+#   data: c4_train_40B
+#   train tokens: 40B
+#   sequence length: 512
+#   effective global batch: 256 x grad_accum 8 = 2048
+#   lr/weight_decay/warmup/checkpoint cadence: matched
+#
+# Model/pool geometry is parameter-targeted for the DAWN-SRW 1B run while
+# remaining divisible by mesh_model=4.
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "dawn_srw"
+  d_model: 3584
+  n_layers: 18
+  n_heads: 56
+  max_seq_len: 512
+  dropout: 0.0
+  gradient_checkpointing: true
+
+  d_route: 384
+
+  n_qk: 3796
+  n_v: 23936
+  n_know: 47612
+  router_dropout: 0.02
+
+training:
+  mesh_model: 4
+  mesh_data: 8
+
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_know: 4
+
+  batch_size: 256
+  gradient_accumulation_steps: 8
+  num_epochs: 1
+
+  lr: 0.0002
+  weight_decay: 0.1
+  pool_weight_decay: 0.02
+  warmup_ratio: 0.06
+
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+
+  sharpness: 500.0
+  activation_threshold: 0.5
+  activation_cutoff: 0.01
+  epsilon: 1.0e-4
+  max_intensity: 100.0
+  scan_scale: 0.01
+  scan_std_floor: 0.5
+
+  dead_penalty_weight: 0.05
+  dead_penalty_threshold: 0.01
+
+  exploration_weight: 0.001
+  exploration_asymmetry: 5.0
+  exploration_warmup_steps: 1000
+  exploration_lower_bound: -0.5
+  exploration_upper_bound: 2.0
+  exploration_bound_eps: 1.0e-3
+
+  checkpoint_interval: 200
+  val_interval: 200
+  log_interval: 100
+  log_analysis_multiplier: 10
+  heavy_geometry_multiplier: 10
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_1B_c4_40B_v4_64
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_1B_c4_40B_v4_64
