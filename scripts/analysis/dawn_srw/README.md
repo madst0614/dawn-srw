@@ -80,7 +80,7 @@ python scripts/analysis/dawn_srw/dawn_srw_decision_probe.py \
 
 Use `--layer all` to scan all layers.
 
-### 4. Ambiguous token comparison
+### 4. Ambiguous token comparison and controls
 
 ```bash
 python scripts/analysis/dawn_srw/dawn_srw_ambiguity_experiment.py \
@@ -96,6 +96,17 @@ Custom case format:
 ```bash
 --case "bank|||I deposited money in the bank|||He sat by the river bank"
 ```
+
+Extended case format for same-sense controls or random-token baselines:
+
+```bash
+--case "same_sense_financial|||bank|||bank|||I deposited money in the bank|||She opened an account at the bank"
+--case "random_token|||bank|||chair|||I deposited money in the bank|||The chair stood beside the table"
+```
+
+Default cases include different-sense ambiguity pairs, same-sense controls, and
+random-token null baselines. Outputs include per-case CSV/plots plus
+`comparison_summary.csv`.
 
 ### 5. Intervention
 

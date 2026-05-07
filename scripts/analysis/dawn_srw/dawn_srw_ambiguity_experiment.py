@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """DAWN-SRW ambiguity / context-dependent RST model-decision experiment.
 
-This experiment compares the RST Layer model decision for the same surface
-string under two different contexts, e.g.:
+This experiment compares the RST Layer model decision for target tokens across
+context pairs, e.g.:
 
     "I deposited money in the bank"
     "He sat by the river bank"
+
+Cases can be different-sense ambiguity pairs, same-sense controls, or
+random-token null baselines.
 
 The main output is a layer-wise Jaccard trajectory:
 
@@ -29,9 +32,9 @@ For each layer and context pair, the script computes three overlaps:
    This approximates the "actually utilized" operator set without fixing k.
 
 It also saves plots:
-  - <target>_jaccard_by_layer.png
-  - <target>_rst_norm_by_layer.png
-  - <target>_active_count_by_layer.png
+  - <comparison>__<target>_jaccard_by_layer.png
+  - <comparison>__<target>_rst_norm_by_layer.png
+  - <comparison>__<target>_active_count_by_layer.png
   - mean_jaccard_by_layer.png  (when multiple cases share layers)
 """
 
@@ -67,11 +70,110 @@ from dawn_srw_common import (
 from dawn_srw_decision_probe import forward_to_rst_input, compute_rst_decision
 
 
-DEFAULT_PAIRS = [
-    ("bank", "I deposited money in the bank", "He sat by the river bank"),
-    ("charge", "The phone needs a charge", "The police filed a charge"),
-    ("light", "The room was filled with bright light", "This bag is very light"),
-    ("apple", "She ate an apple after lunch", "Apple released a new product"),
+DEFAULT_CASES = [
+    # Different-sense ambiguity pairs.
+    {
+        "comparison": "different_sense",
+        "target_a": "bank",
+        "target_b": "bank",
+        "prompt_a": "I deposited money in the bank",
+        "prompt_b": "He sat by the river bank",
+    },
+    {
+        "comparison": "different_sense",
+        "target_a": "charge",
+        "target_b": "charge",
+        "prompt_a": "The phone needs a charge",
+        "prompt_b": "The police filed a charge",
+    },
+    {
+        "comparison": "different_sense",
+        "target_a": "light",
+        "target_b": "light",
+        "prompt_a": "The room was filled with bright light",
+        "prompt_b": "This bag is very light",
+    },
+    {
+        "comparison": "different_sense",
+        "target_a": "apple",
+        "target_b": "apple",
+        "prompt_a": "She ate an apple after lunch",
+        "prompt_b": "Apple released a new product",
+    },
+
+    # Same-sense controls.
+    {
+        "comparison": "same_sense_financial",
+        "target_a": "bank",
+        "target_b": "bank",
+        "prompt_a": "I deposited money in the bank",
+        "prompt_b": "She opened an account at the bank",
+    },
+    {
+        "comparison": "same_sense_river",
+        "target_a": "bank",
+        "target_b": "bank",
+        "prompt_a": "He sat by the river bank",
+        "prompt_b": "The fisherman walked along the river bank",
+    },
+    {
+        "comparison": "same_sense_electric",
+        "target_a": "charge",
+        "target_b": "charge",
+        "prompt_a": "The phone needs a charge",
+        "prompt_b": "The battery lost its charge",
+    },
+    {
+        "comparison": "same_sense_legal",
+        "target_a": "charge",
+        "target_b": "charge",
+        "prompt_a": "The police filed a charge",
+        "prompt_b": "The judge dismissed the charge",
+    },
+    {
+        "comparison": "same_sense_illumination",
+        "target_a": "light",
+        "target_b": "light",
+        "prompt_a": "The room was filled with bright light",
+        "prompt_b": "A bright light shone through the window",
+    },
+    {
+        "comparison": "same_sense_weight",
+        "target_a": "light",
+        "target_b": "light",
+        "prompt_a": "This bag is very light",
+        "prompt_b": "The box felt light in my hands",
+    },
+    {
+        "comparison": "same_sense_fruit",
+        "target_a": "apple",
+        "target_b": "apple",
+        "prompt_a": "She ate an apple after lunch",
+        "prompt_b": "He sliced an apple for breakfast",
+    },
+    {
+        "comparison": "same_sense_company",
+        "target_a": "apple",
+        "target_b": "apple",
+        "prompt_a": "Apple released a new product",
+        "prompt_b": "Apple announced a new laptop",
+    },
+
+    # Random-token null baselines.
+    {
+        "comparison": "random_token",
+        "target_a": "bank",
+        "target_b": "chair",
+        "prompt_a": "I deposited money in the bank",
+        "prompt_b": "The chair stood beside the table",
+    },
+    {
+        "comparison": "random_token",
+        "target_a": "apple",
+        "target_b": "music",
+        "prompt_a": "She ate an apple after lunch",
+        "prompt_b": "The music played softly at night",
+    },
 ]
 
 
@@ -109,6 +211,23 @@ def _safe_name(s: str) -> str:
 def _out_path(output_dir: str, filename: str) -> str:
     """Join an output directory and filename without corrupting gs:// paths."""
     return str(output_dir).rstrip("/") + "/" + filename
+
+
+def _case_stem(case: Dict[str, object]) -> str:
+    comparison = str(case.get("comparison", "case"))
+    target = str(case.get("target", "target"))
+    return _safe_name(f"{comparison}__{target}")
+
+
+def _comparison_group(comparison: str) -> str:
+    comparison = str(comparison or "custom")
+    if comparison.startswith("same_sense"):
+        return "same_sense"
+    if comparison.startswith("different_sense"):
+        return "different_sense"
+    if comparison.startswith("random_token"):
+        return "random_token"
+    return comparison
 
 
 def _write_matplotlib_figure(plt, output_dir: str, filename: str, dpi: int = 180) -> str:
@@ -330,7 +449,7 @@ def run_pair(
     params,
     model_cfg,
     tokenizer,
-    target: str,
+    target_a: str,
     prompt_a: str,
     prompt_b: str,
     layers: Sequence[int],
@@ -340,20 +459,29 @@ def run_pair(
     mass_threshold: float,
     mass_metric: str,
     include_top_rows: bool,
+    *,
+    target_b: str | None = None,
+    comparison: str = "custom",
 ):
+    target_b = target_b or target_a
+    target_label = target_a if target_a == target_b else f"{target_a}_vs_{target_b}"
+
     out = {
-        "target": target,
+        "target": target_label,
+        "target_a": target_a,
+        "target_b": target_b,
+        "comparison": comparison,
         "prompt_a": prompt_a,
         "prompt_b": prompt_b,
         "layers": [],
     }
 
     encoded = []
-    for prompt in [prompt_a, prompt_b]:
+    for prompt, target in [(prompt_a, target_a), (prompt_b, target_b)]:
         ids = encode_prompt(tokenizer, prompt, model_cfg["max_seq_len"])
         tokens = tokenizer.convert_ids_to_tokens(ids)
         idx = find_token_index(tokens, target, default="last")
-        encoded.append((ids, tokens, idx))
+        encoded.append((ids, tokens, idx, target))
 
     out["tokens_a"] = encoded[0][1]
     out["tokens_b"] = encoded[1][1]
@@ -362,7 +490,7 @@ def run_pair(
 
     for layer in layers:
         decision_items = []
-        for ids, tokens, idx in encoded:
+        for ids, tokens, idx, target in encoded:
             state = forward_to_rst_input(
                 mod,
                 params,
@@ -382,6 +510,7 @@ def run_pair(
                 mass_metric=mass_metric,
             )
             item = {
+                "target_text": target,
                 "token_index": int(idx),
                 "token_text": tokens[idx],
                 "summary": dec["summary"],
@@ -431,11 +560,14 @@ def run_pair(
 
 
 def _write_case_csv(case: Dict[str, object], output_dir: str) -> str:
-    path = _out_path(str(output_dir), f"{_safe_name(case['target'])}_jaccard_by_layer.csv")
+    path = _out_path(str(output_dir), f"{_case_stem(case)}_jaccard_by_layer.csv")
     if not is_gcs(path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
     fields = [
+        "comparison",
         "target",
+        "target_a",
+        "target_b",
         "layer",
         "active_set_jaccard",
         "topk_jaccard",
@@ -459,7 +591,10 @@ def _write_case_csv(case: Dict[str, object], output_dir: str) -> str:
             a = row["a"]["summary"]
             b = row["b"]["summary"]
             w.writerow({
+                "comparison": case.get("comparison", "custom"),
                 "target": case["target"],
+                "target_a": case.get("target_a", case["target"]),
+                "target_b": case.get("target_b", case["target"]),
                 "layer": row["layer"],
                 "active_set_jaccard": row["active_set_jaccard"],
                 "topk_jaccard": row["topk_jaccard"],
@@ -479,6 +614,66 @@ def _write_case_csv(case: Dict[str, object], output_dir: str) -> str:
     return path
 
 
+def _comparison_summary_rows(results: Dict[str, object]) -> List[Dict[str, object]]:
+    grouped: Dict[str, Dict[str, object]] = {}
+    metric_keys = ["active_set_jaccard", "topk_jaccard", "effective_mass_jaccard"]
+
+    for case in results.get("cases", []):
+        group = _comparison_group(str(case.get("comparison", "custom")))
+        entry = grouped.setdefault(
+            group,
+            {
+                "comparison_group": group,
+                "case_ids": set(),
+                "n_layer_rows": 0,
+                **{key: [] for key in metric_keys},
+            },
+        )
+        entry["case_ids"].add(_case_stem(case))
+        for row in case.get("layers", []):
+            entry["n_layer_rows"] += 1
+            for key in metric_keys:
+                entry[key].append(float(row[key]))
+
+    rows = []
+    for group in sorted(grouped):
+        entry = grouped[group]
+        row = {
+            "comparison_group": group,
+            "n_cases": len(entry["case_ids"]),
+            "n_layer_rows": int(entry["n_layer_rows"]),
+        }
+        for key in metric_keys:
+            vals = np.asarray(entry[key], dtype=np.float64)
+            row[f"{key}_mean"] = float(vals.mean()) if vals.size else math.nan
+            row[f"{key}_std"] = float(vals.std()) if vals.size else math.nan
+        rows.append(row)
+    return rows
+
+
+def _write_comparison_summary_csv(rows: List[Dict[str, object]], output_dir: str) -> str:
+    path = _out_path(str(output_dir), "comparison_summary.csv")
+    if not is_gcs(path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "comparison_group",
+        "n_cases",
+        "n_layer_rows",
+        "active_set_jaccard_mean",
+        "active_set_jaccard_std",
+        "topk_jaccard_mean",
+        "topk_jaccard_std",
+        "effective_mass_jaccard_mean",
+        "effective_mass_jaccard_std",
+    ]
+    with open_file(path, "w") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    return path
+
+
 def _plot_case(case: Dict[str, object], output_dir: str):
     try:
         import matplotlib
@@ -489,7 +684,8 @@ def _plot_case(case: Dict[str, object], output_dir: str):
         return []
 
     target = str(case["target"])
-    stem = _safe_name(target)
+    comparison = str(case.get("comparison", "custom"))
+    stem = _case_stem(case)
     layers = np.asarray([r["layer"] for r in case["layers"]], dtype=np.int32)
 
     paths = []
@@ -502,7 +698,7 @@ def _plot_case(case: Dict[str, object], output_dir: str):
     plt.ylim(-0.02, 1.02)
     plt.xlabel("Layer")
     plt.ylabel("Jaccard overlap")
-    plt.title(f"RST model-decision overlap for '{target}'")
+    plt.title(f"RST model-decision overlap: {comparison} / '{target}'")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -518,7 +714,7 @@ def _plot_case(case: Dict[str, object], output_dir: str):
     plt.plot(layers, [r["b"]["summary"]["attention_output_norm_at_token"] for r in case["layers"]], linestyle="--", alpha=0.7, label="prompt B attention norm")
     plt.xlabel("Layer")
     plt.ylabel("Output norm at target token")
-    plt.title(f"Attention vs RST transition norm for '{target}'")
+    plt.title(f"Attention vs RST transition norm: {comparison} / '{target}'")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -532,7 +728,7 @@ def _plot_case(case: Dict[str, object], output_dir: str):
     plt.plot(layers, [r["b"]["summary"]["active_count"] for r in case["layers"]], marker="o", label="prompt B active")
     plt.xlabel("Layer")
     plt.ylabel("Active SRW neurons")
-    plt.title(f"RST active set size for '{target}'")
+    plt.title(f"RST active set size: {comparison} / '{target}'")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -576,7 +772,7 @@ def _plot_mean(results: Dict[str, object], output_dir: str):
     plt.ylim(-0.02, 1.02)
     plt.xlabel("Layer")
     plt.ylabel("Mean Jaccard overlap")
-    plt.title("Mean context-dependent RST decision overlap")
+    plt.title("Mean RST decision overlap across all cases")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -597,7 +793,15 @@ def main():
     ap.add_argument("--mass-threshold", type=float, default=0.80)
     ap.add_argument("--active-threshold", type=float, default=0.5)
     ap.add_argument("--layers", default="all", help="'all' or comma-separated layer indices, e.g. 0,5,11")
-    ap.add_argument("--case", action="append", default=[], help="Custom case: target|||prompt A|||prompt B")
+    ap.add_argument(
+        "--case",
+        action="append",
+        default=[],
+        help=(
+            "Custom case: target|||prompt A|||prompt B, or "
+            "comparison|||target A|||target B|||prompt A|||prompt B"
+        ),
+    )
     ap.add_argument("--include-top-rows", action="store_true", help="Also save full top-k rows per layer/context. Larger JSON.")
     ap.add_argument("--no-plots", action="store_true")
     args = ap.parse_args()
@@ -616,12 +820,32 @@ def main():
 
     cases = []
     for c in args.case:
-        parts = c.split("|||")
-        if len(parts) != 3:
-            raise ValueError("--case must be: target|||prompt A|||prompt B")
-        cases.append(tuple(parts))
+        parts = [p.strip() for p in c.split("|||")]
+        if len(parts) == 3:
+            target, prompt_a, prompt_b = parts
+            cases.append({
+                "comparison": "custom",
+                "target_a": target,
+                "target_b": target,
+                "prompt_a": prompt_a,
+                "prompt_b": prompt_b,
+            })
+        elif len(parts) == 5:
+            comparison, target_a, target_b, prompt_a, prompt_b = parts
+            cases.append({
+                "comparison": comparison,
+                "target_a": target_a,
+                "target_b": target_b,
+                "prompt_a": prompt_a,
+                "prompt_b": prompt_b,
+            })
+        else:
+            raise ValueError(
+                "--case must be either: target|||prompt A|||prompt B "
+                "or comparison|||target A|||target B|||prompt A|||prompt B"
+            )
     if not cases:
-        cases = DEFAULT_PAIRS
+        cases = DEFAULT_CASES
 
     ensure_dir(args.output)
 
@@ -637,14 +861,22 @@ def main():
             "active_set_jaccard": "overlap over neurons with activation > active_threshold",
             "topk_jaccard": "overlap over top-k neurons by --sort-by metric",
             "effective_mass_jaccard": "overlap over minimal neuron set covering --mass-threshold of --mass-metric mass",
+            "comparison_group": "coarse control type: different_sense, same_sense, random_token, or custom",
         },
         "cases": [],
+        "comparison_summary": [],
         "plots": [],
         "csv": [],
     }
 
-    for target, a, b in cases:
-        print(f"\n=== target={target!r} ===")
+    for case in cases:
+        comparison = case["comparison"]
+        target_a = case["target_a"]
+        target_b = case["target_b"]
+        a = case["prompt_a"]
+        b = case["prompt_b"]
+
+        print(f"\n=== comparison={comparison!r} target={target_a!r} vs {target_b!r} ===")
         print(f"A: {a}")
         print(f"B: {b}")
         item = run_pair(
@@ -652,7 +884,7 @@ def main():
             params,
             model_cfg,
             tokenizer,
-            target,
+            target_a,
             a,
             b,
             layers,
@@ -662,6 +894,8 @@ def main():
             args.mass_threshold,
             args.mass_metric,
             args.include_top_rows,
+            target_b=target_b,
+            comparison=comparison,
         )
         results["cases"].append(item)
         for row in item["layers"]:
@@ -682,6 +916,22 @@ def main():
             results["plots"].extend(plot_paths)
             for p in plot_paths:
                 print(f"  plot: {p}")
+
+    summary_rows = _comparison_summary_rows(results)
+    results["comparison_summary"] = summary_rows
+    summary_csv = _write_comparison_summary_csv(summary_rows, args.output)
+    results["csv"].append(summary_csv)
+    print(f"\n  csv: {summary_csv}")
+    if summary_rows:
+        print("\nComparison summary:")
+        for row in summary_rows:
+            print(
+                f"  {row['comparison_group']}: "
+                f"J_active={row['active_set_jaccard_mean']:.3f} "
+                f"J_topk={row['topk_jaccard_mean']:.3f} "
+                f"J_eff={row['effective_mass_jaccard_mean']:.3f} "
+                f"(cases={row['n_cases']})"
+            )
 
     if not args.no_plots:
         mean_plot = _plot_mean(results, args.output)

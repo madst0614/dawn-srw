@@ -877,6 +877,33 @@ def dawn_ideal_active_flops(cfg: Dict[str, Any], seq_len: int, util: Dict[str, A
     return float(layers * (attn_router + know_router + full_scores + active_ops + attention + out_proj))
 
 
+def dawn_sparse_active_flops(cfg: Dict[str, Any], seq_len: int, util: Dict[str, Any]) -> Optional[float]:
+    """Theoretical sparse-routing + active-RW estimate.
+
+    This is NOT the current implementation. It assumes candidate-restricted
+    routing/scoring over the measured active operator counts rather than
+    full-pool routing. It keeps route projection, attention, output projection,
+    and LM-head costs.
+    """
+    needed = ("qk_active_neurons_per_token", "v_active_neurons_per_token", "know_active_neurons_per_token")
+    if any(key not in util for key in needed):
+        return None
+    m = cfg["model"]
+    d = int(m.get("d_model", 1280))
+    r = int(m.get("d_route", 256))
+    layers = int(m.get("n_layers", 18))
+    aq = float(util["qk_active_neurons_per_token"])
+    av = float(util["v_active_neurons_per_token"])
+    ak = float(util["know_active_neurons_per_token"])
+    attn_router = 2 * d * (3 * r) + 2 * d * 3
+    know_router = 2 * d * r + 2 * d
+    active_scores = 8 * r * aq + 4 * r * av + 4 * r * ak
+    active_ops = 8 * d * aq + 4 * d * av + 4 * d * ak
+    attention = 4 * seq_len * d
+    out_proj = 2 * d * d
+    return float(layers * (attn_router + know_router + active_scores + active_ops + attention + out_proj))
+
+
 def lm_head_flops(cfg: Dict[str, Any]) -> float:
     m = cfg["model"]
     return float(2 * int(m.get("d_model", 1280)) * int(m.get("vocab_size", 30522)))
@@ -985,13 +1012,15 @@ def compute_table(dawn_cfg: Dict[str, Any], tf_cfg: Dict[str, Any], seq_len: int
     tf_lm = lm_head_flops(tf_cfg)
     dawn_core = dawn_impl_flops(dawn_cfg, seq_len)
     dawn_lm = lm_head_flops(dawn_cfg)
-    ideal = dawn_ideal_active_flops(dawn_cfg, seq_len, dawn_forward)
+    dense_routing_active_rw = dawn_ideal_active_flops(dawn_cfg, seq_len, dawn_forward)
+    sparse_routing_active_rw = dawn_sparse_active_flops(dawn_cfg, seq_len, dawn_forward)
     lines = [
-        "| compute_view | core_flops_per_token | total_flops_per_token_incl_lm_head |",
-        "|---|---:|---:|",
-        f"| dense_transformer_baseline | {sci(tf_core)} | {sci(tf_core + tf_lm)} |",
-        f"| implemented_v394_full_routing | {sci(dawn_core)} | {sci(dawn_core + dawn_lm)} |",
-        f"| idealized_v394_active_operator | {sci(ideal)} | {sci(None if ideal is None else ideal + dawn_lm)} |",
+        "| compute_view | core_flops_per_token | total_flops_per_token_incl_lm_head | ratio_vs_dense_total |",
+        "|---|---:|---:|---:|",
+        f"| dense_transformer_baseline | {sci(tf_core)} | {sci(tf_core + tf_lm)} | 1.00x |",
+        f"| v394_implemented_dense_routing | {sci(dawn_core)} | {sci(dawn_core + dawn_lm)} | {num((dawn_core + dawn_lm) / (tf_core + tf_lm), 2)}x |",
+        f"| v394_dense_routing_active_rw_estimate | {sci(dense_routing_active_rw)} | {sci(None if dense_routing_active_rw is None else dense_routing_active_rw + dawn_lm)} | {('--' if dense_routing_active_rw is None else num((dense_routing_active_rw + dawn_lm) / (tf_core + tf_lm), 2) + 'x')} |",
+        f"| v394_sparse_routing_active_rw_estimate | {sci(sparse_routing_active_rw)} | {sci(None if sparse_routing_active_rw is None else sparse_routing_active_rw + dawn_lm)} | {('--' if sparse_routing_active_rw is None else num((sparse_routing_active_rw + dawn_lm) / (tf_core + tf_lm), 2) + 'x')} |",
     ]
     return "\n".join(lines)
 
