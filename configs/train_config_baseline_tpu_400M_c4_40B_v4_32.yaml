@@ -1,0 +1,58 @@
+# Vanilla Transformer Baseline -- 400M / C4 40B / v4-32
+# Matched to DAWN-SRW 400M:
+#   DAWN-SRW: 393,833,483 params
+#   TF:       ~393,896,960 params
+#   diff:     +63,477 params (+0.016%)
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "baseline"
+  d_model: 1280
+  d_ff: 5120
+  n_layers: 18
+  n_heads: 16
+  max_seq_len: 512
+  dropout: 0.1
+  gradient_checkpointing: true
+
+training:
+  # No neuron-pool sharding for the baseline, so mesh_model=1.
+  mesh_model: 1
+
+  # Match the DAWN config effective batch: 512 * 2 = 1024.
+  batch_size: 1024
+  gradient_accumulation_steps: 1
+
+  num_epochs: 1
+  lr: 0.0003
+  weight_decay: 0.1
+  warmup_ratio: 0.08
+
+  # DAWN-only losses off.
+  orthogonality_weight: 0.0
+  diversity_weight: 0.0
+  load_balance_weight: 0.0
+  entropy_weight: 0.0
+  process_norm_weight: 0.0
+  tau_reg_weight: 0.0
+  dead_penalty_weight: 0.0
+  exploration_weight: 0.0
+
+  checkpoint_interval: 200
+  val_interval: 200
+  log_interval: 100
+  log_analysis_multiplier: 10
+  heavy_geometry_multiplier: 10
+
+use_amp: true
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_400M_c4_40B_matched_393M
+log_dir: gs://dawn-tpu-data-c4/logs/baseline_400M_c4_40B_matched_393M
