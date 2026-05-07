@@ -100,5 +100,5 @@ training:
   heavy_geometry_multiplier: 10
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_v2_more_ex5
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_40M_c4_5B_tag128_v2_more_ex5
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_dmodel_v2_more_ex5
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_40M_c4_5B_dmodel_v2_more_ex5
