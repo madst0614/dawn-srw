@@ -5,7 +5,7 @@
 seed: 1
 
 data:
-  bin_train: gs://dawn-tpu-data-c4/c4_train
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
   bin_val: gs://dawn-tpu-data-c4/c4_val.bin
   max_train_tokens: 5000000000
   max_val_tokens: 10000000
