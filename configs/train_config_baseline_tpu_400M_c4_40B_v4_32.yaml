@@ -26,7 +26,6 @@ model:
 training:
   # No neuron-pool sharding for the baseline, so mesh_model=1.
   mesh_model: 1
-  mesh_data: 32
   # Match the DAWN config effective batch: 512 * 2 = 1024.
   batch_size: 1024
   gradient_accumulation_steps: 1
