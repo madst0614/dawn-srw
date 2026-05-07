@@ -1027,30 +1027,35 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         # Emb drift is computed inside jit so every host participates in the
         # norm collective. A host-0-only version halts the launch group on
         # multi-host meshes.
-        _pool = new_params['neuron_pool']
-        if 'attn_qk_emb' in _pool:
-            _cur_qk = _pool['attn_qk_emb']
-            _cur_v = _pool['attn_v_emb']
-            _cur_rst = _pool['rst_emb']
-        elif 'qk_emb' in _pool:
-            _cur_qk = _pool['qk_emb']
-            _cur_v = _pool['v_emb']
-            _cur_rst = _pool['rst_emb']
+        if is_baseline or 'neuron_pool' not in new_params:
+            drift_attn_qk_emb = jnp.float32(0.0)
+            drift_attn_v_emb = jnp.float32(0.0)
+            drift_rst_emb = jnp.float32(0.0)
         else:
-            # Some archived pool variants expose read tensors instead of emb
-            # tensors; keep the diagnostic slots comparable when resuming them.
-            _cur_qk = _pool['q_read']
-            _cur_v = _pool['v_read']
-            _cur_rst = _pool['rst_read']
-        _prev_qk = prev_emb_snap['attn_qk_emb']
-        _prev_v = prev_emb_snap['attn_v_emb']
-        _prev_rst = prev_emb_snap['rst_emb']
-        drift_attn_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
-                        / (jnp.linalg.norm(_prev_qk) + 1e-8))
-        drift_attn_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
-                       / (jnp.linalg.norm(_prev_v) + 1e-8))
-        drift_rst_emb = (jnp.linalg.norm(_cur_rst - _prev_rst)
-                          / (jnp.linalg.norm(_prev_rst) + 1e-8))
+            _pool = new_params['neuron_pool']
+            if 'attn_qk_emb' in _pool:
+                _cur_qk = _pool['attn_qk_emb']
+                _cur_v = _pool['attn_v_emb']
+                _cur_rst = _pool['rst_emb']
+            elif 'qk_emb' in _pool:
+                _cur_qk = _pool['qk_emb']
+                _cur_v = _pool['v_emb']
+                _cur_rst = _pool['rst_emb']
+            else:
+                # Some archived pool variants expose read tensors instead of emb
+                # tensors; keep the diagnostic slots comparable when resuming them.
+                _cur_qk = _pool['q_read']
+                _cur_v = _pool['v_read']
+                _cur_rst = _pool['rst_read']
+            _prev_qk = prev_emb_snap['attn_qk_emb']
+            _prev_v = prev_emb_snap['attn_v_emb']
+            _prev_rst = prev_emb_snap['rst_emb']
+            drift_attn_qk_emb = (jnp.linalg.norm(_cur_qk - _prev_qk)
+                            / (jnp.linalg.norm(_prev_qk) + 1e-8))
+            drift_attn_v_emb = (jnp.linalg.norm(_cur_v - _prev_v)
+                           / (jnp.linalg.norm(_prev_v) + 1e-8))
+            drift_rst_emb = (jnp.linalg.norm(_cur_rst - _prev_rst)
+                              / (jnp.linalg.norm(_prev_rst) + 1e-8))
 
         # Tau / scan-offset parameters (read inside jit -safe, no cross-device issue)
         tau_rst_b = params.get('router', {}).get(
@@ -3298,6 +3303,14 @@ def main():
         # Initial emb-drift snapshot: pytree of sharded refs matching
         # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
         def _drift_snap(p):
+            if is_baseline or 'neuron_pool' not in p:
+                z = jnp.float32(0.0)
+                return {
+                    'attn_qk_emb': z,
+                    'attn_v_emb': z,
+                    'rst_emb': z,
+                }
+
             pool = p['neuron_pool']
             if 'attn_qk_emb' in pool:
                 return {
@@ -3359,7 +3372,14 @@ def main():
         # === Step-time breakdown (sharded, 1 layer) ===
         # NOTE: runs on ALL hosts -shard_map/psum require collective participation.
         # Only print statements are guarded by is_host0.
+        class _SkipBreakdown(Exception):
+            pass
+
         try:
+            if is_baseline:
+                raise _SkipBreakdown(
+                    "baseline model has no DAWN neuron_pool/router")
+
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
             if is_host0:
@@ -3724,6 +3744,9 @@ def main():
 
             del normed, h_Q, h_K, h_V, tau_all, Q, K, V
             del h_rst, tau_rst, _kout, dummy_x
+        except _SkipBreakdown as e:
+            if is_host0:
+                print(f"  Breakdown skipped: {e}", flush=True)
         except Exception as e:
             if is_host0:
                 import traceback

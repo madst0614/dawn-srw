@@ -23,6 +23,7 @@ model:
   gradient_checkpointing: true
 
 training:
+  mesh_model: 1
   batch_size: 512
   gradient_accumulation_steps: 1
   num_epochs: 1
