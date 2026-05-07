@@ -1,0 +1,82 @@
+# DAWN-SRW -- 400M d_model-matched / C4 40B / v4-64
+#
+# v4-64 from-scratch variant of the v4-32 dmodel run.
+# Keeps model/pool geometry identical for parameter comparability, while using
+# the extra data-parallel axis to remove gradient accumulation:
+#   v4-32: batch_size 512 x grad_accum 2 = effective batch 1024
+#   v4-64: batch_size 1024 x grad_accum 1 = effective batch 1024
+#
+# With mesh_model=2 and 32 total devices, per-device batch remains 32.
+# ============================================================
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: "dawn_srw"
+  d_model: 2304
+  n_layers: 18
+  n_heads: 36
+  max_seq_len: 512
+  dropout: 0.0
+  gradient_checkpointing: true
+
+  d_route: 256
+
+  n_qk: 2330
+  n_v: 14640
+  n_know: 29130
+  router_dropout: 0.02
+
+training:
+  batch_size: 1024
+  mesh_model: 2
+  mesh_data: 16
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_know: 4
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  lr: 0.0003
+  weight_decay: 0.1
+  pool_weight_decay: 0.02    # decays emb and raw read/write operator norms
+  warmup_ratio: 0.08
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+
+  # ---- v4.1 physical constants (gate shape) ----
+  sharpness: 500.0
+  activation_threshold: 0.5
+  activation_cutoff: 0.01
+  epsilon: 1.0e-4
+  max_intensity: 100.0
+  scan_scale: 0.01
+  scan_std_floor: 0.5
+
+  # ---- Dead-only penalty ----
+  dead_penalty_weight: 0.05
+  dead_penalty_threshold: 0.01
+
+  # ---- Explore loss (v4.1+ per-token bound) ----
+  exploration_weight: 0.001
+  exploration_asymmetry: 5.0
+  exploration_warmup_steps: 1000
+  exploration_lower_bound: -0.5
+  exploration_upper_bound: 2.0
+  exploration_bound_eps: 1.0e-3
+
+  checkpoint_interval: 200
+  val_interval: 200
+  log_interval: 100
+  log_analysis_multiplier: 10
+  heavy_geometry_multiplier: 10
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_400M_c4_40B_v4_64_dmodel
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_400M_c4_40B_v4_64_dmodel
