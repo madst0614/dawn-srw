@@ -18,7 +18,7 @@ model:
   d_model: 1280
   d_ff: 5120
   n_layers: 18
-  n_heads: 16
+  n_heads: 20
   max_seq_len: 512
   dropout: 0.0
   gradient_checkpointing: true
@@ -26,7 +26,7 @@ model:
 training:
   # No neuron-pool sharding for the baseline, so mesh_model=1.
   mesh_model: 1
-
+  mesh_data: 32
   # Match the DAWN config effective batch: 512 * 2 = 1024.
   batch_size: 1024
   gradient_accumulation_steps: 1
