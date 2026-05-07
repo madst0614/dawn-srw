@@ -517,7 +517,7 @@ VERSION_REGISTRY = {
     "baseline": {
         "description": "Vanilla Transformer Baseline",
         "aliases": ["vanilla", "base"],
-        "module": "baseline_transformer",
+        "module": "legacy.baseline_transformer",
         "required_params": [
             "d_model", "n_layers", "n_heads", "vocab_size", "max_seq_len",
         ],

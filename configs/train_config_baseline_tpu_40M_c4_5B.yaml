@@ -1,6 +1,9 @@
 # Vanilla Transformer Baseline — TPU Training Config
-# For fair comparison with DAWN v17.1 40M at 5B tokens
-# Parameter-matched: d_model=384, n_layers=12, d_ff=1536 ≈ 40M params
+# Conservative parameter-matched baseline for DAWN-SRW 40M @ 5B tokens
+# Uses standard 4x FFN ratio: d_model=432, d_ff=1728
+# Approx params with BERT uncased vocab 30522: ~40.34M
+# This is slightly Transformer-favored because residual width is larger than DAWN-SRW's 384.
+# Param sanity: old d384 4x ~33.21M; new d432 4x ~40.34M; DAWN-SRW target ~40.22M.
 
 seed: 1
 
@@ -13,12 +16,12 @@ data:
 
 model:
   model_version: "baseline"
-  d_model: 384
-  d_ff: 1536
+  d_model: 432
+  d_ff: 1728
   n_layers: 12
   n_heads: 6
   max_seq_len: 512
-  dropout: 0.1
+  dropout: 0.0
   gradient_checkpointing: true
 
 training:
@@ -39,5 +42,5 @@ training:
 
 use_amp: true
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/baseline_40M_c4_5B
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/baseline_40M_c4_5B_d432_4x_drop0
+log_dir: gs://dawn-tpu-data-c4/logs/baseline_40M_c4_5B_d432_4x_drop0

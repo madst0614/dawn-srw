@@ -63,7 +63,7 @@ def __getattr__(name):
         'DAWN_SRW': ('.dawn_srw', 'DAWN'),
         'DAWN_Spatial': ('.legacy.dawn_spatial', 'DAWN'),
         'DAWN': ('.legacy.model_v17_1', 'DAWN'),
-        'VanillaTransformer': ('.baseline_transformer', 'VanillaTransformer'),
+        'VanillaTransformer': ('.legacy.baseline_transformer', 'VanillaTransformer'),
     }
     _registry_names = {
         'VERSION_REGISTRY', 'normalize_version', 'get_version_info',
@@ -141,6 +141,7 @@ def create_model_by_version(version, config):
         Model instance (DAWN or VanillaTransformer)
     """
     if version == "baseline":
+        from .legacy.baseline_transformer import VanillaTransformer
         return VanillaTransformer(**config)
 
     version = normalize_version(version)

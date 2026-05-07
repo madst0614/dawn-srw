@@ -73,12 +73,20 @@ class TransformerLayer(nn.Module):
         self.ffn = StandardFFN(self.d_model, self.d_ff, self.dropout_rate)
         self.norm1 = nn.LayerNorm()
         self.norm2 = nn.LayerNorm()
+        self.attn_resid_dropout = nn.Dropout(self.dropout_rate)
+        self.ffn_resid_dropout = nn.Dropout(self.dropout_rate)
 
     def __call__(self, x, deterministic=False):
         normed = self.norm1(x)
-        x = x + self.attn(normed, deterministic)
+        attn_out = self.attn(normed, deterministic=deterministic)
+        attn_out = self.attn_resid_dropout(
+            attn_out, deterministic=deterministic)
+        x = x + attn_out
+
         normed = self.norm2(x)
-        x = x + self.ffn(normed, deterministic)
+        ffn_out = self.ffn(normed, deterministic=deterministic)
+        ffn_out = self.ffn_resid_dropout(ffn_out, deterministic=deterministic)
+        x = x + ffn_out
         return x
 
 
@@ -91,12 +99,12 @@ class VanillaTransformer(nn.Module):
     __version__ = "baseline-JAX"
 
     vocab_size: int = 30522
-    d_model: int = 384
-    d_ff: int = 1536
+    d_model: int = 432
+    d_ff: int = 1728
     n_layers: int = 12
     n_heads: int = 6
     max_seq_len: int = 512
-    dropout_rate: float = 0.1
+    dropout_rate: float = 0.0
     gradient_checkpointing: bool = False
 
     def setup(self):
@@ -176,10 +184,11 @@ class VanillaTransformer(nn.Module):
         }
 
     def get_model_info(self):
+        ffn_ratio = self.d_ff / self.d_model
         return [
-            f"  Model: VanillaTransformer (baseline-JAX)",
+            f"  Model: VanillaTransformer (baseline-JAX, standard 4x FFN, parameter-matched)",
             f"  d_model={self.d_model}, d_ff={self.d_ff}, n_layers={self.n_layers}, n_heads={self.n_heads}",
-            f"  max_seq_len={self.max_seq_len}, dropout={self.dropout_rate}",
+            f"  FFN ratio={ffn_ratio:.2f}, dropout={self.dropout_rate}",
             f"  gradient_checkpointing={self.gradient_checkpointing}",
         ]
 
