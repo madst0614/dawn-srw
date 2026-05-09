@@ -1,0 +1,41 @@
+experiments:
+  val_bin: gs://dawn-tpu-data-c4/c4_val.bin
+  seq_len: 512
+  batch_size: 32
+  max_batches: null
+  output_dir: results/paper_eval_YYYYMMDD
+  # Optional for large gs:// validation files; if set, GCS .bin files are
+  # cached locally before memmap evaluation.
+  # local_cache_dir: /tmp/dawn_c4_cache
+
+  baseline:
+    - name: tf_40m
+      config: /home/madst0614/dawn-spatial/configs/train_config_baseline_tpu_40M_c4_5B.yaml
+      checkpoint: gs://your-bucket/path/to/tf_40m/best_model.flax
+      role: main
+      # Optional per-model override. Useful on v4-32 so baseline uses
+      # data-only sharding while DAWN uses a pool-divisible model axis.
+      mesh_model: 1
+
+    - name: tf_400m
+      config: /home/madst0614/dawn-spatial/configs/train_config_baseline_tpu_400M_c4_40B_v4_32.yaml
+      checkpoint: gs://your-bucket/path/to/tf_400m/best_model.flax
+      role: main
+
+  dawn_srw:
+    main:
+      - name: dawn_srw_40m_main
+        config: /home/madst0614/dawn-spatial/configs/train_config_dawn_srw_40M_c4_5B.yaml
+        checkpoint: gs://your-bucket/path/to/dawn_srw_40m/best_model.flax
+        mesh_model: 4
+
+    sub:
+      - name: dawn_srw_ex3
+        config: /home/madst0614/dawn-spatial/configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_ex3.yaml
+        checkpoint: gs://your-bucket/path/to/dawn_srw_ex3/best_model.flax
+        mesh_model: 4
+
+      - name: dawn_srw_ex10
+        config: /home/madst0614/dawn-spatial/configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_ex10.yaml
+        checkpoint: gs://your-bucket/path/to/dawn_srw_ex10/best_model.flax
+        mesh_model: 4

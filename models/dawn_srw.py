@@ -182,7 +182,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      max_intensity=MAX_INTENSITY,
                      scan_scale=SCAN_SCALE,
                      scan_std_floor=SCAN_STD_FLOOR,
-                     analysis=False):
+                     analysis=False,
+                     prune_enabled=False,
+                     prune_activation_threshold=None,
+                     prune_scope="all",
+                     prune_denominator="pruned",
+                     return_prune_stats=False):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
     2-pass chunked inside shard_map:
@@ -222,6 +227,23 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _max_int = jnp.float32(max_intensity)
     _scan_scale = jnp.float32(scan_scale)
     _scan_std_floor = jnp.float32(scan_std_floor)
+    _prune_enabled = bool(prune_enabled)
+    if _prune_enabled and prune_activation_threshold is None:
+        raise ValueError(
+            "prune_activation_threshold must be set when prune_enabled=True")
+    if prune_denominator not in ("pruned", "full"):
+        raise ValueError(
+            "prune_denominator must be 'pruned' or 'full', "
+            f"got {prune_denominator!r}")
+    # prune_scope is resolved by the caller that builds pool-specific closures.
+    # It is accepted here so paper-eval configs can carry one canonical option set.
+    _ = prune_scope
+    _prune_thr = jnp.float32(
+        0.0 if prune_activation_threshold is None
+        else prune_activation_threshold)
+    _denominator_is_full = (prune_denominator == "full")
+    _return_prune_stats = bool(return_prune_stats)
+    _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
 
     # SLIM out_specs: train path.
     _slim_out_specs = (
@@ -262,8 +284,19 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                     # top1_gate_frac_mean scalar
         P(),                     # top1_gate_frac_max scalar
     )
+    _prune_extra_specs = (
+        P(),                     # kept_count_mean scalar
+        P(),                     # kept_frac_mean scalar
+        P(),                     # full_gate_sum_mean scalar
+        P(),                     # kept_gate_sum_mean scalar
+        P(),                     # retained_gate_mass_mean scalar
+        P(),                     # int_cap_frac scalar
+        P(),                     # gate_max_mean scalar
+    )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
                   if analysis else _slim_out_specs + _conc_out_specs)
+    if _return_prune_stats:
+        _out_specs = _out_specs + _prune_extra_specs
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),    # x [B,S,D]
@@ -378,8 +411,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
         # v4.1 diagnostic: ceiling on intensity relative to cap (1e-3 below).
         if analysis:
-            _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
-
             @jax.checkpoint
             def gate_srw_step(carry, i):
                 (out, total_weighted_cost, total_gate_sq, total_gate_max, total_active,
@@ -387,7 +418,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_activation_cost, total_current_cost,
                  total_z_lt_075, total_z_lt_030, total_g_log_g,
                  total_dead_penalty, total_dead_count,
-                 total_int_max, total_int_cap_count) = carry
+                 total_int_max, total_full_gate, total_kept_count,
+                 total_int_cap_count) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
@@ -397,7 +429,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
-                gate = activation * intensity
+                base_gate = activation * intensity
+                if _prune_enabled:
+                    keep = activation > _prune_thr
+                    gate = jnp.where(keep, base_gate, 0.0)
+                    chunk_kept = keep.astype(jnp.float32).sum(
+                        axis=-1, keepdims=True)
+                else:
+                    gate = base_gate
+                    chunk_kept = jnp.full((B, S, 1), cs, dtype=jnp.float32)
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = (intensity >= _int_cap_thresh
                                         ).astype(jnp.float32).sum()
@@ -407,7 +447,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_intensity = gate.sum(axis=-1, keepdims=True)
+                chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
+                chunk_den_cost = (chunk_full_gate if _denominator_is_full
+                                  else chunk_weighted)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -435,7 +477,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_phi_binary + chunk_phi_binary,
-                        total_den_cost + chunk_intensity,
+                        total_den_cost + chunk_den_cost,
                         total_activation_cost,
                         total_current_cost,
                         total_z_lt_075 + chunk_z_lt_075,
@@ -444,18 +486,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_dead_penalty + chunk_dead_penalty,
                         total_dead_count + chunk_dead_count,
                         jnp.maximum(total_int_max, chunk_int_max),
+                        total_full_gate + chunk_full_gate,
+                        total_kept_count + chunk_kept,
                         total_int_cap_count + chunk_int_cap_count), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_phi_binary, total_den_cost, total_activation_cost,
              total_current_cost, total_z_lt_075, total_z_lt_030,
              total_g_log_g, total_dead_penalty, total_dead_count,
-             total_int_max, total_int_cap_count), _ = jax.lax.scan(
+             total_int_max, total_full_gate, total_kept_count,
+             total_int_cap_count), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1, z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1, z1, z1, z1, z1,
                  jnp.float32(0.0), jnp.float32(0.0),
-                 jnp.float32(0.0), jnp.float32(0.0)),
+                 jnp.float32(0.0), z1, z1, jnp.float32(0.0)),
                 jnp.arange(nc))
         else:
             @jax.checkpoint
@@ -464,7 +509,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_strong, total_den_cost,
                  total_activation_cost, total_current_cost,
                  total_dead_penalty, total_dead_count,
-                 total_int_max) = carry
+                 total_int_max, total_full_gate, total_kept_count,
+                 total_int_cap_count) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
@@ -474,15 +520,30 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
-                gate = activation * intensity
+                base_gate = activation * intensity
+                if _prune_enabled:
+                    keep = activation > _prune_thr
+                    gate = jnp.where(keep, base_gate, 0.0)
+                    chunk_kept = keep.astype(jnp.float32).sum(
+                        axis=-1, keepdims=True)
+                else:
+                    gate = base_gate
+                    chunk_kept = jnp.full((B, S, 1), cs, dtype=jnp.float32)
                 chunk_int_max = intensity.max()
+                chunk_int_cap_count = (intensity >= _int_cap_thresh
+                                        ).astype(jnp.float32).sum()
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
                 a = gate * xr_f
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_intensity = gate.sum(axis=-1, keepdims=True)
+                chunk_full_gate = (
+                    base_gate.sum(axis=-1, keepdims=True)
+                    if (_return_prune_stats or _denominator_is_full)
+                    else chunk_weighted)
+                chunk_den_cost = (chunk_full_gate if _denominator_is_full
+                                  else chunk_weighted)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 # sum(gate) feeds the denominator after the chunk scan.
@@ -502,21 +563,26 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
-                        total_den_cost + chunk_intensity,
+                        total_den_cost + chunk_den_cost,
                         total_activation_cost,
                         total_current_cost,
                         total_dead_penalty + chunk_dead_penalty,
                         total_dead_count + chunk_dead_count,
-                        jnp.maximum(total_int_max, chunk_int_max)), None
+                        jnp.maximum(total_int_max, chunk_int_max),
+                        total_full_gate + chunk_full_gate,
+                        total_kept_count + chunk_kept,
+                        total_int_cap_count + chunk_int_cap_count), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_den_cost, total_activation_cost, total_current_cost,
              total_dead_penalty, total_dead_count,
-             total_int_max), _ = jax.lax.scan(
+             total_int_max, total_full_gate, total_kept_count,
+             total_int_cap_count), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1, z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1,
-                 jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
+                 jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0),
+                 z1, z1, jnp.float32(0.0)),
                 jnp.arange(nc))
 
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(gate)
@@ -563,8 +629,26 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     den_cost_mean, activation_cost_mean, current_cost_mean)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
+        prune_out = ()
+        if _return_prune_stats:
+            global_full_gate = jax.lax.psum(total_full_gate, 'model')
+            global_kept_count = jax.lax.psum(total_kept_count, 'model')
+            retained_gate_mass = (
+                global_weighted_cost / jnp.maximum(global_full_gate, 1e-8))
+            int_cap_frac_out = jax.lax.stop_gradient(
+                jax.lax.psum(total_int_cap_count, 'model')
+                / jnp.float32(B * S * N_total))
+            prune_out = (
+                global_kept_count.mean(),
+                (global_kept_count / N_total).mean(),
+                global_full_gate.mean(),
+                global_weighted_cost.mean(),
+                retained_gate_mass.mean(),
+                int_cap_frac_out,
+                global_gate_max.mean(),
+            )
         if not analysis:
-            return slim_out + conc_out
+            return slim_out + conc_out + prune_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -591,7 +675,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         return slim_out + conc_out + (phi_binary_frac, z_lt_075_frac, z_lt_030_frac,
                            score_skew, active_per_token_std, gate_entropy,
                            den_cost_out, activation_cost_out, current_cost_out,
-                           score_kurt, int_cap_frac_out)
+                           score_kurt, int_cap_frac_out) + prune_out
 
     return fused_gate_srw
 
@@ -604,7 +688,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             max_intensity=MAX_INTENSITY,
                             scan_scale=SCAN_SCALE,
                             scan_std_floor=SCAN_STD_FLOOR,
-                            analysis=False):
+                            analysis=False,
+                            prune_enabled=False,
+                            prune_activation_threshold=None,
+                            prune_scope="all",
+                            prune_denominator="pruned",
+                            return_prune_stats=False):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -626,6 +715,22 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _max_int = jnp.float32(max_intensity)
     _scan_scale = jnp.float32(scan_scale)
     _scan_std_floor = jnp.float32(scan_std_floor)
+    _prune_enabled = bool(prune_enabled)
+    if _prune_enabled and prune_activation_threshold is None:
+        raise ValueError(
+            "prune_activation_threshold must be set when prune_enabled=True")
+    if prune_denominator not in ("pruned", "full"):
+        raise ValueError(
+            "prune_denominator must be 'pruned' or 'full', "
+            f"got {prune_denominator!r}")
+    # Scope is resolved by the caller that chooses which pool closures prune.
+    _ = prune_scope
+    _prune_thr = jnp.float32(
+        0.0 if prune_activation_threshold is None
+        else prune_activation_threshold)
+    _denominator_is_full = (prune_denominator == "full")
+    _return_prune_stats = bool(return_prune_stats)
+    _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
 
     _slim_out_specs = (
         P('data', None, None, None),  # out [B,S,2,D]
@@ -664,8 +769,19 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                          # top1_gate_frac_mean scalar
         P(),                          # top1_gate_frac_max scalar
     )
+    _prune_extra_specs = (
+        P(),                          # kept_count_mean scalar
+        P(),                          # kept_frac_mean scalar
+        P(),                          # full_gate_sum_mean scalar
+        P(),                          # kept_gate_sum_mean scalar
+        P(),                          # retained_gate_mass_mean scalar
+        P(),                          # int_cap_frac scalar
+        P(),                          # gate_max_mean scalar
+    )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
                   if analysis else _slim_out_specs + _conc_out_specs)
+    if _return_prune_stats:
+        _out_specs = _out_specs + _prune_extra_specs
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),        # x [B,S,D]
@@ -778,8 +894,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         # --- Pass 2: gate + srw fused ---
         if analysis:
-            _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
-
             @jax.checkpoint
             def gate_srw_step(carry, i):
                 (out, total_weighted_cost, total_gate_sq, total_gate_max, total_active,
@@ -787,7 +901,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_activation_cost, total_current_cost,
                  total_z_lt_075, total_z_lt_030, total_g_log_g,
                  total_dead_penalty, total_dead_count,
-                 total_int_max, total_int_cap_count) = carry
+                 total_int_max, total_full_gate, total_kept_count,
+                 total_int_cap_count) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
@@ -797,7 +912,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
-                gate = activation * intensity
+                base_gate = activation * intensity
+                if _prune_enabled:
+                    keep = activation > _prune_thr
+                    gate = jnp.where(keep, base_gate, 0.0)
+                    chunk_kept = keep.astype(jnp.float32).sum(
+                        axis=-1, keepdims=True)
+                else:
+                    gate = base_gate
+                    chunk_kept = jnp.full((B, S, 2, 1), cs, dtype=jnp.float32)
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = (intensity >= _int_cap_thresh_paired
                                         ).astype(jnp.float32).sum()
@@ -807,7 +930,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)           # [B,S,2,1]
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_intensity = gate.sum(axis=-1, keepdims=True)
+                chunk_full_gate = (
+                    base_gate.sum(axis=-1, keepdims=True)
+                    if (_return_prune_stats or _denominator_is_full)
+                    else chunk_weighted)
+                chunk_den_cost = (chunk_full_gate if _denominator_is_full
+                                  else chunk_weighted)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -835,7 +963,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_active + chunk_active,
                         total_strong + chunk_strong,
                         total_phi_binary + chunk_phi_binary,
-                        total_den_cost + chunk_intensity,
+                        total_den_cost + chunk_den_cost,
                         total_activation_cost,
                         total_current_cost,
                         total_z_lt_075 + chunk_z_lt_075,
@@ -844,19 +972,22 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         total_dead_penalty + chunk_dead_penalty,
                         total_dead_count + chunk_dead_count,
                         jnp.maximum(total_int_max, chunk_int_max),
+                        total_full_gate + chunk_full_gate,
+                        total_kept_count + chunk_kept,
                         total_int_cap_count + chunk_int_cap_count), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_phi_binary, total_den_cost, total_activation_cost,
              total_current_cost, total_z_lt_075, total_z_lt_030,
              total_g_log_g, total_dead_penalty, total_dead_count,
-             total_int_max, total_int_cap_count), _ = jax.lax.scan(
+             total_int_max, total_full_gate, total_kept_count,
+             total_int_cap_count), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0),
-                 jnp.float32(0.0), jnp.float32(0.0)),
+                 jnp.float32(0.0), z1_r, z1_r, jnp.float32(0.0)),
                 jnp.arange(nc))
         else:
             @jax.checkpoint
@@ -865,7 +996,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_strong, total_den_cost,
                  total_activation_cost, total_current_cost,
                  total_dead_penalty, total_dead_count,
-                 total_int_max) = carry
+                 total_int_max, total_full_gate, total_kept_count,
+                 total_int_cap_count) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
@@ -875,15 +1007,27 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 activation = jax.nn.sigmoid(_sharp * margin)
                 active_margin = jnp.maximum(margin - _act_cut, 0.0)
                 intensity = _eps + jnp.minimum(active_margin, _max_int)
-                gate = activation * intensity
+                base_gate = activation * intensity
+                if _prune_enabled:
+                    keep = activation > _prune_thr
+                    gate = jnp.where(keep, base_gate, 0.0)
+                    chunk_kept = keep.astype(jnp.float32).sum(
+                        axis=-1, keepdims=True)
+                else:
+                    gate = base_gate
+                    chunk_kept = jnp.full((B, S, 2, 1), cs, dtype=jnp.float32)
                 chunk_int_max = intensity.max()
+                chunk_int_cap_count = (intensity >= _int_cap_thresh_paired
+                                        ).astype(jnp.float32).sum()
                 xr = x_bf @ rc.T
                 xr_f = xr.astype(jnp.float32)
                 a = gate * xr_f[:, :, None, :]
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_intensity = gate.sum(axis=-1, keepdims=True)
+                chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
+                chunk_den_cost = (chunk_full_gate if _denominator_is_full
+                                  else chunk_weighted)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1, 2))
@@ -902,22 +1046,27 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_gate_max, gate.max(axis=-1, keepdims=True)),
                         total_active + chunk_active,
                         total_strong + chunk_strong,
-                        total_den_cost + chunk_intensity,
+                        total_den_cost + chunk_den_cost,
                         total_activation_cost,
                         total_current_cost,
                         total_dead_penalty + chunk_dead_penalty,
                         total_dead_count + chunk_dead_count,
-                        jnp.maximum(total_int_max, chunk_int_max)), None
+                        jnp.maximum(total_int_max, chunk_int_max),
+                        total_full_gate + chunk_full_gate,
+                        total_kept_count + chunk_kept,
+                        total_int_cap_count + chunk_int_cap_count), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_den_cost, total_activation_cost, total_current_cost,
              total_dead_penalty, total_dead_count,
-             total_int_max), _ = jax.lax.scan(
+             total_int_max, total_full_gate, total_kept_count,
+             total_int_cap_count), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r,
-                 jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0)),
+                 jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0),
+                 z1_r, z1_r, jnp.float32(0.0)),
                 jnp.arange(nc))
 
         # Normalize per route independently
@@ -966,8 +1115,26 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     int_max_out, den_cost_mean, activation_cost_mean, current_cost_mean)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
+        prune_out = ()
+        if _return_prune_stats:
+            global_full_gate = jax.lax.psum(total_full_gate, 'model')
+            global_kept_count = jax.lax.psum(total_kept_count, 'model')
+            retained_gate_mass = (
+                global_weighted_cost / jnp.maximum(global_full_gate, 1e-8))
+            int_cap_frac_out = jax.lax.stop_gradient(
+                jax.lax.psum(total_int_cap_count, 'model')
+                / jnp.float32(B * S * 2 * N_total))
+            prune_out = (
+                global_kept_count.mean(),
+                (global_kept_count / N_total).mean(),
+                global_full_gate.mean(),
+                global_weighted_cost.mean(),
+                retained_gate_mass.mean(),
+                int_cap_frac_out,
+                global_gate_max.mean(),
+            )
         if not analysis:
-            return slim_out + conc_out
+            return slim_out + conc_out + prune_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -994,7 +1161,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         return slim_out + conc_out + (phi_binary_frac_mean, z_lt_075_frac, z_lt_030_frac,
                            score_skew, active_per_token_std, gate_entropy,
                            den_cost_out, activation_cost_out, current_cost_out,
-                           score_kurt, int_cap_frac_out)
+                           score_kurt, int_cap_frac_out) + prune_out
 
     return fused_gate_srw_paired
 
@@ -1087,7 +1254,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False):
+                  sharded_fns, analysis=False, return_prune_stats=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1151,6 +1318,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_den_cost_mean, qk_activation_cost_mean, qk_current_cost_mean) = qk_ret[:16]
     (qk_gate_eff_n, qk_gate_eff_ratio,
      qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[16:20]
+    if return_prune_stats:
+        (qk_kept_count, qk_kept_frac, qk_full_gate_sum, qk_kept_gate_sum,
+         qk_retained_gate_mass, qk_int_cap_frac,
+         qk_gate_max_mean) = qk_ret[20:27]
     if analysis:
         (qk_phi_bin, qk_z075, qk_z030, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_activation_cost, qk_current_cost,
@@ -1166,6 +1337,10 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_den_cost_mean, v_activation_cost_mean, v_current_cost_mean) = v_ret[:16]
     (v_gate_eff_n, v_gate_eff_ratio,
      v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[16:20]
+    if return_prune_stats:
+        (v_kept_count, v_kept_frac, v_full_gate_sum, v_kept_gate_sum,
+         v_retained_gate_mass, v_int_cap_frac,
+         v_gate_max_mean) = v_ret[20:27]
     if analysis:
         (v_phi_bin, v_z075, v_z030, v_skew, v_apt_std, v_entropy,
          v_den_cost, v_activation_cost, v_current_cost,
@@ -1251,7 +1426,16 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_gate_eff_n, attn_gate_eff_ratio,
                 attn_top1_gate_frac, attn_top1_gate_frac_max)
     if not analysis:
-        return slim_ret
+        if not return_prune_stats:
+            return slim_ret
+        return slim_ret + (
+            qk_kept_count, qk_kept_frac, qk_full_gate_sum,
+            qk_kept_gate_sum, qk_retained_gate_mass,
+            qk_int_cap_frac, qk_gate_max_mean,
+            v_kept_count, v_kept_frac, v_full_gate_sum,
+            v_kept_gate_sum, v_retained_gate_mass,
+            v_int_cap_frac, v_gate_max_mean,
+        )
 
     attn_qk_phi_binary = qk_phi_bin.mean()
     attn_v_phi_binary = v_phi_bin.mean()
@@ -1282,7 +1466,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
 def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False):
+                  sharded_fns, analysis=False, return_prune_stats=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -1318,6 +1502,10 @@ def _rst_forward(x, pool_params, router_params, rng,
      rst_den_cost_mean, rst_activation_cost_mean, rst_current_cost_mean) = rst_ret[:16]
     (rst_gate_eff_n, rst_gate_eff_ratio,
      rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[16:20]
+    if return_prune_stats:
+        (rst_kept_count, rst_kept_frac, rst_full_gate_sum,
+         rst_kept_gate_sum, rst_retained_gate_mass, rst_int_cap_frac,
+         rst_gate_max_mean) = rst_ret[20:27]
     if analysis:
         (phi_binary_frac, rst_z_lt_075_frac, rst_z_lt_030_frac,
          rst_score_skew, rst_active_per_token_std, rst_gate_entropy,
@@ -1355,7 +1543,13 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_gate_eff_n, rst_gate_eff_ratio,
                 rst_top1_gate_frac, rst_top1_gate_frac_max)
     if not analysis:
-        return slim_ret
+        if not return_prune_stats:
+            return slim_ret
+        return slim_ret + (
+            rst_kept_count, rst_kept_frac, rst_full_gate_sum,
+            rst_kept_gate_sum, rst_retained_gate_mass,
+            rst_int_cap_frac, rst_gate_max_mean,
+        )
 
     rst_phi_binary = phi_binary_frac.mean()
     return slim_ret + (
@@ -1467,7 +1661,8 @@ class DAWN(nn.Module):
         self.norm = nn.LayerNorm()
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
-                 deterministic=False, sharded_fns=None, analysis=False):
+                 deterministic=False, sharded_fns=None, analysis=False,
+                 return_prune_stats=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -1475,6 +1670,10 @@ class DAWN(nn.Module):
         such as distribution shape, boundary fraction, entropy, tau stats,
         raw norms, and debug norms.
         """
+        if analysis and return_prune_stats:
+            raise ValueError(
+                "return_prune_stats is paper-eval-only and cannot be "
+                "combined with analysis=True")
         B, S = input_ids.shape
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
@@ -1589,7 +1788,8 @@ class DAWN(nn.Module):
                     self.n_qk, self.n_v,
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
-                    sharded_fns=_sharded, analysis=analysis)
+                    sharded_fns=_sharded, analysis=analysis,
+                    return_prune_stats=return_prune_stats)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -1606,6 +1806,13 @@ class DAWN(nn.Module):
                  a_current_cost_mean,
                  a_gate_eff_n, a_gate_eff_ratio,
                  a_top1_gate_frac, a_top1_gate_frac_max) = attn_ret[:33]
+                if return_prune_stats:
+                    (a_qk_kept_count, a_qk_kept_frac, a_qk_full_gate_sum,
+                     a_qk_kept_gate_sum, a_qk_retained_gate_mass,
+                     a_qk_int_cap_frac, a_qk_gate_max_mean,
+                     a_v_kept_count, a_v_kept_frac, a_v_full_gate_sum,
+                     a_v_kept_gate_sum, a_v_retained_gate_mass,
+                     a_v_int_cap_frac, a_v_gate_max_mean) = attn_ret[33:47]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -1623,7 +1830,8 @@ class DAWN(nn.Module):
                 rst_ret = _rst_forward(
                     normed, pool_params, router_params, rng_rst,
                     self.router_dropout, self.dropout_rate, deterministic,
-                    sharded_fns=_sharded, analysis=analysis)
+                    sharded_fns=_sharded, analysis=analysis,
+                    return_prune_stats=return_prune_stats)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_z_act, k_tau_abs,
@@ -1635,6 +1843,10 @@ class DAWN(nn.Module):
                  k_current_cost_mean,
                  k_gate_eff_n, k_gate_eff_ratio,
                  k_top1_gate_frac, k_top1_gate_frac_max) = rst_ret[:28]
+                if return_prune_stats:
+                    (k_kept_count, k_kept_frac, k_full_gate_sum,
+                     k_kept_gate_sum, k_retained_gate_mass,
+                     k_int_cap_frac, k_gate_max_mean) = rst_ret[28:35]
                 if analysis:
                     (k_raw_out_norm,
                      k_tau_std, k_tau_kernel_norm,
@@ -1672,6 +1884,21 @@ class DAWN(nn.Module):
                            k_gate_eff_n, k_gate_eff_ratio,
                            k_top1_gate_frac, k_top1_gate_frac_max,
                            )
+                if return_prune_stats:
+                    slim_ys = slim_ys + (
+                        a_qk_kept_count, a_qk_kept_frac,
+                        a_qk_full_gate_sum, a_qk_kept_gate_sum,
+                        a_qk_retained_gate_mass, a_qk_int_cap_frac,
+                        a_qk_gate_max_mean,
+                        a_v_kept_count, a_v_kept_frac,
+                        a_v_full_gate_sum, a_v_kept_gate_sum,
+                        a_v_retained_gate_mass, a_v_int_cap_frac,
+                        a_v_gate_max_mean,
+                        k_kept_count, k_kept_frac,
+                        k_full_gate_sum, k_kept_gate_sum,
+                        k_retained_gate_mass, k_int_cap_frac,
+                        k_gate_max_mean,
+                    )
                 if not analysis:
                     return x, slim_ys
                 return x, slim_ys + (
@@ -1726,6 +1953,7 @@ class DAWN(nn.Module):
             attn_top1_gate_frac_all, attn_top1_gate_frac_max_all,
             rst_gate_eff_n_all, rst_gate_eff_ratio_all,
             rst_top1_gate_frac_all, rst_top1_gate_frac_max_all) = scan_ys[:59]
+            _scan_offset = 59
             if analysis:
                 (attn_qk_raw_norm_all, attn_v_raw_norm_all, rst_raw_out_norm_all,
                  attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
@@ -1744,7 +1972,21 @@ class DAWN(nn.Module):
                  attn_qk_emb_n_max_all, attn_v_emb_n_max_all,
                  rst_emb_n_max_all,
                  attn_score_kurt_all, rst_score_kurt_all,
-                 attn_int_cap_frac_all, rst_int_cap_frac_all) = scan_ys[59:]
+                 attn_int_cap_frac_all, rst_int_cap_frac_all) = scan_ys[_scan_offset:]
+                _scan_offset += 38
+            if return_prune_stats:
+                (attn_qk_kept_count_all, attn_qk_kept_frac_all,
+                 attn_qk_full_gate_sum_all, attn_qk_kept_gate_sum_all,
+                 attn_qk_retained_gate_mass_all, attn_qk_int_cap_frac_all,
+                 attn_qk_gate_max_mean_all,
+                 attn_v_kept_count_all, attn_v_kept_frac_all,
+                 attn_v_full_gate_sum_all, attn_v_kept_gate_sum_all,
+                 attn_v_retained_gate_mass_all, attn_v_int_cap_frac_all,
+                 attn_v_gate_max_mean_all,
+                 rst_kept_count_all, rst_kept_frac_all,
+                 rst_full_gate_sum_all, rst_kept_gate_sum_all,
+                 rst_retained_gate_mass_all, rst_int_cap_frac_prune_all,
+                 rst_gate_max_mean_all) = scan_ys[_scan_offset:]
             # Aux is averaged over layers after attention and RST terms are
             # collected.  Attention keeps historical Q/K/V scaling upstream.
             total_aux = (attn_auxes + rst_auxes).mean()
@@ -1823,6 +2065,30 @@ class DAWN(nn.Module):
             'rst_top1_gate_frac': rst_top1_gate_frac_all.mean(),
             'rst_top1_gate_frac_max': rst_top1_gate_frac_max_all.max(),
         }
+        if return_prune_stats and not self.is_initializing():
+            result.update({
+                'attn_qk_kept_count_mean': attn_qk_kept_count_all.mean(),
+                'attn_qk_kept_frac_mean': attn_qk_kept_frac_all.mean(),
+                'attn_qk_full_gate_sum_mean': attn_qk_full_gate_sum_all.mean(),
+                'attn_qk_kept_gate_sum_mean': attn_qk_kept_gate_sum_all.mean(),
+                'attn_qk_retained_gate_mass': attn_qk_retained_gate_mass_all.mean(),
+                'attn_qk_int_cap_frac': attn_qk_int_cap_frac_all.mean(),
+                'attn_qk_gate_max_mean': attn_qk_gate_max_mean_all.mean(),
+                'attn_v_kept_count_mean': attn_v_kept_count_all.mean(),
+                'attn_v_kept_frac_mean': attn_v_kept_frac_all.mean(),
+                'attn_v_full_gate_sum_mean': attn_v_full_gate_sum_all.mean(),
+                'attn_v_kept_gate_sum_mean': attn_v_kept_gate_sum_all.mean(),
+                'attn_v_retained_gate_mass': attn_v_retained_gate_mass_all.mean(),
+                'attn_v_int_cap_frac': attn_v_int_cap_frac_all.mean(),
+                'attn_v_gate_max_mean': attn_v_gate_max_mean_all.mean(),
+                'rst_kept_count_mean': rst_kept_count_all.mean(),
+                'rst_kept_frac_mean': rst_kept_frac_all.mean(),
+                'rst_full_gate_sum_mean': rst_full_gate_sum_all.mean(),
+                'rst_kept_gate_sum_mean': rst_kept_gate_sum_all.mean(),
+                'rst_retained_gate_mass': rst_retained_gate_mass_all.mean(),
+                'rst_int_cap_frac': rst_int_cap_frac_prune_all.mean(),
+                'rst_gate_max_mean': rst_gate_max_mean_all.mean(),
+            })
         if analysis and not self.is_initializing():
             _residual_norm = jnp.linalg.norm(x, axis=-1).mean()
             _emb_norm = jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean()
