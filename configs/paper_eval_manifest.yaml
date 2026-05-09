@@ -5,7 +5,7 @@ experiments:
   # below set per-model mesh_model so pool sizes divide cleanly.
   batch_size: 32
   max_batches: null
-  output_dir: results/paper_eval_v4_32_20260509
+  output_dir: results/paper_eval_v4_32_v_more_main_t099_20260509
   local_cache_dir: /tmp/dawn_c4_cache
 
   baseline:
@@ -17,12 +17,17 @@ experiments:
 
   dawn_srw:
     main:
-      - name: dawn_srw_40m_tag128_main
+      - name: dawn_srw_40m_v_more_main
+        config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128_v_more.yaml
+        checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.5_40M_c4_5B_v_more/run_vspatial-r1-v4.1.5.5_20260501_194123_3201
+        mesh_model: 2
+
+    sub:
+      - name: dawn_srw_tag128
         config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128.yaml
         checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.5_40M_c4_5B_tag_128/run_vspatial-r1-v4.1.5.5_20260501_183736_3201
         mesh_model: 4
 
-    sub:
       - name: dawn_srw_ex10
         config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_ex10.yaml
         checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.5_40M_c4_5B_ex10/run_vspatial-r1-v4.1.5.5_20260501_194129_3201
@@ -36,11 +41,6 @@ experiments:
       - name: dawn_srw_tag128_balanced
         config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128_balanced.yaml
         checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.5_40M_c4_5B_tag128_balanced/run_vspatial-r1-v4.1.5.5_20260502_154000_3201
-        mesh_model: 2
-
-      - name: dawn_srw_v_more
-        config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128_v_more.yaml
-        checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_spatial_r1v4.1.5.5_40M_c4_5B_v_more/run_vspatial-r1-v4.1.5.5_20260501_194123_3201
         mesh_model: 2
 
       - name: dawn_srw_v2_more
@@ -61,4 +61,9 @@ experiments:
       - name: dawn_srw_v_more_ex3
         config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128_v_more_ex3.yaml
         checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_v_more_ex3/run_vdawn_srw_20260503_232315_3201
+        mesh_model: 2
+
+      - name: dawn_srw_v2_more_ex5
+        config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128_v2_more_ex5.yaml
+        checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_v2_more_ex5/run_vdawn_srw_20260508_033114_3201
         mesh_model: 2

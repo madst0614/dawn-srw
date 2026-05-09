@@ -19,7 +19,7 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
 GH_TOKEN=""
 
 MANIFEST="configs/paper_eval_manifest.yaml"
-OUT_DIR="gs://dawn-tpu-data-c4/paper_results/paper_eval_v4_32_20260509"
+OUT_DIR="gs://dawn-tpu-data-c4/paper_results/paper_eval_v4_32_v_more_main_t099_20260509"
 MAX_BATCHES="-1"
 BATCH_SIZE=""
 SEQ_LEN=""
@@ -31,6 +31,7 @@ WORKERS="auto"
 DETACH="1"
 INSTALL_DEPS="1"
 SINGLE_DEVICE="0"
+INCLUDE_DEBUG_PRUNE_CONTROL="0"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --extra-args) EXTRA_ARGS="$2"; shift 2 ;;
         --workers) WORKERS="$2"; shift 2 ;;
         --single-device) SINGLE_DEVICE="1"; shift ;;
+        --include-debug-prune-control) INCLUDE_DEBUG_PRUNE_CONTROL="1"; shift ;;
         --foreground) DETACH="0"; shift ;;
         --detach) DETACH="1"; shift ;;
         --no-install) INSTALL_DEPS="0"; shift ;;
@@ -66,6 +68,8 @@ while [[ $# -gt 0 ]]; do
             echo "Execution:"
             echo "  --workers all|0|N     Default: all, or 0 with --single-device"
             echo "  --single-device       Worker 0 only"
+            echo "  --include-debug-prune-control"
+            echo "                        Run debug_all_t101 destructive prune control"
             echo "  --foreground          Stream run instead of tmux detach"
             echo "  --detach              Run in tmux (default)"
             echo "  --no-install          Skip pip dependency install"
@@ -109,6 +113,7 @@ echo "  Detached:     $DETACH"
 echo "  Manifest:     $MANIFEST"
 echo "  Output:       $OUT_DIR"
 echo "  Max batches:  $MAX_BATCHES"
+echo "  Debug prune:  $INCLUDE_DEBUG_PRUNE_CONTROL"
 echo "============================================"
 
 echo "Checking TPU status..."
@@ -132,6 +137,7 @@ EXTRA_ARGS='${EXTRA_ARGS}'
 DETACH='${DETACH}'
 INSTALL_DEPS='${INSTALL_DEPS}'
 SINGLE_DEVICE='${SINGLE_DEVICE}'
+INCLUDE_DEBUG_PRUNE_CONTROL='${INCLUDE_DEBUG_PRUNE_CONTROL}'
 WORK_DIR="\$HOME/dawn-spatial"
 
 echo "[setup] host=\$(hostname) branch=\$BRANCH"
@@ -169,6 +175,7 @@ RUN_CMD=(
 if [ -n "\$BATCH_SIZE" ]; then RUN_CMD+=(--batch_size "\$BATCH_SIZE"); fi
 if [ -n "\$SEQ_LEN" ]; then RUN_CMD+=(--seq_len "\$SEQ_LEN"); fi
 if [ "\$SINGLE_DEVICE" = "1" ]; then RUN_CMD+=(--single_device); fi
+if [ "\$INCLUDE_DEBUG_PRUNE_CONTROL" = "1" ]; then RUN_CMD+=(--include_debug_prune_control); fi
 if [ -n "\$EXTRA_ARGS" ]; then
     # shellcheck disable=SC2206
     EXTRA_ARRAY=(\$EXTRA_ARGS)

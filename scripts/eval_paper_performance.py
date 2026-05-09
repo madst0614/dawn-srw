@@ -82,6 +82,8 @@ FLOPS_NOTE = (
 )
 
 FLOP_CONVENTION = "multiply_add_2_flops"
+MAIN_REPRESENTATIVE_HARD_VARIANT = "hard_all_t099"
+DEBUG_PRUNE_MIN_LOSS_DELTA = 1.0e-2
 
 FLOPS_TABLE_COLUMNS = (
     "model_name", "variant", "val_loss", "delta_loss",
@@ -98,6 +100,15 @@ FLOPS_TABLE_COLUMNS = (
     "retained_gate_mass_qk",
     "retained_gate_mass_v",
     "retained_gate_mass_rst",
+    "full_gate_sum_qk",
+    "kept_gate_sum_qk",
+    "dropped_gate_mass_qk",
+    "full_gate_sum_v",
+    "kept_gate_sum_v",
+    "dropped_gate_mass_v",
+    "full_gate_sum_rst",
+    "kept_gate_sum_rst",
+    "dropped_gate_mass_rst",
 )
 
 DAWN_METRIC_KEYS = (
@@ -156,6 +167,16 @@ SUB_DAWN_VARIANTS = (
     Variant("sub_hard_all_t090", True, "all", 0.90),
 )
 
+DEBUG_DAWN_VARIANTS = (
+    Variant(
+        "debug_all_t101",
+        True,
+        "all",
+        1.01,
+        notes="debug-only destructive prune control; not for paper tables",
+    ),
+)
+
 
 def is_host0() -> bool:
     if jax is None:
@@ -165,7 +186,7 @@ def is_host0() -> bool:
 
 def log(msg: str) -> None:
     if is_host0():
-        print(msg, flush=True)
+        print(msg, file=sys.stderr, flush=True)
 
 
 def is_gcs(path: str | os.PathLike[str]) -> bool:
@@ -564,7 +585,9 @@ def evaluate_variant(model, params, cfg: Dict[str, Any], val_bin: str,
             stat_sums[key] = stat_sums.get(key, 0.0) + float(value) * valid_f
         n_batches_done += 1
         if is_host0() and (b + 1 == n_batches or (b + 1) % progress_every == 0):
-            print(f"    {variant.name}: {b + 1}/{n_batches} batches", flush=True)
+            end = "\n" if b + 1 == n_batches else ""
+            print(f"\r\033[K    {variant.name}: {b + 1}/{n_batches} batches",
+                  end=end, file=sys.stderr, flush=True)
 
     if total_valid <= 0:
         raise RuntimeError("No valid tokens evaluated")
@@ -884,6 +907,11 @@ def variants_for(model_entry: Dict[str, Any]) -> Tuple[Variant, ...]:
 def selected_variants_for(model_entry: Dict[str, Any],
                           args: Optional[argparse.Namespace]) -> Tuple[Variant, ...]:
     variants = variants_for(model_entry)
+    if (args is not None
+            and getattr(args, "include_debug_prune_control", False)
+            and model_entry["family"] == "dawn_srw"
+            and model_entry.get("role") == "main"):
+        variants = variants + DEBUG_DAWN_VARIANTS
     if args is None or not getattr(args, "variants", None):
         return variants
     if model_entry["family"] == "baseline":
@@ -1040,12 +1068,34 @@ def fnum(x: Any, digits: int = 4) -> Any:
         return x
 
 
+def dropped_gate_mass(retained: Any) -> Any:
+    if retained is None or retained == "":
+        return ""
+    try:
+        return 1.0 - float(retained)
+    except Exception:
+        return ""
+
+
+def gate_mass_table_fields(r: Dict[str, Any], digits: int = 8) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for pool in ("qk", "v", "rst"):
+        retained = r.get(f"{pool}_retained_gate_mass")
+        out.update({
+            f"retained_gate_mass_{pool}": fnum(retained, digits),
+            f"full_gate_sum_{pool}": fnum(r.get(f"{pool}_full_gate_sum_mean"), digits),
+            f"kept_gate_sum_{pool}": fnum(r.get(f"{pool}_kept_gate_sum_mean"), digits),
+            f"dropped_gate_mass_{pool}": fnum(dropped_gate_mass(retained), digits),
+        })
+    return out
+
+
 def flops_table_row(r: Dict[str, Any]) -> Dict[str, Any]:
     if r.get("model_type") == "dawn_srw":
         delta_loss = r.get("delta_loss_vs_full_soft")
     else:
         delta_loss = r.get("loss_delta_vs_baseline", "")
-    return {
+    row = {
         "model_name": r.get("model_name", ""),
         "variant": r.get("variant", ""),
         "val_loss": fnum(r.get("val_loss"), 5),
@@ -1065,20 +1115,86 @@ def flops_table_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "kept_qk": fnum(r.get("estimated_executed_rw_ops_qk"), 2),
         "kept_v": fnum(r.get("estimated_executed_rw_ops_v"), 2),
         "kept_rst": fnum(r.get("estimated_executed_rw_ops_rst"), 2),
-        "retained_gate_mass_qk": fnum(r.get("qk_retained_gate_mass"), 4),
-        "retained_gate_mass_v": fnum(r.get("v_retained_gate_mass"), 4),
-        "retained_gate_mass_rst": fnum(r.get("rst_retained_gate_mass"), 4),
     }
+    row.update(gate_mass_table_fields(r, digits=8))
+    return row
 
 
-def summarize_tables(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+def is_debug_variant_row(r: Dict[str, Any]) -> bool:
+    return str(r.get("variant", "")).startswith("debug_")
+
+
+def hard_pruning_table_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    row = {
+        "model_name": r["model_name"],
+        "variant": r["variant"],
+        "threshold": r.get("prune_activation_threshold"),
+        "val_loss": fnum(r["val_loss"], 5),
+        "delta_loss_vs_full": fnum(r.get("delta_loss_vs_full_soft"), 5),
+        "acc": fnum(r["accuracy"], 5),
+        "delta_acc_vs_full": fnum(r.get("delta_acc_vs_full_soft"), 5),
+        "kept_qk": fnum(r.get("estimated_executed_rw_ops_qk"), 2),
+        "kept_v": fnum(r.get("estimated_executed_rw_ops_v"), 2),
+        "kept_rst": fnum(r.get("estimated_executed_rw_ops_rst"), 2),
+        "estimated_rw_flops_ratio_vs_full_pool": fnum(r.get("estimated_rw_flops_ratio_vs_full_pool"), 5),
+    }
+    row.update(gate_mass_table_fields(r, digits=8))
+    return row
+
+
+def all_variants_appendix_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    row = {
+        "model_name": r.get("model_name", ""),
+        "model_type": r.get("model_type", ""),
+        "role": r.get("role", ""),
+        "variant": r.get("variant", ""),
+        "threshold": r.get("prune_activation_threshold", ""),
+        "params": r.get("params", ""),
+        "tokens": r.get("valid_tokens", ""),
+        "val_loss": fnum(r.get("val_loss"), 5),
+        "ppl": fnum(r.get("ppl"), 3),
+        "acc": fnum(r.get("accuracy"), 5),
+        "delta_loss_vs_full": fnum(r.get("delta_loss_vs_full_soft"), 5),
+        "delta_acc_vs_full": fnum(r.get("delta_acc_vs_full_soft"), 5),
+        "loss_delta_vs_baseline": fnum(r.get("loss_delta_vs_baseline"), 5),
+        "accuracy_delta_vs_baseline": fnum(r.get("accuracy_delta_vs_baseline"), 5),
+        "active_qk": fnum(r.get("qk_active_count_mean"), 2),
+        "active_v": fnum(r.get("v_active_count_mean"), 2),
+        "active_rst": fnum(r.get("rst_active_count_mean"), 2),
+        "strong_qk": fnum(r.get("qk_strong_count_mean"), 2),
+        "strong_v": fnum(r.get("v_strong_count_mean"), 2),
+        "strong_rst": fnum(r.get("rst_strong_count_mean"), 2),
+        "kept_qk": fnum(r.get("estimated_executed_rw_ops_qk"), 2),
+        "kept_v": fnum(r.get("estimated_executed_rw_ops_v"), 2),
+        "kept_rst": fnum(r.get("estimated_executed_rw_ops_rst"), 2),
+        "ratio_sparse_exact_vs_transformer": fnum(r.get("ratio_sparse_exact_vs_transformer"), 5),
+        "ratio_sparse_exact_vs_dawn_full": fnum(r.get("ratio_sparse_exact_vs_dawn_full"), 5),
+        "ratio_sparse_rw_only_vs_full_rw": fnum(r.get("ratio_sparse_rw_only_vs_full_rw"), 5),
+        "estimated_rw_flops_ratio_vs_full_pool": fnum(r.get("estimated_rw_flops_ratio_vs_full_pool"), 5),
+        "notes": r.get("notes", ""),
+    }
+    row.update(gate_mass_table_fields(r, digits=8))
+    return row
+
+
+def debug_control_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    row = all_variants_appendix_row(r)
+    row["debug_note"] = "not for paper tables; destructive pruning-path control"
+    return row
+
+
+def summarize_tables(rows: List[Dict[str, Any]],
+                     main_hard_variant: str = MAIN_REPRESENTATIVE_HARD_VARIANT
+                     ) -> Dict[str, List[Dict[str, Any]]]:
     ok = [r for r in rows if r.get("status", "ok") == "ok"]
+    paper_ok = [r for r in ok if not is_debug_variant_row(r)]
+    debug_ok = [r for r in ok if is_debug_variant_row(r)]
     main_perf = []
-    for r in ok:
+    for r in paper_ok:
         if r.get("model_type") == "baseline_transformer" or (
                 r.get("model_type") == "dawn_srw"
                 and r.get("role") == "main"
-                and r.get("variant") in ("full_soft", "hard_all_t090")):
+                and r.get("variant") in ("full_soft", main_hard_variant)):
             main_perf.append({
                 "model_name": r["model_name"] if r.get("variant") in ("full_validation", "full_soft") else f"{r['model_name']} ({r['variant']})",
                 "model_type": r["model_type"],
@@ -1091,50 +1207,28 @@ def summarize_tables(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
             })
 
     hard_main = []
-    for r in ok:
+    main_hard_variants = {
+        "full_soft",
+        main_hard_variant,
+        "hard_rst_t090",
+        "hard_attn_t090",
+        "hard_qk_t090",
+        "hard_v_t090",
+    }
+    for r in paper_ok:
         if r.get("model_type") == "dawn_srw" and r.get("role") == "main" and (
-                r.get("variant") == "full_soft" or r.get("variant", "").endswith("_t090")):
-            hard_main.append({
-                "model_name": r["model_name"],
-                "variant": r["variant"],
-                "threshold": r.get("prune_activation_threshold"),
-                "val_loss": fnum(r["val_loss"], 5),
-                "delta_loss_vs_full": fnum(r.get("delta_loss_vs_full_soft"), 5),
-                "acc": fnum(r["accuracy"], 5),
-                "delta_acc_vs_full": fnum(r.get("delta_acc_vs_full_soft"), 5),
-                "kept_qk": fnum(r.get("estimated_executed_rw_ops_qk"), 2),
-                "kept_v": fnum(r.get("estimated_executed_rw_ops_v"), 2),
-                "kept_rst": fnum(r.get("estimated_executed_rw_ops_rst"), 2),
-                "retained_gate_mass_qk": fnum(r.get("qk_retained_gate_mass"), 4),
-                "retained_gate_mass_v": fnum(r.get("v_retained_gate_mass"), 4),
-                "retained_gate_mass_rst": fnum(r.get("rst_retained_gate_mass"), 4),
-                "estimated_rw_flops_ratio_vs_full_pool": fnum(r.get("estimated_rw_flops_ratio_vs_full_pool"), 5),
-            })
+                r.get("variant") in main_hard_variants):
+            hard_main.append(hard_pruning_table_row(r))
 
     threshold_sweep = []
-    for r in ok:
+    for r in paper_ok:
         if r.get("model_type") == "dawn_srw" and r.get("role") == "main" and (
                 r.get("variant") == "full_soft" or r.get("variant", "").startswith("hard_all_t")):
-            threshold_sweep.append(dict(hard_main[-1]) if False else {
-                "model_name": r["model_name"],
-                "variant": r["variant"],
-                "threshold": r.get("prune_activation_threshold"),
-                "val_loss": fnum(r["val_loss"], 5),
-                "delta_loss_vs_full": fnum(r.get("delta_loss_vs_full_soft"), 5),
-                "acc": fnum(r["accuracy"], 5),
-                "delta_acc_vs_full": fnum(r.get("delta_acc_vs_full_soft"), 5),
-                "kept_qk": fnum(r.get("estimated_executed_rw_ops_qk"), 2),
-                "kept_v": fnum(r.get("estimated_executed_rw_ops_v"), 2),
-                "kept_rst": fnum(r.get("estimated_executed_rw_ops_rst"), 2),
-                "retained_gate_mass_qk": fnum(r.get("qk_retained_gate_mass"), 4),
-                "retained_gate_mass_v": fnum(r.get("v_retained_gate_mass"), 4),
-                "retained_gate_mass_rst": fnum(r.get("rst_retained_gate_mass"), 4),
-                "estimated_rw_flops_ratio_vs_full_pool": fnum(r.get("estimated_rw_flops_ratio_vs_full_pool"), 5),
-            })
+            threshold_sweep.append(hard_pruning_table_row(r))
 
     sub_rows = []
     by_model = {}
-    for r in ok:
+    for r in paper_ok:
         if r.get("model_type") == "dawn_srw" and r.get("role") == "sub":
             by_model.setdefault(r["model_name"], {})[r["variant"]] = r
     for name, variants in by_model.items():
@@ -1159,9 +1253,9 @@ def summarize_tables(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
             "strong_ratio_qk": fnum(full.get("qk_strong_frac_mean"), 5),
             "strong_ratio_v": fnum(full.get("v_strong_frac_mean"), 5),
             "strong_ratio_rst": fnum(full.get("rst_strong_frac_mean"), 5),
-            "retained_gate_mass_qk": fnum(strong.get("qk_retained_gate_mass"), 4),
-            "retained_gate_mass_v": fnum(strong.get("v_retained_gate_mass"), 4),
-            "retained_gate_mass_rst": fnum(strong.get("rst_retained_gate_mass"), 4),
+            "retained_gate_mass_qk": fnum(strong.get("qk_retained_gate_mass"), 8),
+            "retained_gate_mass_v": fnum(strong.get("v_retained_gate_mass"), 8),
+            "retained_gate_mass_rst": fnum(strong.get("rst_retained_gate_mass"), 8),
             "estimated_rw_flops_ratio_vs_full_pool": fnum(strong.get("estimated_rw_flops_ratio_vs_full_pool"), 5),
         })
 
@@ -1191,24 +1285,26 @@ def summarize_tables(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
         })
 
     flops_main = []
-    for r in ok:
+    for r in paper_ok:
         is_main_model = (
             r.get("model_type") == "baseline_transformer"
             or r.get("role") == "main"
         )
         is_main_variant = (
-            r.get("variant") in ("full_validation", "full_soft", "hard_all_t090")
+            r.get("variant") in ("full_validation", "full_soft", main_hard_variant)
         )
         if is_main_model and is_main_variant:
             flops_main.append(flops_table_row(r))
 
-    flops_appendix = [flops_table_row(r) for r in ok]
+    flops_appendix = [flops_table_row(r) for r in paper_ok]
     flops_tradeoff = [
-        flops_table_row(r) for r in ok
+        flops_table_row(r) for r in paper_ok
         if r.get("model_type") == "dawn_srw"
     ]
+    all_variants_appendix = [all_variants_appendix_row(r) for r in paper_ok]
+    debug_controls = [debug_control_row(r) for r in debug_ok]
 
-    return {
+    tables = {
         "table_main_performance.csv": main_perf,
         "table_dawn_hard_pruning_main.csv": hard_main,
         "table_dawn_threshold_sweep_appendix.csv": threshold_sweep,
@@ -1217,7 +1313,11 @@ def summarize_tables(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any
         "table_theoretical_flops_main.csv": flops_main,
         "table_theoretical_flops_appendix.csv": flops_appendix,
         "table_flops_vs_loss_tradeoff.csv": flops_tradeoff,
+        "table_all_variants_appendix.csv": all_variants_appendix,
     }
+    if debug_controls:
+        tables["debug_prune_control_not_for_paper.csv"] = debug_controls
+    return tables
 
 
 def markdown_table(rows: Sequence[Dict[str, Any]]) -> str:
@@ -1296,6 +1396,18 @@ def write_readme(output_dir: str) -> None:
         "- table_theoretical_flops_main.csv: main FLOPs accounting rows.\n"
         "- table_theoretical_flops_appendix.csv: all model/variant FLOPs accounting rows.\n"
         "- table_flops_vs_loss_tradeoff.csv: DAWN FLOPs/loss tradeoff rows.\n\n"
+        "- table_all_variants_appendix.csv: compact one-stop appendix across all non-debug rows.\n\n"
+        "Debug controls:\n"
+        "- debug_all_t101 is an optional destructive pruning-path control enabled by "
+        "--include_debug_prune_control. It hard-prunes all pools at activation "
+        "threshold 1.01 and is not intended for paper performance tables.\n"
+        "- If debug_all_t101 is run and its loss is almost unchanged from full_soft, "
+        "the sanity check fails because that would suggest the pruning path is not "
+        "affecting the forward output.\n\n"
+        "Rerun note:\n"
+        "- The launch wrappers use --resume_existing. After code or table-format "
+        "changes, prefer a fresh --output_dir to avoid accidentally reusing old "
+        "raw rows for newly added variants or diagnostics.\n\n"
         "The final console summary also prints full copyable CSV blocks between "
         "COPYABLE_PAPER_DATA_CSV_BEGIN and COPYABLE_PAPER_DATA_CSV_END.\n"
     )
@@ -1305,7 +1417,7 @@ def write_readme(output_dir: str) -> None:
 def save_outputs(output_dir: str, rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
     raw_csv = join_path(output_dir, "results_raw.csv")
     write_csv(raw_csv, rows)
-    tables = summarize_tables(rows)
+    tables = summarize_tables(rows, args.main_hard_variant)
     for filename, table_rows in tables.items():
         columns = FLOPS_TABLE_COLUMNS if filename in (
             "table_theoretical_flops_main.csv",
@@ -1327,6 +1439,7 @@ def print_console_summary(tables: Dict[str, List[Dict[str, Any]]], output_dir: s
         ("DAWN Sub Strong Compare", "table_dawn_sub_strong_compare.csv"),
         ("Theoretical FLOPs Main", "table_theoretical_flops_main.csv"),
         ("FLOPs vs Loss Tradeoff", "table_flops_vs_loss_tradeoff.csv"),
+        ("All Variants Appendix", "table_all_variants_appendix.csv"),
     )
     for title, filename in summary_files:
         print(f"\n=== {title} ===")
@@ -1351,6 +1464,8 @@ def print_console_summary(tables: Dict[str, List[Dict[str, Any]]], output_dir: s
             "table_theoretical_flops_main.csv",
             "table_theoretical_flops_appendix.csv",
             "table_flops_vs_loss_tradeoff.csv",
+            "table_all_variants_appendix.csv",
+            "debug_prune_control_not_for_paper.csv",
             "paper_tables.md", "paper_tables.tex",
             "run_manifest_resolved.yaml", "README.txt"):
         print(f"  {join_path(output_dir, fn)}")
@@ -1392,6 +1507,43 @@ def sanity_checks(rows: List[Dict[str, Any]]) -> None:
             k99 = by_variant["hard_all_t099"].get("estimated_executed_rw_ops_total_per_token_per_layer")
             if k90 is not None and k99 is not None and float(k99) > float(k90) + 1e-3:
                 raise ValueError(f"{name}: hard_all_t099 kept more neurons than hard_all_t090")
+        threshold_order = [
+            "hard_all_t050",
+            "hard_all_t070",
+            "hard_all_t080",
+            "hard_all_t090",
+            "hard_all_t095",
+            "hard_all_t099",
+        ]
+        for pool in ("qk", "v", "rst"):
+            prev_name = None
+            prev_kept = None
+            for variant_name in threshold_order:
+                row = by_variant.get(variant_name)
+                if not row:
+                    continue
+                kept = float(row.get(f"{pool}_kept_count_mean") or 0.0)
+                if prev_kept is not None and kept > prev_kept + 1e-3:
+                    raise ValueError(
+                        f"{name}: {pool} kept_count is not monotonic: "
+                        f"{variant_name} kept {kept} > {prev_name} kept {prev_kept}")
+                prev_name = variant_name
+                prev_kept = kept
+        debug_row = by_variant.get("debug_all_t101")
+        full_row = by_variant.get("full_soft")
+        if debug_row and full_row:
+            debug_loss = float(debug_row["val_loss"])
+            full_loss = float(full_row["val_loss"])
+            if abs(debug_loss - full_loss) < DEBUG_PRUNE_MIN_LOSS_DELTA:
+                raise ValueError(
+                    f"{name}: debug_all_t101 loss {debug_loss:.6f} is too close "
+                    f"to full_soft loss {full_loss:.6f}; pruning path may not "
+                    "be affecting forward output")
+            for pool in ("qk", "v", "rst"):
+                kept = float(debug_row.get(f"{pool}_kept_count_mean") or 0.0)
+                if kept > 1e-3:
+                    raise ValueError(
+                        f"{name}: debug_all_t101 {pool} kept_count should be zero, got {kept}")
 
 
 def parse_config_explore_fields(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1419,7 +1571,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--variants", default=None,
                     help=("Comma-separated DAWN variants to run. Baseline "
                           "full_validation is always kept. Example: "
-                          "full_soft,hard_all_t090"))
+                          "full_soft,hard_all_t099"))
+    ap.add_argument("--main_hard_variant", default=MAIN_REPRESENTATIVE_HARD_VARIANT,
+                    help=("Representative main-table hard-pruned DAWN variant. "
+                          "Default: hard_all_t099."))
+    ap.add_argument("--include_debug_prune_control", action="store_true",
+                    help=("Run debug_all_t101 on main DAWN checkpoints as a "
+                          "destructive pruning-path control. Not used in paper tables."))
     ap.add_argument("--no_latex", action="store_true")
     ap.add_argument("--no_markdown", action="store_true")
     ap.add_argument("--exclude_lm_head_flops", dest="include_lm_head_flops",
@@ -1559,7 +1717,7 @@ def main() -> None:
     sanity_checks(rows)
     write_jsonl(raw_path, rows)
     save_outputs(output_dir, rows, args)
-    print_console_summary(summarize_tables(rows), output_dir)
+    print_console_summary(summarize_tables(rows, args.main_hard_variant), output_dir)
 
 
 if __name__ == "__main__":
