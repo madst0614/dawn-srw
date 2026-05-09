@@ -440,6 +440,35 @@ def _list_files(directory, pattern="*.flax"):
     return sorted((str(f) for f in Path(dir_str).glob(pattern)), key=_sort_key)
 
 
+def _select_resume_checkpoint(folder):
+    """Pick the best checkpoint for continuing training from a run folder.
+
+    best_model.flax may point to an older validation-best step, so it is only
+    used as a fallback when no step/epoch/emergency checkpoint exists.
+    """
+    import re
+    candidates = _list_files(folder, "*.flax")
+    if not candidates:
+        return None
+
+    def _name(path):
+        return str(path).rsplit('/', 1)[-1]
+
+    def _step_key(path):
+        name = _name(path)
+        m = re.match(r'(?:checkpoint_step|emergency_step)(\d+)\.flax$', name)
+        if m:
+            return (3, int(m.group(1)))
+        m = re.match(r'checkpoint_epoch(\d+)\.flax$', name)
+        if m:
+            return (2, int(m.group(1)))
+        if name == 'best_model.flax':
+            return (1, -1)
+        return (0, -1)
+
+    return max(candidates, key=_step_key)
+
+
 def _makedirs(path):
     """Create directory (local only; GCS doesn't need explicit mkdir)."""
     if not _is_gcs(path):
@@ -3171,9 +3200,9 @@ def main():
         if jax.process_index() == 0:
             if cli_args.resume_from:
                 folder = cli_args.resume_from.rstrip('/')
-                candidates = _list_files(folder, "*.flax")
-                if candidates:
-                    _host0_resume_path = candidates[-1]
+                selected = _select_resume_checkpoint(folder)
+                if selected:
+                    _host0_resume_path = selected
                     _host0_checkpoint_dir = folder
                     print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
                     print(f"  Resuming from: {_host0_resume_path}")
@@ -3183,9 +3212,9 @@ def main():
             else:
                 run_folders = _list_run_folders(base_checkpoint_dir)
                 for folder in reversed(run_folders):
-                    candidates = _list_files(folder, "*.flax")
-                    if candidates:
-                        _host0_resume_path = candidates[-1]
+                    selected = _select_resume_checkpoint(folder)
+                    if selected:
+                        _host0_resume_path = selected
                         _host0_checkpoint_dir = folder
                         print(f"  Auto-resume: found checkpoint in {_host0_checkpoint_dir}")
                         print(f"  Resuming from: {_host0_resume_path}")
@@ -4337,6 +4366,26 @@ def main():
                 print(f"\n  *** train_step check FAILED: {type(e).__name__}: {e}")
                 print("  This is not necessarily OOM; it is a code/runtime error during the dummy train_step.")
         raise
+
+    # The OOM/JIT probe intentionally consumes two RNG splits before the
+    # training loop on both fresh and resumed runs. After a resume, advance
+    # from that same post-probe RNG state by the number of completed training
+    # micro-steps so dropout keys line up with an uninterrupted run.
+    if _is_resuming and global_step > 0:
+        if is_host0:
+            print(
+                f"  Advancing train RNG by {global_step} completed step(s) "
+                "for deterministic resume",
+                flush=True,
+            )
+
+        def _advance_rng_by_splits(key, n_steps):
+            def _body(_, k):
+                k, _ = jax.random.split(k)
+                return k
+            return jax.lax.fori_loop(0, int(n_steps), _body, key)
+
+        rng = _advance_rng_by_splits(rng, global_step)
 
     # ----------------------------------------------------------
     # Training log file (host 0 only)

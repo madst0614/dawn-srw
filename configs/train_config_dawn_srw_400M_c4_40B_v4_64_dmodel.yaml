@@ -32,7 +32,7 @@ model:
   n_qk: 2330
   n_v: 14640
   n_know: 29130
-  router_dropout: 0.02
+  router_dropout: 0.005
 
 training:
   batch_size: 1024
