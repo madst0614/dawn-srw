@@ -1166,6 +1166,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'raw_scan_offset_attn',
             params.get('router', {}).get('raw_scan_offset_attn', {})).get(
                 'bias', jnp.zeros(3))
+        explore_loss_weighted_metric = (
+            jnp.float32(exploration_weight)
+            * explore_stats['explore_loss_raw']
+            * explore_stats['explore_active'])
 
         metrics = {
             'total_loss': total_loss,
@@ -1197,7 +1201,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'exploration_loss_weighted_rst': (
                 exploration_weight * explore_stats['explore_rst_raw']
                 * explore_stats['explore_active']),
-            'exploration_loss_weighted_total': explore_loss_weighted,
+            'exploration_loss_weighted_total': explore_loss_weighted_metric,
             'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
             'exploration_raw_post_bound': explore_stats['explore_loss_raw'],
             'exploration_attn_pre_bound': explore_stats['explore_attn_pre_bound'],
@@ -1212,7 +1216,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + orth_weight * orth_loss
                 + div_weight * div_loss
                 + dead_penalty_weight * dead_penalty
-                + explore_loss_weighted)),
+                + explore_loss_weighted_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
