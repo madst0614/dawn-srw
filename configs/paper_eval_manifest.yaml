@@ -63,7 +63,7 @@ experiments:
         checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_v_more_ex3/run_vdawn_srw_20260503_232315_3201
         mesh_model: 2
 
-      - name: dawn_srw_v2_more_ex5
-        config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128_v2_more_ex5.yaml
-        checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_v2_more_ex5/run_vdawn_srw_20260508_033114_3201
+      - name: dawn_srw_v2_more_ex3
+        config: configs/train_config_spatial_r1_v4_1_5_5_40M_c4_5B_tag128_v2_more_ex3.yaml
+        checkpoint: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_v2_more_ex3/run_vdawn_srw_20260503_232307_3201
         mesh_model: 2
