@@ -161,20 +161,6 @@ class Variant:
     return_prune_stats: bool = True
 
 
-MAIN_DAWN_VARIANTS = (
-    Variant("full_soft", False, "all", None, notes="soft-gated full pool"),
-    Variant("hard_all_t050", True, "all", 0.50),
-    Variant("hard_all_t070", True, "all", 0.70),
-    Variant("hard_all_t080", True, "all", 0.80),
-    Variant("hard_all_t090", True, "all", 0.90),
-    Variant("hard_all_t095", True, "all", 0.95),
-    Variant("hard_all_t099", True, "all", 0.99),
-    Variant("hard_rst_t090", True, "rst", 0.90),
-    Variant("hard_attn_t090", True, "attn", 0.90),
-    Variant("hard_qk_t090", True, "qk", 0.90),
-    Variant("hard_v_t090", True, "v", 0.90),
-)
-
 FORWARD_PATH_VALIDATION_VARIANT = Variant(
     HARD_T101_VARIANT,
     True,
@@ -184,12 +170,26 @@ FORWARD_PATH_VALIDATION_VARIANT = Variant(
     notes="forward-path validation boundary case; all RW neurons removed",
 )
 
+MAIN_DAWN_VARIANTS = (
+    Variant("full_soft", False, "all", None, notes="soft-gated full pool"),
+    Variant("hard_all_t050", True, "all", 0.50),
+    Variant("hard_all_t070", True, "all", 0.70),
+    Variant("hard_all_t080", True, "all", 0.80),
+    Variant("hard_all_t090", True, "all", 0.90),
+    Variant("hard_all_t095", True, "all", 0.95),
+    Variant("hard_all_t099", True, "all", 0.99),
+    FORWARD_PATH_VALIDATION_VARIANT,
+    Variant("hard_rst_t090", True, "rst", 0.90),
+    Variant("hard_attn_t090", True, "attn", 0.90),
+    Variant("hard_qk_t090", True, "qk", 0.90),
+    Variant("hard_v_t090", True, "v", 0.90),
+)
+
 SUB_DAWN_VARIANTS = (
     Variant("full_soft", False, "all", None, notes="soft-gated full pool"),
     Variant("sub_hard_all_t090", True, "all", 0.90),
 )
 
-MAIN_DAWN_VARIANTS = MAIN_DAWN_VARIANTS + (FORWARD_PATH_VALIDATION_VARIANT,)
 FORWARD_PATH_VALIDATION_VARIANTS = (FORWARD_PATH_VALIDATION_VARIANT,)
 
 
