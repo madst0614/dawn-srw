@@ -598,19 +598,30 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         global_active = jax.lax.psum(total_active, 'model')
-        active_frac = global_active / N_total
-        strong_frac = jax.lax.psum(total_strong, 'model') / N_total
-        z_mean_active = jax.lax.psum(total_weighted_cost, 'model') / (global_active + 1e-8)
+        # Measurement path: detached copies for diagnostics / feedback refs.
+        # Action path above keeps global_den_cost/global_weighted_cost live for
+        # the SRW denominator and output gradient.
+        global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
+        global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
+        global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
+        global_activation_cost_m = jax.lax.stop_gradient(global_activation_cost)
+        global_current_cost_m = jax.lax.stop_gradient(global_current_cost)
+        global_active_m = jax.lax.stop_gradient(global_active)
+        global_strong_m = jax.lax.stop_gradient(
+            jax.lax.psum(total_strong, 'model'))
+        global_gate_max_m = jax.lax.stop_gradient(global_gate_max)
+        active_frac = global_active_m / N_total
+        strong_frac = global_strong_m / N_total
+        z_mean_active = global_weighted_cost_m / (global_active_m + 1e-8)
 
-        score_std_out = s_std.mean()
-        es_out = global_weighted_cost.mean()          # sum(gate), observational
-        active_n_mean = global_active.mean()
-        gate_eff_n = jax.lax.stop_gradient(
-            (global_weighted_cost ** 2) / (global_gate_sq + 1e-8))
-        gate_eff_ratio = jax.lax.stop_gradient(
-            gate_eff_n / jnp.maximum(global_active, 1.0))
-        top1_gate_frac = jax.lax.stop_gradient(
-            global_gate_max / jnp.maximum(global_weighted_cost, 1e-8))
+        score_std_out = jax.lax.stop_gradient(s_std.mean())
+        es_out = global_weighted_cost_m.mean()          # sum(gate), observational
+        active_n_mean = global_active_m.mean()
+        gate_eff_n = ((global_weighted_cost_m ** 2)
+                      / (global_gate_sq_m + 1e-8))
+        gate_eff_ratio = gate_eff_n / jnp.maximum(global_active_m, 1.0)
+        top1_gate_frac = global_gate_max_m / jnp.maximum(
+            global_weighted_cost_m, 1e-8)
         tau_abs_mean = jax.lax.stop_gradient(tau).mean()
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
@@ -619,9 +630,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_max_out = jax.lax.pmax(
             jax.lax.stop_gradient(total_int_max), 'model')
 
-        den_cost_mean = global_den_cost.mean()
-        activation_cost_mean = global_activation_cost.mean()
-        current_cost_mean = global_current_cost.mean()
+        den_cost_mean = global_den_cost_m.mean()
+        activation_cost_mean = global_activation_cost_m.mean()
+        current_cost_mean = global_current_cost_m.mean()
 
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                     score_std_out, es_out, active_n_mean, strong_frac, z_mean_active,
@@ -633,42 +644,47 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         if _return_prune_stats:
             global_full_gate = jax.lax.psum(total_full_gate, 'model')
             global_kept_count = jax.lax.psum(total_kept_count, 'model')
+            global_full_gate_m = jax.lax.stop_gradient(global_full_gate)
+            global_kept_count_m = jax.lax.stop_gradient(global_kept_count)
             retained_gate_mass = (
-                global_weighted_cost / jnp.maximum(global_full_gate, 1e-8))
+                global_weighted_cost_m / jnp.maximum(global_full_gate_m, 1e-8))
             int_cap_frac_out = jax.lax.stop_gradient(
                 jax.lax.psum(total_int_cap_count, 'model')
                 / jnp.float32(B * S * N_total))
             prune_out = (
-                global_kept_count.mean(),
-                (global_kept_count / N_total).mean(),
-                global_full_gate.mean(),
-                global_weighted_cost.mean(),
+                global_kept_count_m.mean(),
+                (global_kept_count_m / N_total).mean(),
+                global_full_gate_m.mean(),
+                global_weighted_cost_m.mean(),
                 retained_gate_mass.mean(),
                 int_cap_frac_out,
-                global_gate_max.mean(),
+                global_gate_max_m.mean(),
             )
         if not analysis:
             return slim_out + conc_out + prune_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
+        phi_binary_frac = jax.lax.stop_gradient(phi_binary_frac)
         # Safety floor: active can collapse to 0 at init; clamp to 1.0.
-        _active_denom = jnp.maximum(global_active, 1.0)
+        _active_denom = jnp.maximum(global_active_m, 1.0)
         z_lt_075_frac = jax.lax.stop_gradient(
             (jax.lax.psum(total_z_lt_075, 'model') / _active_denom).mean())
         z_lt_030_frac = jax.lax.stop_gradient(
             (jax.lax.psum(total_z_lt_030, 'model') / _active_denom).mean())
-        active_per_token_std = jax.lax.stop_gradient(global_active).std()
-        global_g_log_g = jax.lax.psum(total_g_log_g, 'model')
-        gate_sum_eps = jnp.maximum(global_weighted_cost, 1e-6)
-        safe_glogg = jnp.where(global_weighted_cost > 1e-6, global_g_log_g, 0.0)
+        active_per_token_std = global_active_m.std()
+        global_g_log_g = jax.lax.stop_gradient(
+            jax.lax.psum(total_g_log_g, 'model'))
+        gate_sum_eps = jnp.maximum(global_weighted_cost_m, 1e-6)
+        safe_glogg = jnp.where(
+            global_weighted_cost_m > 1e-6, global_g_log_g, 0.0)
         entropy_per_token = -safe_glogg / gate_sum_eps + jnp.log(gate_sum_eps)
         entropy_per_token = jnp.where(
             jnp.isfinite(entropy_per_token), entropy_per_token, 0.0)
-        gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
-        den_cost_out = global_den_cost.mean()
-        activation_cost_out = jax.lax.psum(total_activation_cost, 'model').mean()
-        current_cost_out = jax.lax.psum(total_current_cost, 'model').mean()
+        gate_entropy = entropy_per_token.mean()
+        den_cost_out = global_den_cost_m.mean()
+        activation_cost_out = global_activation_cost_m.mean()
+        current_cost_out = global_current_cost_m.mean()
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * N_total))
@@ -1081,23 +1097,34 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         out = jax.lax.psum(out.astype(jnp.bfloat16), 'model')
 
         global_active = jax.lax.psum(total_active, 'model')
-        active_frac = global_active / N_total
+        # Measurement path: detached copies for diagnostics / feedback refs.
+        # Action path above keeps global_den_cost/global_weighted_cost live for
+        # the SRW denominator and output gradient.
+        global_weighted_cost_m = jax.lax.stop_gradient(global_weighted_cost)
+        global_gate_sq_m = jax.lax.stop_gradient(global_gate_sq)
+        global_den_cost_m = jax.lax.stop_gradient(global_den_cost)
+        global_activation_cost_m = jax.lax.stop_gradient(global_activation_cost)
+        global_current_cost_m = jax.lax.stop_gradient(global_current_cost)
+        global_active_m = jax.lax.stop_gradient(global_active)
+        global_strong_m = jax.lax.stop_gradient(
+            jax.lax.psum(total_strong, 'model'))
+        global_gate_max_m = jax.lax.stop_gradient(global_gate_max)
+        active_frac = global_active_m / N_total
         active_frac_mean = active_frac.mean(axis=2)
-        strong_frac = jax.lax.psum(total_strong, 'model') / N_total
+        strong_frac = global_strong_m / N_total
         strong_frac_mean = strong_frac.mean(axis=2)
-        z_mean_active = global_weighted_cost / (global_active + 1e-8)
+        z_mean_active = global_weighted_cost_m / (global_active_m + 1e-8)
         z_mean_active_mean = z_mean_active.mean(axis=2)
-        raw_gate_max_mean = global_gate_max.mean(axis=2)
+        raw_gate_max_mean = global_gate_max_m.mean(axis=2)
 
-        score_std_out = s_std.mean()
-        es_out = global_weighted_cost.mean()
-        active_n_mean = global_active.mean()
-        gate_eff_n = jax.lax.stop_gradient(
-            (global_weighted_cost ** 2) / (global_gate_sq + 1e-8))
-        gate_eff_ratio = jax.lax.stop_gradient(
-            gate_eff_n / jnp.maximum(global_active, 1.0))
-        top1_gate_frac = jax.lax.stop_gradient(
-            global_gate_max / jnp.maximum(global_weighted_cost, 1e-8))
+        score_std_out = jax.lax.stop_gradient(s_std.mean())
+        es_out = global_weighted_cost_m.mean()
+        active_n_mean = global_active_m.mean()
+        gate_eff_n = ((global_weighted_cost_m ** 2)
+                      / (global_gate_sq_m + 1e-8))
+        gate_eff_ratio = gate_eff_n / jnp.maximum(global_active_m, 1.0)
+        top1_gate_frac = global_gate_max_m / jnp.maximum(
+            global_weighted_cost_m, 1e-8)
         tau_abs_mean = jax.lax.stop_gradient(tau).mean()
         dead_penalty_out = jax.lax.psum(total_dead_penalty, 'model')
         dead_count_out = jax.lax.stop_gradient(
@@ -1105,9 +1132,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_max_out = jax.lax.pmax(
             jax.lax.stop_gradient(total_int_max), 'model')
 
-        den_cost_mean = global_den_cost.mean()
-        activation_cost_mean = global_activation_cost.mean()
-        current_cost_mean = global_current_cost.mean()
+        den_cost_mean = global_den_cost_m.mean()
+        activation_cost_mean = global_activation_cost_m.mean()
+        current_cost_mean = global_current_cost_m.mean()
 
         slim_out = (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                     score_std_out, es_out, active_n_mean, strong_frac_mean,
@@ -1119,42 +1146,46 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         if _return_prune_stats:
             global_full_gate = jax.lax.psum(total_full_gate, 'model')
             global_kept_count = jax.lax.psum(total_kept_count, 'model')
+            global_full_gate_m = jax.lax.stop_gradient(global_full_gate)
+            global_kept_count_m = jax.lax.stop_gradient(global_kept_count)
             retained_gate_mass = (
-                global_weighted_cost / jnp.maximum(global_full_gate, 1e-8))
+                global_weighted_cost_m / jnp.maximum(global_full_gate_m, 1e-8))
             int_cap_frac_out = jax.lax.stop_gradient(
                 jax.lax.psum(total_int_cap_count, 'model')
                 / jnp.float32(B * S * 2 * N_total))
             prune_out = (
-                global_kept_count.mean(),
-                (global_kept_count / N_total).mean(),
-                global_full_gate.mean(),
-                global_weighted_cost.mean(),
+                global_kept_count_m.mean(),
+                (global_kept_count_m / N_total).mean(),
+                global_full_gate_m.mean(),
+                global_weighted_cost_m.mean(),
                 retained_gate_mass.mean(),
                 int_cap_frac_out,
-                global_gate_max.mean(),
+                global_gate_max_m.mean(),
             )
         if not analysis:
             return slim_out + conc_out + prune_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
-        phi_binary_frac_mean = phi_binary_frac.mean(axis=2)
-        _active_denom = jnp.maximum(global_active, 1.0)
+        phi_binary_frac_mean = jax.lax.stop_gradient(phi_binary_frac).mean(axis=2)
+        _active_denom = jnp.maximum(global_active_m, 1.0)
         z_lt_075_frac = jax.lax.stop_gradient(
             (jax.lax.psum(total_z_lt_075, 'model') / _active_denom).mean())
         z_lt_030_frac = jax.lax.stop_gradient(
             (jax.lax.psum(total_z_lt_030, 'model') / _active_denom).mean())
-        active_per_token_std = jax.lax.stop_gradient(global_active).std()
-        global_g_log_g = jax.lax.psum(total_g_log_g, 'model')
-        gate_sum_eps = jnp.maximum(global_weighted_cost, 1e-6)
-        safe_glogg = jnp.where(global_weighted_cost > 1e-6, global_g_log_g, 0.0)
+        active_per_token_std = global_active_m.std()
+        global_g_log_g = jax.lax.stop_gradient(
+            jax.lax.psum(total_g_log_g, 'model'))
+        gate_sum_eps = jnp.maximum(global_weighted_cost_m, 1e-6)
+        safe_glogg = jnp.where(
+            global_weighted_cost_m > 1e-6, global_g_log_g, 0.0)
         entropy_per_token = -safe_glogg / gate_sum_eps + jnp.log(gate_sum_eps)
         entropy_per_token = jnp.where(
             jnp.isfinite(entropy_per_token), entropy_per_token, 0.0)
-        gate_entropy = jax.lax.stop_gradient(entropy_per_token).mean()
-        den_cost_out = global_den_cost.mean()
-        activation_cost_out = jax.lax.psum(total_activation_cost, 'model').mean()
-        current_cost_out = jax.lax.psum(total_current_cost, 'model').mean()
+        gate_entropy = entropy_per_token.mean()
+        den_cost_out = global_den_cost_m.mean()
+        activation_cost_out = global_activation_cost_m.mean()
+        current_cost_out = global_current_cost_m.mean()
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * 2 * N_total))

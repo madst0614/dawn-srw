@@ -68,6 +68,7 @@ echo "[3/4] Skipping standalone JAX TPU preflight; train_jax.py will verify devi
 # 4. Launch training in tmux (survives SSH disconnect)
 echo "[4/4] Starting training in tmux session 'train'..."
 echo "  Config: $CONFIG"
+echo "  Train args: ${TRAIN_ARGS:-}"
 echo "  Host: $(hostname)"
 echo "  Timestamp: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "  Log: ~/train.log"

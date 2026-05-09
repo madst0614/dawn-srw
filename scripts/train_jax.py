@@ -744,12 +744,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
+                      weight_decay=0.0, pool_weight_decay=0.0,
                       exploration_warmup_steps=5000,
                       exploration_lower_bound=-0.5,
                       exploration_upper_bound=2.0,
                       exploration_bound_eps=1.0e-3,
                       is_baseline=False, is_spatial=False,
-                      sharded_fns=None, mesh=None):
+                      sharded_fns=None, mesh=None,
+                      debug_diagnostics=False):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
     v4.1 explore (redesigned): no EMA, no warmup. For every step compute
@@ -830,12 +832,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             if have_explore:
                 vmask_f = valid_mask.astype(jnp.float32)
                 # Global mean CE across all valid tokens (multi-host safe).
-                global_mean_ce = _global_mean_reducer(per_token_ce, valid_mask)
-                # Signed deviation; gradient only flows through tau_offset.
+                global_mean_ce = jax.lax.stop_gradient(
+                    _global_mean_reducer(per_token_ce, valid_mask))
+                # RPE/easy-hard coefficient is measurement feedback only.
+                # Keep CE's own gradient path through ce_loss, not through RPE.
                 deviation = jax.lax.stop_gradient(
                     per_token_ce - global_mean_ce)                   # [B, S-1]
                 # Asymmetric: full push on hard tokens, `asym`쨌push on easy ones.
-                signal = jnp.where(deviation > 0, deviation, _asym * deviation)
+                signal = jax.lax.stop_gradient(
+                    jnp.where(deviation > 0, deviation, _asym * deviation))
 
                 # v4.1+ per-token/layer/route bounded explore. tau_offset is
                 # NOT clipped (CE keeps full gradient); only the explore-loss
@@ -846,17 +851,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 k_tau_t = rst_tau_off[:, :, :-1, :]     # [L, B, S-1, 1]
                 dev_b = signal[None, :, :, None]          # [1, B, S-1, 1]
                 vmask_b = vmask_f[None, :, :, None]       # [1, B, S-1, 1]
+                a_tau_ref = jax.lax.stop_gradient(a_tau_t)
+                k_tau_ref = jax.lax.stop_gradient(k_tau_t)
 
                 # Per-element bound-hit masks. Hard off, not soft decay.
-                a_down_off = (dev_b > 0) & (a_tau_t <= _explore_lower + _explore_eps)
-                a_up_off   = (dev_b < 0) & (a_tau_t >= _explore_upper - _explore_eps)
-                a_off_mask = a_down_off | a_up_off
-                k_down_off = (dev_b > 0) & (k_tau_t <= _explore_lower + _explore_eps)
-                k_up_off   = (dev_b < 0) & (k_tau_t >= _explore_upper - _explore_eps)
-                k_off_mask = k_down_off | k_up_off
+                # The block decision is measurement feedback; the loss below
+                # still differentiates through the original tau_offset tensor.
+                a_down_off = (dev_b > 0) & (a_tau_ref <= _explore_lower + _explore_eps)
+                a_up_off   = (dev_b < 0) & (a_tau_ref >= _explore_upper - _explore_eps)
+                a_off_mask = jax.lax.stop_gradient(a_down_off | a_up_off)
+                k_down_off = (dev_b > 0) & (k_tau_ref <= _explore_lower + _explore_eps)
+                k_up_off   = (dev_b < 0) & (k_tau_ref >= _explore_upper - _explore_eps)
+                k_off_mask = jax.lax.stop_gradient(k_down_off | k_up_off)
 
-                a_active = jnp.where(a_off_mask, 0.0, 1.0)
-                k_active = jnp.where(k_off_mask, 0.0, 1.0)
+                a_active = jax.lax.stop_gradient(jnp.where(a_off_mask, 0.0, 1.0))
+                k_active = jax.lax.stop_gradient(jnp.where(k_off_mask, 0.0, 1.0))
 
                 # tau_offset distribution diagnostics (stop_gradient, obs-only).
                 _a_tau_flat = jax.lax.stop_gradient(attn_tau_off)
@@ -875,8 +884,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Per-element contribution -reduce. Gradient flows through
                 # the tau_offset tensor only (signal is stop_gradient'd).
                 vsum_eps = vmask_f.sum() + 1e-8
-                a_contrib = dev_b * a_tau_t * a_active * vmask_b
-                k_contrib = dev_b * k_tau_t * k_active * vmask_b
+                a_contrib_pre = dev_b * a_tau_t * vmask_b
+                k_contrib_pre = dev_b * k_tau_t * vmask_b
+                a_contrib = a_contrib_pre * a_active
+                k_contrib = k_contrib_pre * k_active
+                explore_attn_pre_bound = a_contrib_pre.sum() / vsum_eps
+                explore_rst_pre_bound = k_contrib_pre.sum() / vsum_eps
+                explore_loss_pre_bound = (
+                    explore_attn_pre_bound + explore_rst_pre_bound)
                 explore_attn_raw = a_contrib.sum() / vsum_eps
                 explore_rst_raw = k_contrib.sum() / vsum_eps
                 explore_loss_raw = explore_attn_raw + explore_rst_raw
@@ -907,6 +922,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 explore_loss_raw = jnp.float32(0.0)
                 explore_attn_raw = jnp.float32(0.0)
                 explore_rst_raw = jnp.float32(0.0)
+                explore_loss_pre_bound = jnp.float32(0.0)
+                explore_attn_pre_bound = jnp.float32(0.0)
+                explore_rst_pre_bound = jnp.float32(0.0)
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
                 neg_mean = jnp.float32(0.0)
@@ -960,6 +978,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 explore_loss_raw=explore_loss_raw,
                 explore_attn_raw=explore_attn_raw,
                 explore_rst_raw=explore_rst_raw,
+                explore_loss_pre_bound=explore_loss_pre_bound,
+                explore_attn_pre_bound=explore_attn_pre_bound,
+                explore_rst_pre_bound=explore_rst_pre_bound,
                 pos_frac=pos_frac, pos_mean=pos_mean, neg_mean=neg_mean,
                 block_frac_a=block_frac_a, block_frac_k=block_frac_k,
                 dev_pos_max=dev_pos_max, dev_neg_max=dev_neg_max,
@@ -985,42 +1006,110 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
 
-        grad_norm = jnp.sqrt(
-            sum(jnp.sum(g ** 2) for g in jax.tree.leaves(grads)))
-
-        def _tree_norm(tree):
+        def _tree_sq(tree):
             leaves = jax.tree.leaves(tree)
             if not leaves:
                 return jnp.float32(0.0)
-            return jnp.sqrt(sum(jnp.sum(jnp.square(x.astype(jnp.float32)))
-                                for x in leaves) + 1e-12)
+            return sum(jnp.sum(jnp.square(x.astype(jnp.float32)))
+                       for x in leaves)
+
+        def _tree_norm(tree):
+            return jnp.sqrt(_tree_sq(tree) + 1e-12)
 
         def _child_norm(tree, key):
             return _tree_norm(tree[key]) if key in tree else jnp.float32(0.0)
 
+        def _path_tree(tree, *keys):
+            cur = tree
+            for key in keys:
+                if not hasattr(cur, '__contains__') or key not in cur:
+                    return {}
+                cur = cur[key]
+            return cur
+
+        grad_norm = _tree_norm(grads)
+        grad_global_postclip = jnp.minimum(grad_norm, jnp.float32(1.0))
+
         _grouter = grads.get('router', {})
         _gpool = grads.get('neuron_pool', {})
+        grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
+        grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
+        grad_router_tau_attn = _child_norm(_grouter, 'tau_attn')
+        grad_router_tau_rst = _child_norm(_grouter, 'tau_rst')
+        grad_router_scan_attn = _child_norm(_grouter, 'raw_scan_offset_attn')
+        grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
+        grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
+        grad_pool_attn_qk_read = _child_norm(_gpool, 'attn_qk_read')
+        grad_pool_attn_qk_write = _child_norm(_gpool, 'attn_qk_write')
+        grad_pool_attn_v_emb = _child_norm(_gpool, 'attn_v_emb')
+        grad_pool_attn_v_read = _child_norm(_gpool, 'attn_v_read')
+        grad_pool_attn_v_write = _child_norm(_gpool, 'attn_v_write')
+        grad_pool_rst_emb = _child_norm(_gpool, 'rst_emb')
+        grad_pool_rst_read = _child_norm(_gpool, 'rst_read')
+        grad_pool_rst_write = _child_norm(_gpool, 'rst_write')
+        if debug_diagnostics:
+            grad_token_emb = _tree_norm(_path_tree(grads, 'token_emb'))
+            grad_pos_emb = _tree_norm(_path_tree(grads, 'pos_emb'))
+            grad_pool_scales = jnp.sqrt(
+                _tree_sq(_path_tree(_gpool, 'attn_qk_scale'))
+                + _tree_sq(_path_tree(_gpool, 'attn_v_scale'))
+                + _tree_sq(_path_tree(_gpool, 'rst_scale'))
+                + 1e-12)
+            grad_expand_O_sq = jnp.float32(0.0)
+            grad_layernorms_sq = _tree_sq(_path_tree(grads, 'norm'))
+            for _i in range(getattr(model, 'n_layers', 0)):
+                _gb = _path_tree(grads, f'block_{_i}')
+                grad_expand_O_sq = (
+                    grad_expand_O_sq
+                    + _tree_sq(_path_tree(_gb, 'attn', 'expand_O')))
+                grad_layernorms_sq = (
+                    grad_layernorms_sq
+                    + _tree_sq(_path_tree(_gb, 'norm1'))
+                    + _tree_sq(_path_tree(_gb, 'norm2')))
+            grad_expand_O = jnp.sqrt(grad_expand_O_sq + 1e-12)
+            grad_layernorms = jnp.sqrt(grad_layernorms_sq + 1e-12)
+            grad_lm_head_or_token_tied = grad_token_emb
+        else:
+            grad_token_emb = jnp.float32(0.0)
+            grad_pos_emb = jnp.float32(0.0)
+            grad_pool_scales = jnp.float32(0.0)
+            grad_expand_O = jnp.float32(0.0)
+            grad_layernorms = jnp.float32(0.0)
+            grad_lm_head_or_token_tied = jnp.float32(0.0)
         grad_router_proj = (
-            _child_norm(_grouter, 'proj_attn')
-            + _child_norm(_grouter, 'proj_rst'))
+            grad_router_proj_attn + grad_router_proj_rst)
         grad_router_tau = (
-            _child_norm(_grouter, 'tau_attn')
-            + _child_norm(_grouter, 'tau_rst'))
+            grad_router_tau_attn + grad_router_tau_rst)
         grad_router_scan = (
-            _child_norm(_grouter, 'raw_scan_offset_attn')
-            + _child_norm(_grouter, 'raw_scan_offset_rst'))
+            grad_router_scan_attn + grad_router_scan_rst)
         grad_pool_emb = (
-            _child_norm(_gpool, 'attn_qk_emb')
-            + _child_norm(_gpool, 'attn_v_emb')
-            + _child_norm(_gpool, 'rst_emb'))
+            grad_pool_attn_qk_emb + grad_pool_attn_v_emb
+            + grad_pool_rst_emb)
         grad_pool_read = (
-            _child_norm(_gpool, 'attn_qk_read')
-            + _child_norm(_gpool, 'attn_v_read')
-            + _child_norm(_gpool, 'rst_read'))
+            grad_pool_attn_qk_read + grad_pool_attn_v_read
+            + grad_pool_rst_read)
         grad_pool_write = (
-            _child_norm(_gpool, 'attn_qk_write')
-            + _child_norm(_gpool, 'attn_v_write')
-            + _child_norm(_gpool, 'rst_write'))
+            grad_pool_attn_qk_write + grad_pool_attn_v_write
+            + grad_pool_rst_write)
+        _ppool = params.get('neuron_pool', {})
+        if debug_diagnostics:
+            pool_weight_decay_loss = jnp.float32(0.5 * pool_weight_decay) * (
+                _tree_sq(_path_tree(_ppool, 'attn_qk_emb'))
+                + _tree_sq(_path_tree(_ppool, 'attn_qk_read'))
+                + _tree_sq(_path_tree(_ppool, 'attn_qk_write'))
+                + _tree_sq(_path_tree(_ppool, 'attn_v_emb'))
+                + _tree_sq(_path_tree(_ppool, 'attn_v_read'))
+                + _tree_sq(_path_tree(_ppool, 'attn_v_write'))
+                + _tree_sq(_path_tree(_ppool, 'rst_emb'))
+                + _tree_sq(_path_tree(_ppool, 'rst_read'))
+                + _tree_sq(_path_tree(_ppool, 'rst_write')))
+            normal_weight_decay_loss = (
+                jnp.float32(0.5 * weight_decay)
+                * jnp.maximum(_tree_sq(params) - _tree_sq(_ppool),
+                              jnp.float32(0.0)))
+        else:
+            pool_weight_decay_loss = jnp.float32(0.0)
+            normal_weight_decay_loss = jnp.float32(0.0)
         pool_diag = _pool_param_diagnostics(params, full=False)
         pool_update_diag = _pool_update_diagnostics(params, grads)
 
@@ -1082,12 +1171,74 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'total_loss': total_loss,
             'ce_loss': ce_loss,
             'aux_loss': aux_loss,
+            'aux_loss_raw': aux_loss,
+            'aux_loss_weighted': lb_weight * aux_loss,
+            'load_balance_loss_raw': aux_loss,
+            'load_balance_loss_weighted': lb_weight * aux_loss,
             'tau_reg': tau_reg,
+            'tau_reg_weighted': tau_reg_weight * tau_reg,
             'orth_loss': orth_loss,
+            'orth_loss_weighted': orth_weight * orth_loss,
             'div_loss': div_loss,
+            'diversity_loss_raw': div_loss,
+            'diversity_loss_weighted': div_weight * div_loss,
+            'dead_penalty_weight': jnp.float32(dead_penalty_weight),
+            'dead_penalty_weighted_total': dead_penalty_weight * dead_penalty,
+            'exploration_warmup_factor': explore_stats['explore_active'],
+            'exploration_weight_effective': (
+                jnp.float32(exploration_weight) * explore_stats['explore_active']),
+            'exploration_asymmetry': jnp.float32(exploration_asymmetry),
+            'exploration_loss_raw_total': explore_stats['explore_loss_raw'],
+            'exploration_loss_raw_attn': explore_stats['explore_attn_raw'],
+            'exploration_loss_raw_rst': explore_stats['explore_rst_raw'],
+            'exploration_loss_weighted_attn': (
+                exploration_weight * explore_stats['explore_attn_raw']
+                * explore_stats['explore_active']),
+            'exploration_loss_weighted_rst': (
+                exploration_weight * explore_stats['explore_rst_raw']
+                * explore_stats['explore_active']),
+            'exploration_loss_weighted_total': explore_loss_weighted,
+            'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
+            'exploration_raw_post_bound': explore_stats['explore_loss_raw'],
+            'exploration_attn_pre_bound': explore_stats['explore_attn_pre_bound'],
+            'exploration_rst_pre_bound': explore_stats['explore_rst_pre_bound'],
+            'pool_weight_decay_loss': pool_weight_decay_loss,
+            'normal_weight_decay_loss': normal_weight_decay_loss,
+            'total_loss_minus_ce': total_loss - ce_loss,
+            'reconstructed_loss_error': jnp.abs(total_loss - (
+                ce_loss
+                + lb_weight * aux_loss
+                + tau_reg_weight * tau_reg
+                + orth_weight * orth_loss
+                + div_weight * div_loss
+                + dead_penalty_weight * dead_penalty
+                + explore_loss_weighted)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
+            'grad_global_preclip': grad_norm,
+            'grad_global_postclip': grad_global_postclip,
+            'grad_token_emb': grad_token_emb,
+            'grad_pos_emb': grad_pos_emb,
+            'grad_router_proj_attn': grad_router_proj_attn,
+            'grad_router_proj_rst': grad_router_proj_rst,
+            'grad_router_tau_attn': grad_router_tau_attn,
+            'grad_router_tau_rst': grad_router_tau_rst,
+            'grad_router_scan_attn': grad_router_scan_attn,
+            'grad_router_scan_rst': grad_router_scan_rst,
+            'grad_pool_attn_qk_emb': grad_pool_attn_qk_emb,
+            'grad_pool_attn_qk_read': grad_pool_attn_qk_read,
+            'grad_pool_attn_qk_write': grad_pool_attn_qk_write,
+            'grad_pool_attn_v_emb': grad_pool_attn_v_emb,
+            'grad_pool_attn_v_read': grad_pool_attn_v_read,
+            'grad_pool_attn_v_write': grad_pool_attn_v_write,
+            'grad_pool_rst_emb': grad_pool_rst_emb,
+            'grad_pool_rst_read': grad_pool_rst_read,
+            'grad_pool_rst_write': grad_pool_rst_write,
+            'grad_pool_scales': grad_pool_scales,
+            'grad_expand_O': grad_expand_O,
+            'grad_layernorms': grad_layernorms,
+            'grad_lm_head_or_token_tied': grad_lm_head_or_token_tied,
             'grad_router_proj': grad_router_proj,
             'grad_router_tau': grad_router_tau,
             'grad_router_scan': grad_router_scan,
@@ -1174,11 +1325,37 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_dead_penalty': result.get('rst_dead_penalty', jnp.float32(0.0)),
             'attn_dead_count': result.get('attn_dead_count', jnp.float32(0.0)),
             'rst_dead_count': result.get('rst_dead_count', jnp.float32(0.0)),
+            'dead_count_total': (
+                result.get('attn_dead_count', jnp.float32(0.0))
+                + result.get('rst_dead_count', jnp.float32(0.0))),
+            'dead_penalty_raw_total': dead_penalty,
+            'attn_dead_penalty_raw': result.get(
+                'attn_dead_penalty', jnp.float32(0.0)),
+            'rst_dead_penalty_raw': result.get(
+                'rst_dead_penalty', jnp.float32(0.0)),
+            'dead_penalty_per_dead': (
+                dead_penalty / jnp.maximum(
+                    result.get('attn_dead_count', jnp.float32(0.0))
+                    + result.get('rst_dead_count', jnp.float32(0.0)),
+                    jnp.float32(1.0))),
+            'attn_dead_penalty_per_dead': (
+                result.get('attn_dead_penalty', jnp.float32(0.0))
+                / jnp.maximum(result.get('attn_dead_count', jnp.float32(0.0)),
+                              jnp.float32(1.0))),
+            'rst_dead_penalty_per_dead': (
+                result.get('rst_dead_penalty', jnp.float32(0.0))
+                / jnp.maximum(result.get('rst_dead_count', jnp.float32(0.0)),
+                              jnp.float32(1.0))),
             # v4.1 RPE exploration + diagnostics.
             'global_mean_ce': explore_stats['global_mean_ce'],
             'pos_frac': explore_stats['pos_frac'],
             'pos_mean': explore_stats['pos_mean'],
             'neg_mean': explore_stats['neg_mean'],
+            'rpe_pos_frac': explore_stats['pos_frac'],
+            'rpe_pos_avg': explore_stats['pos_mean'],
+            'rpe_neg_avg': explore_stats['neg_mean'],
+            'rpe_dev_pos': explore_stats['dev_pos_max'],
+            'rpe_dev_neg': explore_stats['dev_neg_max'],
             'explore_loss_raw': explore_stats['explore_loss_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
             'explore_rst_raw': explore_stats['explore_rst_raw'],
@@ -1186,6 +1363,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'explore_active': explore_stats['explore_active'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
             'explore_block_frac_k': explore_stats['block_frac_k'],
+            'rpe_block_attn': explore_stats['block_frac_a'],
+            'rpe_block_rst': explore_stats['block_frac_k'],
             'dev_pos_max': explore_stats['dev_pos_max'],
             'dev_neg_max': explore_stats['dev_neg_max'],
             'attn_tau_off_min': explore_stats['attn_tau_off_min'],
@@ -1201,6 +1380,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # v4.1 intensity / v4.1.5 gate-denominator diagnostics.
             'attn_int_max': result.get('attn_int_max', jnp.float32(0.0)),
             'rst_int_max': result.get('rst_int_max', jnp.float32(0.0)),
+            'attn_int_cap_frac': result.get('attn_int_cap_frac', jnp.float32(0.0)),
+            'rst_int_cap_frac': result.get('rst_int_cap_frac', jnp.float32(0.0)),
             'attn_intensity_sum_mean': result.get('attn_intensity_sum_mean', jnp.float32(0.0)),
             'rst_intensity_sum_mean': result.get('rst_intensity_sum_mean', jnp.float32(0.0)),
             'attn_gate_den_sum_mean': result.get('attn_gate_den_sum_mean', jnp.float32(0.0)),
@@ -1742,15 +1923,18 @@ class GCSLogger:
 # Module-level loggers -set up in main()
 _train_logger = None
 _jsonl_logger = None
+_debug_logger = None
+_debug_jsonl_logger = None
 
 
-def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
-    """Create GCSLogger instances for training log and JSONL log.
+def _setup_loggers(training_log_file, jsonl_log_file, resume=False,
+                   debug_log_file=None, debug_jsonl_log_file=None):
+    """Create GCSLogger instances for training/debug text + JSONL logs.
 
     resume=True downloads existing GCS content to the local scratch file
     first so new lines append rather than overwrite.
     """
-    global _train_logger, _jsonl_logger
+    global _train_logger, _jsonl_logger, _debug_logger, _debug_jsonl_logger
     import tempfile
     tmpdir = Path(tempfile.gettempdir()) / "dawn_logs"
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -1767,6 +1951,28 @@ def _setup_loggers(training_log_file, jsonl_log_file, resume=False):
     else:
         _jsonl_logger = GCSLogger(None, jsonl_log_file, resume=resume)
 
+    if debug_log_file:
+        if _is_gcs(debug_log_file):
+            local_debug = str(tmpdir / Path(debug_log_file).name)
+            _debug_logger = GCSLogger(debug_log_file, local_debug,
+                                      resume=resume)
+        else:
+            _debug_logger = GCSLogger(None, debug_log_file, resume=resume)
+    else:
+        _debug_logger = None
+
+    if debug_jsonl_log_file:
+        if _is_gcs(debug_jsonl_log_file):
+            local_debug_jsonl = str(tmpdir / Path(debug_jsonl_log_file).name)
+            _debug_jsonl_logger = GCSLogger(debug_jsonl_log_file,
+                                            local_debug_jsonl,
+                                            resume=resume)
+        else:
+            _debug_jsonl_logger = GCSLogger(None, debug_jsonl_log_file,
+                                            resume=resume)
+    else:
+        _debug_jsonl_logger = None
+
 
 def sync_logs():
     """Flush local logs to GCS. Call every FAST log for live visibility."""
@@ -1774,6 +1980,10 @@ def sync_logs():
         _train_logger.sync()
     if _jsonl_logger:
         _jsonl_logger.sync()
+    if _debug_logger:
+        _debug_logger.sync()
+    if _debug_jsonl_logger:
+        _debug_jsonl_logger.sync()
 
 
 def log_message(msg, log_file=None):
@@ -1786,6 +1996,18 @@ def log_message(msg, log_file=None):
             _train_logger.write(msg + '\n')
         except Exception as e:
             print(f"  [warn] log_message write failed: {e}", flush=True)
+
+
+def log_debug_message(msg):
+    """Write to the debug log file only. Host 0 only; no stdout pollution."""
+    if jax.process_index() != 0:
+        return
+    if not _debug_logger:
+        return
+    try:
+        _debug_logger.write(msg + '\n')
+    except Exception as e:
+        print(f"  [warn] log_debug_message write failed: {e}", flush=True)
 
 
 def format_time(seconds):
@@ -1807,6 +2029,19 @@ def log_jsonl(record):
         _jsonl_logger.write(line + '\n')
     except Exception as e:
         print(f"  [warn] log_jsonl write failed: {e}", flush=True)
+
+
+def log_debug_jsonl(record):
+    """Append a JSON-lines record to the debug JSONL log. Host 0 only."""
+    if jax.process_index() != 0:
+        return
+    if not _debug_jsonl_logger:
+        return
+    try:
+        line = json.dumps(record, default=str)
+        _debug_jsonl_logger.write(line + '\n')
+    except Exception as e:
+        print(f"  [warn] log_debug_jsonl write failed: {e}", flush=True)
 
 
 def check_nan_inf(metrics_dict, global_step, epoch):
@@ -1869,21 +2104,92 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'tau_reg': win_avgs['tau_reg'],
         'orth_loss': win_avgs['orth'],
         'div_loss': win_avgs['div'],
+        'aux_loss_raw': float(m.get('aux_loss_raw', win_avgs['aux'])),
+        'aux_loss_weighted': float(m.get(
+            'aux_loss_weighted', ctx['lb_weight'] * win_avgs['aux'])),
+        'load_balance_loss_raw': float(m.get(
+            'load_balance_loss_raw', win_avgs['aux'])),
+        'load_balance_loss_weighted': float(m.get(
+            'load_balance_loss_weighted', ctx['lb_weight'] * win_avgs['aux'])),
+        'diversity_loss_raw': float(m.get('diversity_loss_raw', win_avgs['div'])),
+        'diversity_loss_weighted': float(m.get(
+            'diversity_loss_weighted', ctx['div_weight'] * win_avgs['div'])),
         'aux_weighted': ctx['lb_weight'] * win_avgs['aux'],
         'tau_reg_weighted': ctx['tau_reg_weight'] * win_avgs['tau_reg'],
         'orth_weighted': ctx['orth_weight'] * win_avgs['orth'],
         'div_weighted': ctx['div_weight'] * win_avgs['div'],
+        'pool_weight_decay_loss': float(m.get('pool_weight_decay_loss', 0.0)),
+        'normal_weight_decay_loss': float(m.get('normal_weight_decay_loss', 0.0)),
+        'total_loss_minus_ce': float(m.get(
+            'total_loss_minus_ce', win_avgs['loss'] - win_avgs['ce'])),
+        'reconstructed_loss_error': float(m.get('reconstructed_loss_error', 0.0)),
         # Dead-only penalty.
         'dead_penalty': float(m.get('dead_penalty', 0.0)),
         'attn_dead_penalty': float(m.get('attn_dead_penalty', 0.0)),
         'rst_dead_penalty': float(m.get('rst_dead_penalty', 0.0)),
+        'dead_penalty_raw_total': float(m.get('dead_penalty_raw_total', 0.0)),
+        'attn_dead_penalty_raw': float(m.get('attn_dead_penalty_raw', 0.0)),
+        'rst_dead_penalty_raw': float(m.get('rst_dead_penalty_raw', 0.0)),
+        'dead_penalty_weight': float(m.get(
+            'dead_penalty_weight', ctx['dead_penalty_weight'])),
         'dead_penalty_weighted': ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)),
+        'dead_penalty_weighted_total': float(m.get(
+            'dead_penalty_weighted_total',
+            ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)))),
+        'dead_count_total': float(m.get('dead_count_total', 0.0)),
+        'dead_penalty_per_dead': float(m.get('dead_penalty_per_dead', 0.0)),
+        'attn_dead_penalty_per_dead': float(m.get(
+            'attn_dead_penalty_per_dead', 0.0)),
+        'rst_dead_penalty_per_dead': float(m.get(
+            'rst_dead_penalty_per_dead', 0.0)),
         # Explore loss (RPE).
         'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
         'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
+        'exploration_loss_raw_total': float(m.get(
+            'exploration_loss_raw_total', m.get('explore_loss_raw', 0.0))),
+        'exploration_loss_raw_attn': float(m.get(
+            'exploration_loss_raw_attn', m.get('explore_attn_raw', 0.0))),
+        'exploration_loss_raw_rst': float(m.get(
+            'exploration_loss_raw_rst', m.get('explore_rst_raw', 0.0))),
+        'exploration_warmup_factor': float(m.get('exploration_warmup_factor', 0.0)),
+        'exploration_weight_effective': float(m.get(
+            'exploration_weight_effective', 0.0)),
+        'exploration_asymmetry': float(m.get('exploration_asymmetry', 0.0)),
+        'exploration_loss_weighted_attn': float(m.get(
+            'exploration_loss_weighted_attn', 0.0)),
+        'exploration_loss_weighted_rst': float(m.get(
+            'exploration_loss_weighted_rst', 0.0)),
+        'exploration_loss_weighted_total': float(m.get(
+            'exploration_loss_weighted_total', m.get('explore_loss_weighted', 0.0))),
+        'exploration_raw_pre_bound': float(m.get('exploration_raw_pre_bound', 0.0)),
+        'exploration_raw_post_bound': float(m.get('exploration_raw_post_bound', 0.0)),
         # Accuracy / training status.
         'accuracy': win_avgs['acc'],
         'grad_norm': float(m['grad_norm']),
+        'grad_global_preclip': float(m.get('grad_global_preclip', m['grad_norm'])),
+        'grad_global_postclip': float(m.get('grad_global_postclip', 0.0)),
+        'grad_token_emb': float(m.get('grad_token_emb', 0.0)),
+        'grad_pos_emb': float(m.get('grad_pos_emb', 0.0)),
+        'grad_router_proj_attn': float(m.get('grad_router_proj_attn', 0.0)),
+        'grad_router_proj_rst': float(m.get('grad_router_proj_rst', 0.0)),
+        'grad_router_tau_attn': float(m.get('grad_router_tau_attn', 0.0)),
+        'grad_router_tau_rst': float(m.get('grad_router_tau_rst', 0.0)),
+        'grad_router_scan_attn': float(m.get('grad_router_scan_attn', 0.0)),
+        'grad_router_scan_rst': float(m.get('grad_router_scan_rst', 0.0)),
+        'grad_pool_attn_qk_emb': float(m.get('grad_pool_attn_qk_emb', 0.0)),
+        'grad_pool_attn_qk_read': float(m.get('grad_pool_attn_qk_read', 0.0)),
+        'grad_pool_attn_qk_write': float(m.get('grad_pool_attn_qk_write', 0.0)),
+        'grad_pool_attn_v_emb': float(m.get('grad_pool_attn_v_emb', 0.0)),
+        'grad_pool_attn_v_read': float(m.get('grad_pool_attn_v_read', 0.0)),
+        'grad_pool_attn_v_write': float(m.get('grad_pool_attn_v_write', 0.0)),
+        'grad_pool_rst_emb': float(m.get('grad_pool_rst_emb', 0.0)),
+        'grad_pool_rst_read': float(m.get('grad_pool_rst_read', 0.0)),
+        'grad_pool_rst_write': float(m.get('grad_pool_rst_write', 0.0)),
+        'grad_pool_scales': float(m.get('grad_pool_scales', 0.0)),
+        'grad_expand_O': float(m.get('grad_expand_O', 0.0)),
+        'grad_layernorms': float(m.get('grad_layernorms', 0.0)),
+        'grad_lm_head_or_token_tied': float(m.get(
+            'grad_lm_head_or_token_tied', 0.0)),
         'grad_router_proj': float(m.get('grad_router_proj', 0.0)),
         'grad_router_tau': float(m.get('grad_router_tau', 0.0)),
         'grad_router_scan': float(m.get('grad_router_scan', 0.0)),
@@ -1909,6 +2215,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_raw_gate_max': float(m.get('rst_raw_gate_max', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', 0.0)),
         'rst_int_max': float(m.get('rst_int_max', 0.0)),
+        'attn_int_cap_frac': float(m.get('attn_int_cap_frac', 0.0)),
+        'rst_int_cap_frac': float(m.get('rst_int_cap_frac', 0.0)),
         'attn_den_cost_mean': float(m.get('attn_den_cost_mean', 0.0)),
         'rst_den_cost_mean': float(m.get('rst_den_cost_mean', 0.0)),
         'attn_act_cost_mean': float(m.get('attn_act_cost_mean', 0.0)),
@@ -2012,6 +2320,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_qk_raw_norm': float(m.get('attn_qk_raw_norm', 0.0)),
         'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
         'rst_raw_out_norm': float(m.get('rst_raw_out_norm', 0.0)),
+        'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
+        'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
+        'debug_emb_norm': float(m.get('debug_emb_norm', 0.0)),
         'rst_z_mean_active': float(m.get('rst_z_mean_active', 0.0)),
         'attn_qk_z_mean_active': float(m.get('attn_qk_z_mean_active', 0.0)),
         'attn_v_z_mean_active': float(m.get('attn_v_z_mean_active', 0.0)),
@@ -2020,6 +2331,15 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'pos_frac': float(m.get('pos_frac', 0.0)),
         'pos_mean': float(m.get('pos_mean', 0.0)),
         'neg_mean': float(m.get('neg_mean', 0.0)),
+        'rpe_pos_frac': float(m.get('rpe_pos_frac', m.get('pos_frac', 0.0))),
+        'rpe_pos_avg': float(m.get('rpe_pos_avg', m.get('pos_mean', 0.0))),
+        'rpe_neg_avg': float(m.get('rpe_neg_avg', m.get('neg_mean', 0.0))),
+        'rpe_dev_pos': float(m.get('rpe_dev_pos', m.get('dev_pos_max', 0.0))),
+        'rpe_dev_neg': float(m.get('rpe_dev_neg', m.get('dev_neg_max', 0.0))),
+        'rpe_block_attn': float(m.get(
+            'rpe_block_attn', m.get('explore_block_frac_a', 0.0))),
+        'rpe_block_rst': float(m.get(
+            'rpe_block_rst', m.get('explore_block_frac_k', 0.0))),
         'explore_attn_raw': float(m.get('explore_attn_raw', 0.0)),
         'explore_rst_raw': float(m.get('explore_rst_raw', 0.0)),
         'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
@@ -2175,6 +2495,228 @@ def _print_regular_block(rec, ctx):
         f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
         f" {ctx['s_per_it']:.2f}s/it"
     )
+
+
+def _collapse_reasons(rec):
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+
+    reasons = []
+    if _g('grad_global_preclip', _g('grad_norm')) > 50.0:
+        reasons.append('grad_spike')
+    if _g('total_loss_minus_ce') > 5.0:
+        reasons.append('loss_minus_ce_spike')
+    if _g('dead_count_total', _g('attn_dead_count') + _g('rst_dead_count')) > 100.0:
+        reasons.append('dead_spike')
+    if max(_g('attn_int_cap_frac'), _g('rst_int_cap_frac')) > 0.001:
+        reasons.append('int_cap_hit')
+    if max(_g('attn_qk_op_gain_max'), _g('attn_v_op_gain_max'),
+           _g('rst_op_gain_max')) > 20.0:
+        reasons.append('op_gain_high')
+    layer_out_max = 0.0
+    for key in ('per_layer_attn_out_norm', 'per_layer_rst_out_norm'):
+        vals = rec.get(key, []) or []
+        try:
+            layer_out_max = max(layer_out_max, max(float(v) for v in vals))
+        except ValueError:
+            pass
+    if layer_out_max > 50.0:
+        reasons.append('late_layer_out_high')
+    if max(_g('attn_top1_gate_frac'), _g('rst_top1_gate_frac')) > 0.5:
+        reasons.append('top1_gate_high')
+    if min(_g('attn_gate_eff_ratio', 1.0),
+           _g('rst_gate_eff_ratio', 1.0)) < 0.05:
+        reasons.append('gate_eff_low')
+    return reasons
+
+
+def _print_debug_block(rec, ctx):
+    """Write debug-only DAWN-SRW collapse diagnostics to debug_log_*.txt."""
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+
+    def _layer_max(key):
+        vals = rec.get(key, []) or []
+        try:
+            return max(float(v) for v in vals)
+        except ValueError:
+            return 0.0
+
+    step = rec.get('step', 0)
+    log_debug_message(
+        f"[DEBUG_DIAG] step={step} epoch={rec.get('epoch', 0)} "
+        f"loss={_g('total_loss'):.4f} ce={_g('ce_loss'):.4f} "
+        f"grad={_g('grad_global_preclip', _g('grad_norm')):.3f} "
+        f"lr={_g('lr'):.3e}"
+    )
+    log_debug_message(
+        f"loss_terms: ce={_g('ce_loss'):.6f} "
+        f"aux_raw_lb_plus_internal_tau={_g('aux_loss_raw', _g('aux_loss')):.6f} "
+        f"aux_w={_g('aux_loss_weighted', _g('aux_weighted')):.6f} "
+        f"div_raw={_g('diversity_loss_raw', _g('div_loss')):.6f} "
+        f"div_w={_g('diversity_loss_weighted', _g('div_weighted')):.6f} "
+        f"load_balance_raw_current_aux={_g('load_balance_loss_raw', _g('aux_loss')):.6f} "
+        f"load_balance_w={_g('load_balance_loss_weighted', _g('aux_weighted')):.6f} "
+        f"dead_raw={_g('dead_penalty_raw_total', _g('dead_penalty')):.6f} "
+        f"dead_w={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f} "
+        f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
+        f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
+        f"wd_pool={_g('pool_weight_decay_loss'):.6f} "
+        f"wd_normal={_g('normal_weight_decay_loss'):.6f} "
+        f"total_minus_ce={_g('total_loss_minus_ce'):.6f} "
+        f"recon_err={_g('reconstructed_loss_error'):.3e}"
+    )
+    log_debug_message(
+        f"dead_diag: a_count={_g('attn_dead_count'):.1f} "
+        f"rst_count={_g('rst_dead_count'):.1f} "
+        f"total={_g('dead_count_total'):.1f} "
+        f"raw[a={_g('attn_dead_penalty_raw', _g('attn_dead_penalty')):.6f} "
+        f"rst={_g('rst_dead_penalty_raw', _g('rst_dead_penalty')):.6f}] "
+        f"per_dead[a={_g('attn_dead_penalty_per_dead'):.6f} "
+        f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
+        f"total={_g('dead_penalty_per_dead'):.6f}] "
+        f"weight={_g('dead_penalty_weight'):.4f} "
+        f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
+    )
+    log_debug_message(
+        f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
+        f"w_eff={_g('exploration_weight_effective'):.6f} "
+        f"asym={_g('exploration_asymmetry'):.3f} "
+        f"raw[a={_g('exploration_loss_raw_attn', _g('explore_attn_raw')):+.6f} "
+        f"rst={_g('exploration_loss_raw_rst', _g('explore_rst_raw')):+.6f} "
+        f"total={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f}] "
+        f"weighted[a={_g('exploration_loss_weighted_attn'):+.6f} "
+        f"rst={_g('exploration_loss_weighted_rst'):+.6f} "
+        f"total={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f}] "
+        f"pre_bound={_g('exploration_raw_pre_bound'):+.6f} "
+        f"post_bound={_g('exploration_raw_post_bound'):+.6f} "
+        f"rpe[pos_frac={_g('rpe_pos_frac', _g('pos_frac')):.3f} "
+        f"pos_avg={_g('rpe_pos_avg', _g('pos_mean')):.4f} "
+        f"neg_avg={_g('rpe_neg_avg', _g('neg_mean')):.4f} "
+        f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
+        f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
+        f"block_attn={_g('rpe_block_attn', _g('explore_block_frac_a')):.3f} "
+        f"block_rst={_g('rpe_block_rst', _g('explore_block_frac_k')):.3f}]"
+    )
+    log_debug_message(
+        f"route_diag: active_n[qk={_g('attn_qk_active') * ctx.get('n_qk_cfg', 0):.1f} "
+        f"v={_g('attn_v_active') * ctx.get('n_v_cfg', 0):.1f} "
+        f"rst={_g('rst_active') * ctx.get('n_rst_cfg', 0):.1f}] "
+        f"active_frac[qk={_g('attn_qk_active'):.4f} "
+        f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
+        f"strong[qk={_g('attn_qk_strong'):.4f} "
+        f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
+        f"den[attn={_g('attn_gate_den_sum_mean'):.3f} "
+        f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
+        f"eff[attn={_g('attn_gate_eff_n'):.3f}/{_g('attn_gate_eff_ratio'):.4f} "
+        f"rst={_g('rst_gate_eff_n'):.3f}/{_g('rst_gate_eff_ratio'):.4f}] "
+        f"top1[attn_m={_g('attn_top1_gate_frac'):.4f} "
+        f"attn_max={_g('attn_top1_gate_frac_max'):.4f} "
+        f"rst_m={_g('rst_top1_gate_frac'):.4f} "
+        f"rst_max={_g('rst_top1_gate_frac_max'):.4f}] "
+        f"gate_max[attn={_g('attn_raw_gate_max'):.3f} "
+        f"rst={_g('rst_raw_gate_max'):.3f}]"
+    )
+    log_debug_message(
+        f"tau_diag: score_std[attn={_g('attn_score_std'):.4f} "
+        f"rst={_g('rst_score_std'):.4f}] "
+        f"tau_abs[attn={_g('attn_tau_abs_mean'):.4f} "
+        f"rst={_g('rst_tau_abs_mean'):.4f}] "
+        f"tau_offset_attn[min={_g('attn_tau_off_min'):+.4f} "
+        f"p01={_g('attn_tau_off_p01'):+.4f} p99={_g('attn_tau_off_p99'):+.4f} "
+        f"max={_g('attn_tau_off_max'):+.4f} "
+        f"neg={_g('attn_tau_off_neg_frac'):.4f}] "
+        f"tau_offset_rst[min={_g('rst_tau_off_min'):+.4f} "
+        f"p01={_g('rst_tau_off_p01'):+.4f} p99={_g('rst_tau_off_p99'):+.4f} "
+        f"max={_g('rst_tau_off_max'):+.4f} "
+        f"neg={_g('rst_tau_off_neg_frac'):.4f}] "
+        f"scan_offset[attn=({_g('raw_scan_offset_attn_bias_0'):+.4f},"
+        f"{_g('raw_scan_offset_attn_bias_1'):+.4f},"
+        f"{_g('raw_scan_offset_attn_bias_2'):+.4f}) "
+        f"rst={_g('raw_scan_offset_rst_bias'):+.4f}]"
+    )
+    log_debug_message(
+        f"amp_diag: int_max[attn={_g('attn_int_max'):.3f} "
+        f"rst={_g('rst_int_max'):.3f}] "
+        f"int_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
+        f"rst={_g('rst_int_cap_frac'):.6f}] "
+        f"op_gain_max[qk={_g('attn_qk_op_gain_max'):.3f} "
+        f"v={_g('attn_v_op_gain_max'):.3f} "
+        f"rst={_g('rst_op_gain_max'):.3f}] "
+        f"rw_max[qk_r={_g('attn_qk_read_norm_max'):.3f} "
+        f"qk_w={_g('attn_qk_write_norm_max'):.3f} "
+        f"v_r={_g('attn_v_read_norm_max'):.3f} "
+        f"v_w={_g('attn_v_write_norm_max'):.3f} "
+        f"rst_r={_g('rst_read_norm_max'):.3f} "
+        f"rst_w={_g('rst_write_norm_max'):.3f}] "
+        f"scale[qk={_g('attn_qk_pool_scale'):.3f} "
+        f"v={_g('attn_v_pool_scale'):.3f} rst={_g('rst_pool_scale'):.3f}]"
+    )
+    log_debug_message(
+        f"out_diag: final_resid={_g('debug_residual_norm'):.3f} "
+        f"logit_max={_g('debug_logit_max'):.3f} "
+        f"logit_norm_mean={_g('debug_emb_norm'):.3f} "
+        f"attn_out_mean={_g('attn_out_norm'):.3f} "
+        f"rst_out_mean={_g('rst_out_norm'):.3f} "
+        f"layer_attn_max={_layer_max('per_layer_attn_out_norm'):.3f} "
+        f"layer_rst_max={_layer_max('per_layer_rst_out_norm'):.3f}"
+    )
+    log_debug_message(
+        f"grad_groups: global_pre={_g('grad_global_preclip', _g('grad_norm')):.6f} "
+        f"global_post={_g('grad_global_postclip'):.6f} "
+        f"token_emb={_g('grad_token_emb'):.6f} "
+        f"pos_emb={_g('grad_pos_emb'):.6f} "
+        f"router_proj_attn={_g('grad_router_proj_attn'):.6f} "
+        f"router_proj_rst={_g('grad_router_proj_rst'):.6f} "
+        f"router_tau_attn={_g('grad_router_tau_attn'):.6f} "
+        f"router_tau_rst={_g('grad_router_tau_rst'):.6f} "
+        f"router_scan_attn={_g('grad_router_scan_attn'):.6f} "
+        f"router_scan_rst={_g('grad_router_scan_rst'):.6f} "
+        f"qk_rw={_g('grad_pool_attn_qk_read'):.6f}/{_g('grad_pool_attn_qk_write'):.6f} "
+        f"v_rw={_g('grad_pool_attn_v_read'):.6f}/{_g('grad_pool_attn_v_write'):.6f} "
+        f"rst_rw={_g('grad_pool_rst_read'):.6f}/{_g('grad_pool_rst_write'):.6f} "
+        f"pool_scale={_g('grad_pool_scales'):.6f} "
+        f"expand_O={_g('grad_expand_O'):.6f} "
+        f"ln={_g('grad_layernorms'):.6f} "
+        f"lm_head_or_token_tied={_g('grad_lm_head_or_token_tied'):.6f}"
+    )
+    reasons = _collapse_reasons(rec)
+    if reasons:
+        log_debug_message(
+            f"[COLLAPSE_WARN] step={step} reasons={','.join(reasons)}")
+    log_debug_message("")
+
+
+def _print_debug_analysis_block(rec, ctx):
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+
+    log_debug_message(
+        f"analysis_diag: step={rec.get('step', 0)} "
+        f"boundary_phi[qk={_g('attn_qk_phi_binary'):.6f} "
+        f"v={_g('attn_v_phi_binary'):.6f} rst={_g('rst_phi_binary'):.6f}] "
+        f"z_lt_075[attn={_g('attn_z_lt_075'):.6f} "
+        f"rst={_g('rst_z_lt_075'):.6f}] "
+        f"z_lt_030[attn={_g('attn_z_lt_030'):.6f} "
+        f"rst={_g('rst_z_lt_030'):.6f}] "
+        f"entropy[attn={_g('attn_gate_entropy'):.6f} "
+        f"rst={_g('rst_gate_entropy'):.6f}] "
+        f"int_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
+        f"rst={_g('rst_int_cap_frac'):.6f}] "
+        f"raw_out_norm[attn_qk={_g('attn_qk_raw_norm'):.6f} "
+        f"attn_v={_g('attn_v_raw_norm'):.6f} "
+        f"rst={_g('rst_raw_out_norm'):.6f}] "
+        f"normalized_out_norm[attn={_g('attn_out_norm'):.6f} "
+        f"rst={_g('rst_out_norm'):.6f}] "
+        f"final_resid={_g('debug_residual_norm'):.6f} "
+        f"logit_max={_g('debug_logit_max'):.6f} "
+        f"logit_norm_mean={_g('debug_emb_norm'):.6f}"
+    )
+    reasons = _collapse_reasons(rec)
+    if reasons:
+        log_debug_message(
+            f"[COLLAPSE_WARN] step={rec.get('step', 0)} reasons={','.join(reasons)}")
+    log_debug_message("")
 
 
 def _build_analysis_record(base, metrics, ctx):
@@ -2474,8 +3016,9 @@ def main():
                         help='Override batch_size from config (global)')
     parser.add_argument('--lr', type=float, default=None,
                         help='Override learning rate from config')
-    parser.add_argument('--debug', action='store_true',
-                        help='Debug mode: log every step with detailed metrics')
+    parser.add_argument('--debug', nargs='?', const=1, default=0, type=int,
+                        help=('Write detailed diagnostics to a separate debug log '
+                              'every N steps (default N=1 when flag is present)'))
     parser.add_argument('--resume-from', type=str, default=None,
                         help='Resume from specific run folder path (e.g. gs://...../run_v...)')
     cli_args = parser.parse_args()
@@ -2496,7 +3039,8 @@ def main():
     set_seed(seed)
 
     # Training params (from YAML first, may be overridden by checkpoint config below)
-    debug_mode = cli_args.debug
+    debug_interval = max(0, int(cli_args.debug or 0))
+    debug_mode = debug_interval > 0
     tcfg = cfg['training']
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
@@ -3264,12 +3808,14 @@ def main():
         tau_reg_weight, dead_penalty_weight,
         exploration_weight, exploration_asymmetry,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
+        weight_decay=weight_decay, pool_weight_decay=pool_weight_decay,
         exploration_warmup_steps=exploration_warmup_steps,
         exploration_lower_bound=exploration_lower_bound,
         exploration_upper_bound=exploration_upper_bound,
         exploration_bound_eps=exploration_bound_eps,
         is_baseline=is_baseline, is_spatial=is_spatial,
-        sharded_fns=_sharded_fns, mesh=mesh)
+        sharded_fns=_sharded_fns, mesh=mesh,
+        debug_diagnostics=debug_mode)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
@@ -3798,6 +4344,8 @@ def main():
         # into training_log_<ts1>.txt + training_log_<ts2>.txt + ...
         _existing_logs = sorted(_list_files(log_dir, "training_log_*.txt"))
         _existing_jsonls = sorted(_list_files(log_dir, "metrics_*.jsonl"))
+        _existing_debug_logs = sorted(_list_files(log_dir, "debug_log_*.txt"))
+        _existing_debug_jsonls = sorted(_list_files(log_dir, "debug_metrics_*.jsonl"))
         _is_log_resume = (resume_path is not None) and bool(_existing_logs)
         if _is_log_resume:
             training_log_file = _existing_logs[-1]
@@ -3806,9 +4354,28 @@ def main():
         else:
             training_log_file = _join(log_dir, f'training_log_{timestamp}.txt')
             jsonl_log_file = _join(log_dir, f'metrics_{timestamp}.jsonl')
+        if debug_mode:
+            if (resume_path is not None) and _existing_debug_logs:
+                debug_log_file = _existing_debug_logs[-1]
+                debug_jsonl_log_file = (
+                    _existing_debug_jsonls[-1] if _existing_debug_jsonls
+                    else _join(log_dir, f'debug_metrics_{timestamp}.jsonl'))
+                _is_debug_log_resume = True
+            else:
+                debug_log_file = _join(log_dir, f'debug_log_{timestamp}.txt')
+                debug_jsonl_log_file = _join(
+                    log_dir, f'debug_metrics_{timestamp}.jsonl')
+                _is_debug_log_resume = False
+        else:
+            debug_log_file = None
+            debug_jsonl_log_file = None
+            _is_debug_log_resume = False
 
         # Set up loggers (local append + periodic GCS sync)
-        _setup_loggers(training_log_file, jsonl_log_file, resume=_is_log_resume)
+        _setup_loggers(
+            training_log_file, jsonl_log_file, resume=_is_log_resume,
+            debug_log_file=debug_log_file,
+            debug_jsonl_log_file=debug_jsonl_log_file)
 
         n_params = count_parameters(params)
         log_message(f"DAWN {model_version} Training Log (Multi-Host) - {timestamp}")
@@ -3816,6 +4383,17 @@ def main():
         log_message(f"Parameters: {n_params:,}")
         log_message(f"Hosts: {n_hosts}, Local devices: {n_local_devices}, Total: {jax.device_count()}")
         log_message(f"Total steps: {total_steps}")
+        if debug_mode:
+            log_message(
+                f"Debug diagnostics: every {debug_interval} step(s) -> {debug_log_file}")
+            log_debug_message(
+                f"DAWN {model_version} Debug Diagnostics - {timestamp}")
+            log_debug_message(f"Config: {config_path}")
+            log_debug_message(f"Training log: {training_log_file}")
+            log_debug_message(f"Debug interval: {debug_interval}")
+            log_debug_message(
+                f"Resume append: {_is_debug_log_resume}")
+            log_debug_message("")
         log_message("")
         sync_logs()
 
@@ -3887,7 +4465,8 @@ def main():
         print(f"  Log cadence: regular={LOG_REGULAR}"
               f" analysis={LOG_ANALYSIS}"
               f" geometry={LOG_GEOMETRY}"
-              f" val={val_interval}",
+              f" val={val_interval}"
+              f" debug={'off' if not debug_mode else debug_interval}",
               flush=True)
 
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
@@ -3999,7 +4578,10 @@ def main():
             # the ANALYSIS stats now require a separate forward with the
             # full-stats kernels and only run on val ticks.
             _is_early_debug = global_step in (1, 5, 10, 20, 50)
-            is_regular = (global_step % LOG_REGULAR == 0) or _is_early_debug or debug_mode
+            is_regular = (global_step % LOG_REGULAR == 0) or _is_early_debug
+            is_debug_log = (
+                debug_mode and global_step > 0
+                and (global_step % debug_interval == 0))
 
             if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
@@ -4087,9 +4669,71 @@ def main():
                 win_count = 0
                 win_start_time = time.time()
 
+            # ---- DEBUG diagnostics: separate log, no stdout/train-log noise ----
+            if is_debug_log and is_host0:
+                _debug_vals = jax.device_get({
+                    'loss': metrics['total_loss'],
+                    'ce': metrics['ce_loss'],
+                    'aux': metrics['aux_loss'],
+                    'tau_reg': metrics.get('tau_reg', jnp.float32(0.0)),
+                    'orth': metrics['orth_loss'],
+                    'div': metrics['div_loss'],
+                    'correct': metrics['correct'],
+                    'valid': metrics['valid_count'],
+                })
+                _debug_valid = int(_debug_vals['valid'])
+                _debug_vdiv = _debug_valid if _debug_valid > 0 else 1
+                debug_avgs = {
+                    'loss': float(_debug_vals['loss']),
+                    'ce': float(_debug_vals['ce']),
+                    'aux': float(_debug_vals['aux']),
+                    'tau_reg': float(_debug_vals['tau_reg']),
+                    'orth': float(_debug_vals['orth']),
+                    'div': float(_debug_vals['div']),
+                    'acc': int(_debug_vals['correct']) / _debug_vdiv,
+                }
+                _elapsed = time.time() - win_start_time
+                _steps_per_sec = (win_count / _elapsed) if _elapsed > 0 else 0.0
+                _opt_step = global_step // grad_accum_steps
+                _current_lr = float(schedule(_opt_step))
+                _total_elapsed = time.time() - train_start_time
+                _epoch_elapsed = time.time() - epoch_start
+                _progress = (global_step / total_micro_steps * 100
+                             if total_micro_steps > 0 else 0.0)
+                _s_per_it = _epoch_elapsed / epoch_steps if epoch_steps > 0 else 0.0
+                _remaining = max(steps_per_epoch - epoch_step_counter, 0)
+                _eta = _s_per_it * _remaining
+                debug_ctx = {
+                    'lb_weight': lb_weight,
+                    'tau_reg_weight': tau_reg_weight,
+                    'orth_weight': orth_weight,
+                    'div_weight': div_weight,
+                    'dead_penalty_weight': dead_penalty_weight,
+                    'n_qk_cfg': cfg['model'].get(
+                        'n_qk', cfg['model'].get('n_q', 0)),
+                    'n_v_cfg': cfg['model'].get('n_v', 0),
+                    'n_rst_cfg': cfg['model'].get('n_know', 0),
+                    'current_lr': _current_lr,
+                    'steps_per_sec': _steps_per_sec,
+                    'total_elapsed': _total_elapsed,
+                    'epoch_elapsed': _epoch_elapsed,
+                    'eta': _eta,
+                    's_per_it': _s_per_it,
+                    'total_micro_steps': total_micro_steps,
+                    'progress': _progress,
+                    'model_version': model_version,
+                }
+                debug_metrics = jax.device_get(metrics)
+                debug_rec = _build_regular_record(
+                    debug_metrics, debug_avgs, debug_ctx, global_step, epoch)
+                _print_debug_block(debug_rec, debug_ctx)
+                log_debug_jsonl({'type': 'debug_train', **debug_rec})
+                sync_logs()
+
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
             _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)
+            _do_debug_analysis = is_debug_log
             _do_geometry = (global_step % LOG_GEOMETRY == 0 and global_step > 0)
             _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
             _new_best = False
@@ -4120,7 +4764,7 @@ def main():
             # Single analysis forward at the configured analysis cadence. Compiles
             # once on first call (extra HBM + time logged). Result dict
             # is released after the JSONL write so HBM snaps back.
-            if _do_analysis and analysis_step_fn is not None:
+            if (_do_analysis or _do_debug_analysis) and analysis_step_fn is not None:
                 val_loader.reset()
                 _analysis_batch = None
                 for _ab_ids, _ab_mask in val_loader:
@@ -4163,8 +4807,15 @@ def main():
                             a_rec['step'] = global_step
                             a_rec['epoch'] = epoch
                             a_rec['analysis_step_sec'] = float(_a_elapsed)
-                            _print_analysis_block(a_rec, _ctx_a)
-                            log_jsonl({'type': 'train_analysis', **a_rec})
+                            if _do_analysis:
+                                _print_analysis_block(a_rec, _ctx_a)
+                                log_jsonl({'type': 'train_analysis', **a_rec})
+                            if _do_debug_analysis:
+                                _print_debug_analysis_block(a_rec, _ctx_a)
+                                log_debug_jsonl({
+                                    'type': 'debug_train_analysis',
+                                    **a_rec,
+                                })
                             sync_logs()
                     finally:
                         # Explicit release -jit-returned dict holds

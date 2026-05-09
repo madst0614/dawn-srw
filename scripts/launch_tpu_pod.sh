@@ -36,8 +36,17 @@ while [[ $# -gt 0 ]]; do
         --config)   CONFIG="$2";   shift 2 ;;
         --token)    GH_TOKEN="$2"; shift 2 ;;
         --from-scratch) TRAIN_ARGS="$TRAIN_ARGS --from-scratch"; shift ;;
+        --debug)
+            if [[ $# -ge 2 && "$2" != --* ]]; then
+                TRAIN_ARGS="$TRAIN_ARGS --debug $2"
+                shift 2
+            else
+                TRAIN_ARGS="$TRAIN_ARGS --debug"
+                shift
+            fi
+            ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--debug [N]]"
             echo ""
             echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
             echo "  --zone     GCP zone            (default: $ZONE)"
@@ -45,6 +54,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
             echo "  --from-scratch  Start training from scratch (ignore checkpoints)"
+            echo "  --debug [N]  Enable train_jax.py debug diagnostics every N steps (default: 1)"
             echo "  --token    GitHub access token   (for private repos)"
             exit 0
             ;;
