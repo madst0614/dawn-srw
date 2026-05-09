@@ -231,9 +231,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     if _prune_enabled and prune_activation_threshold is None:
         raise ValueError(
             "prune_activation_threshold must be set when prune_enabled=True")
-    if prune_denominator not in ("pruned", "full"):
+    if prune_denominator not in ("pruned", "retained", "full"):
         raise ValueError(
-            "prune_denominator must be 'pruned' or 'full', "
+            "prune_denominator must be 'pruned', 'retained', or 'full', "
             f"got {prune_denominator!r}")
     # prune_scope is resolved by the caller that builds pool-specific closures.
     # It is accepted here so paper-eval configs can carry one canonical option set.
@@ -719,9 +719,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     if _prune_enabled and prune_activation_threshold is None:
         raise ValueError(
             "prune_activation_threshold must be set when prune_enabled=True")
-    if prune_denominator not in ("pruned", "full"):
+    if prune_denominator not in ("pruned", "retained", "full"):
         raise ValueError(
-            "prune_denominator must be 'pruned' or 'full', "
+            "prune_denominator must be 'pruned', 'retained', or 'full', "
             f"got {prune_denominator!r}")
     # Scope is resolved by the caller that chooses which pool closures prune.
     _ = prune_scope

@@ -83,7 +83,19 @@ FLOPS_NOTE = (
 
 FLOP_CONVENTION = "multiply_add_2_flops"
 MAIN_REPRESENTATIVE_HARD_VARIANT = "hard_all_t099"
-DEBUG_PRUNE_MIN_LOSS_DELTA = 1.0e-2
+HARD_T101_VARIANT = "hard_all_t101"
+LEGACY_HARD_T101_VARIANT = "debug_" + HARD_T101_VARIANT[len("hard_"):]
+HARD_T101_MIN_LOSS_DELTA = 1.0e-4
+HARD_T101_ZERO_TOL = 1.0e-6
+HARD_T101_VALIDATION_TABLE = "table_hard_pruning_forward_path_validation.csv"
+HARD_T101_VALIDATION_DESCRIPTION = (
+    "This experiment validates that hard-pruned gates are applied to the actual "
+    "forward computation path. The threshold rho=1.01 removes all RW neurons "
+    "from all pools because Select activations are bounded above by one. If "
+    "hard pruning were only a diagnostic count and not applied to the forward "
+    "path, hard_all_t101 would remain close to full_soft. Degradation relative "
+    "to full_soft confirms that the hard-pruned path changes model computation."
+)
 
 FLOPS_TABLE_COLUMNS = (
     "model_name", "variant", "val_loss", "delta_loss",
@@ -146,6 +158,7 @@ class Variant:
     threshold: Optional[float] = None
     denominator: str = "pruned"
     notes: str = ""
+    return_prune_stats: bool = True
 
 
 MAIN_DAWN_VARIANTS = (
@@ -162,20 +175,22 @@ MAIN_DAWN_VARIANTS = (
     Variant("hard_v_t090", True, "v", 0.90),
 )
 
+FORWARD_PATH_VALIDATION_VARIANT = Variant(
+    HARD_T101_VARIANT,
+    True,
+    "all",
+    1.01,
+    denominator="retained",
+    notes="forward-path validation boundary case; all RW neurons removed",
+)
+
 SUB_DAWN_VARIANTS = (
     Variant("full_soft", False, "all", None, notes="soft-gated full pool"),
     Variant("sub_hard_all_t090", True, "all", 0.90),
 )
 
-DEBUG_DAWN_VARIANTS = (
-    Variant(
-        "debug_all_t101",
-        True,
-        "all",
-        1.01,
-        notes="debug-only destructive prune control; not for paper tables",
-    ),
-)
+MAIN_DAWN_VARIANTS = MAIN_DAWN_VARIANTS + (FORWARD_PATH_VALIDATION_VARIANT,)
+FORWARD_PATH_VALIDATION_VARIANTS = (FORWARD_PATH_VALIDATION_VARIANT,)
 
 
 def is_host0() -> bool:
@@ -470,7 +485,7 @@ def build_sharded_fns(cfg: Dict[str, Any], mesh: Mesh, mesh_model: int,
             "prune_activation_threshold": variant.threshold if enabled else None,
             "prune_scope": variant.scope,
             "prune_denominator": variant.denominator,
-            "return_prune_stats": True,
+            "return_prune_stats": variant.return_prune_stats,
         })
         return kw
 
@@ -556,7 +571,14 @@ def evaluate_variant(model, params, cfg: Dict[str, Any], val_bin: str,
                      max_batches: Optional[int], local_cache_dir: Optional[str],
                      mesh: Optional[Mesh], data_sharding, sharded_fns,
                      variant: Variant, progress_every: int) -> Dict[str, Any]:
-    eval_step = make_eval_step(model, sharded_fns, return_prune_stats=cfg["model"].get("model_version") in DAWN_SRW_VERSIONS)
+    eval_step = make_eval_step(
+        model,
+        sharded_fns,
+        return_prune_stats=(
+            cfg["model"].get("model_version") in DAWN_SRW_VERSIONS
+            and variant.return_prune_stats
+        ),
+    )
     total_loss = 0.0
     total_correct = 0.0
     total_valid = 0.0
@@ -898,34 +920,62 @@ def parse_models(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def variants_for(model_entry: Dict[str, Any]) -> Tuple[Variant, ...]:
     if model_entry["family"] == "baseline":
-        return (Variant("full_validation", False, notes="baseline full validation"),)
+        return (Variant(
+            "full_validation",
+            False,
+            notes="baseline full validation",
+            return_prune_stats=False,
+        ),)
     if model_entry.get("role") == "sub":
         return SUB_DAWN_VARIANTS
     return MAIN_DAWN_VARIANTS
 
 
-def selected_variants_for(model_entry: Dict[str, Any],
-                          args: Optional[argparse.Namespace]) -> Tuple[Variant, ...]:
-    variants = variants_for(model_entry)
-    if (args is not None
-            and getattr(args, "include_debug_prune_control", False)
-            and model_entry["family"] == "dawn_srw"
-            and model_entry.get("role") == "main"):
-        variants = variants + DEBUG_DAWN_VARIANTS
+def parse_variant_names(args: Optional[argparse.Namespace]) -> set[str]:
     if args is None or not getattr(args, "variants", None):
-        return variants
-    if model_entry["family"] == "baseline":
-        return variants
-    wanted = {
+        return set()
+    return {
         name.strip()
         for name in str(args.variants).split(",")
         if name.strip()
     }
-    selected = tuple(v for v in variants if v.name in wanted)
+
+
+def include_hard_t101(args: Optional[argparse.Namespace]) -> bool:
+    """Legacy option compatibility; hard_all_t101 is now part of the default run."""
+    if args is None:
+        return False
+    return bool(
+        getattr(args, "include_hard_t101", False)
+        or getattr(args, "include_forward_path_control", False)
+        or getattr(args, "include_debug_prune_control", False)
+    )
+
+
+def is_main_dawn(model_entry: Dict[str, Any]) -> bool:
+    return (
+        model_entry["family"] == "dawn_srw"
+        and model_entry.get("role") == "main"
+    )
+
+
+def selected_variants_for(model_entry: Dict[str, Any],
+                          args: Optional[argparse.Namespace]) -> Tuple[Variant, ...]:
+    variants = variants_for(model_entry)
+    wanted = parse_variant_names(args)
+    needs_default_t101 = is_main_dawn(model_entry)
+    available = variants
+    if args is None or not wanted:
+        return available
+    if model_entry["family"] == "baseline":
+        return variants
+    selected = tuple(v for v in available if v.name in wanted)
     if not selected:
         raise ValueError(
             f"No variants selected for {model_entry.get('name')}; "
-            f"requested={sorted(wanted)}, available={[v.name for v in variants]}")
+            f"requested={sorted(wanted)}, available={[v.name for v in available]}")
+    if needs_default_t101 and HARD_T101_VARIANT not in {v.name for v in selected}:
+        selected = selected + FORWARD_PATH_VALIDATION_VARIANTS
     return selected
 
 
@@ -947,11 +997,22 @@ def resolve_run_config(manifest: Dict[str, Any], args: argparse.Namespace) -> Di
     }
 
 
+def canonical_variant_name(name: Any) -> Any:
+    return HARD_T101_VARIANT if name == LEGACY_HARD_T101_VARIANT else name
+
+
+def canonicalize_rows(rows: Sequence[Dict[str, Any]]) -> None:
+    for row in rows:
+        if row.get("variant") == LEGACY_HARD_T101_VARIANT:
+            row["variant"] = HARD_T101_VARIANT
+            row["notes"] = FORWARD_PATH_VALIDATION_VARIANTS[0].notes
+
+
 def completed_keys(raw_path: str) -> set[Tuple[str, str]]:
     done = set()
     for row in read_jsonl(raw_path):
         if row.get("status", "ok") == "ok":
-            done.add((row.get("model_name"), row.get("variant")))
+            done.add((row.get("model_name"), canonical_variant_name(row.get("variant"))))
     return done
 
 
@@ -984,6 +1045,11 @@ def build_row(model_entry: Dict[str, Any], cfg: Dict[str, Any], params,
         "prune_scope": variant.scope if variant.prune_enabled else "",
         "prune_activation_threshold": threshold_label(variant),
         "prune_denominator": variant.denominator if variant.prune_enabled else "",
+        "return_prune_stats": (
+            variant.return_prune_stats
+            if model_entry["family"] == "dawn_srw"
+            else False
+        ),
         "params": count_params(params),
         "checkpoint": model_entry["checkpoint"],
         "checkpoint_file": ckpt_meta.get("checkpoint_file", ""),
@@ -1055,6 +1121,7 @@ def add_deltas(rows: List[Dict[str, Any]]) -> None:
 
 def load_all_rows(raw_path: str) -> List[Dict[str, Any]]:
     rows = read_jsonl(raw_path)
+    canonicalize_rows(rows)
     add_deltas(rows)
     return rows
 
@@ -1120,8 +1187,8 @@ def flops_table_row(r: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
-def is_debug_variant_row(r: Dict[str, Any]) -> bool:
-    return str(r.get("variant", "")).startswith("debug_")
+def is_forward_path_validation_variant_row(r: Dict[str, Any]) -> bool:
+    return r.get("variant") == HARD_T101_VARIANT
 
 
 def hard_pruning_table_row(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -1177,20 +1244,46 @@ def all_variants_appendix_row(r: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
-def debug_control_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    row = all_variants_appendix_row(r)
-    row["debug_note"] = "not for paper tables; destructive pruning-path control"
-    return row
+def hard_t101_interpretation(variant: str) -> str:
+    if variant == "full_soft":
+        return "Full soft-gated evaluation."
+    if variant == MAIN_REPRESENTATIVE_HARD_VARIANT:
+        return "Strict hard-pruned evaluation; performance-preserving selected-RW execution."
+    if variant == HARD_T101_VARIANT:
+        return (
+            "Boundary hard-pruned evaluation; all RW neurons removed, validating "
+            "that hard-pruned gates affect the forward path."
+        )
+    return ""
+
+
+def forward_path_validation_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "variant": r.get("variant", ""),
+        "rho": r.get("prune_activation_threshold", ""),
+        "loss": fnum(r.get("val_loss"), 5),
+        "delta_loss_vs_full": fnum(r.get("delta_loss_vs_full_soft"), 5),
+        "acc": fnum(r.get("accuracy"), 5),
+        "qk_kept": fnum(r.get("estimated_executed_rw_ops_qk"), 2),
+        "v_kept": fnum(r.get("estimated_executed_rw_ops_v"), 2),
+        "rst_kept": fnum(r.get("estimated_executed_rw_ops_rst"), 2),
+        "retained_gate_mass_qk": fnum(r.get("qk_retained_gate_mass"), 8),
+        "retained_gate_mass_v": fnum(r.get("v_retained_gate_mass"), 8),
+        "retained_gate_mass_rst": fnum(r.get("rst_retained_gate_mass"), 8),
+        "interpretation": hard_t101_interpretation(str(r.get("variant", ""))),
+    }
 
 
 def summarize_tables(rows: List[Dict[str, Any]],
                      main_hard_variant: str = MAIN_REPRESENTATIVE_HARD_VARIANT
                      ) -> Dict[str, List[Dict[str, Any]]]:
     ok = [r for r in rows if r.get("status", "ok") == "ok"]
-    paper_ok = [r for r in ok if not is_debug_variant_row(r)]
-    debug_ok = [r for r in ok if is_debug_variant_row(r)]
+    performance_ok = [
+        r for r in ok
+        if not is_forward_path_validation_variant_row(r)
+    ]
     main_perf = []
-    for r in paper_ok:
+    for r in performance_ok:
         if r.get("model_type") == "baseline_transformer" or (
                 r.get("model_type") == "dawn_srw"
                 and r.get("role") == "main"
@@ -1215,20 +1308,34 @@ def summarize_tables(rows: List[Dict[str, Any]],
         "hard_qk_t090",
         "hard_v_t090",
     }
-    for r in paper_ok:
+    for r in performance_ok:
         if r.get("model_type") == "dawn_srw" and r.get("role") == "main" and (
                 r.get("variant") in main_hard_variants):
             hard_main.append(hard_pruning_table_row(r))
 
     threshold_sweep = []
-    for r in paper_ok:
+    for r in performance_ok:
         if r.get("model_type") == "dawn_srw" and r.get("role") == "main" and (
                 r.get("variant") == "full_soft" or r.get("variant", "").startswith("hard_all_t")):
             threshold_sweep.append(hard_pruning_table_row(r))
 
+    forward_path_validation = []
+    validation_order = ("full_soft", MAIN_REPRESENTATIVE_HARD_VARIANT, HARD_T101_VARIANT)
+    by_main_model = {}
+    for r in ok:
+        if r.get("model_type") == "dawn_srw" and r.get("role") == "main":
+            by_main_model.setdefault(r["model_name"], {})[r["variant"]] = r
+    for variants in by_main_model.values():
+        if HARD_T101_VARIANT not in variants:
+            continue
+        for variant_name in validation_order:
+            row = variants.get(variant_name)
+            if row:
+                forward_path_validation.append(forward_path_validation_row(row))
+
     sub_rows = []
     by_model = {}
-    for r in paper_ok:
+    for r in performance_ok:
         if r.get("model_type") == "dawn_srw" and r.get("role") == "sub":
             by_model.setdefault(r["model_name"], {})[r["variant"]] = r
     for name, variants in by_model.items():
@@ -1285,7 +1392,7 @@ def summarize_tables(rows: List[Dict[str, Any]],
         })
 
     flops_main = []
-    for r in paper_ok:
+    for r in performance_ok:
         is_main_model = (
             r.get("model_type") == "baseline_transformer"
             or r.get("role") == "main"
@@ -1296,18 +1403,18 @@ def summarize_tables(rows: List[Dict[str, Any]],
         if is_main_model and is_main_variant:
             flops_main.append(flops_table_row(r))
 
-    flops_appendix = [flops_table_row(r) for r in paper_ok]
+    flops_appendix = [flops_table_row(r) for r in performance_ok]
     flops_tradeoff = [
-        flops_table_row(r) for r in paper_ok
+        flops_table_row(r) for r in performance_ok
         if r.get("model_type") == "dawn_srw"
     ]
-    all_variants_appendix = [all_variants_appendix_row(r) for r in paper_ok]
-    debug_controls = [debug_control_row(r) for r in debug_ok]
+    all_variants_appendix = [all_variants_appendix_row(r) for r in performance_ok]
 
     tables = {
         "table_main_performance.csv": main_perf,
         "table_dawn_hard_pruning_main.csv": hard_main,
         "table_dawn_threshold_sweep_appendix.csv": threshold_sweep,
+        HARD_T101_VALIDATION_TABLE: forward_path_validation,
         "table_dawn_sub_strong_compare.csv": sub_rows,
         "table_explore_sweep_appendix.csv": explore,
         "table_theoretical_flops_main.csv": flops_main,
@@ -1315,8 +1422,6 @@ def summarize_tables(rows: List[Dict[str, Any]],
         "table_flops_vs_loss_tradeoff.csv": flops_tradeoff,
         "table_all_variants_appendix.csv": all_variants_appendix,
     }
-    if debug_controls:
-        tables["debug_prune_control_not_for_paper.csv"] = debug_controls
     return tables
 
 
@@ -1372,7 +1477,11 @@ def write_publication_files(output_dir: str, tables: Dict[str, List[Dict[str, An
     if not no_markdown:
         parts = ["# Paper Evaluation Tables\n", README_NOTE + "\n", FLOPS_NOTE + "\n"]
         for filename, rows in tables.items():
-            parts.append(f"\n## {filename[:-4]}\n")
+            if filename == HARD_T101_VALIDATION_TABLE:
+                parts.append("\n## Hard-pruning forward-path validation\n")
+                parts.append(HARD_T101_VALIDATION_DESCRIPTION + "\n")
+            else:
+                parts.append(f"\n## {filename[:-4]}\n")
             parts.append(markdown_table(rows))
         write_text(join_path(output_dir, "paper_tables.md"), "\n".join(parts))
     if not no_latex:
@@ -1391,23 +1500,34 @@ def write_readme(output_dir: str) -> None:
         "- table_main_performance.csv: compact paper main-table candidates.\n"
         "- table_dawn_hard_pruning_main.csv: main DAWN full vs hard-pruned rows.\n"
         "- table_dawn_threshold_sweep_appendix.csv: threshold sweep appendix rows.\n"
+        "- table_hard_pruning_forward_path_validation.csv: rho=1.01 hard-pruning "
+        "forward-path validation rows.\n"
         "- table_dawn_sub_strong_compare.csv: sub-checkpoint full vs strong-only comparison.\n"
         "- table_explore_sweep_appendix.csv: exploration sweep rows when config fields exist.\n"
         "- table_theoretical_flops_main.csv: main FLOPs accounting rows.\n"
         "- table_theoretical_flops_appendix.csv: all model/variant FLOPs accounting rows.\n"
         "- table_flops_vs_loss_tradeoff.csv: DAWN FLOPs/loss tradeoff rows.\n\n"
-        "- table_all_variants_appendix.csv: compact one-stop appendix across all non-debug rows.\n\n"
-        "Debug controls:\n"
-        "- debug_all_t101 is an optional destructive pruning-path control enabled by "
-        "--include_debug_prune_control. It hard-prunes all pools at activation "
-        "threshold 1.01 and is not intended for paper performance tables.\n"
-        "- If debug_all_t101 is run and its loss is almost unchanged from full_soft, "
-        "the sanity check fails because that would suggest the pruning path is not "
+        "- table_all_variants_appendix.csv: compact one-stop appendix across "
+        "standard performance rows.\n\n"
+        "Hard-pruning forward-path validation:\n"
+        "- hard_all_t101 applies rho=1.01 to every RW-neuron pool. Since Select "
+        "activations are bounded above by one, this removes all RW neurons and "
+        "validates that hard-pruned gates affect the actual forward path.\n"
+        "- hard_all_t101 is included in the default main DAWN evaluation run. "
+        "--include_hard_t101, --include_forward_path_control, and the legacy "
+        "--include_debug_prune_control flag remain accepted for compatibility.\n"
+        "- If hard_all_t101 loss is almost unchanged from full_soft, the sanity "
+        "check fails because that would suggest the pruning path is not "
         "affecting the forward output.\n\n"
+        "Example:\n"
+        "bash scripts/run_paper_eval_v4_32.sh \\\n"
+        "  --output_dir gs://dawn-tpu-data-c4/paper_results/paper_eval_v4_32_hard_t101_20260509 \\\n"
+        "  --variants full_soft,hard_all_t099 \\\n"
+        "  --fail_fast\n\n"
         "Rerun note:\n"
-        "- The launch wrappers use --resume_existing. After code or table-format "
-        "changes, prefer a fresh --output_dir to avoid accidentally reusing old "
-        "raw rows for newly added variants or diagnostics.\n\n"
+        "- The launch wrappers use --resume_existing. Existing output_dir values "
+        "can skip hard_all_t101 once that row already exists, so prefer a fresh "
+        "--output_dir for the forward-path validation run.\n\n"
         "The final console summary also prints full copyable CSV blocks between "
         "COPYABLE_PAPER_DATA_CSV_BEGIN and COPYABLE_PAPER_DATA_CSV_END.\n"
     )
@@ -1436,6 +1556,7 @@ def print_console_summary(tables: Dict[str, List[Dict[str, Any]]], output_dir: s
         ("Baseline/Main Performance", "table_main_performance.csv"),
         ("DAWN Main Full vs Strong/Hard", "table_dawn_hard_pruning_main.csv"),
         ("DAWN Threshold Sweep", "table_dawn_threshold_sweep_appendix.csv"),
+        ("Hard-pruning Forward-path Validation", HARD_T101_VALIDATION_TABLE),
         ("DAWN Sub Strong Compare", "table_dawn_sub_strong_compare.csv"),
         ("Theoretical FLOPs Main", "table_theoretical_flops_main.csv"),
         ("FLOPs vs Loss Tradeoff", "table_flops_vs_loss_tradeoff.csv"),
@@ -1459,13 +1580,13 @@ def print_console_summary(tables: Dict[str, List[Dict[str, Any]]], output_dir: s
             "table_main_performance.csv",
             "table_dawn_hard_pruning_main.csv",
             "table_dawn_threshold_sweep_appendix.csv",
+            HARD_T101_VALIDATION_TABLE,
             "table_dawn_sub_strong_compare.csv",
             "table_explore_sweep_appendix.csv",
             "table_theoretical_flops_main.csv",
             "table_theoretical_flops_appendix.csv",
             "table_flops_vs_loss_tradeoff.csv",
             "table_all_variants_appendix.csv",
-            "debug_prune_control_not_for_paper.csv",
             "paper_tables.md", "paper_tables.tex",
             "run_manifest_resolved.yaml", "README.txt"):
         print(f"  {join_path(output_dir, fn)}")
@@ -1529,21 +1650,31 @@ def sanity_checks(rows: List[Dict[str, Any]]) -> None:
                         f"{variant_name} kept {kept} > {prev_name} kept {prev_kept}")
                 prev_name = variant_name
                 prev_kept = kept
-        debug_row = by_variant.get("debug_all_t101")
+        hard_t101_row = by_variant.get(HARD_T101_VARIANT)
         full_row = by_variant.get("full_soft")
-        if debug_row and full_row:
-            debug_loss = float(debug_row["val_loss"])
+        if hard_t101_row and not full_row:
+            raise RuntimeError(
+                f"{name}: {HARD_T101_VARIANT} requires a full_soft row for "
+                "forward-path validation sanity checks")
+        if hard_t101_row and full_row:
+            hard_t101_loss = float(hard_t101_row["val_loss"])
             full_loss = float(full_row["val_loss"])
-            if abs(debug_loss - full_loss) < DEBUG_PRUNE_MIN_LOSS_DELTA:
-                raise ValueError(
-                    f"{name}: debug_all_t101 loss {debug_loss:.6f} is too close "
+            if abs(hard_t101_loss - full_loss) < HARD_T101_MIN_LOSS_DELTA:
+                raise RuntimeError(
+                    f"{name}: {HARD_T101_VARIANT} loss {hard_t101_loss:.6f} is too close "
                     f"to full_soft loss {full_loss:.6f}; pruning path may not "
                     "be affecting forward output")
             for pool in ("qk", "v", "rst"):
-                kept = float(debug_row.get(f"{pool}_kept_count_mean") or 0.0)
-                if kept > 1e-3:
-                    raise ValueError(
-                        f"{name}: debug_all_t101 {pool} kept_count should be zero, got {kept}")
+                kept = float(hard_t101_row.get(f"{pool}_kept_count_mean") or 0.0)
+                if abs(kept) > HARD_T101_ZERO_TOL:
+                    raise RuntimeError(
+                        f"{name}: {HARD_T101_VARIANT} {pool}_kept_mean "
+                        f"should be zero, got {kept}")
+                mass = float(hard_t101_row.get(f"{pool}_retained_gate_mass") or 0.0)
+                if abs(mass) > HARD_T101_ZERO_TOL:
+                    raise RuntimeError(
+                        f"{name}: {HARD_T101_VARIANT} retained_gate_mass_{pool} "
+                        f"should be zero, got {mass}")
 
 
 def parse_config_explore_fields(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1575,9 +1706,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--main_hard_variant", default=MAIN_REPRESENTATIVE_HARD_VARIANT,
                     help=("Representative main-table hard-pruned DAWN variant. "
                           "Default: hard_all_t099."))
+    ap.add_argument("--include_hard_t101", action="store_true",
+                    help=("Compatibility flag; hard_all_t101 is included in "
+                          "the default main DAWN evaluation run."))
+    ap.add_argument("--include_forward_path_control", action="store_true",
+                    help=("Alias for --include_hard_t101."))
     ap.add_argument("--include_debug_prune_control", action="store_true",
-                    help=("Run debug_all_t101 on main DAWN checkpoints as a "
-                          "destructive pruning-path control. Not used in paper tables."))
+                    help=("Legacy alias for --include_hard_t101."))
     ap.add_argument("--no_latex", action="store_true")
     ap.add_argument("--no_markdown", action="store_true")
     ap.add_argument("--exclude_lm_head_flops", dest="include_lm_head_flops",
