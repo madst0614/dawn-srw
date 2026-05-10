@@ -1548,11 +1548,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     return train_step
 
 
-def create_eval_step(model, sharded_fns=None):
+def create_eval_step(model, sharded_fns=None, return_dead_stats=False):
     """Create a jit-compiled evaluation step.
 
-    Uses the SLIM forward (analysis=False) -eval only needs loss /
-    correct / valid_count.
+    Uses the SLIM forward (analysis=False). Eval normally needs only loss /
+    correct / valid_count, with optional scalar dead stats for validation
+    logging.
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
 
@@ -1574,6 +1575,16 @@ def create_eval_step(model, sharded_fns=None):
             rngs={'dropout': eval_rng},
             **extra_kw,
         )
+        if return_dead_stats:
+            return (
+                result['loss'],
+                result['correct'],
+                result['valid_count'],
+                result.get('attn_dead_count', jnp.float32(0.0)),
+                result.get(
+                    'rst_dead_count',
+                    result.get('know_dead_count', jnp.float32(0.0))),
+            )
         return result['loss'], result['correct'], result['valid_count']
 
     return eval_step
@@ -1873,7 +1884,8 @@ def shard_batch(batch, n_devices):
 # ============================================================
 
 def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
-             verbose=True, data_sharding_spec=None):
+             verbose=True, data_sharding_spec=None,
+             return_dead_stats=False):
     """Run evaluation and return avg loss and accuracy.
 
     All hosts must call this (pmap requires it), but only verbose=True host prints.
@@ -1883,6 +1895,11 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
     total_loss_jax = jnp.float32(0.0)
     total_correct_jax = jnp.int32(0)
     total_valid_jax = jnp.int32(0)
+    dead_attn_sum_jax = jnp.float32(0.0)
+    dead_attn_max_jax = jnp.float32(0.0)
+    dead_rst_sum_jax = jnp.float32(0.0)
+    dead_rst_max_jax = jnp.float32(0.0)
+    dead_batches = 0
 
     eval_total = min(max_batches, len(val_loader))
     eval_start = time.time()
@@ -1898,17 +1915,40 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
             input_ids = shard_to_mesh(input_ids, data_sharding_spec, gs)
             attention_mask = shard_to_mesh(attention_mask, data_sharding_spec, gs)
 
-        ce_loss, correct, valid_count = eval_step_fn(params, input_ids, attention_mask)
+        if return_dead_stats:
+            (ce_loss, correct, valid_count,
+             attn_dead_count, rst_dead_count) = eval_step_fn(
+                params, input_ids, attention_mask)
+            attn_dead_count = jnp.asarray(attn_dead_count, dtype=jnp.float32)
+            rst_dead_count = jnp.asarray(rst_dead_count, dtype=jnp.float32)
+            # These are per-validation-batch dead statistics. They are not
+            # persistent lifetime dead-neuron counts.
+            dead_attn_sum_jax = dead_attn_sum_jax + attn_dead_count
+            dead_attn_max_jax = jnp.maximum(dead_attn_max_jax, attn_dead_count)
+            dead_rst_sum_jax = dead_rst_sum_jax + rst_dead_count
+            dead_rst_max_jax = jnp.maximum(dead_rst_max_jax, rst_dead_count)
+            dead_batches += 1
+        else:
+            ce_loss, correct, valid_count = eval_step_fn(
+                params, input_ids, attention_mask)
 
         total_loss_jax = total_loss_jax + ce_loss * valid_count.astype(jnp.float32)
         total_correct_jax = total_correct_jax + correct
         total_valid_jax = total_valid_jax + valid_count
 
-    totals = jax.device_get({
+    totals_payload = {
         'loss': total_loss_jax,
         'correct': total_correct_jax,
         'valid': total_valid_jax,
-    })
+    }
+    if return_dead_stats:
+        totals_payload.update({
+            'dead_attn_sum': dead_attn_sum_jax,
+            'dead_attn_max': dead_attn_max_jax,
+            'dead_rst_sum': dead_rst_sum_jax,
+            'dead_rst_max': dead_rst_max_jax,
+        })
+    totals = jax.device_get(totals_payload)
     total_loss = float(totals['loss'])
     total_correct = int(totals['correct'])
     total_valid = int(totals['valid'])
@@ -1919,6 +1959,16 @@ def evaluate(eval_step_fn, params, val_loader, n_devices, max_batches=200,
         print(f"  Eval: {done}/{eval_total} batches, {eval_elapsed:.1f}s", flush=True)
     avg_loss = total_loss / total_valid if total_valid > 0 else 0.0
     avg_acc = total_correct / total_valid if total_valid > 0 else 0.0
+    if return_dead_stats:
+        denom = float(dead_batches) if dead_batches > 0 else 1.0
+        dead_stats = {
+            'val_attn_dead_mean': float(totals['dead_attn_sum']) / denom,
+            'val_attn_dead_max': float(totals['dead_attn_max']),
+            'val_rst_dead_mean': float(totals['dead_rst_sum']) / denom,
+            'val_rst_dead_max': float(totals['dead_rst_max']),
+            'val_dead_batches': int(dead_batches),
+        }
+        return avg_loss, avg_acc, dead_stats
     return avg_loss, avg_acc
 
 
@@ -2278,6 +2328,57 @@ def log_debug_jsonl(record):
         _debug_jsonl_logger.write(line + '\n')
     except Exception as e:
         print(f"  [warn] log_debug_jsonl write failed: {e}", flush=True)
+
+
+def _dead_pool_totals(ctx):
+    attn_total = float(ctx.get('n_qk_cfg', 0) + ctx.get('n_v_cfg', 0))
+    rst_total = float(ctx.get(
+        'n_rst_cfg',
+        ctx.get('n_know_cfg', 0)))
+    return attn_total, rst_total
+
+
+def _attach_validation_dead_fractions(rec, ctx):
+    attn_total, rst_total = _dead_pool_totals(ctx)
+    a_mean = float(rec.get(
+        'val_attn_dead_mean',
+        rec.get('attn_dead_count', 0.0)))
+    a_max = float(rec.get(
+        'val_attn_dead_max',
+        rec.get('attn_dead_count', 0.0)))
+    rst_mean = float(rec.get(
+        'val_rst_dead_mean',
+        rec.get('rst_dead_count', 0.0)))
+    rst_max = float(rec.get(
+        'val_rst_dead_max',
+        rec.get('rst_dead_count', 0.0)))
+    rec['val_attn_dead_mean'] = a_mean
+    rec['val_attn_dead_max'] = a_max
+    rec['val_rst_dead_mean'] = rst_mean
+    rec['val_rst_dead_max'] = rst_max
+    rec['val_attn_dead_frac_mean'] = (
+        a_mean / attn_total if attn_total > 0.0 else 0.0)
+    rec['val_attn_dead_frac_max'] = (
+        a_max / attn_total if attn_total > 0.0 else 0.0)
+    rec['val_rst_dead_frac_mean'] = (
+        rst_mean / rst_total if rst_total > 0.0 else 0.0)
+    rec['val_rst_dead_frac_max'] = (
+        rst_max / rst_total if rst_total > 0.0 else 0.0)
+    return rec
+
+
+def _print_validation_dead_stats(rec, ctx):
+    rec = _attach_validation_dead_fractions(dict(rec), ctx)
+    log_message(
+        f"  dead_val[a_mean={rec['val_attn_dead_mean']:.1f}"
+        f" a_max={rec['val_attn_dead_max']:.1f}"
+        f" rst_mean={rec['val_rst_dead_mean']:.1f}"
+        f" rst_max={rec['val_rst_dead_max']:.1f}]"
+        f" | dead_frac[a_mean={rec['val_attn_dead_frac_mean'] * 100:.3f}%"
+        f" a_max={rec['val_attn_dead_frac_max'] * 100:.3f}%"
+        f" rst_mean={rec['val_rst_dead_frac_mean'] * 100:.3f}%"
+        f" rst_max={rec['val_rst_dead_frac_max'] * 100:.3f}%]"
+    )
 
 
 def check_nan_inf(metrics_dict, global_step, epoch):
@@ -3276,6 +3377,23 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_z_lt_075': float(m.get('rst_z_lt_075', 0.0)),
         'attn_z_lt_030': float(m.get('attn_z_lt_030', 0.0)),
         'rst_z_lt_030': float(m.get('rst_z_lt_030', 0.0)),
+        # These are per-validation-batch dead statistics. They are not
+        # persistent lifetime dead-neuron counts.
+        'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
+        'rst_dead_count': float(m.get('rst_dead_count', 0.0)),
+        'val_attn_dead_mean': float(m.get(
+            'val_attn_dead_mean',
+            m.get('attn_dead_count', 0.0))),
+        'val_attn_dead_max': float(m.get(
+            'val_attn_dead_max',
+            m.get('attn_dead_count', 0.0))),
+        'val_rst_dead_mean': float(m.get(
+            'val_rst_dead_mean',
+            m.get('rst_dead_count', 0.0))),
+        'val_rst_dead_max': float(m.get(
+            'val_rst_dead_max',
+            m.get('rst_dead_count', 0.0))),
+        'val_dead_batches': int(m.get('val_dead_batches', 1)),
         'attn_int_cap_frac': float(m.get('attn_int_cap_frac', 0.0)),
         'rst_int_cap_frac': float(m.get('rst_int_cap_frac', 0.0)),
         'attn_int_max': float(m.get('attn_int_max', float('nan'))),
@@ -3403,6 +3521,7 @@ def _build_analysis_record(base, metrics, ctx):
                 m.get('rst_gate_den_sum_mean',
                       m.get('rst_den_cost', 0.0)))),
         })
+    _attach_validation_dead_fractions(rec, ctx)
     # HBM (host-0 local device 0 snapshot).
     try:
         mem = jax.local_devices()[0].memory_stats()
@@ -3460,6 +3579,7 @@ def _print_analysis_block(rec, ctx):
         f" attn_qk={rec['attn_qk_emb_norm_max']:.2f}"
         f" attn_v={rec['attn_v_emb_norm_max']:.2f}"
     )
+    _print_validation_dead_stats(rec, ctx)
     log_message(
         f"  emb_full qk[{_emb_full('attn_qk_emb_norm')}]"
         f" v[{_emb_full('attn_v_emb_norm')}]"
@@ -4450,7 +4570,8 @@ def main():
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
         debug_local_spikes=_train_local_diag)
-    eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
+    eval_step_fn = create_eval_step(
+        model, sharded_fns=_sharded_fns, return_dead_stats=True)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
     # degrades to empty then.
@@ -5142,6 +5263,8 @@ def main():
     # each log event. Fed into train_step so the drift collective runs inside
     # jit on all hosts; the actual ||쨌|| reductions live there.
     _prev_emb_snap = _drift_snap(params)
+    _latest_val_dead_stats = None
+    _latest_val_dead_step = None
 
     for epoch in range(start_epoch, num_epochs):
         epoch_start = time.time()
@@ -5312,7 +5435,8 @@ def main():
                         'n_qk_cfg': cfg['model'].get(
                             'n_qk', cfg['model'].get('n_q', 0)),
                         'n_v_cfg': cfg['model'].get('n_v', 0),
-                        'n_rst_cfg': cfg['model'].get('n_know', 0),
+                        'n_rst_cfg': cfg['model'].get(
+                            'n_rst', cfg['model'].get('n_know', 0)),
                         'current_lr': _current_lr,
                         'steps_per_sec': _steps_per_sec,
                         'total_elapsed': _total_elapsed,
@@ -5383,7 +5507,8 @@ def main():
                     'n_qk_cfg': cfg['model'].get(
                         'n_qk', cfg['model'].get('n_q', 0)),
                     'n_v_cfg': cfg['model'].get('n_v', 0),
-                    'n_rst_cfg': cfg['model'].get('n_know', 0),
+                    'n_rst_cfg': cfg['model'].get(
+                        'n_rst', cfg['model'].get('n_know', 0)),
                     'current_lr': _current_lr,
                     'steps_per_sec': _steps_per_sec,
                     'total_elapsed': _total_elapsed,
@@ -5418,17 +5543,32 @@ def main():
                 if is_host0:
                     log_message(f"\n  Mid-epoch validation at step {global_step}...")
                 val_loader.reset()
-                val_loss, val_acc = evaluate(
+                val_loss, val_acc, val_dead_stats = evaluate(
                     eval_step_fn, params, val_loader, n_local_devices,
-                    verbose=is_host0, data_sharding_spec=data_sharding)
+                    verbose=is_host0, data_sharding_spec=data_sharding,
+                    return_dead_stats=True)
+                _latest_val_dead_stats = val_dead_stats
+                _latest_val_dead_step = global_step
                 if is_host0:
+                    _val_dead_ctx = {
+                        'n_qk_cfg': cfg['model'].get(
+                            'n_qk', cfg['model'].get('n_q', 0)),
+                        'n_v_cfg': cfg['model'].get('n_v', 0),
+                        'n_rst_cfg': cfg['model'].get(
+                            'n_rst', cfg['model'].get('n_know', 0)),
+                    }
+                    val_dead_log = _attach_validation_dead_fractions(
+                        dict(val_dead_stats), _val_dead_ctx)
                     log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+                    if not (_do_analysis and analysis_step_fn is not None):
+                        _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
                     log_jsonl({
                         'type': 'val',
                         'step': global_step,
                         'epoch': epoch,
                         'val_loss': val_loss,
                         'val_acc': val_acc,
+                        **val_dead_log,
                         'timestamp': datetime.now().isoformat(),
                     })
                 if val_loss < best_val_loss:
@@ -5468,11 +5608,15 @@ def main():
                                 'n_qk_cfg': cfg['model'].get(
                                     'n_qk', cfg['model'].get('n_q', 0)),
                                 'n_v_cfg': cfg['model'].get('n_v', 0),
-                                'n_rst_cfg': cfg['model'].get('n_know', 0),
+                                'n_rst_cfg': cfg['model'].get(
+                                    'n_rst', cfg['model'].get('n_know', 0)),
                                 'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
                             }
                             analysis_payload = dict(analysis_result)
+                            if _latest_val_dead_step == global_step \
+                                    and _latest_val_dead_stats is not None:
+                                analysis_payload.update(_latest_val_dead_stats)
                             for _pool in ('qk', 'v', 'know'):
                                 for _part in ('emb', 'read', 'write'):
                                     _key = f'{_pool}_{_part}_grad_ratio'
@@ -5606,22 +5750,36 @@ def main():
         if is_host0:
             log_message("  Running end-of-epoch validation...")
         val_loader.reset()
-        val_loss, val_acc = evaluate(
+        val_loss, val_acc, val_dead_stats = evaluate(
             eval_step_fn, params, val_loader, n_local_devices,
-            verbose=is_host0, data_sharding_spec=data_sharding)
+            verbose=is_host0, data_sharding_spec=data_sharding,
+            return_dead_stats=True)
+        _latest_val_dead_stats = val_dead_stats
+        _latest_val_dead_step = global_step
 
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
 
         if is_host0:
+            _val_dead_ctx = {
+                'n_qk_cfg': cfg['model'].get(
+                    'n_qk', cfg['model'].get('n_q', 0)),
+                'n_v_cfg': cfg['model'].get('n_v', 0),
+                'n_rst_cfg': cfg['model'].get(
+                    'n_rst', cfg['model'].get('n_know', 0)),
+            }
+            val_dead_log = _attach_validation_dead_fractions(
+                dict(val_dead_stats), _val_dead_ctx)
             log_message(f"  Val loss={val_loss:.4f}, Val acc={val_acc:.4f}")
+            _print_validation_dead_stats(val_dead_log, _val_dead_ctx)
             log_jsonl({
                 'type': 'val_epoch',
                 'step': global_step,
                 'epoch': epoch,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
+                **val_dead_log,
                 'train_loss': epoch_avg_loss,
                 'train_acc': epoch_avg_acc,
                 'epoch_time': epoch_elapsed,
