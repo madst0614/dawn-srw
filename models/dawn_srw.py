@@ -217,6 +217,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     four gate-concentration diagnostics, and skips distribution-shape stats
     (skew/kurt), boundary/entropy counters and intensity-cap fraction.
     XLA DCE's the unused work.
+    `local_diagnostics=True` appends a lightweight, scalar-only local-spike
+    summary to either path. It is independent of `analysis=True` and is
+    collected inline during the existing chunk scan.
     `analysis=True`: returns the SLIM/concentration tuple followed by 11 extra
     observational scalars/arrays (score_skew, score_kurt, apt_std,
     gate_entropy, phi_binary, z_lt_075_frac, z_lt_030_frac,
@@ -310,7 +313,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                   if analysis else _slim_out_specs + _conc_out_specs)
     if _return_prune_stats:
         _out_specs = _out_specs + _prune_extra_specs
-    if analysis and _local_diagnostics:
+    if _local_diagnostics:
         _out_specs = _out_specs + _local_diag_specs
 
     @partial(shard_map, mesh=mesh,
@@ -338,6 +341,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1 = jnp.zeros((B, S, 1))
+        diag_neg_inf = jnp.float32(-1.0e30)
+        diag_vals_init = jnp.full(
+            (1, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
 
         def route_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
@@ -434,7 +440,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_z_lt_075, total_z_lt_030, total_g_log_g,
                  total_dead_penalty, total_dead_count,
                  total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count) = carry
+                 total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
@@ -465,6 +471,22 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
                 chunk_den_cost = (chunk_full_gate if _denominator_is_full
                                   else chunk_weighted)
+                if _local_diagnostics:
+                    write_norm = jnp.linalg.norm(
+                        wc.astype(jnp.float32), axis=-1)
+                    contrib_proxy = (
+                        jnp.abs(jax.lax.stop_gradient(gate * xr_f))
+                        * write_norm[None, None, :])
+                    diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
+                    diag_chunk = diag_chunk.at[:, 1].set(
+                        jnp.max(jax.lax.stop_gradient(margin)))
+                    diag_chunk = diag_chunk.at[:, 4].set(
+                        jnp.max(jax.lax.stop_gradient(intensity)))
+                    diag_chunk = diag_chunk.at[:, 5].set(
+                        jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
+                    diag_chunk = diag_chunk.at[:, 6].set(
+                        jnp.max(contrib_proxy))
+                    diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -503,19 +525,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_full_gate + chunk_full_gate,
                         total_kept_count + chunk_kept,
-                        total_int_cap_count + chunk_int_cap_count), None
+                        total_int_cap_count + chunk_int_cap_count,
+                        diag_vals), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_phi_binary, total_den_cost, total_activation_cost,
              total_current_cost, total_z_lt_075, total_z_lt_030,
              total_g_log_g, total_dead_penalty, total_dead_count,
              total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count), _ = jax.lax.scan(
+             total_int_cap_count, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1, z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1, z1, z1, z1, z1,
                  jnp.float32(0.0), jnp.float32(0.0),
-                 jnp.float32(0.0), z1, z1, jnp.float32(0.0)),
+                 jnp.float32(0.0), z1, z1, jnp.float32(0.0),
+                 diag_vals_init),
                 jnp.arange(nc))
         else:
             @jax.checkpoint
@@ -525,7 +549,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_activation_cost, total_current_cost,
                  total_dead_penalty, total_dead_count,
                  total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count) = carry
+                 total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
@@ -559,6 +583,22 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     else chunk_weighted)
                 chunk_den_cost = (chunk_full_gate if _denominator_is_full
                                   else chunk_weighted)
+                if _local_diagnostics:
+                    write_norm = jnp.linalg.norm(
+                        wc.astype(jnp.float32), axis=-1)
+                    contrib_proxy = (
+                        jnp.abs(jax.lax.stop_gradient(gate * xr_f))
+                        * write_norm[None, None, :])
+                    diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
+                    diag_chunk = diag_chunk.at[:, 1].set(
+                        jnp.max(jax.lax.stop_gradient(margin)))
+                    diag_chunk = diag_chunk.at[:, 4].set(
+                        jnp.max(jax.lax.stop_gradient(intensity)))
+                    diag_chunk = diag_chunk.at[:, 5].set(
+                        jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
+                    diag_chunk = diag_chunk.at[:, 6].set(
+                        jnp.max(contrib_proxy))
+                    diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 # sum(gate) feeds the denominator after the chunk scan.
@@ -586,18 +626,19 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_full_gate + chunk_full_gate,
                         total_kept_count + chunk_kept,
-                        total_int_cap_count + chunk_int_cap_count), None
+                        total_int_cap_count + chunk_int_cap_count,
+                        diag_vals), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_den_cost, total_activation_cost, total_current_cost,
              total_dead_penalty, total_dead_count,
              total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count), _ = jax.lax.scan(
+             total_int_cap_count, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1, z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0),
-                 z1, z1, jnp.float32(0.0)),
+                 z1, z1, jnp.float32(0.0), diag_vals_init),
                 jnp.arange(nc))
 
         global_weighted_cost = jax.lax.psum(total_weighted_cost, 'model')  # sum(gate)
@@ -675,8 +716,42 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 int_cap_frac_out,
                 global_gate_max_m.mean(),
             )
+        local_diag_out = ()
+        if _local_diagnostics:
+            tau_abs_max = jnp.max(jnp.abs(jax.lax.stop_gradient(tau_offset)))
+            top1_share_max = jnp.max(
+                global_gate_max_m / jnp.maximum(global_den_cost_m, 1e-8))
+            gate_den_sum_max = jnp.max(global_den_cost_m)
+            local_out_norm_max = jnp.max(jnp.linalg.norm(
+                jax.lax.stop_gradient(out), axis=-1))
+            residual_norm_max = jnp.max(jnp.linalg.norm(
+                jax.lax.stop_gradient(x), axis=-1))
+            token_vals = jnp.stack([
+                tau_abs_max, top1_share_max, gate_den_sum_max,
+                local_out_norm_max, residual_norm_max,
+            ]).reshape((1, 5))
+            token_slots = jnp.array([0, 2, 3, 7, 8], dtype=jnp.int32)
+            metric_vals = diag_vals.at[:, token_slots].set(token_vals)
+            metric_vals = jax.lax.stop_gradient(metric_vals)
+            metric_vals = jax.lax.pmax(metric_vals, 'model')
+            metric_vals = jax.lax.pmax(metric_vals, 'data')
+            metric_locs = jnp.full(
+                (1, LOCAL_SPIKE_METRIC_COUNT, 3), -1, dtype=jnp.int32)
+            top1_details = jnp.zeros(
+                (1, LOCAL_SPIKE_TOP1_COUNT), dtype=jnp.float32)
+            top1_details = top1_details.at[:, 0].set(metric_vals[:, 2])
+            top1_details = top1_details.at[:, 4].set(metric_vals[:, 1])
+            top1_details = top1_details.at[:, 6].set(metric_vals[:, 3])
+            top1_details = top1_details.at[:, 7].set(metric_vals[:, 4])
+            top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
+            top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
+            top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_locs = jnp.full((1, 3), -1, dtype=jnp.int32)
+            local_diag_out = (
+                metric_vals.astype(jnp.float32), metric_locs,
+                top1_details, top1_locs)
         if not analysis:
-            return slim_out + conc_out + prune_out
+            return slim_out + conc_out + prune_out + local_diag_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -703,8 +778,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * N_total))
-        local_diag_out = ()
-        if _local_diagnostics:
+        # local_diag_out is collected inline in pass 2 above; do not run a
+        # diagnostics-only chunk replay here.
+        if False and _local_diagnostics:
             data_axis = jax.lax.axis_index('data')
             model_axis = jax.lax.axis_index('model')
             global_b_base = data_axis * B
@@ -920,7 +996,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     Returns out [B,S,2,D], active [B,S,1], gate_max [B,S,1].
 
     v4.1 gate: activation * intensity (see make_sharded_srw docstring).
-    analysis: see make_sharded_srw docstring.
+    analysis/local_diagnostics: see make_sharded_srw docstring.
     """
     _model_axis_size = mesh.shape['model']
     _data_axis_size = mesh.shape['data']
@@ -1006,7 +1082,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                   if analysis else _slim_out_specs + _conc_out_specs)
     if _return_prune_stats:
         _out_specs = _out_specs + _prune_extra_specs
-    if analysis and _local_diagnostics:
+    if _local_diagnostics:
         _out_specs = _out_specs + _local_diag_specs
 
     @partial(shard_map, mesh=mesh,
@@ -1035,6 +1111,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         read_bf = read_local.astype(jnp.bfloat16)
         write_bf = write_local.astype(jnp.bfloat16)
         z1_r = jnp.zeros((B, S, 2, 1))
+        diag_neg_inf = jnp.float32(-1.0e30)
+        diag_vals_init = jnp.full(
+            (2, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
 
         def route_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
@@ -1128,7 +1207,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_z_lt_075, total_z_lt_030, total_g_log_g,
                  total_dead_penalty, total_dead_count,
                  total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count) = carry
+                 total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
@@ -1162,6 +1241,26 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     else chunk_weighted)
                 chunk_den_cost = (chunk_full_gate if _denominator_is_full
                                   else chunk_weighted)
+                if _local_diagnostics:
+                    write_norm = jnp.linalg.norm(
+                        wc.astype(jnp.float32), axis=-1)
+                    xr_r = xr_f[:, :, None, :]
+                    contrib_proxy = (
+                        jnp.abs(jax.lax.stop_gradient(gate * xr_r))
+                        * write_norm[None, None, None, :])
+                    diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
+                    diag_chunk = diag_chunk.at[:, 1].set(
+                        jnp.max(jax.lax.stop_gradient(margin),
+                                axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 4].set(
+                        jnp.max(jax.lax.stop_gradient(intensity),
+                                axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 5].set(
+                        jnp.max(jnp.abs(jax.lax.stop_gradient(
+                            xr_r + jnp.zeros_like(gate))), axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 6].set(
+                        jnp.max(contrib_proxy, axis=(0, 1, 3)))
+                    diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_phi_binary = ((activation > 0.1) & (activation < 0.9)
@@ -1200,20 +1299,22 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_full_gate + chunk_full_gate,
                         total_kept_count + chunk_kept,
-                        total_int_cap_count + chunk_int_cap_count), None
+                        total_int_cap_count + chunk_int_cap_count,
+                        diag_vals), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_phi_binary, total_den_cost, total_activation_cost,
              total_current_cost, total_z_lt_075, total_z_lt_030,
              total_g_log_g, total_dead_penalty, total_dead_count,
              total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count), _ = jax.lax.scan(
+             total_int_cap_count, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0),
-                 jnp.float32(0.0), z1_r, z1_r, jnp.float32(0.0)),
+                 jnp.float32(0.0), z1_r, z1_r, jnp.float32(0.0),
+                 diag_vals_init),
                 jnp.arange(nc))
         else:
             @jax.checkpoint
@@ -1223,7 +1324,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_activation_cost, total_current_cost,
                  total_dead_penalty, total_dead_count,
                  total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count) = carry
+                 total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
@@ -1254,6 +1355,26 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
                 chunk_den_cost = (chunk_full_gate if _denominator_is_full
                                   else chunk_weighted)
+                if _local_diagnostics:
+                    write_norm = jnp.linalg.norm(
+                        wc.astype(jnp.float32), axis=-1)
+                    xr_r = xr_f[:, :, None, :]
+                    contrib_proxy = (
+                        jnp.abs(jax.lax.stop_gradient(gate * xr_r))
+                        * write_norm[None, None, None, :])
+                    diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
+                    diag_chunk = diag_chunk.at[:, 1].set(
+                        jnp.max(jax.lax.stop_gradient(margin),
+                                axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 4].set(
+                        jnp.max(jax.lax.stop_gradient(intensity),
+                                axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 5].set(
+                        jnp.max(jnp.abs(jax.lax.stop_gradient(
+                            xr_r + jnp.zeros_like(gate))), axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 6].set(
+                        jnp.max(contrib_proxy, axis=(0, 1, 3)))
+                    diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 max_gate_chunk = gate.max(axis=(0, 1, 2))
@@ -1280,19 +1401,20 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_int_max, chunk_int_max),
                         total_full_gate + chunk_full_gate,
                         total_kept_count + chunk_kept,
-                        total_int_cap_count + chunk_int_cap_count), None
+                        total_int_cap_count + chunk_int_cap_count,
+                        diag_vals), None
 
             (raw_out, total_weighted_cost, total_gate_sq, total_gate_max, total_active, total_strong,
              total_den_cost, total_activation_cost, total_current_cost,
              total_dead_penalty, total_dead_count,
              total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count), _ = jax.lax.scan(
+             total_int_cap_count, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
                  z1_r, z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0),
-                 z1_r, z1_r, jnp.float32(0.0)),
+                 z1_r, z1_r, jnp.float32(0.0), diag_vals_init),
                 jnp.arange(nc))
 
         # Normalize per route independently
@@ -1372,8 +1494,48 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 int_cap_frac_out,
                 global_gate_max_m.mean(),
             )
+        local_diag_out = ()
+        if _local_diagnostics:
+            tau_abs_max = jnp.max(
+                jnp.abs(jax.lax.stop_gradient(tau_offset[..., 0])),
+                axis=(0, 1))
+            top1_share_max = jnp.max(
+                global_gate_max_m / jnp.maximum(global_den_cost_m, 1e-8),
+                axis=(0, 1, 3))
+            gate_den_sum_max = jnp.max(global_den_cost_m, axis=(0, 1, 3))
+            local_out_norm_max = jnp.max(
+                jnp.linalg.norm(jax.lax.stop_gradient(out), axis=-1),
+                axis=(0, 1))
+            residual_norm_max = jnp.repeat(
+                jnp.max(jnp.linalg.norm(
+                    jax.lax.stop_gradient(x), axis=-1)),
+                2)
+            token_vals = jnp.stack([
+                tau_abs_max, top1_share_max, gate_den_sum_max,
+                local_out_norm_max, residual_norm_max,
+            ], axis=1)
+            token_slots = jnp.array([0, 2, 3, 7, 8], dtype=jnp.int32)
+            metric_vals = diag_vals.at[:, token_slots].set(token_vals)
+            metric_vals = jax.lax.stop_gradient(metric_vals)
+            metric_vals = jax.lax.pmax(metric_vals, 'model')
+            metric_vals = jax.lax.pmax(metric_vals, 'data')
+            metric_locs = jnp.full(
+                (2, LOCAL_SPIKE_METRIC_COUNT, 3), -1, dtype=jnp.int32)
+            top1_details = jnp.zeros(
+                (2, LOCAL_SPIKE_TOP1_COUNT), dtype=jnp.float32)
+            top1_details = top1_details.at[:, 0].set(metric_vals[:, 2])
+            top1_details = top1_details.at[:, 4].set(metric_vals[:, 1])
+            top1_details = top1_details.at[:, 6].set(metric_vals[:, 3])
+            top1_details = top1_details.at[:, 7].set(metric_vals[:, 4])
+            top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
+            top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
+            top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_locs = jnp.full((2, 3), -1, dtype=jnp.int32)
+            local_diag_out = (
+                metric_vals.astype(jnp.float32), metric_locs,
+                top1_details, top1_locs)
         if not analysis:
-            return slim_out + conc_out + prune_out
+            return slim_out + conc_out + prune_out + local_diag_out
 
         # --- Analysis-only extras ---
         phi_binary_frac = jax.lax.psum(total_phi_binary, 'model') / N_total
@@ -1399,8 +1561,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * 2 * N_total))
-        local_diag_out = ()
-        if _local_diagnostics:
+        # local_diag_out is collected inline in pass 2 above; do not run a
+        # diagnostics-only chunk replay here.
+        if False and _local_diagnostics:
             data_axis = jax.lax.axis_index('data')
             model_axis = jax.lax.axis_index('model')
             global_b_base = data_axis * B
@@ -1755,9 +1918,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          qk_den_cost, qk_activation_cost, qk_current_cost,
          qk_kurt, qk_int_cap) = qk_ret[20:31]
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
-        if local_diagnostics:
-            (qk_local_values, qk_local_locs,
-             qk_top1_values, qk_top1_locs) = qk_ret[-4:]
+    if local_diagnostics:
+        (qk_local_values, qk_local_locs,
+         qk_top1_values, qk_top1_locs) = qk_ret[-4:]
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
     v_ret = fused_single_v(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
@@ -1777,9 +1940,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          v_den_cost, v_activation_cost, v_current_cost,
          v_kurt, v_int_cap) = v_ret[20:31]
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
-        if local_diagnostics:
-            (v_local_values, v_local_locs,
-             v_top1_values, v_top1_locs) = v_ret[-4:]
+    if local_diagnostics:
+        (v_local_values, v_local_locs,
+         v_top1_values, v_top1_locs) = v_ret[-4:]
     V = V * v_scale
 
     d_head = d_model // n_heads
@@ -1797,36 +1960,40 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_scores = jnp.where(causal, attn_scores,
                                 jnp.finfo(attn_scores.dtype).min)
         attn_w = jax.nn.softmax(attn_scores, axis=-1)
-        if analysis:
+        if analysis or local_diagnostics:
             attn_logit_max_dbg = jnp.max(attn_scores)
             attn_softmax_top1_dbg = jnp.max(attn_w)
         attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
         out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
-        if analysis:
+        if analysis or local_diagnostics:
             return out_dbg, attn_logit_max_dbg, attn_softmax_top1_dbg
         return out_dbg
 
+    if analysis or local_diagnostics:
+        q_norms_dbg = jnp.linalg.norm(Q, axis=-1)
+        k_norms_dbg = jnp.linalg.norm(K, axis=-1)
+        v_norms_dbg = jnp.linalg.norm(V, axis=-1)
     if analysis:
-        q_norm = jnp.linalg.norm(Q, axis=-1).mean()
-        k_norm = jnp.linalg.norm(K, axis=-1).mean()
-        v_norm_dbg = jnp.linalg.norm(V, axis=-1).mean()
+        q_norm = q_norms_dbg.mean()
+        k_norm = k_norms_dbg.mean()
+        v_norm_dbg = v_norms_dbg.mean()
         attn_logit_max = (q_norm * k_norm / scale)
 
-    if analysis:
+    if analysis or local_diagnostics:
         out, attn_logit_max_actual, attn_softmax_top1_max = _attn_scores(
             Q, K, V, rng_attn_drop)
     else:
         out = _attn_scores(Q, K, V, rng_attn_drop)
-    if analysis:
+    if analysis or local_diagnostics:
         o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
-        q_norm_max = jnp.linalg.norm(Q, axis=-1).max()
-        k_norm_max = jnp.linalg.norm(K, axis=-1).max()
-        v_norm_max = jnp.linalg.norm(V, axis=-1).max()
+        q_norm_max = q_norms_dbg.max()
+        k_norm_max = k_norms_dbg.max()
+        v_norm_max = v_norms_dbg.max()
         o_input_norm_max = jnp.linalg.norm(out, axis=-1).max()
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     attn_out_norm = jnp.linalg.norm(out, axis=-1).mean()
-    if analysis:
+    if analysis or local_diagnostics:
         o_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -1876,16 +2043,36 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_gate_eff_n, attn_gate_eff_ratio,
                 attn_top1_gate_frac, attn_top1_gate_frac_max)
     if not analysis:
-        if not return_prune_stats:
-            return slim_ret
-        return slim_ret + (
-            qk_kept_count, qk_kept_frac, qk_full_gate_sum,
-            qk_kept_gate_sum, qk_retained_gate_mass,
-            qk_int_cap_frac, qk_gate_max_mean,
-            v_kept_count, v_kept_frac, v_full_gate_sum,
-            v_kept_gate_sum, v_retained_gate_mass,
-            v_int_cap_frac, v_gate_max_mean,
-        )
+        ret = slim_ret
+        if return_prune_stats:
+            ret = ret + (
+                qk_kept_count, qk_kept_frac, qk_full_gate_sum,
+                qk_kept_gate_sum, qk_retained_gate_mass,
+                qk_int_cap_frac, qk_gate_max_mean,
+                v_kept_count, v_kept_frac, v_full_gate_sum,
+                v_kept_gate_sum, v_retained_gate_mass,
+                v_int_cap_frac, v_gate_max_mean,
+            )
+        if local_diagnostics:
+            attn_local_layer_values = jnp.stack([
+                q_norm_max, k_norm_max, v_norm_max,
+                attn_logit_max_actual, attn_softmax_top1_max,
+                o_input_norm_max, o_out_norm_max,
+            ])
+            attn_local_values = jnp.concatenate(
+                [qk_local_values, v_local_values], axis=0)
+            attn_local_locs = jnp.concatenate(
+                [qk_local_locs, v_local_locs], axis=0)
+            attn_top1_values = jnp.concatenate(
+                [qk_top1_values, v_top1_values], axis=0)
+            attn_top1_locs = jnp.concatenate(
+                [qk_top1_locs, v_top1_locs], axis=0)
+            ret = ret + (
+                attn_local_layer_values,
+                attn_local_values, attn_local_locs,
+                attn_top1_values, attn_top1_locs,
+            )
+        return ret
 
     attn_qk_phi_binary = qk_phi_bin.mean()
     attn_v_phi_binary = v_phi_bin.mean()
@@ -1979,9 +2166,9 @@ def _rst_forward(x, pool_params, router_params, rng,
          rst_den_cost, rst_activation_cost, rst_current_cost,
          rst_score_kurt, rst_int_cap_frac) = rst_ret[20:31]
         rst_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
-        if local_diagnostics:
-            (rst_local_values, rst_local_locs,
-             rst_top1_values, rst_top1_locs) = rst_ret[-4:]
+    if local_diagnostics:
+        (rst_local_values, rst_local_locs,
+         rst_top1_values, rst_top1_locs) = rst_ret[-4:]
     out = out * rst_scale
     rst_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     rng, rng_out = jax.random.split(rng)
@@ -2013,13 +2200,19 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_gate_eff_n, rst_gate_eff_ratio,
                 rst_top1_gate_frac, rst_top1_gate_frac_max)
     if not analysis:
-        if not return_prune_stats:
-            return slim_ret
-        return slim_ret + (
-            rst_kept_count, rst_kept_frac, rst_full_gate_sum,
-            rst_kept_gate_sum, rst_retained_gate_mass,
-            rst_int_cap_frac, rst_gate_max_mean,
-        )
+        ret = slim_ret
+        if return_prune_stats:
+            ret = ret + (
+                rst_kept_count, rst_kept_frac, rst_full_gate_sum,
+                rst_kept_gate_sum, rst_retained_gate_mass,
+                rst_int_cap_frac, rst_gate_max_mean,
+            )
+        if local_diagnostics:
+            ret = ret + (
+                rst_local_values, rst_local_locs,
+                rst_top1_values, rst_top1_locs,
+            )
+        return ret
 
     rst_phi_binary = phi_binary_frac.mean()
     analysis_ret = slim_ret + (
@@ -2300,10 +2493,10 @@ class DAWN(nn.Module):
                      a_den_cost, a_activation_cost, a_current_cost,
                      a_qk_emb_n_max, a_v_emb_n_max,
                      a_score_kurt, a_int_cap_frac) = attn_ret[33:56]
-                    if local_diagnostics:
-                        (a_attn_local_layer_values,
-                         a_attn_local_values, a_attn_local_locs,
-                         a_attn_top1_values, a_attn_top1_locs) = attn_ret[56:]
+                if local_diagnostics:
+                    (a_attn_local_layer_values,
+                     a_attn_local_values, a_attn_local_locs,
+                     a_attn_top1_values, a_attn_top1_locs) = attn_ret[-5:]
                 x = x + attn_out
 
                 normed = _layer_norm(
@@ -2337,9 +2530,9 @@ class DAWN(nn.Module):
                      k_den_cost, k_activation_cost, k_current_cost,
                      k_emb_n_max, k_score_kurt, k_phi_bin,
                      k_int_cap_frac) = rst_ret[28:43]
-                    if local_diagnostics:
-                        (k_local_values, k_local_locs,
-                         k_top1_values, k_top1_locs) = rst_ret[43:]
+                if local_diagnostics:
+                    (k_local_values, k_local_locs,
+                     k_top1_values, k_top1_locs) = rst_ret[-4:]
                 x = x + rst_out
 
                 slim_ys = (attn_aux, rst_aux,
@@ -2385,6 +2578,14 @@ class DAWN(nn.Module):
                         k_gate_max_mean,
                     )
                 if not analysis:
+                    if local_diagnostics:
+                        slim_ys = slim_ys + (
+                            a_attn_local_layer_values,
+                            a_attn_local_values, a_attn_local_locs,
+                            a_attn_top1_values, a_attn_top1_locs,
+                            k_local_values, k_local_locs,
+                            k_top1_values, k_top1_locs,
+                        )
                     return x, slim_ys
                 analysis_ys = slim_ys + (
                     a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
@@ -2448,6 +2649,21 @@ class DAWN(nn.Module):
             rst_gate_eff_n_all, rst_gate_eff_ratio_all,
             rst_top1_gate_frac_all, rst_top1_gate_frac_max_all) = scan_ys[:59]
             _scan_offset = 59
+            if return_prune_stats:
+                (attn_qk_kept_count_all, attn_qk_kept_frac_all,
+                 attn_qk_full_gate_sum_all, attn_qk_kept_gate_sum_all,
+                 attn_qk_retained_gate_mass_all, attn_qk_int_cap_frac_all,
+                 attn_qk_gate_max_mean_all,
+                 attn_v_kept_count_all, attn_v_kept_frac_all,
+                 attn_v_full_gate_sum_all, attn_v_kept_gate_sum_all,
+                 attn_v_retained_gate_mass_all, attn_v_int_cap_frac_all,
+                 attn_v_gate_max_mean_all,
+                 rst_kept_count_all, rst_kept_frac_all,
+                 rst_full_gate_sum_all, rst_kept_gate_sum_all,
+                 rst_retained_gate_mass_all, rst_int_cap_frac_prune_all,
+                 rst_gate_max_mean_all) = scan_ys[
+                    _scan_offset:_scan_offset + 21]
+                _scan_offset += 21
             if analysis:
                 (attn_qk_raw_norm_all, attn_v_raw_norm_all, rst_raw_out_norm_all,
                  attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
@@ -2469,26 +2685,14 @@ class DAWN(nn.Module):
                  attn_int_cap_frac_all, rst_int_cap_frac_all) = scan_ys[
                     _scan_offset:_scan_offset + 38]
                 _scan_offset += 38
-                if local_diagnostics:
-                    (attn_local_layer_values_all,
-                     attn_local_values_all, attn_local_locs_all,
-                     attn_top1_values_all, attn_top1_locs_all,
-                     rst_local_values_all, rst_local_locs_all,
-                     rst_top1_values_all, rst_top1_locs_all) = scan_ys[_scan_offset:]
-                    _scan_offset += 9
-            if return_prune_stats:
-                (attn_qk_kept_count_all, attn_qk_kept_frac_all,
-                 attn_qk_full_gate_sum_all, attn_qk_kept_gate_sum_all,
-                 attn_qk_retained_gate_mass_all, attn_qk_int_cap_frac_all,
-                 attn_qk_gate_max_mean_all,
-                 attn_v_kept_count_all, attn_v_kept_frac_all,
-                 attn_v_full_gate_sum_all, attn_v_kept_gate_sum_all,
-                 attn_v_retained_gate_mass_all, attn_v_int_cap_frac_all,
-                 attn_v_gate_max_mean_all,
-                 rst_kept_count_all, rst_kept_frac_all,
-                 rst_full_gate_sum_all, rst_kept_gate_sum_all,
-                 rst_retained_gate_mass_all, rst_int_cap_frac_prune_all,
-                 rst_gate_max_mean_all) = scan_ys[_scan_offset:]
+            if local_diagnostics:
+                (attn_local_layer_values_all,
+                 attn_local_values_all, attn_local_locs_all,
+                 attn_top1_values_all, attn_top1_locs_all,
+                 rst_local_values_all, rst_local_locs_all,
+                 rst_top1_values_all, rst_top1_locs_all) = scan_ys[
+                    _scan_offset:_scan_offset + 9]
+                _scan_offset += 9
             # Aux is averaged over layers after attention and RST terms are
             # collected.  Attention keeps historical Q/K/V scaling upstream.
             total_aux = (attn_auxes + rst_auxes).mean()
@@ -2635,26 +2839,26 @@ class DAWN(nn.Module):
                 'attn_int_cap_frac': attn_int_cap_frac_all.mean(),
                 'rst_int_cap_frac': rst_int_cap_frac_all.mean(),
             })
-            if local_diagnostics:
-                result.update({
-                    'attn_local_layer_values': attn_local_layer_values_all,
-                    'local_spike_values': jnp.concatenate([
-                        attn_local_values_all,
-                        rst_local_values_all,
-                    ], axis=1),
-                    'local_spike_locs': jnp.concatenate([
-                        attn_local_locs_all,
-                        rst_local_locs_all,
-                    ], axis=1),
-                    'local_top1_values': jnp.concatenate([
-                        attn_top1_values_all,
-                        rst_top1_values_all,
-                    ], axis=1),
-                    'local_top1_locs': jnp.concatenate([
-                        attn_top1_locs_all,
-                        rst_top1_locs_all,
-                    ], axis=1),
-                })
+        if local_diagnostics and not self.is_initializing():
+            result.update({
+                'attn_local_layer_values': attn_local_layer_values_all,
+                'local_spike_values': jnp.concatenate([
+                    attn_local_values_all,
+                    rst_local_values_all,
+                ], axis=1),
+                'local_spike_locs': jnp.concatenate([
+                    attn_local_locs_all,
+                    rst_local_locs_all,
+                ], axis=1),
+                'local_top1_values': jnp.concatenate([
+                    attn_top1_values_all,
+                    rst_top1_values_all,
+                ], axis=1),
+                'local_top1_locs': jnp.concatenate([
+                    attn_top1_locs_all,
+                    rst_top1_locs_all,
+                ], axis=1),
+            })
 
 
         if labels is not None:

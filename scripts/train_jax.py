@@ -843,6 +843,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _explore_eps = jnp.float32(exploration_bound_eps)
     _warmup_steps = jnp.int32(exploration_warmup_steps)
     _pass_analysis_kw = _model_accepts_analysis(model)
+    _pass_local_kw = _model_accepts_local_diagnostics(model)
+    _local_layers = int(getattr(model, 'n_layers', 1))
 
     @jax.jit
     def train_step(params, opt_state, input_ids, attention_mask, dropout_key,
@@ -855,6 +857,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['sharded_fns'] = sharded_fns
             if _pass_analysis_kw:
                 extra_kw['analysis'] = False
+            if debug_diagnostics and _pass_local_kw:
+                extra_kw['local_diagnostics'] = True
             result = model.apply(
                 {'params': params},
                 input_ids,
@@ -1499,6 +1503,32 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'drift_attn_v_emb': drift_attn_v_emb,
             'drift_rst_emb': drift_rst_emb,
         }
+        if debug_diagnostics:
+            metrics.update({
+                'local_spike_values': result.get(
+                    'local_spike_values',
+                    jnp.zeros((_local_layers, len(LOCAL_SPIKE_POOL_NAMES),
+                               len(LOCAL_SPIKE_METRIC_NAMES)),
+                              dtype=jnp.float32)),
+                'local_spike_locs': result.get(
+                    'local_spike_locs',
+                    jnp.full((_local_layers, len(LOCAL_SPIKE_POOL_NAMES),
+                              len(LOCAL_SPIKE_METRIC_NAMES), 3),
+                             -1, dtype=jnp.int32)),
+                'local_top1_values': result.get(
+                    'local_top1_values',
+                    jnp.zeros((_local_layers, len(LOCAL_SPIKE_POOL_NAMES),
+                               len(LOCAL_TOP1_FIELD_NAMES)),
+                              dtype=jnp.float32)),
+                'local_top1_locs': result.get(
+                    'local_top1_locs',
+                    jnp.full((_local_layers, len(LOCAL_SPIKE_POOL_NAMES), 3),
+                             -1, dtype=jnp.int32)),
+                'attn_local_layer_values': result.get(
+                    'attn_local_layer_values',
+                    jnp.zeros((_local_layers, len(ATTN_LOCAL_FIELD_NAMES)),
+                              dtype=jnp.float32)),
+            })
         metrics.update(pool_diag)
         metrics.update(pool_update_diag)
 
@@ -1574,12 +1604,12 @@ def create_analysis_step(model, sharded_fns=None):
 
 
 def create_debug_forward_step(model, sharded_fns=None, drop_compare=False):
-    """Diagnostics-only forward on the current train batch.
+    """Optional diagnostics-only forward for tiny debug/val batches.
 
     No gradients are taken and the result is never fed to the optimizer.
+    The main train loop does not call this on the current train batch.
     """
     _pass_analysis_kw = _model_accepts_analysis(model)
-    _pass_local_kw = _model_accepts_local_diagnostics(model)
     _drop_compare = bool(drop_compare)
 
     def _summary(result):
@@ -1619,9 +1649,7 @@ def create_debug_forward_step(model, sharded_fns=None, drop_compare=False):
         if sharded_fns is not None:
             extra_kw['sharded_fns'] = sharded_fns
         if _pass_analysis_kw:
-            extra_kw['analysis'] = True
-        if _pass_local_kw:
-            extra_kw['local_diagnostics'] = True
+            extra_kw['analysis'] = False
         result = model.apply(
             {'params': params},
             input_ids,
@@ -2595,6 +2623,11 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         pl_a, pl_k = [], []
     rec['per_layer_attn_out_norm'] = pl_a
     rec['per_layer_rst_out_norm'] = pl_k
+    for _diag_key in ('local_spike_values', 'local_spike_locs',
+                      'local_top1_values', 'local_top1_locs',
+                      'attn_local_layer_values'):
+        if _diag_key in m:
+            rec[_diag_key] = _jsonable_diag_value(jax.device_get(m[_diag_key]))
     return rec
 
 
@@ -2803,12 +2836,83 @@ def _best_from_values(values, metric_idx):
     return layer, pool, float(sub[layer, pool])
 
 
+def _print_local_spike_inline_block(rec):
+    values = _diag_array(rec, 'local_spike_values', ndim=3)
+    if values is None:
+        return
+
+    def _metric(name):
+        idx = LOCAL_SPIKE_METRIC_NAMES.index(name)
+        layer, pool, val = _best_from_values(values, idx)
+        return val, layer, pool
+
+    def _pool_name(pool):
+        return LOCAL_SPIKE_POOL_NAMES[pool] if 0 <= pool < len(LOCAL_SPIKE_POOL_NAMES) else 'NA'
+
+    top1_val, top1_layer, top1_pool = _metric('top1_share')
+    int_val, int_layer, int_pool = _metric('intensity')
+    tau_val, tau_layer, tau_pool = _metric('tau_abs')
+    margin_val, margin_layer, margin_pool = _metric('gate_raw')
+    den_val, den_layer, den_pool = _metric('gate_den_sum')
+    read_val, read_layer, read_pool = _metric('read_abs')
+    contrib_val, contrib_layer, contrib_pool = _metric('contrib_norm')
+    out_val, out_layer, out_pool = _metric('out_norm')
+
+    attn_vals = _diag_array(rec, 'attn_local_layer_values', ndim=2)
+    attn_logit = 0.0
+    attn_logit_layer = -1
+    softmax_top1 = 0.0
+    softmax_top1_layer = -1
+    if attn_vals is not None:
+        logit_idx = ATTN_LOCAL_FIELD_NAMES.index('attn_logit_max')
+        softmax_idx = ATTN_LOCAL_FIELD_NAMES.index('softmax_top1_max')
+        attn_logit_layer = int(np.nanargmax(attn_vals[:, logit_idx]))
+        softmax_top1_layer = int(np.nanargmax(attn_vals[:, softmax_idx]))
+        attn_logit = float(attn_vals[attn_logit_layer, logit_idx])
+        softmax_top1 = float(attn_vals[softmax_top1_layer, softmax_idx])
+
+    log_debug_message("[LOCAL_SPIKE_INLINE]")
+    log_debug_message("source=train_forward extra_forward=false")
+    log_debug_message(
+        f"top1_max={top1_val:.6f} top1_layer={top1_layer} "
+        f"top1_pool={_pool_name(top1_pool)}")
+    log_debug_message(
+        f"int_max={int_val:.6f} int_layer={int_layer} "
+        f"int_pool={_pool_name(int_pool)}")
+    log_debug_message(
+        f"tau_abs_max={tau_val:.6f} tau_layer={tau_layer} "
+        f"tau_pool={_pool_name(tau_pool)}")
+    log_debug_message(
+        f"margin_max={margin_val:.6f} margin_layer={margin_layer} "
+        f"margin_pool={_pool_name(margin_pool)}")
+    log_debug_message(
+        f"gate_den_sum_max={den_val:.6f} den_layer={den_layer} "
+        f"den_pool={_pool_name(den_pool)}")
+    log_debug_message(
+        f"read_abs_max={read_val:.6f} read_layer={read_layer} "
+        f"read_pool={_pool_name(read_pool)}")
+    log_debug_message(
+        f"contrib_proxy_max={contrib_val:.6f} "
+        f"contrib_layer={contrib_layer} "
+        f"contrib_pool={_pool_name(contrib_pool)}")
+    log_debug_message(
+        f"out_norm_max={out_val:.6f} out_layer={out_layer} "
+        f"out_pool={_pool_name(out_pool)}")
+    log_debug_message(
+        f"attn_logit_max={attn_logit:.6f} "
+        f"attn_logit_layer={attn_logit_layer} "
+        f"softmax_top1_max={softmax_top1:.6f} "
+        f"softmax_top1_layer={softmax_top1_layer}")
+
+
 def _print_local_spike_block(rec):
     values = _diag_array(rec, 'local_spike_values', ndim=3)
     locs = _diag_array(rec, 'local_spike_locs', ndim=4)
     top1_values = _diag_array(rec, 'local_top1_values', ndim=3)
     top1_locs = _diag_array(rec, 'local_top1_locs', ndim=3)
     if values is None or locs is None or top1_values is None or top1_locs is None:
+        return
+    if np.all(locs < 0):
         return
 
     top1_idx = LOCAL_TOP1_FIELD_NAMES.index('top1')
@@ -3052,6 +3156,7 @@ def _print_debug_block(rec, ctx):
         f"layer_attn_max={_layer_max('per_layer_attn_out_norm'):.3f} "
         f"layer_rst_max={_layer_max('per_layer_rst_out_norm'):.3f}"
     )
+    _print_local_spike_inline_block(rec)
     _print_local_spike_block(rec)
     _print_attention_local_block(rec)
     log_debug_message(
@@ -3415,8 +3520,8 @@ def main():
                         help=('Write detailed diagnostics to a separate debug log '
                               'every N steps (default N=1 when flag is present)'))
     parser.add_argument('--debug-drop-compare', action='store_true',
-                        help=('On debug intervals, run an extra deterministic '
-                              'diagnostics-only forward on the same batch.'))
+                        help=('Reserved for tiny opt-in debug/val forwards; '
+                              'never runs on the current train batch.'))
     parser.add_argument('--resume-from', type=str, default=None,
                         help='Resume from specific run folder path (e.g. gs://...../run_v...)')
     cli_args = parser.parse_args()
@@ -4131,13 +4236,12 @@ def main():
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path (v4.1 removed its non-sharded fallback).
     #
-    # v4.1: two parallel kernel sets. `_sharded_fns` = slim (train path,
-    # observational stats stripped). `_sharded_fns_analysis` = full
-    # (all distribution/boundary/saturation stats; used only by
-    # analysis_step at val time).
+    # v4.1: `_sharded_fns` = slim train path. When --debug is enabled it
+    # appends scalar-only inline local diagnostics to that same train kernel.
+    # `_sharded_fns_analysis` = full observational stats, used only by
+    # analysis_step at the configured analysis cadence.
     _sharded_fns = None
     _sharded_fns_analysis = None
-    _sharded_fns_debug = None
     _spec = MODEL_REGISTRY.get(model_version)
     _force_sharded = bool(_spec and _spec.force_sharded)
     if _spec is not None and (mesh_model > 1 or _force_sharded):
@@ -4154,14 +4258,26 @@ def main():
         _srw_base_kwargs = {'mesh': mesh}
         if _spec.sharded_kwargs is not None:
             _srw_base_kwargs.update(_spec.sharded_kwargs(cfg))
-        # Slim (train) -kwargs don't set analysis, so defaults to False.
+        import inspect as _inspect
+        _supports_analysis = (
+            'analysis' in _inspect.signature(make_sharded_srw).parameters
+        )
+        _supports_local_diag = (
+            'local_diagnostics' in _inspect.signature(make_sharded_srw).parameters
+        )
+        _train_local_diag = bool(debug_mode and _supports_local_diag)
+        _srw_train_kwargs = dict(_srw_base_kwargs)
+        if _train_local_diag:
+            _srw_train_kwargs['local_diagnostics'] = True
+        # Slim (train) -analysis defaults to False. Debug local diagnostics,
+        # when enabled, are scalar-only outputs on this same train path.
         _sharded_single_v = make_sharded_srw(
-            max_chunk_size=attn_v_max_chunk, **_srw_base_kwargs)
+            max_chunk_size=attn_v_max_chunk, **_srw_train_kwargs)
         _sharded_single_rst = make_sharded_srw(
-            max_chunk_size=rst_max_chunk, **_srw_base_kwargs)
+            max_chunk_size=rst_max_chunk, **_srw_train_kwargs)
         if hasattr(_v3, 'make_sharded_srw_paired'):
             _sharded_paired_attn_qk = _v3.make_sharded_srw_paired(
-                max_chunk_size=attn_qk_max_chunk, **_srw_base_kwargs)
+                max_chunk_size=attn_qk_max_chunk, **_srw_train_kwargs)
             _sharded_fns = {
                 'single': _sharded_single_v,
                 'attn_v_single': _sharded_single_v,
@@ -4175,10 +4291,6 @@ def main():
         # only to factories that accept it -v4.1 does, earlier versions
         # silently absorb it via **kwargs or raise; only probe when the
         # factory advertises the kwarg.
-        import inspect as _inspect
-        _supports_analysis = (
-            'analysis' in _inspect.signature(make_sharded_srw).parameters
-        )
         if _supports_analysis:
             _sharded_single_v_a = make_sharded_srw(
                 analysis=True, max_chunk_size=attn_v_max_chunk, **_srw_base_kwargs)
@@ -4197,36 +4309,12 @@ def main():
                 }
             else:
                 _sharded_fns_analysis = _sharded_single_rst_a
-            _supports_local_diag = (
-                'local_diagnostics' in _inspect.signature(make_sharded_srw).parameters
-            )
-            if debug_mode and _supports_local_diag:
-                _sharded_single_v_d = make_sharded_srw(
-                    analysis=True, local_diagnostics=True,
-                    max_chunk_size=attn_v_max_chunk, **_srw_base_kwargs)
-                _sharded_single_rst_d = make_sharded_srw(
-                    analysis=True, local_diagnostics=True,
-                    max_chunk_size=rst_max_chunk, **_srw_base_kwargs)
-                if hasattr(_v3, 'make_sharded_srw_paired'):
-                    _sharded_paired_d = _v3.make_sharded_srw_paired(
-                        analysis=True, local_diagnostics=True,
-                        max_chunk_size=attn_qk_max_chunk,
-                        **_srw_base_kwargs)
-                    _sharded_fns_debug = {
-                        'single': _sharded_single_v_d,
-                        'attn_v_single': _sharded_single_v_d,
-                        'rst_single': _sharded_single_rst_d,
-                        'paired': _sharded_paired_d,
-                        'attn_qk_paired': _sharded_paired_d,
-                    }
-                else:
-                    _sharded_fns_debug = _sharded_single_rst_d
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'}"
-                  f"; debug local={'on' if _sharded_fns_debug is not None else 'off'})")
+                  f"; inline debug local={'on' if _train_local_diag else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -4250,12 +4338,13 @@ def main():
             model, sharded_fns=_sharded_fns_analysis)
     else:
         analysis_step_fn = None
-    if _sharded_fns_debug is not None:
-        debug_forward_step_fn = create_debug_forward_step(
-            model, sharded_fns=_sharded_fns_debug,
-            drop_compare=debug_drop_compare)
-    else:
-        debug_forward_step_fn = None
+    # No current-train-batch debug forward: --debug uses scalar-only inline
+    # diagnostics returned by train_step.
+    debug_forward_step_fn = None
+    if debug_drop_compare and is_host0:
+        print("  Drop compare requested, but current-train-batch debug "
+              "forwards are disabled; inline train diagnostics remain on.",
+              flush=True)
     geometry_step_fn = create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
@@ -4983,11 +5072,6 @@ def main():
             attention_mask = shard_to_mesh(
                 attention_mask, data_sharding, (batch_size, max_seq_len))
 
-            _debug_forward_params = (
-                params if (
-                    debug_mode and debug_forward_step_fn is not None
-                    and ((global_step + 1) % debug_interval == 0))
-                else None)
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
                 input_ids, attention_mask, step_rng, _prev_emb_snap,
@@ -5043,19 +5127,6 @@ def main():
                 and (global_step % debug_interval == 0))
 
             debug_forward_result = None
-            if is_debug_log and debug_forward_step_fn is not None:
-                _df_params = (
-                    _debug_forward_params
-                    if _debug_forward_params is not None else params)
-                debug_forward_result = debug_forward_step_fn(
-                    _df_params, input_ids, attention_mask, step_rng)
-                jax.block_until_ready(
-                    debug_forward_result['normal'][
-                        'debug_forward_summary']['loss'])
-                if debug_drop_compare:
-                    jax.block_until_ready(
-                        debug_forward_result['deterministic'][
-                            'debug_forward_summary']['loss'])
 
             if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
@@ -5210,7 +5281,9 @@ def main():
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
             _do_analysis = (global_step % LOG_ANALYSIS == 0 and global_step > 0)
-            _do_debug_analysis = is_debug_log
+            # --debug is served by inline train_step metrics. Do not trigger
+            # the full analysis forward on debug ticks.
+            _do_debug_analysis = False
             _do_geometry = (global_step % LOG_GEOMETRY == 0 and global_step > 0)
             _do_ckpt = (global_step % ckpt_interval == 0 and global_step > 0)
             _new_best = False
