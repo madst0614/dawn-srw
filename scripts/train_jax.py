@@ -3148,8 +3148,8 @@ def _print_debug_block(rec, ctx):
         f"rst={_g('raw_scan_offset_rst_bias'):+.4f}]"
     )
     log_debug_message(
-        f"amp_diag: int_max[attn={_g('attn_int_max'):.3f} "
-        f"rst={_g('rst_int_max'):.3f}] "
+        f"amp_diag: int_max[attn={_g('attn_int_max', float('nan')):.3f} "
+        f"rst={_g('rst_int_max', float('nan')):.3f}] "
         f"int_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
         f"rst={_g('rst_int_cap_frac'):.6f}] "
         f"op_gain_max[qk={_g('attn_qk_op_gain_max'):.3f} "
@@ -3278,6 +3278,8 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_z_lt_030': float(m.get('rst_z_lt_030', 0.0)),
         'attn_int_cap_frac': float(m.get('attn_int_cap_frac', 0.0)),
         'rst_int_cap_frac': float(m.get('rst_int_cap_frac', 0.0)),
+        'attn_int_max': float(m.get('attn_int_max', float('nan'))),
+        'rst_int_max': float(m.get('rst_int_max', float('nan'))),
         'attn_qk_emb_norm_max': float(m.get('attn_qk_emb_norm_max', 0.0)),
         'attn_v_emb_norm_max': float(m.get('attn_v_emb_norm_max', 0.0)),
         'rst_emb_norm_max': float(m.get('rst_emb_norm_max', 0.0)),
@@ -3307,25 +3309,18 @@ def _build_analysis_record(base, metrics, ctx):
         'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
         'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
         'attn_q_norm_mean': float(m.get('attn_q_norm_mean', 0.0)),
-        'attn_q_norm_p95': float(m.get('attn_q_norm_p95', 0.0)),
-        'attn_q_norm_p99': float(m.get('attn_q_norm_p99', 0.0)),
+        'attn_q_norm_std': float(m.get('attn_q_norm_std', 0.0)),
         'attn_q_norm_max': float(m.get('attn_q_norm_max', 0.0)),
         'attn_k_norm_mean': float(m.get('attn_k_norm_mean', 0.0)),
-        'attn_k_norm_p95': float(m.get('attn_k_norm_p95', 0.0)),
-        'attn_k_norm_p99': float(m.get('attn_k_norm_p99', 0.0)),
+        'attn_k_norm_std': float(m.get('attn_k_norm_std', 0.0)),
         'attn_k_norm_max': float(m.get('attn_k_norm_max', 0.0)),
         'attn_logit_mean': float(m.get('attn_logit_mean', 0.0)),
         'attn_logit_std': float(m.get('attn_logit_std', 0.0)),
-        'attn_logit_p95': float(m.get('attn_logit_p95', 0.0)),
-        'attn_logit_p99': float(m.get('attn_logit_p99', 0.0)),
         'attn_logit_max': float(m.get('attn_logit_max', 0.0)),
         'attn_softmax_top1_mean': float(m.get('attn_softmax_top1_mean', 0.0)),
-        'attn_softmax_top1_p95': float(m.get('attn_softmax_top1_p95', 0.0)),
         'attn_softmax_top1_max': float(m.get('attn_softmax_top1_max', 0.0)),
         'attn_logit_gap_top1_top2_mean': float(m.get(
             'attn_logit_gap_top1_top2_mean', 0.0)),
-        'attn_logit_gap_top1_top2_p95': float(m.get(
-            'attn_logit_gap_top1_top2_p95', 0.0)),
         'attn_logit_gap_top1_top2_max': float(m.get(
             'attn_logit_gap_top1_top2_max', 0.0)),
         'attn_softmax_entropy_mean': float(m.get(
@@ -3459,8 +3454,8 @@ def _print_analysis_block(rec, ctx):
     log_message(
         f"  saturation cap_frac[attn={_g('attn_int_cap_frac')*100:.4f}%"
         f" rst={_g('rst_int_cap_frac')*100:.4f}%]"
-        f" | int_max[attn={_g('attn_int_max'):.3f}"
-        f" rst={_g('rst_int_max'):.3f}]"
+        f" | int_max[attn={_g('attn_int_max', float('nan')):.3f}"
+        f" rst={_g('rst_int_max', float('nan')):.3f}]"
         f" | emb_max rst={rec['rst_emb_norm_max']:.2f}"
         f" attn_qk={rec['attn_qk_emb_norm_max']:.2f}"
         f" attn_v={rec['attn_v_emb_norm_max']:.2f}"
@@ -3528,26 +3523,27 @@ def _print_analysis_block(rec, ctx):
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.6':
         log_message("[ATTN_QK_DIAG]")
         log_message(
-            f"  logit[p99={_g('attn_logit_p99'):.2f}"
+            f"  logit[mean={_g('attn_logit_mean'):.2f}"
+            f" std={_g('attn_logit_std'):.2f}"
             f" max={_g('attn_logit_max'):.2f}"
             f" layer_max={int(rec.get('attn_logit_max_layer', -1))}]"
         )
         log_message(
-            f"  q_norm[p99={_g('attn_q_norm_p99'):.2f}"
+            f"  q_norm[mean={_g('attn_q_norm_mean'):.2f}"
+            f" std={_g('attn_q_norm_std'):.2f}"
             f" max={_g('attn_q_norm_max'):.2f}]"
         )
         log_message(
-            f"  k_norm[p99={_g('attn_k_norm_p99'):.2f}"
+            f"  k_norm[mean={_g('attn_k_norm_mean'):.2f}"
+            f" std={_g('attn_k_norm_std'):.2f}"
             f" max={_g('attn_k_norm_max'):.2f}]"
         )
         log_message(
             f"  softmax_top1[mean={_g('attn_softmax_top1_mean'):.3f}"
-            f" p95={_g('attn_softmax_top1_p95'):.3f}"
             f" max={_g('attn_softmax_top1_max'):.3f}]"
         )
         log_message(
             f"  gap[top1_top2 mean={_g('attn_logit_gap_top1_top2_mean'):.2f}"
-            f" p95={_g('attn_logit_gap_top1_top2_p95'):.2f}"
             f" max={_g('attn_logit_gap_top1_top2_max'):.2f}]"
         )
         log_message(

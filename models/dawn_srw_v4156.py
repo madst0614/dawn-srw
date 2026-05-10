@@ -1975,10 +1975,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     scale = jnp.sqrt(jnp.float32(d_head))
     rng, rng_attn_drop = jax.random.split(rng)
 
-    def _diag_percentile(values, pct):
-        values = jax.lax.stop_gradient(values.astype(jnp.float32))
-        return jnp.percentile(values, pct)
-
     @jax.checkpoint
     def _attn_scores(Q, K, V, rng_drop):
         attn_scores = jnp.einsum('bhsd,bhtd->bhst', Q, K) / scale
@@ -1999,27 +1995,27 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             ).sum() / valid_count
             attn_logit_std = jnp.sqrt(attn_logit_var + 1e-12)
 
-            valid_frac = (S + 1.0) / (2.0 * S)
-            invalid_frac = 1.0 - valid_frac
             masked_scores = jnp.where(causal_4d, scores_sg, score_floor)
-            attn_logit_p95 = _diag_percentile(
-                masked_scores, 100.0 * (invalid_frac + valid_frac * 0.95))
-            attn_logit_p99 = _diag_percentile(
-                masked_scores, 100.0 * (invalid_frac + valid_frac * 0.99))
             attn_logit_max_dbg = jnp.max(masked_scores)
 
             attn_w_sg = jax.lax.stop_gradient(attn_w.astype(jnp.float32))
             softmax_top1 = jnp.max(attn_w_sg, axis=-1)
             softmax_top1_mean = softmax_top1.mean()
-            softmax_top1_p95 = _diag_percentile(softmax_top1, 95.0)
             softmax_top1_max = softmax_top1.max()
 
-            top2_logits = jax.lax.top_k(masked_scores, 2)[0]
-            logit_gap = top2_logits[..., 0] - top2_logits[..., 1]
+            top1_logits = jnp.max(masked_scores, axis=-1)
+            top1_idx = jnp.argmax(masked_scores, axis=-1)
+            attn_idx = jnp.arange(S)
+            second_scores = jnp.where(
+                attn_idx[None, None, None, :] == top1_idx[..., None],
+                score_floor,
+                masked_scores)
+            top2_logits = jnp.max(second_scores, axis=-1)
             has_top2 = (jnp.arange(S) + 1) > 1
-            logit_gap = jnp.where(has_top2[None, None, :], logit_gap, 0.0)
+            top2_logits = jnp.where(
+                has_top2[None, None, :], top2_logits, top1_logits)
+            logit_gap = top1_logits - top2_logits
             logit_gap_mean = logit_gap.mean()
-            logit_gap_p95 = _diag_percentile(logit_gap, 95.0)
             logit_gap_max = logit_gap.max()
 
             entropy_terms = jnp.where(
@@ -2038,9 +2034,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             return (
                 out_dbg,
                 attn_logit_mean, attn_logit_std,
-                attn_logit_p95, attn_logit_p99, attn_logit_max_dbg,
-                softmax_top1_mean, softmax_top1_p95, softmax_top1_max,
-                logit_gap_mean, logit_gap_p95, logit_gap_max,
+                attn_logit_max_dbg,
+                softmax_top1_mean, softmax_top1_max,
+                logit_gap_mean, logit_gap_max,
                 softmax_entropy_mean, softmax_entropy_min,
             )
         if local_diagnostics:
@@ -2053,21 +2049,18 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         v_norms_dbg = jnp.linalg.norm(V, axis=-1)
     if analysis:
         q_norm = q_norms_dbg.mean()
-        q_norm_p95 = _diag_percentile(q_norms_dbg, 95.0)
-        q_norm_p99 = _diag_percentile(q_norms_dbg, 99.0)
+        q_norm_std = q_norms_dbg.std()
         q_norm_max = q_norms_dbg.max()
         k_norm = k_norms_dbg.mean()
-        k_norm_p95 = _diag_percentile(k_norms_dbg, 95.0)
-        k_norm_p99 = _diag_percentile(k_norms_dbg, 99.0)
+        k_norm_std = k_norms_dbg.std()
         k_norm_max = k_norms_dbg.max()
         v_norm_dbg = v_norms_dbg.mean()
 
     if analysis:
         (out,
-         attn_logit_mean, attn_logit_std,
-         attn_logit_p95, attn_logit_p99, attn_logit_max_actual,
-         softmax_top1_mean, softmax_top1_p95, attn_softmax_top1_max,
-         logit_gap_mean, logit_gap_p95, logit_gap_max,
+         attn_logit_mean, attn_logit_std, attn_logit_max_actual,
+         softmax_top1_mean, attn_softmax_top1_max,
+         logit_gap_mean, logit_gap_max,
          softmax_entropy_mean, softmax_entropy_min) = _attn_scores(
             Q, K, V, rng_attn_drop)
     elif local_diagnostics:
@@ -2190,12 +2183,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_qk_emb_norm_max, attn_v_emb_norm_max,
         attn_score_kurt,
         attn_int_cap_frac,
-        q_norm_p95, q_norm_p99, q_norm_max,
-        k_norm_p95, k_norm_p99, k_norm_max,
+        q_norm_std, q_norm_max,
+        k_norm_std, k_norm_max,
         attn_logit_mean, attn_logit_std,
-        attn_logit_p95, attn_logit_p99,
-        softmax_top1_mean, softmax_top1_p95, attn_softmax_top1_max,
-        logit_gap_mean, logit_gap_p95, logit_gap_max,
+        softmax_top1_mean, attn_softmax_top1_max,
+        logit_gap_mean, logit_gap_max,
         softmax_entropy_mean, softmax_entropy_min,
         o_input_norm_max, o_out_norm_max,
     )
@@ -2593,15 +2585,13 @@ class DAWN(nn.Module):
                      a_den_cost, a_activation_cost, a_current_cost,
                      a_qk_emb_n_max, a_v_emb_n_max,
                      a_score_kurt, a_int_cap_frac,
-                     a_q_norm_p95, a_q_norm_p99, a_q_norm_max,
-                     a_k_norm_p95, a_k_norm_p99, a_k_norm_max,
+                     a_q_norm_std, a_q_norm_max,
+                     a_k_norm_std, a_k_norm_max,
                      a_logit_mean, a_logit_std,
-                     a_logit_p95, a_logit_p99,
-                     a_softmax_top1_mean, a_softmax_top1_p95,
-                     a_softmax_top1_max,
-                     a_logit_gap_mean, a_logit_gap_p95, a_logit_gap_max,
+                     a_softmax_top1_mean, a_softmax_top1_max,
+                     a_logit_gap_mean, a_logit_gap_max,
                      a_softmax_entropy_mean, a_softmax_entropy_min,
-                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[33:76]
+                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[33:70]
                 if local_diagnostics:
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
@@ -2714,13 +2704,11 @@ class DAWN(nn.Module):
                     k_emb_n_max,
                     a_score_kurt, k_score_kurt,
                     a_int_cap_frac, k_int_cap_frac,
-                    a_q_norm_p95, a_q_norm_p99, a_q_norm_max,
-                    a_k_norm_p95, a_k_norm_p99, a_k_norm_max,
+                    a_q_norm_std, a_q_norm_max,
+                    a_k_norm_std, a_k_norm_max,
                     a_logit_mean, a_logit_std,
-                    a_logit_p95, a_logit_p99,
-                    a_softmax_top1_mean, a_softmax_top1_p95,
-                    a_softmax_top1_max,
-                    a_logit_gap_mean, a_logit_gap_p95, a_logit_gap_max,
+                    a_softmax_top1_mean, a_softmax_top1_max,
+                    a_logit_gap_mean, a_logit_gap_max,
                     a_softmax_entropy_mean, a_softmax_entropy_min,
                     a_o_input_norm_max, a_o_out_norm_max,
                 )
@@ -2801,20 +2789,17 @@ class DAWN(nn.Module):
                  rst_emb_n_max_all,
                  attn_score_kurt_all, rst_score_kurt_all,
                  attn_int_cap_frac_all, rst_int_cap_frac_all,
-                 attn_q_norm_p95_all, attn_q_norm_p99_all, attn_q_norm_max_all,
-                 attn_k_norm_p95_all, attn_k_norm_p99_all, attn_k_norm_max_all,
+                 attn_q_norm_std_all, attn_q_norm_max_all,
+                 attn_k_norm_std_all, attn_k_norm_max_all,
                  attn_logit_mean_all, attn_logit_std_all,
-                 attn_logit_p95_all, attn_logit_p99_all,
-                 attn_softmax_top1_mean_all, attn_softmax_top1_p95_all,
-                 attn_softmax_top1_max_all,
-                 attn_logit_gap_mean_all, attn_logit_gap_p95_all,
-                 attn_logit_gap_max_all,
+                 attn_softmax_top1_mean_all, attn_softmax_top1_max_all,
+                 attn_logit_gap_mean_all, attn_logit_gap_max_all,
                  attn_softmax_entropy_mean_all,
                  attn_softmax_entropy_min_all,
                  attn_o_input_norm_max_all,
                  attn_o_output_norm_max_all) = scan_ys[
-                    _scan_offset:_scan_offset + 58]
-                _scan_offset += 58
+                    _scan_offset:_scan_offset + 52]
+                _scan_offset += 52
             if local_diagnostics:
                 (attn_local_layer_values_all,
                  attn_local_values_all, attn_local_locs_all,
@@ -2968,24 +2953,18 @@ class DAWN(nn.Module):
                 'debug_logit_max': attn_logit_max_all.mean(),
                 'debug_o_input_norm': attn_o_input_norm_all.mean(),
                 'attn_q_norm_mean': attn_q_norm_all.mean(),
-                'attn_q_norm_p95': attn_q_norm_p95_all.max(),
-                'attn_q_norm_p99': attn_q_norm_p99_all.max(),
+                'attn_q_norm_std': attn_q_norm_std_all.mean(),
                 'attn_q_norm_max': attn_q_norm_max_all.max(),
                 'attn_k_norm_mean': attn_k_norm_all.mean(),
-                'attn_k_norm_p95': attn_k_norm_p95_all.max(),
-                'attn_k_norm_p99': attn_k_norm_p99_all.max(),
+                'attn_k_norm_std': attn_k_norm_std_all.mean(),
                 'attn_k_norm_max': attn_k_norm_max_all.max(),
                 'attn_logit_mean': attn_logit_mean_all.mean(),
                 'attn_logit_std': attn_logit_std_all.mean(),
-                'attn_logit_p95': attn_logit_p95_all.max(),
-                'attn_logit_p99': attn_logit_p99_all.max(),
                 'attn_logit_max': attn_logit_max_all.max(),
                 'attn_logit_max_layer': _attn_logit_max_layer,
                 'attn_softmax_top1_mean': attn_softmax_top1_mean_all.mean(),
-                'attn_softmax_top1_p95': attn_softmax_top1_p95_all.max(),
                 'attn_softmax_top1_max': attn_softmax_top1_max_all.max(),
                 'attn_logit_gap_top1_top2_mean': attn_logit_gap_mean_all.mean(),
-                'attn_logit_gap_top1_top2_p95': attn_logit_gap_p95_all.max(),
                 'attn_logit_gap_top1_top2_max': attn_logit_gap_max_all.max(),
                 'attn_softmax_entropy_mean': attn_softmax_entropy_mean_all.mean(),
                 'attn_softmax_entropy_min': attn_softmax_entropy_min_all.min(),
@@ -2994,23 +2973,17 @@ class DAWN(nn.Module):
                 'attn_o_output_norm_mean': attn_out_norm_all.mean(),
                 'attn_o_output_norm_max': attn_o_output_norm_max_all.max(),
                 'per_layer_attn_q_norm_mean': attn_q_norm_all,
-                'per_layer_attn_q_norm_p95': attn_q_norm_p95_all,
-                'per_layer_attn_q_norm_p99': attn_q_norm_p99_all,
+                'per_layer_attn_q_norm_std': attn_q_norm_std_all,
                 'per_layer_attn_q_norm_max': attn_q_norm_max_all,
                 'per_layer_attn_k_norm_mean': attn_k_norm_all,
-                'per_layer_attn_k_norm_p95': attn_k_norm_p95_all,
-                'per_layer_attn_k_norm_p99': attn_k_norm_p99_all,
+                'per_layer_attn_k_norm_std': attn_k_norm_std_all,
                 'per_layer_attn_k_norm_max': attn_k_norm_max_all,
                 'per_layer_attn_logit_mean': attn_logit_mean_all,
                 'per_layer_attn_logit_std': attn_logit_std_all,
-                'per_layer_attn_logit_p95': attn_logit_p95_all,
-                'per_layer_attn_logit_p99': attn_logit_p99_all,
                 'per_layer_attn_logit_max': attn_logit_max_all,
                 'per_layer_attn_softmax_top1_mean': attn_softmax_top1_mean_all,
-                'per_layer_attn_softmax_top1_p95': attn_softmax_top1_p95_all,
                 'per_layer_attn_softmax_top1_max': attn_softmax_top1_max_all,
                 'per_layer_attn_logit_gap_top1_top2_mean': attn_logit_gap_mean_all,
-                'per_layer_attn_logit_gap_top1_top2_p95': attn_logit_gap_p95_all,
                 'per_layer_attn_logit_gap_top1_top2_max': attn_logit_gap_max_all,
                 'per_layer_attn_softmax_entropy_mean': attn_softmax_entropy_mean_all,
                 'per_layer_attn_softmax_entropy_min': attn_softmax_entropy_min_all,
