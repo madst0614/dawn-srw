@@ -1495,7 +1495,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_gate_raw, chunk_gate_raw_loc = _chunk_route_max(raw, s)
                 chunk_top1, chunk_top1_loc = _chunk_route_max(top1_share, s)
                 chunk_int, chunk_int_loc = _chunk_route_max(intensity, s)
-                chunk_read, chunk_read_loc = _chunk_route_max(jnp.abs(xr_r), s)
+                chunk_read, chunk_read_loc = _chunk_route_max(
+                    jnp.abs(xr_r + jnp.zeros_like(gate)), s)
                 chunk_contrib, chunk_contrib_loc = _chunk_route_max(contrib_norm, s)
                 chunk_vals = jnp.stack([
                     chunk_gate_raw, chunk_top1, chunk_int,
