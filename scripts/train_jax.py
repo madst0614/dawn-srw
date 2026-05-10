@@ -68,6 +68,18 @@ from models.dawn_srw import (
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
 # in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
 
+LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
+LOCAL_SPIKE_METRIC_NAMES = (
+    'tau_abs', 'gate_raw', 'top1_share', 'gate_den_sum', 'intensity',
+    'read_abs', 'contrib_norm', 'out_norm', 'resid_norm')
+LOCAL_TOP1_FIELD_NAMES = (
+    'top1', 'score', 'tau', 'margin', 'gate_raw', 'gate_norm',
+    'gate_den', 'intensity', 'read_scalar', 'write_norm', 'read_norm',
+    'op_gain', 'contrib_norm', 'total_out_norm', 'contrib_frac')
+ATTN_LOCAL_FIELD_NAMES = (
+    'q_norm_max', 'k_norm_max', 'v_norm_max', 'attn_logit_max',
+    'softmax_top1_max', 'o_in_norm_max', 'o_out_norm_max')
+
 
 
 # ============================================================
@@ -675,6 +687,15 @@ def _model_accepts_analysis(model):
         return False
 
 
+def _model_accepts_local_diagnostics(model):
+    """Return True if model.__call__ accepts local diagnostic controls."""
+    import inspect as _inspect
+    try:
+        return 'local_diagnostics' in _inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _scalar0(x):
     return jnp.asarray(x, dtype=jnp.float32).reshape(())
 
@@ -1086,18 +1107,48 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + 1e-12)
             grad_expand_O_sq = jnp.float32(0.0)
             grad_layernorms_sq = _tree_sq(_path_tree(grads, 'norm'))
+            _grad_expand_layers = []
+            _grad_ln_layers = []
             for _i in range(getattr(model, 'n_layers', 0)):
                 _gb = _path_tree(grads, f'block_{_i}')
+                _expand_sq_i = _tree_sq(_path_tree(_gb, 'attn', 'expand_O'))
+                _ln_sq_i = (
+                    _tree_sq(_path_tree(_gb, 'norm1'))
+                    + _tree_sq(_path_tree(_gb, 'norm2')))
                 grad_expand_O_sq = (
                     grad_expand_O_sq
-                    + _tree_sq(_path_tree(_gb, 'attn', 'expand_O')))
+                    + _expand_sq_i)
                 grad_layernorms_sq = (
                     grad_layernorms_sq
-                    + _tree_sq(_path_tree(_gb, 'norm1'))
-                    + _tree_sq(_path_tree(_gb, 'norm2')))
+                    + _ln_sq_i)
+                _grad_expand_layers.append(jnp.sqrt(_expand_sq_i + 1e-12))
+                _grad_ln_layers.append(jnp.sqrt(_ln_sq_i + 1e-12))
             grad_expand_O = jnp.sqrt(grad_expand_O_sq + 1e-12)
             grad_layernorms = jnp.sqrt(grad_layernorms_sq + 1e-12)
             grad_lm_head_or_token_tied = grad_token_emb
+            grad_expand_O_per_layer = (
+                jnp.stack(_grad_expand_layers)
+                if _grad_expand_layers else jnp.zeros((1,), dtype=jnp.float32))
+            grad_layernorms_per_layer = (
+                jnp.stack(_grad_ln_layers)
+                if _grad_ln_layers else jnp.zeros((1,), dtype=jnp.float32))
+            grad_router_proj_attn_per_layer = jnp.asarray(
+                [grad_router_proj_attn], dtype=jnp.float32)
+            grad_router_proj_rst_per_layer = jnp.asarray(
+                [grad_router_proj_rst], dtype=jnp.float32)
+            grad_router_tau_attn_per_layer = jnp.asarray(
+                [grad_router_tau_attn], dtype=jnp.float32)
+            grad_router_tau_rst_per_layer = jnp.asarray(
+                [grad_router_tau_rst], dtype=jnp.float32)
+            grad_pool_attn_qk_rw = jnp.asarray(
+                [grad_pool_attn_qk_read, grad_pool_attn_qk_write],
+                dtype=jnp.float32)
+            grad_pool_attn_v_rw = jnp.asarray(
+                [grad_pool_attn_v_read, grad_pool_attn_v_write],
+                dtype=jnp.float32)
+            grad_pool_rst_rw = jnp.asarray(
+                [grad_pool_rst_read, grad_pool_rst_write],
+                dtype=jnp.float32)
         else:
             grad_token_emb = jnp.float32(0.0)
             grad_pos_emb = jnp.float32(0.0)
@@ -1105,6 +1156,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_expand_O = jnp.float32(0.0)
             grad_layernorms = jnp.float32(0.0)
             grad_lm_head_or_token_tied = jnp.float32(0.0)
+            grad_expand_O_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_layernorms_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_router_proj_attn_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_router_proj_rst_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_router_tau_attn_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_router_tau_rst_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_pool_attn_qk_rw = jnp.zeros((2,), dtype=jnp.float32)
+            grad_pool_attn_v_rw = jnp.zeros((2,), dtype=jnp.float32)
+            grad_pool_rst_rw = jnp.zeros((2,), dtype=jnp.float32)
         grad_router_proj = (
             grad_router_proj_attn + grad_router_proj_rst)
         grad_router_tau = (
@@ -1272,6 +1332,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_expand_O': grad_expand_O,
             'grad_layernorms': grad_layernorms,
             'grad_lm_head_or_token_tied': grad_lm_head_or_token_tied,
+            'grad_router_proj_attn_per_layer': grad_router_proj_attn_per_layer,
+            'grad_router_proj_rst_per_layer': grad_router_proj_rst_per_layer,
+            'grad_router_tau_attn_per_layer': grad_router_tau_attn_per_layer,
+            'grad_router_tau_rst_per_layer': grad_router_tau_rst_per_layer,
+            'grad_pool_attn_qk_rw': grad_pool_attn_qk_rw,
+            'grad_pool_attn_v_rw': grad_pool_attn_v_rw,
+            'grad_pool_rst_rw': grad_pool_rst_rw,
+            'grad_expand_O_per_layer': grad_expand_O_per_layer,
+            'grad_layernorms_per_layer': grad_layernorms_per_layer,
             'grad_router_proj': grad_router_proj,
             'grad_router_tau': grad_router_tau,
             'grad_router_scan': grad_router_scan,
@@ -1502,6 +1571,101 @@ def create_analysis_step(model, sharded_fns=None):
         return result
 
     return analysis_step
+
+
+def create_debug_forward_step(model, sharded_fns=None, drop_compare=False):
+    """Diagnostics-only forward on the current train batch.
+
+    No gradients are taken and the result is never fed to the optimizer.
+    """
+    _pass_analysis_kw = _model_accepts_analysis(model)
+    _pass_local_kw = _model_accepts_local_diagnostics(model)
+    _drop_compare = bool(drop_compare)
+
+    def _summary(result):
+        local_vals = result.get(
+            'local_spike_values',
+            jnp.zeros((1, 1, len(LOCAL_SPIKE_METRIC_NAMES)),
+                      dtype=jnp.float32))
+        attn_vals = result.get(
+            'attn_local_layer_values',
+            jnp.zeros((1, len(ATTN_LOCAL_FIELD_NAMES)), dtype=jnp.float32))
+        top1_idx = LOCAL_SPIKE_METRIC_NAMES.index('top1_share')
+        int_idx = LOCAL_SPIKE_METRIC_NAMES.index('intensity')
+        tau_idx = LOCAL_SPIKE_METRIC_NAMES.index('tau_abs')
+        out_idx = LOCAL_SPIKE_METRIC_NAMES.index('out_norm')
+        den_idx = LOCAL_SPIKE_METRIC_NAMES.index('gate_den_sum')
+        logit_idx = ATTN_LOCAL_FIELD_NAMES.index('attn_logit_max')
+        active = (
+            result.get('attn_qk_active', jnp.float32(0.0))
+            + result.get('attn_v_active', jnp.float32(0.0))
+            + result.get('rst_active', jnp.float32(0.0))) / jnp.float32(3.0)
+        return {
+            'loss': result.get('loss', jnp.float32(0.0)),
+            'ce': result.get('loss', jnp.float32(0.0)),
+            'top1_max': jnp.max(local_vals[:, :, top1_idx]),
+            'int_max': jnp.max(local_vals[:, :, int_idx]),
+            'tau_abs_max': jnp.max(local_vals[:, :, tau_idx]),
+            'local_out_norm_max': jnp.max(local_vals[:, :, out_idx]),
+            'active_frac': active,
+            'gate_den_sum_max': jnp.max(local_vals[:, :, den_idx]),
+            'attention_logit_max': jnp.max(attn_vals[:, logit_idx]),
+        }
+
+    def _run_forward(params, input_ids, attention_mask, dropout_key,
+                     deterministic):
+        labels = jnp.where(attention_mask == 1, input_ids, -100)
+        extra_kw = {}
+        if sharded_fns is not None:
+            extra_kw['sharded_fns'] = sharded_fns
+        if _pass_analysis_kw:
+            extra_kw['analysis'] = True
+        if _pass_local_kw:
+            extra_kw['local_diagnostics'] = True
+        result = model.apply(
+            {'params': params},
+            input_ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            deterministic=deterministic,
+            rngs={'dropout': dropout_key},
+            **extra_kw,
+        )
+        result = dict(result)
+        result['debug_forward_summary'] = _summary(result)
+        return result
+
+    @jax.jit
+    def debug_forward_step(params, input_ids, attention_mask, dropout_key):
+        normal = _run_forward(
+            params, input_ids, attention_mask, dropout_key,
+            deterministic=False)
+        if _drop_compare:
+            det_key = jax.random.fold_in(dropout_key, jnp.int32(12345))
+            deterministic = _run_forward(
+                params, input_ids, attention_mask, det_key,
+                deterministic=True)
+        else:
+            deterministic = {
+                'debug_forward_summary': {
+                    'loss': jnp.float32(0.0),
+                    'ce': jnp.float32(0.0),
+                    'top1_max': jnp.float32(0.0),
+                    'int_max': jnp.float32(0.0),
+                    'tau_abs_max': jnp.float32(0.0),
+                    'local_out_norm_max': jnp.float32(0.0),
+                    'active_frac': jnp.float32(0.0),
+                    'gate_den_sum_max': jnp.float32(0.0),
+                    'attention_logit_max': jnp.float32(0.0),
+                }
+            }
+        return {
+            'normal': normal,
+            'deterministic': deterministic,
+            'drop_compare_enabled': jnp.asarray(_drop_compare),
+        }
+
+    return debug_forward_step
 
 
 def create_geometry_step(max_sample=512):
@@ -2126,6 +2290,14 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     old train_fast / train_deep JSONL types should switch to type='train'.
     """
     m = metrics
+    def _arr(key):
+        try:
+            return [float(v) for v in np.asarray(
+                jax.device_get(m.get(key, jnp.zeros((0,), dtype=jnp.float32)))
+            ).reshape(-1)]
+        except Exception:
+            return []
+
     is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
     rec = {
         'step': global_step,
@@ -2223,6 +2395,15 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_layernorms': float(m.get('grad_layernorms', 0.0)),
         'grad_lm_head_or_token_tied': float(m.get(
             'grad_lm_head_or_token_tied', 0.0)),
+        'grad_router_proj_attn_per_layer': _arr('grad_router_proj_attn_per_layer'),
+        'grad_router_proj_rst_per_layer': _arr('grad_router_proj_rst_per_layer'),
+        'grad_router_tau_attn_per_layer': _arr('grad_router_tau_attn_per_layer'),
+        'grad_router_tau_rst_per_layer': _arr('grad_router_tau_rst_per_layer'),
+        'grad_pool_attn_qk_rw': _arr('grad_pool_attn_qk_rw'),
+        'grad_pool_attn_v_rw': _arr('grad_pool_attn_v_rw'),
+        'grad_pool_rst_rw': _arr('grad_pool_rst_rw'),
+        'grad_expand_O_per_layer': _arr('grad_expand_O_per_layer'),
+        'grad_layernorms_per_layer': _arr('grad_layernorms_per_layer'),
         'grad_router_proj': float(m.get('grad_router_proj', 0.0)),
         'grad_router_tau': float(m.get('grad_router_tau', 0.0)),
         'grad_router_scan': float(m.get('grad_router_scan', 0.0)),
@@ -2563,6 +2744,183 @@ def _collapse_reasons(rec):
     return reasons
 
 
+def _jsonable_diag_value(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if hasattr(value, 'tolist'):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    return value
+
+
+def _attach_debug_forward_record(rec, debug_forward):
+    """Merge diagnostics-only forward outputs into a host-side log record."""
+    if not debug_forward:
+        return rec
+    normal = debug_forward.get('normal', {})
+    for key in ('local_spike_values', 'local_spike_locs',
+                'local_top1_values', 'local_top1_locs',
+                'attn_local_layer_values'):
+        if key in normal:
+            rec[key] = _jsonable_diag_value(normal[key])
+    if 'debug_forward_summary' in normal:
+        for key, val in normal['debug_forward_summary'].items():
+            rec[f'debug_normal_{key}'] = float(val)
+    enabled = bool(debug_forward.get('drop_compare_enabled', False))
+    rec['debug_drop_compare_enabled'] = enabled
+    if enabled:
+        det = debug_forward.get('deterministic', {})
+        if 'debug_forward_summary' in det:
+            for key, val in det['debug_forward_summary'].items():
+                rec[f'debug_deterministic_{key}'] = float(val)
+    return rec
+
+
+def _diag_array(rec, key, ndim=None):
+    arr = np.asarray(rec.get(key, []), dtype=np.float32)
+    if ndim is not None and arr.ndim != ndim:
+        return None
+    if arr.size == 0:
+        return None
+    return arr
+
+
+def _format_loc(loc):
+    loc = np.asarray(loc).astype(np.int64).reshape(-1)
+    b = int(loc[0]) if loc.size > 0 else -1
+    t = int(loc[1]) if loc.size > 1 else -1
+    n = int(loc[2]) if loc.size > 2 else -1
+    n_part = "neuron=NA" if n < 0 else f"neuron={n}"
+    return f"b={b} t={t} {n_part}"
+
+
+def _best_from_values(values, metric_idx):
+    sub = values[:, :, metric_idx]
+    flat_idx = int(np.nanargmax(sub))
+    layer, pool = np.unravel_index(flat_idx, sub.shape)
+    return layer, pool, float(sub[layer, pool])
+
+
+def _print_local_spike_block(rec):
+    values = _diag_array(rec, 'local_spike_values', ndim=3)
+    locs = _diag_array(rec, 'local_spike_locs', ndim=4)
+    top1_values = _diag_array(rec, 'local_top1_values', ndim=3)
+    top1_locs = _diag_array(rec, 'local_top1_locs', ndim=3)
+    if values is None or locs is None or top1_values is None or top1_locs is None:
+        return
+
+    top1_idx = LOCAL_TOP1_FIELD_NAMES.index('top1')
+    top1_sub = top1_values[:, :, top1_idx]
+    flat_idx = int(np.nanargmax(top1_sub))
+    layer, pool = np.unravel_index(flat_idx, top1_sub.shape)
+    fields = {
+        name: float(top1_values[layer, pool, i])
+        for i, name in enumerate(LOCAL_TOP1_FIELD_NAMES)
+    }
+    loc = top1_locs[layer, pool]
+    log_debug_message("[LOCAL_SPIKE]")
+    log_debug_message(
+        f"top1_global: pool={LOCAL_SPIKE_POOL_NAMES[pool]} "
+        f"layer={layer} {_format_loc(loc)} "
+        f"top1={fields['top1']:.6f} gate_raw={fields['gate_raw']:.6f} "
+        f"den={fields['gate_den']:.6f} int={fields['intensity']:.6f} "
+        f"score={fields['score']:.6f} tau={fields['tau']:.6f} "
+        f"margin={fields['margin']:.6f} read={fields['read_scalar']:.6f} "
+        f"gate_norm={fields['gate_norm']:.6f} "
+        f"read_norm={fields['read_norm']:.6f} "
+        f"write_norm={fields['write_norm']:.6f} "
+        f"op_gain={fields['op_gain']:.6f} "
+        f"contrib={fields['contrib_norm']:.6f} "
+        f"out_norm={fields['total_out_norm']:.6f} "
+        f"contrib_frac={fields['contrib_frac']:.6f}"
+    )
+
+    for metric in ('tau_abs', 'intensity', 'gate_raw', 'gate_den_sum',
+                   'read_abs', 'contrib_norm', 'out_norm', 'resid_norm'):
+        mi = LOCAL_SPIKE_METRIC_NAMES.index(metric)
+        l, p, val = _best_from_values(values, mi)
+        log_debug_message(
+            f"{metric}_max: pool={LOCAL_SPIKE_POOL_NAMES[p]} "
+            f"layer={l} {_format_loc(locs[l, p, mi])} value={val:.6f}")
+
+    for p, pool_name in enumerate(LOCAL_SPIKE_POOL_NAMES):
+        parts = []
+        for metric in LOCAL_SPIKE_METRIC_NAMES:
+            mi = LOCAL_SPIKE_METRIC_NAMES.index(metric)
+            l = int(np.nanargmax(values[:, p, mi]))
+            parts.append(
+                f"{metric}=L{l}:{values[l, p, mi]:.4g}"
+                f"@{_format_loc(locs[l, p, mi])}")
+        log_debug_message(f"pool_max[{pool_name}]: " + " ".join(parts))
+
+
+def _print_attention_local_block(rec):
+    vals = _diag_array(rec, 'attn_local_layer_values', ndim=2)
+    if vals is None:
+        return
+    logit_idx = ATTN_LOCAL_FIELD_NAMES.index('attn_logit_max')
+    layer = int(np.nanargmax(vals[:, logit_idx]))
+    row = vals[layer]
+    pieces = [
+        f"{name}={float(row[i]):.6f}"
+        for i, name in enumerate(ATTN_LOCAL_FIELD_NAMES)
+    ]
+    log_debug_message("[ATTN_LOCAL]")
+    log_debug_message(f"layer_max: layer={layer} " + " ".join(pieces))
+
+
+def _fmt_grad_array(rec, key):
+    vals = rec.get(key, [])
+    arr = np.asarray(vals, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return "[]"
+    return "[" + ", ".join(f"{float(v):.6g}" for v in arr) + "]"
+
+
+def _print_grad_layer_block(rec):
+    if 'grad_expand_O_per_layer' not in rec:
+        return
+    log_debug_message("[GRAD_LAYER]")
+    log_debug_message(
+        "shared_note=router/pool_rw are shared params; single-entry arrays are pool-level")
+    for label, key in (
+            ('router_tau_attn', 'grad_router_tau_attn_per_layer'),
+            ('router_proj_attn', 'grad_router_proj_attn_per_layer'),
+            ('router_tau_rst', 'grad_router_tau_rst_per_layer'),
+            ('router_proj_rst', 'grad_router_proj_rst_per_layer'),
+            ('qk_rw_read_write', 'grad_pool_attn_qk_rw'),
+            ('v_rw_read_write', 'grad_pool_attn_v_rw'),
+            ('rst_rw_read_write', 'grad_pool_rst_rw'),
+            ('expand_O', 'grad_expand_O_per_layer'),
+            ('layernorm', 'grad_layernorms_per_layer')):
+        if key in rec:
+            log_debug_message(f"{label}={_fmt_grad_array(rec, key)}")
+
+
+def _print_drop_compare_block(rec):
+    if not rec.get('debug_drop_compare_enabled', False):
+        return
+
+    def _line(prefix):
+        return (
+            f"loss={float(rec.get(prefix + '_loss', 0.0)):.6f} "
+            f"ce={float(rec.get(prefix + '_ce', 0.0)):.6f} "
+            f"top1_max={float(rec.get(prefix + '_top1_max', 0.0)):.6f} "
+            f"int_max={float(rec.get(prefix + '_int_max', 0.0)):.6f} "
+            f"tau_abs_max={float(rec.get(prefix + '_tau_abs_max', 0.0)):.6f} "
+            f"out_max={float(rec.get(prefix + '_local_out_norm_max', 0.0)):.6f} "
+            f"active={float(rec.get(prefix + '_active_frac', 0.0)):.6f} "
+            f"den_max={float(rec.get(prefix + '_gate_den_sum_max', 0.0)):.6f} "
+            f"attention_logit_max={float(rec.get(prefix + '_attention_logit_max', 0.0)):.6f}"
+        )
+
+    log_debug_message("[DROP_COMPARE]")
+    log_debug_message("normal: " + _line('debug_normal'))
+    log_debug_message("deterministic: " + _line('debug_deterministic'))
+
+
 def _print_debug_block(rec, ctx):
     """Write debug-only DAWN-SRW collapse diagnostics to debug_log_*.txt."""
     def _g(key, default=0.0):
@@ -2694,6 +3052,8 @@ def _print_debug_block(rec, ctx):
         f"layer_attn_max={_layer_max('per_layer_attn_out_norm'):.3f} "
         f"layer_rst_max={_layer_max('per_layer_rst_out_norm'):.3f}"
     )
+    _print_local_spike_block(rec)
+    _print_attention_local_block(rec)
     log_debug_message(
         f"grad_groups: global_pre={_g('grad_global_preclip', _g('grad_norm')):.6f} "
         f"global_post={_g('grad_global_postclip'):.6f} "
@@ -2713,6 +3073,8 @@ def _print_debug_block(rec, ctx):
         f"ln={_g('grad_layernorms'):.6f} "
         f"lm_head_or_token_tied={_g('grad_lm_head_or_token_tied'):.6f}"
     )
+    _print_grad_layer_block(rec)
+    _print_drop_compare_block(rec)
     reasons = _collapse_reasons(rec)
     if reasons:
         log_debug_message(
@@ -3052,6 +3414,9 @@ def main():
     parser.add_argument('--debug', nargs='?', const=1, default=0, type=int,
                         help=('Write detailed diagnostics to a separate debug log '
                               'every N steps (default N=1 when flag is present)'))
+    parser.add_argument('--debug-drop-compare', action='store_true',
+                        help=('On debug intervals, run an extra deterministic '
+                              'diagnostics-only forward on the same batch.'))
     parser.add_argument('--resume-from', type=str, default=None,
                         help='Resume from specific run folder path (e.g. gs://...../run_v...)')
     cli_args = parser.parse_args()
@@ -3074,6 +3439,7 @@ def main():
     # Training params (from YAML first, may be overridden by checkpoint config below)
     debug_interval = max(0, int(cli_args.debug or 0))
     debug_mode = debug_interval > 0
+    debug_drop_compare = bool(cli_args.debug_drop_compare)
     tcfg = cfg['training']
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
@@ -3771,6 +4137,7 @@ def main():
     # analysis_step at val time).
     _sharded_fns = None
     _sharded_fns_analysis = None
+    _sharded_fns_debug = None
     _spec = MODEL_REGISTRY.get(model_version)
     _force_sharded = bool(_spec and _spec.force_sharded)
     if _spec is not None and (mesh_model > 1 or _force_sharded):
@@ -3830,11 +4197,36 @@ def main():
                 }
             else:
                 _sharded_fns_analysis = _sharded_single_rst_a
+            _supports_local_diag = (
+                'local_diagnostics' in _inspect.signature(make_sharded_srw).parameters
+            )
+            if debug_mode and _supports_local_diag:
+                _sharded_single_v_d = make_sharded_srw(
+                    analysis=True, local_diagnostics=True,
+                    max_chunk_size=attn_v_max_chunk, **_srw_base_kwargs)
+                _sharded_single_rst_d = make_sharded_srw(
+                    analysis=True, local_diagnostics=True,
+                    max_chunk_size=rst_max_chunk, **_srw_base_kwargs)
+                if hasattr(_v3, 'make_sharded_srw_paired'):
+                    _sharded_paired_d = _v3.make_sharded_srw_paired(
+                        analysis=True, local_diagnostics=True,
+                        max_chunk_size=attn_qk_max_chunk,
+                        **_srw_base_kwargs)
+                    _sharded_fns_debug = {
+                        'single': _sharded_single_v_d,
+                        'attn_v_single': _sharded_single_v_d,
+                        'rst_single': _sharded_single_rst_d,
+                        'paired': _sharded_paired_d,
+                        'attn_qk_paired': _sharded_paired_d,
+                    }
+                else:
+                    _sharded_fns_debug = _sharded_single_rst_d
         if is_host0:
             print(f"  shard_map enabled (mesh_model={mesh_model}, QK fused"
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
-                  f"; analysis kernels={'on' if _supports_analysis else 'off'})")
+                  f"; analysis kernels={'on' if _supports_analysis else 'off'}"
+                  f"; debug local={'on' if _sharded_fns_debug is not None else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -3858,6 +4250,12 @@ def main():
             model, sharded_fns=_sharded_fns_analysis)
     else:
         analysis_step_fn = None
+    if _sharded_fns_debug is not None:
+        debug_forward_step_fn = create_debug_forward_step(
+            model, sharded_fns=_sharded_fns_debug,
+            drop_compare=debug_drop_compare)
+    else:
+        debug_forward_step_fn = None
     geometry_step_fn = create_geometry_step(
         max_sample=int(tcfg.get(
             'geometry_max_sample',
@@ -4445,6 +4843,8 @@ def main():
             log_debug_message(f"Training log: {training_log_file}")
             log_debug_message(f"Debug interval: {debug_interval}")
             log_debug_message(
+                f"Drop compare: {'on' if debug_drop_compare else 'off'}")
+            log_debug_message(
                 f"Resume append: {_is_debug_log_resume}")
             log_debug_message("")
         log_message("")
@@ -4519,7 +4919,8 @@ def main():
               f" analysis={LOG_ANALYSIS}"
               f" geometry={LOG_GEOMETRY}"
               f" val={val_interval}"
-              f" debug={'off' if not debug_mode else debug_interval}",
+              f" debug={'off' if not debug_mode else debug_interval}"
+              f" drop_compare={'on' if debug_drop_compare else 'off'}",
               flush=True)
 
     # Emb drift snapshot (sense vectors). Held on every host, refreshed at
@@ -4582,6 +4983,11 @@ def main():
             attention_mask = shard_to_mesh(
                 attention_mask, data_sharding, (batch_size, max_seq_len))
 
+            _debug_forward_params = (
+                params if (
+                    debug_mode and debug_forward_step_fn is not None
+                    and ((global_step + 1) % debug_interval == 0))
+                else None)
             params, opt_state, metrics = train_step_fn(
                 params, opt_state,
                 input_ids, attention_mask, step_rng, _prev_emb_snap,
@@ -4635,6 +5041,21 @@ def main():
             is_debug_log = (
                 debug_mode and global_step > 0
                 and (global_step % debug_interval == 0))
+
+            debug_forward_result = None
+            if is_debug_log and debug_forward_step_fn is not None:
+                _df_params = (
+                    _debug_forward_params
+                    if _debug_forward_params is not None else params)
+                debug_forward_result = debug_forward_step_fn(
+                    _df_params, input_ids, attention_mask, step_rng)
+                jax.block_until_ready(
+                    debug_forward_result['normal'][
+                        'debug_forward_summary']['loss'])
+                if debug_drop_compare:
+                    jax.block_until_ready(
+                        debug_forward_result['deterministic'][
+                            'debug_forward_summary']['loss'])
 
             if is_regular:
                 # Refresh emb-drift snapshot on every host (ref reassignment
@@ -4779,6 +5200,9 @@ def main():
                 debug_metrics = jax.device_get(metrics)
                 debug_rec = _build_regular_record(
                     debug_metrics, debug_avgs, debug_ctx, global_step, epoch)
+                if debug_forward_result is not None:
+                    debug_rec = _attach_debug_forward_record(
+                        debug_rec, jax.device_get(debug_forward_result))
                 _print_debug_block(debug_rec, debug_ctx)
                 log_debug_jsonl({'type': 'debug_train', **debug_rec})
                 sync_logs()

@@ -163,6 +163,11 @@ def unit_norm_init(scale=1.0):
     return init
 
 
+LOCAL_SPIKE_METRIC_COUNT = 9
+LOCAL_SPIKE_TOP1_COUNT = 15
+ATTN_LOCAL_METRIC_COUNT = 7
+
+
 # ================================================================
 # 2. shard_map based gate + sense_read_write
 # ================================================================
@@ -187,7 +192,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      prune_activation_threshold=None,
                      prune_scope="all",
                      prune_denominator="pruned",
-                     return_prune_stats=False):
+                     return_prune_stats=False,
+                     local_diagnostics=False):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
     2-pass chunked inside shard_map:
@@ -243,6 +249,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         else prune_activation_threshold)
     _denominator_is_full = (prune_denominator == "full")
     _return_prune_stats = bool(return_prune_stats)
+    _local_diagnostics = bool(local_diagnostics)
     _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
 
     # SLIM out_specs: train path.
@@ -293,10 +300,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                     # int_cap_frac scalar
         P(),                     # gate_max_mean scalar
     )
+    _local_diag_specs = (
+        P(),                     # local_spike_values [1, metric]
+        P(),                     # local_spike_locs [1, metric, b/t/neuron]
+        P(),                     # top1_breakdown_values [1, field]
+        P(),                     # top1_breakdown_locs [1, b/t/neuron]
+    )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
                   if analysis else _slim_out_specs + _conc_out_specs)
     if _return_prune_stats:
         _out_specs = _out_specs + _prune_extra_specs
+    if analysis and _local_diagnostics:
+        _out_specs = _out_specs + _local_diag_specs
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),    # x [B,S,D]
@@ -688,10 +703,195 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * N_total))
+        local_diag_out = ()
+        if _local_diagnostics:
+            data_axis = jax.lax.axis_index('data')
+            model_axis = jax.lax.axis_index('model')
+            global_b_base = data_axis * B
+            global_n_base = model_axis * N_local
+            neg_inf = jnp.float32(-1.0e30)
+
+            def _globalize(value, loc):
+                value = jax.lax.stop_gradient(value)
+                loc = jax.lax.stop_gradient(loc.astype(jnp.float32))
+                for axis in ('model', 'data'):
+                    gvalue = jax.lax.pmax(value, axis)
+                    mask = (value == gvalue).astype(jnp.float32)
+                    denom = jax.lax.psum(mask, axis)
+                    loc = (
+                        jax.lax.psum(loc * mask[..., None], axis)
+                        / jnp.maximum(denom[..., None], 1.0))
+                    value = gvalue
+                return value, loc
+
+            def _globalize_top1(value, loc, details):
+                value = jax.lax.stop_gradient(value)
+                loc = jax.lax.stop_gradient(loc.astype(jnp.float32))
+                details = jax.lax.stop_gradient(details.astype(jnp.float32))
+                for axis in ('model', 'data'):
+                    gvalue = jax.lax.pmax(value, axis)
+                    mask = (value == gvalue).astype(jnp.float32)
+                    denom = jax.lax.psum(mask, axis)
+                    loc = (
+                        jax.lax.psum(loc * mask[..., None], axis)
+                        / jnp.maximum(denom[..., None], 1.0))
+                    details = (
+                        jax.lax.psum(details * mask[..., None], axis)
+                        / jnp.maximum(denom[..., None], 1.0))
+                    value = gvalue
+                return value, loc, details
+
+            def _token_route_max(vals):
+                # vals [B,S,1]; returns [1], [1,3].
+                flat = vals[:, :, 0].reshape((1, B * S))
+                arg = jnp.argmax(flat, axis=1).astype(jnp.int32)
+                val = jnp.take_along_axis(flat, arg[:, None], axis=1)[:, 0]
+                b = arg // S + global_b_base
+                t = arg % S
+                n = jnp.full_like(b, -1)
+                return val, jnp.stack([b, t, n], axis=-1)
+
+            def _chunk_route_max(vals, start):
+                # vals [B,S,1,cs]; returns [1], [1,3].
+                flat = vals[:, :, 0, :].reshape((1, B * S * cs))
+                arg = jnp.argmax(flat, axis=1).astype(jnp.int32)
+                val = jnp.take_along_axis(flat, arg[:, None], axis=1)[:, 0]
+                b = arg // (S * cs) + global_b_base
+                rem = arg % (S * cs)
+                t = rem // cs
+                n = rem % cs + start + global_n_base
+                return val, jnp.stack([b, t, n], axis=-1)
+
+            def _chunk_route_take(vals, arg):
+                flat = vals[:, :, 0, :].reshape((1, B * S * cs))
+                return jnp.take_along_axis(flat, arg[:, None], axis=1)[:, 0]
+
+            def _local_diag_step(carry, i):
+                (metric_vals, metric_locs, top1_vals, top1_locs,
+                 top1_details) = carry
+                s = i * cs
+                route, rc, wc = route_chunk(s)
+                scores = h_bf @ route.T
+                scores_f = scores.astype(jnp.float32)[:, :, None, :]
+                tau_r = tau[:, :, None, :]
+                raw = scores_f - tau_r
+                gate_raw = raw - _act_thr
+                activation = jax.nn.sigmoid(_sharp * gate_raw)
+                active_margin = jnp.maximum(gate_raw - _act_cut, 0.0)
+                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                base_gate = activation * intensity
+                if _prune_enabled:
+                    keep = activation > _prune_thr
+                    gate = jnp.where(keep, base_gate, 0.0)
+                else:
+                    gate = base_gate
+                xr = (x_bf @ rc.T).astype(jnp.float32)[:, :, None, :]
+                read_norm = jnp.linalg.norm(rc.astype(jnp.float32), axis=-1)
+                write_norm = jnp.linalg.norm(wc.astype(jnp.float32), axis=-1)
+                read_norm_b = read_norm[None, None, None, :]
+                write_norm_b = write_norm[None, None, None, :]
+                op_gain = read_norm_b * write_norm_b
+                gate_den = jnp.maximum(global_weighted_cost_m[:, :, None, :], 1e-8)
+                out_den = jnp.maximum(global_den_cost_m[:, :, None, :], 1.0)
+                top1_share = gate / gate_den
+                contrib_norm = jnp.abs((gate / out_den) * xr) * write_norm_b
+
+                chunk_gate_raw, chunk_gate_raw_loc = _chunk_route_max(raw, s)
+                chunk_top1, chunk_top1_loc = _chunk_route_max(top1_share, s)
+                chunk_int, chunk_int_loc = _chunk_route_max(intensity, s)
+                chunk_read, chunk_read_loc = _chunk_route_max(jnp.abs(xr), s)
+                chunk_contrib, chunk_contrib_loc = _chunk_route_max(contrib_norm, s)
+                chunk_vals = jnp.stack([
+                    chunk_gate_raw, chunk_top1, chunk_int,
+                    chunk_read, chunk_contrib,
+                ], axis=1)
+                chunk_locs = jnp.stack([
+                    chunk_gate_raw_loc, chunk_top1_loc, chunk_int_loc,
+                    chunk_read_loc, chunk_contrib_loc,
+                ], axis=1)
+                slots = jnp.array([1, 2, 4, 5, 6], dtype=jnp.int32)
+                old_vals = metric_vals[:, slots]
+                old_locs = metric_locs[:, slots, :]
+                take = chunk_vals > old_vals
+                metric_vals = metric_vals.at[:, slots].set(
+                    jnp.where(take, chunk_vals, old_vals))
+                metric_locs = metric_locs.at[:, slots, :].set(
+                    jnp.where(take[..., None], chunk_locs, old_locs))
+
+                flat_top1 = top1_share[:, :, 0, :].reshape((1, B * S * cs))
+                arg = jnp.argmax(flat_top1, axis=1).astype(jnp.int32)
+                chunk_top1_val = jnp.take_along_axis(
+                    flat_top1, arg[:, None], axis=1)[:, 0]
+                chunk_score = _chunk_route_take(scores_f, arg)
+                chunk_tau = _chunk_route_take(tau_r + jnp.zeros_like(scores_f), arg)
+                chunk_margin = chunk_score - chunk_tau
+                chunk_gate_raw = _chunk_route_take(gate_raw, arg)
+                chunk_gate = _chunk_route_take(gate, arg)
+                chunk_gate_den = _chunk_route_take(
+                    gate_den + jnp.zeros_like(gate), arg)
+                chunk_intensity = _chunk_route_take(intensity, arg)
+                chunk_xr = _chunk_route_take(xr, arg)
+                chunk_write_norm = _chunk_route_take(
+                    write_norm_b + jnp.zeros_like(gate), arg)
+                chunk_read_norm = _chunk_route_take(
+                    read_norm_b + jnp.zeros_like(gate), arg)
+                chunk_op_gain = _chunk_route_take(op_gain + jnp.zeros_like(gate), arg)
+                chunk_contrib = _chunk_route_take(contrib_norm, arg)
+                out_norm_r = jnp.linalg.norm(out[:, :, None, :], axis=-1)
+                chunk_out_norm = _chunk_route_take(
+                    out_norm_r[..., None] + jnp.zeros_like(gate), arg)
+                chunk_contrib_frac = chunk_contrib / jnp.maximum(chunk_out_norm, 1e-8)
+                chunk_details = jnp.stack([
+                    chunk_top1_val, chunk_score, chunk_tau, chunk_margin,
+                    chunk_gate_raw, chunk_gate / jnp.maximum(chunk_gate_den, 1e-8),
+                    chunk_gate_den, chunk_intensity, chunk_xr,
+                    chunk_write_norm, chunk_read_norm, chunk_op_gain,
+                    chunk_contrib, chunk_out_norm, chunk_contrib_frac,
+                ], axis=1)
+                take_top1 = chunk_top1_val > top1_vals
+                top1_vals = jnp.where(take_top1, chunk_top1_val, top1_vals)
+                top1_locs = jnp.where(take_top1[:, None],
+                                      chunk_top1_loc, top1_locs)
+                top1_details = jnp.where(take_top1[:, None],
+                                         chunk_details, top1_details)
+                return (metric_vals, metric_locs, top1_vals, top1_locs,
+                        top1_details), None
+
+            metric_vals0 = jnp.full((1, LOCAL_SPIKE_METRIC_COUNT), neg_inf)
+            metric_locs0 = jnp.zeros((1, LOCAL_SPIKE_METRIC_COUNT, 3),
+                                     dtype=jnp.int32)
+            top1_vals0 = jnp.full((1,), neg_inf)
+            top1_locs0 = jnp.zeros((1, 3), dtype=jnp.int32)
+            top1_details0 = jnp.zeros((1, LOCAL_SPIKE_TOP1_COUNT),
+                                      dtype=jnp.float32)
+            (metric_vals, metric_locs, top1_vals, top1_locs,
+             top1_details), _ = jax.lax.scan(
+                _local_diag_step,
+                (metric_vals0, metric_locs0, top1_vals0, top1_locs0,
+                 top1_details0),
+                jnp.arange(nc))
+
+            tau_val, tau_loc = _token_route_max(jnp.abs(tau_offset[:, :, None, 0]))
+            den_val, den_loc = _token_route_max(global_den_cost_m[:, :, None, 0])
+            out_val, out_loc = _token_route_max(
+                jnp.linalg.norm(out[:, :, None, :], axis=-1))
+            resid_val, resid_loc = _token_route_max(
+                jnp.linalg.norm(x, axis=-1)[:, :, None])
+            token_vals = jnp.stack([tau_val, den_val, out_val, resid_val], axis=1)
+            token_locs = jnp.stack([tau_loc, den_loc, out_loc, resid_loc], axis=1)
+            token_slots = jnp.array([0, 3, 7, 8], dtype=jnp.int32)
+            metric_vals = metric_vals.at[:, token_slots].set(token_vals)
+            metric_locs = metric_locs.at[:, token_slots, :].set(token_locs)
+
+            metric_vals, metric_locs = _globalize(metric_vals, metric_locs)
+            top1_vals, top1_locs, top1_details = _globalize_top1(
+                top1_vals, top1_locs, top1_details)
+            local_diag_out = (metric_vals, metric_locs,
+                              top1_details, top1_locs)
         return slim_out + conc_out + (phi_binary_frac, z_lt_075_frac, z_lt_030_frac,
                            score_skew, active_per_token_std, gate_entropy,
                            den_cost_out, activation_cost_out, current_cost_out,
-                           score_kurt, int_cap_frac_out) + prune_out
+                           score_kurt, int_cap_frac_out) + prune_out + local_diag_out
 
     return fused_gate_srw
 
@@ -709,7 +909,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             prune_activation_threshold=None,
                             prune_scope="all",
                             prune_denominator="pruned",
-                            return_prune_stats=False):
+                            return_prune_stats=False,
+                            local_diagnostics=False):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -746,6 +947,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         else prune_activation_threshold)
     _denominator_is_full = (prune_denominator == "full")
     _return_prune_stats = bool(return_prune_stats)
+    _local_diagnostics = bool(local_diagnostics)
     _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
 
     _slim_out_specs = (
@@ -794,10 +996,18 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                          # int_cap_frac scalar
         P(),                          # gate_max_mean scalar
     )
+    _local_diag_specs = (
+        P(),                          # local_spike_values [2, metric]
+        P(),                          # local_spike_locs [2, metric, b/t/neuron]
+        P(),                          # top1_breakdown_values [2, field]
+        P(),                          # top1_breakdown_locs [2, b/t/neuron]
+    )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
                   if analysis else _slim_out_specs + _conc_out_specs)
     if _return_prune_stats:
         _out_specs = _out_specs + _prune_extra_specs
+    if analysis and _local_diagnostics:
+        _out_specs = _out_specs + _local_diag_specs
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P('data', None, None),        # x [B,S,D]
@@ -1189,10 +1399,195 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         int_cap_frac_out = jax.lax.stop_gradient(
             jax.lax.psum(total_int_cap_count, 'model')
             / jnp.float32(B * S * 2 * N_total))
+        local_diag_out = ()
+        if _local_diagnostics:
+            data_axis = jax.lax.axis_index('data')
+            model_axis = jax.lax.axis_index('model')
+            global_b_base = data_axis * B
+            global_n_base = model_axis * N_local
+            neg_inf = jnp.float32(-1.0e30)
+
+            def _globalize(value, loc):
+                value = jax.lax.stop_gradient(value)
+                loc = jax.lax.stop_gradient(loc.astype(jnp.float32))
+                for axis in ('model', 'data'):
+                    gvalue = jax.lax.pmax(value, axis)
+                    mask = (value == gvalue).astype(jnp.float32)
+                    denom = jax.lax.psum(mask, axis)
+                    loc = (
+                        jax.lax.psum(loc * mask[..., None], axis)
+                        / jnp.maximum(denom[..., None], 1.0))
+                    value = gvalue
+                return value, loc
+
+            def _globalize_top1(value, loc, details):
+                value = jax.lax.stop_gradient(value)
+                loc = jax.lax.stop_gradient(loc.astype(jnp.float32))
+                details = jax.lax.stop_gradient(details.astype(jnp.float32))
+                for axis in ('model', 'data'):
+                    gvalue = jax.lax.pmax(value, axis)
+                    mask = (value == gvalue).astype(jnp.float32)
+                    denom = jax.lax.psum(mask, axis)
+                    loc = (
+                        jax.lax.psum(loc * mask[..., None], axis)
+                        / jnp.maximum(denom[..., None], 1.0))
+                    details = (
+                        jax.lax.psum(details * mask[..., None], axis)
+                        / jnp.maximum(denom[..., None], 1.0))
+                    value = gvalue
+                return value, loc, details
+
+            def _token_route_max(vals):
+                # vals [B,S,2]; returns [2], [2,3].
+                flat = vals.transpose(2, 0, 1).reshape((2, B * S))
+                arg = jnp.argmax(flat, axis=1).astype(jnp.int32)
+                val = jnp.take_along_axis(flat, arg[:, None], axis=1)[:, 0]
+                b = arg // S + global_b_base
+                t = arg % S
+                n = jnp.full_like(b, -1)
+                return val, jnp.stack([b, t, n], axis=-1)
+
+            def _chunk_route_max(vals, start):
+                # vals [B,S,2,cs]; returns [2], [2,3].
+                flat = vals.transpose(2, 0, 1, 3).reshape((2, B * S * cs))
+                arg = jnp.argmax(flat, axis=1).astype(jnp.int32)
+                val = jnp.take_along_axis(flat, arg[:, None], axis=1)[:, 0]
+                b = arg // (S * cs) + global_b_base
+                rem = arg % (S * cs)
+                t = rem // cs
+                n = rem % cs + start + global_n_base
+                return val, jnp.stack([b, t, n], axis=-1)
+
+            def _chunk_route_take(vals, arg):
+                flat = vals.transpose(2, 0, 1, 3).reshape((2, B * S * cs))
+                return jnp.take_along_axis(flat, arg[:, None], axis=1)[:, 0]
+
+            def _local_diag_step(carry, i):
+                (metric_vals, metric_locs, top1_vals, top1_locs,
+                 top1_details) = carry
+                s = i * cs
+                route, rc, wc = route_chunk(s)
+                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
+                scores_f = scores.astype(jnp.float32)
+                raw = scores_f - tau
+                gate_raw = raw - _act_thr
+                activation = jax.nn.sigmoid(_sharp * gate_raw)
+                active_margin = jnp.maximum(gate_raw - _act_cut, 0.0)
+                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                base_gate = activation * intensity
+                if _prune_enabled:
+                    keep = activation > _prune_thr
+                    gate = jnp.where(keep, base_gate, 0.0)
+                else:
+                    gate = base_gate
+                xr = (x_bf @ rc.T).astype(jnp.float32)
+                xr_r = xr[:, :, None, :]
+                read_norm = jnp.linalg.norm(rc.astype(jnp.float32), axis=-1)
+                write_norm = jnp.linalg.norm(wc.astype(jnp.float32), axis=-1)
+                read_norm_b = read_norm[None, None, None, :]
+                write_norm_b = write_norm[None, None, None, :]
+                op_gain = read_norm_b * write_norm_b
+                gate_den = jnp.maximum(global_weighted_cost_m, 1e-8)
+                out_den = jnp.maximum(global_den_cost_m, 1.0)
+                top1_share = gate / gate_den
+                contrib_norm = jnp.abs((gate / out_den) * xr_r) * write_norm_b
+
+                chunk_gate_raw, chunk_gate_raw_loc = _chunk_route_max(raw, s)
+                chunk_top1, chunk_top1_loc = _chunk_route_max(top1_share, s)
+                chunk_int, chunk_int_loc = _chunk_route_max(intensity, s)
+                chunk_read, chunk_read_loc = _chunk_route_max(jnp.abs(xr_r), s)
+                chunk_contrib, chunk_contrib_loc = _chunk_route_max(contrib_norm, s)
+                chunk_vals = jnp.stack([
+                    chunk_gate_raw, chunk_top1, chunk_int,
+                    chunk_read, chunk_contrib,
+                ], axis=1)
+                chunk_locs = jnp.stack([
+                    chunk_gate_raw_loc, chunk_top1_loc, chunk_int_loc,
+                    chunk_read_loc, chunk_contrib_loc,
+                ], axis=1)
+                slots = jnp.array([1, 2, 4, 5, 6], dtype=jnp.int32)
+                old_vals = metric_vals[:, slots]
+                old_locs = metric_locs[:, slots, :]
+                take = chunk_vals > old_vals
+                metric_vals = metric_vals.at[:, slots].set(
+                    jnp.where(take, chunk_vals, old_vals))
+                metric_locs = metric_locs.at[:, slots, :].set(
+                    jnp.where(take[..., None], chunk_locs, old_locs))
+
+                flat_top1 = top1_share.transpose(2, 0, 1, 3).reshape(
+                    (2, B * S * cs))
+                arg = jnp.argmax(flat_top1, axis=1).astype(jnp.int32)
+                chunk_top1_val = jnp.take_along_axis(
+                    flat_top1, arg[:, None], axis=1)[:, 0]
+                chunk_score = _chunk_route_take(scores_f, arg)
+                chunk_tau = _chunk_route_take(tau + jnp.zeros_like(scores_f), arg)
+                chunk_margin = chunk_score - chunk_tau
+                chunk_gate_raw = _chunk_route_take(gate_raw, arg)
+                chunk_gate = _chunk_route_take(gate, arg)
+                chunk_gate_den = _chunk_route_take(
+                    gate_den + jnp.zeros_like(gate), arg)
+                chunk_intensity = _chunk_route_take(intensity, arg)
+                chunk_xr = _chunk_route_take(xr_r + jnp.zeros_like(gate), arg)
+                chunk_write_norm = _chunk_route_take(
+                    write_norm_b + jnp.zeros_like(gate), arg)
+                chunk_read_norm = _chunk_route_take(
+                    read_norm_b + jnp.zeros_like(gate), arg)
+                chunk_op_gain = _chunk_route_take(op_gain + jnp.zeros_like(gate), arg)
+                chunk_contrib = _chunk_route_take(contrib_norm, arg)
+                out_norm_r = jnp.linalg.norm(out, axis=-1)
+                chunk_out_norm = _chunk_route_take(
+                    out_norm_r[..., None] + jnp.zeros_like(gate), arg)
+                chunk_contrib_frac = chunk_contrib / jnp.maximum(chunk_out_norm, 1e-8)
+                chunk_details = jnp.stack([
+                    chunk_top1_val, chunk_score, chunk_tau, chunk_margin,
+                    chunk_gate_raw, chunk_gate / jnp.maximum(chunk_gate_den, 1e-8),
+                    chunk_gate_den, chunk_intensity, chunk_xr,
+                    chunk_write_norm, chunk_read_norm, chunk_op_gain,
+                    chunk_contrib, chunk_out_norm, chunk_contrib_frac,
+                ], axis=1)
+                take_top1 = chunk_top1_val > top1_vals
+                top1_vals = jnp.where(take_top1, chunk_top1_val, top1_vals)
+                top1_locs = jnp.where(take_top1[:, None],
+                                      chunk_top1_loc, top1_locs)
+                top1_details = jnp.where(take_top1[:, None],
+                                         chunk_details, top1_details)
+                return (metric_vals, metric_locs, top1_vals, top1_locs,
+                        top1_details), None
+
+            metric_vals0 = jnp.full((2, LOCAL_SPIKE_METRIC_COUNT), neg_inf)
+            metric_locs0 = jnp.zeros((2, LOCAL_SPIKE_METRIC_COUNT, 3),
+                                     dtype=jnp.int32)
+            top1_vals0 = jnp.full((2,), neg_inf)
+            top1_locs0 = jnp.zeros((2, 3), dtype=jnp.int32)
+            top1_details0 = jnp.zeros((2, LOCAL_SPIKE_TOP1_COUNT),
+                                      dtype=jnp.float32)
+            (metric_vals, metric_locs, top1_vals, top1_locs,
+             top1_details), _ = jax.lax.scan(
+                _local_diag_step,
+                (metric_vals0, metric_locs0, top1_vals0, top1_locs0,
+                 top1_details0),
+                jnp.arange(nc))
+
+            tau_val, tau_loc = _token_route_max(jnp.abs(tau_offset[..., 0]))
+            den_val, den_loc = _token_route_max(global_den_cost_m[..., 0])
+            out_val, out_loc = _token_route_max(jnp.linalg.norm(out, axis=-1))
+            resid_val, resid_loc = _token_route_max(
+                jnp.repeat(jnp.linalg.norm(x, axis=-1)[:, :, None], 2, axis=2))
+            token_vals = jnp.stack([tau_val, den_val, out_val, resid_val], axis=1)
+            token_locs = jnp.stack([tau_loc, den_loc, out_loc, resid_loc], axis=1)
+            token_slots = jnp.array([0, 3, 7, 8], dtype=jnp.int32)
+            metric_vals = metric_vals.at[:, token_slots].set(token_vals)
+            metric_locs = metric_locs.at[:, token_slots, :].set(token_locs)
+
+            metric_vals, metric_locs = _globalize(metric_vals, metric_locs)
+            top1_vals, top1_locs, top1_details = _globalize_top1(
+                top1_vals, top1_locs, top1_details)
+            local_diag_out = (metric_vals, metric_locs,
+                              top1_details, top1_locs)
         return slim_out + conc_out + (phi_binary_frac_mean, z_lt_075_frac, z_lt_030_frac,
                            score_skew, active_per_token_std, gate_entropy,
                            den_cost_out, activation_cost_out, current_cost_out,
-                           score_kurt, int_cap_frac_out) + prune_out
+                           score_kurt, int_cap_frac_out) + prune_out + local_diag_out
 
     return fused_gate_srw_paired
 
@@ -1285,7 +1680,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False, return_prune_stats=False):
+                  sharded_fns, analysis=False, return_prune_stats=False,
+                  local_diagnostics=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1356,8 +1752,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     if analysis:
         (qk_phi_bin, qk_z075, qk_z030, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_activation_cost, qk_current_cost,
-         qk_kurt, qk_int_cap) = qk_ret[20:]
+         qk_kurt, qk_int_cap) = qk_ret[20:31]
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
+        if local_diagnostics:
+            (qk_local_values, qk_local_locs,
+             qk_top1_values, qk_top1_locs) = qk_ret[-4:]
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
     v_ret = fused_single_v(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
@@ -1375,8 +1774,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     if analysis:
         (v_phi_bin, v_z075, v_z030, v_skew, v_apt_std, v_entropy,
          v_den_cost, v_activation_cost, v_current_cost,
-         v_kurt, v_int_cap) = v_ret[20:]
+         v_kurt, v_int_cap) = v_ret[20:31]
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
+        if local_diagnostics:
+            (v_local_values, v_local_locs,
+             v_top1_values, v_top1_locs) = v_ret[-4:]
     V = V * v_scale
 
     d_head = d_model // n_heads
@@ -1394,8 +1796,14 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_scores = jnp.where(causal, attn_scores,
                                 jnp.finfo(attn_scores.dtype).min)
         attn_w = jax.nn.softmax(attn_scores, axis=-1)
+        if analysis:
+            attn_logit_max_dbg = jnp.max(attn_scores)
+            attn_softmax_top1_dbg = jnp.max(attn_w)
         attn_w = safe_dropout(attn_w, dropout_rate, deterministic, rng_drop)
-        return jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        out_dbg = jnp.einsum('bhst,bhtd->bhsd', attn_w, V)
+        if analysis:
+            return out_dbg, attn_logit_max_dbg, attn_softmax_top1_dbg
+        return out_dbg
 
     if analysis:
         q_norm = jnp.linalg.norm(Q, axis=-1).mean()
@@ -1403,12 +1811,22 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         v_norm_dbg = jnp.linalg.norm(V, axis=-1).mean()
         attn_logit_max = (q_norm * k_norm / scale)
 
-    out = _attn_scores(Q, K, V, rng_attn_drop)
+    if analysis:
+        out, attn_logit_max_actual, attn_softmax_top1_max = _attn_scores(
+            Q, K, V, rng_attn_drop)
+    else:
+        out = _attn_scores(Q, K, V, rng_attn_drop)
     if analysis:
         o_input_norm = jnp.linalg.norm(out, axis=-1).mean()
+        q_norm_max = jnp.linalg.norm(Q, axis=-1).max()
+        k_norm_max = jnp.linalg.norm(K, axis=-1).max()
+        v_norm_max = jnp.linalg.norm(V, axis=-1).max()
+        o_input_norm_max = jnp.linalg.norm(out, axis=-1).max()
     out = out.transpose(0, 2, 1, 3).reshape(B, S, D)
     out = out @ expand_O_kernel
     attn_out_norm = jnp.linalg.norm(out, axis=-1).mean()
+    if analysis:
+        o_out_norm_max = jnp.linalg.norm(out, axis=-1).max()
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
 
@@ -1480,9 +1898,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_current_cost = (qk_current_cost + v_current_cost) / 2
     attn_score_kurt = (qk_kurt + v_kurt) / 2
     attn_int_cap_frac = (qk_int_cap + v_int_cap) / 2.0
-    return slim_ret + (
+    analysis_ret = slim_ret + (
         qk_raw_norm, v_raw_norm,
-        q_norm, k_norm, v_norm_dbg, attn_logit_max, o_input_norm,
+        q_norm, k_norm, v_norm_dbg, attn_logit_max_actual, o_input_norm,
         attn_qk_phi_binary, attn_v_phi_binary,
         attn_tau_std, attn_tau_kernel_norm,
         attn_z_lt_075_frac, attn_z_lt_030_frac,
@@ -1493,11 +1911,28 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_score_kurt,
         attn_int_cap_frac,
     )
+    if local_diagnostics:
+        attn_local_layer_values = jnp.stack([
+            q_norm_max, k_norm_max, v_norm_max,
+            attn_logit_max_actual, attn_softmax_top1_max,
+            o_input_norm_max, o_out_norm_max,
+        ])
+        attn_local_values = jnp.concatenate([qk_local_values, v_local_values], axis=0)
+        attn_local_locs = jnp.concatenate([qk_local_locs, v_local_locs], axis=0)
+        attn_top1_values = jnp.concatenate([qk_top1_values, v_top1_values], axis=0)
+        attn_top1_locs = jnp.concatenate([qk_top1_locs, v_top1_locs], axis=0)
+        analysis_ret = analysis_ret + (
+            attn_local_layer_values,
+            attn_local_values, attn_local_locs,
+            attn_top1_values, attn_top1_locs,
+        )
+    return analysis_ret
 
 
 def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False, return_prune_stats=False):
+                  sharded_fns, analysis=False, return_prune_stats=False,
+                  local_diagnostics=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -1541,8 +1976,11 @@ def _rst_forward(x, pool_params, router_params, rng,
         (phi_binary_frac, rst_z_lt_075_frac, rst_z_lt_030_frac,
          rst_score_skew, rst_active_per_token_std, rst_gate_entropy,
          rst_den_cost, rst_activation_cost, rst_current_cost,
-         rst_score_kurt, rst_int_cap_frac) = rst_ret[20:]
+         rst_score_kurt, rst_int_cap_frac) = rst_ret[20:31]
         rst_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
+        if local_diagnostics:
+            (rst_local_values, rst_local_locs,
+             rst_top1_values, rst_top1_locs) = rst_ret[-4:]
     out = out * rst_scale
     rst_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     rng, rng_out = jax.random.split(rng)
@@ -1583,7 +2021,7 @@ def _rst_forward(x, pool_params, router_params, rng,
         )
 
     rst_phi_binary = phi_binary_frac.mean()
-    return slim_ret + (
+    analysis_ret = slim_ret + (
         rst_raw_out_norm,
         rst_tau_std, rst_tau_kernel_norm,
         rst_z_lt_075_frac, rst_z_lt_030_frac,
@@ -1595,6 +2033,12 @@ def _rst_forward(x, pool_params, router_params, rng,
         rst_phi_binary,
         rst_int_cap_frac,
     )
+    if local_diagnostics:
+        analysis_ret = analysis_ret + (
+            rst_local_values, rst_local_locs,
+            rst_top1_values, rst_top1_locs,
+        )
+    return analysis_ret
 
 
 # ================================================================
@@ -1693,7 +2137,7 @@ class DAWN(nn.Module):
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
                  deterministic=False, sharded_fns=None, analysis=False,
-                 return_prune_stats=False):
+                 return_prune_stats=False, local_diagnostics=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -1820,7 +2264,8 @@ class DAWN(nn.Module):
                     self.n_heads, self.d_model,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
-                    return_prune_stats=return_prune_stats)
+                    return_prune_stats=return_prune_stats,
+                    local_diagnostics=local_diagnostics)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -1853,7 +2298,11 @@ class DAWN(nn.Module):
                      a_skew, a_apt_std, a_entropy,
                      a_den_cost, a_activation_cost, a_current_cost,
                      a_qk_emb_n_max, a_v_emb_n_max,
-                     a_score_kurt, a_int_cap_frac) = attn_ret[33:]
+                     a_score_kurt, a_int_cap_frac) = attn_ret[33:56]
+                    if local_diagnostics:
+                        (a_attn_local_layer_values,
+                         a_attn_local_values, a_attn_local_locs,
+                         a_attn_top1_values, a_attn_top1_locs) = attn_ret[56:]
                 x = x + attn_out
 
                 normed = _layer_norm(
@@ -1862,7 +2311,8 @@ class DAWN(nn.Module):
                     normed, pool_params, router_params, rng_rst,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
-                    return_prune_stats=return_prune_stats)
+                    return_prune_stats=return_prune_stats,
+                    local_diagnostics=local_diagnostics)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_z_act, k_tau_abs,
@@ -1885,7 +2335,10 @@ class DAWN(nn.Module):
                      k_skew, k_apt_std, k_entropy,
                      k_den_cost, k_activation_cost, k_current_cost,
                      k_emb_n_max, k_score_kurt, k_phi_bin,
-                     k_int_cap_frac) = rst_ret[28:]
+                     k_int_cap_frac) = rst_ret[28:43]
+                    if local_diagnostics:
+                        (k_local_values, k_local_locs,
+                         k_top1_values, k_top1_locs) = rst_ret[43:]
                 x = x + rst_out
 
                 slim_ys = (attn_aux, rst_aux,
@@ -1932,7 +2385,7 @@ class DAWN(nn.Module):
                     )
                 if not analysis:
                     return x, slim_ys
-                return x, slim_ys + (
+                analysis_ys = slim_ys + (
                     a_qk_raw_norm, a_v_raw_norm, k_raw_out_norm,
                     a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
                     k_phi_bin, a_qk_phi_bin, a_v_phi_bin,
@@ -1951,6 +2404,15 @@ class DAWN(nn.Module):
                     a_score_kurt, k_score_kurt,
                     a_int_cap_frac, k_int_cap_frac,
                 )
+                if local_diagnostics:
+                    analysis_ys = analysis_ys + (
+                        a_attn_local_layer_values,
+                        a_attn_local_values, a_attn_local_locs,
+                        a_attn_top1_values, a_attn_top1_locs,
+                        k_local_values, k_local_locs,
+                        k_top1_values, k_top1_locs,
+                    )
+                return x, analysis_ys
 
             if self.gradient_checkpointing:
                 scan_body = jax.checkpoint(scan_body)
@@ -2003,8 +2465,16 @@ class DAWN(nn.Module):
                  attn_qk_emb_n_max_all, attn_v_emb_n_max_all,
                  rst_emb_n_max_all,
                  attn_score_kurt_all, rst_score_kurt_all,
-                 attn_int_cap_frac_all, rst_int_cap_frac_all) = scan_ys[_scan_offset:]
+                 attn_int_cap_frac_all, rst_int_cap_frac_all) = scan_ys[
+                    _scan_offset:_scan_offset + 38]
                 _scan_offset += 38
+                if local_diagnostics:
+                    (attn_local_layer_values_all,
+                     attn_local_values_all, attn_local_locs_all,
+                     attn_top1_values_all, attn_top1_locs_all,
+                     rst_local_values_all, rst_local_locs_all,
+                     rst_top1_values_all, rst_top1_locs_all) = scan_ys[_scan_offset:]
+                    _scan_offset += 9
             if return_prune_stats:
                 (attn_qk_kept_count_all, attn_qk_kept_frac_all,
                  attn_qk_full_gate_sum_all, attn_qk_kept_gate_sum_all,
@@ -2164,6 +2634,26 @@ class DAWN(nn.Module):
                 'attn_int_cap_frac': attn_int_cap_frac_all.mean(),
                 'rst_int_cap_frac': rst_int_cap_frac_all.mean(),
             })
+            if local_diagnostics:
+                result.update({
+                    'attn_local_layer_values': attn_local_layer_values_all,
+                    'local_spike_values': jnp.concatenate([
+                        attn_local_values_all,
+                        rst_local_values_all,
+                    ], axis=1),
+                    'local_spike_locs': jnp.concatenate([
+                        attn_local_locs_all,
+                        rst_local_locs_all,
+                    ], axis=1),
+                    'local_top1_values': jnp.concatenate([
+                        attn_top1_values_all,
+                        rst_top1_values_all,
+                    ], axis=1),
+                    'local_top1_locs': jnp.concatenate([
+                        attn_top1_locs_all,
+                        rst_top1_locs_all,
+                    ], axis=1),
+                })
 
 
         if labels is not None:
