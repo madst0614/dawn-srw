@@ -811,7 +811,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_bound_eps=1.0e-3,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
-                      debug_diagnostics=False):
+                      debug_diagnostics=False,
+                      debug_local_spikes=False):
     """Create a jit-compiled training step. Mesh SPMD handles parallelism.
 
     v4.1 explore (redesigned): no EMA, no warmup. For every step compute
@@ -867,7 +868,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 extra_kw['sharded_fns'] = sharded_fns
             if _pass_analysis_kw:
                 extra_kw['analysis'] = False
-            if debug_diagnostics and _pass_local_kw:
+            if debug_local_spikes and _pass_local_kw:
                 extra_kw['local_diagnostics'] = True
             result = model.apply(
                 {'params': params},
@@ -1513,7 +1514,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'drift_attn_v_emb': drift_attn_v_emb,
             'drift_rst_emb': drift_rst_emb,
         }
-        if debug_diagnostics:
+        if debug_local_spikes:
             metrics.update({
                 'local_spike_values': result.get(
                     'local_spike_values',
@@ -3539,6 +3540,9 @@ def main():
     parser.add_argument('--debug', nargs='?', const=1, default=0, type=int,
                         help=('Write detailed diagnostics to a separate debug log '
                               'every N steps (default N=1 when flag is present)'))
+    parser.add_argument('--debug-local-spikes', action='store_true',
+                        help=('Opt into inline LOCAL_SPIKE diagnostics during '
+                              'train forward passes. Requires --debug to log them.'))
     parser.add_argument('--debug-drop-compare', action='store_true',
                         help=('Reserved for tiny opt-in debug/val forwards; '
                               'never runs on the current train batch.'))
@@ -3564,6 +3568,7 @@ def main():
     # Training params (from YAML first, may be overridden by checkpoint config below)
     debug_interval = max(0, int(cli_args.debug or 0))
     debug_mode = debug_interval > 0
+    debug_local_spikes = bool(debug_mode and cli_args.debug_local_spikes)
     debug_drop_compare = bool(cli_args.debug_drop_compare)
     tcfg = cfg['training']
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
@@ -4259,12 +4264,13 @@ def main():
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path (v4.1 removed its non-sharded fallback).
     #
-    # v4.1: `_sharded_fns` = slim train path. When --debug is enabled it
-    # appends scalar-only inline local diagnostics to that same train kernel.
+    # v4.1: `_sharded_fns` = slim train path. --debug-local-spikes appends
+    # scalar-only inline local diagnostics to that same train kernel.
     # `_sharded_fns_analysis` = full observational stats, used only by
     # analysis_step at the configured analysis cadence.
     _sharded_fns = None
     _sharded_fns_analysis = None
+    _train_local_diag = False
     _spec = MODEL_REGISTRY.get(model_version)
     _force_sharded = bool(_spec and _spec.force_sharded)
     if _spec is not None and (mesh_model > 1 or _force_sharded):
@@ -4288,12 +4294,12 @@ def main():
         _supports_local_diag = (
             'local_diagnostics' in _inspect.signature(make_sharded_srw).parameters
         )
-        _train_local_diag = bool(debug_mode and _supports_local_diag)
+        _train_local_diag = bool(debug_local_spikes and _supports_local_diag)
         _srw_train_kwargs = dict(_srw_base_kwargs)
         if _train_local_diag:
             _srw_train_kwargs['local_diagnostics'] = True
-        # Slim (train) -analysis defaults to False. Debug local diagnostics,
-        # when enabled, are scalar-only outputs on this same train path.
+        # Slim (train) -analysis defaults to False. Local spike diagnostics,
+        # when explicitly enabled, are scalar-only outputs on this path.
         _sharded_single_v = make_sharded_srw(
             max_chunk_size=attn_v_max_chunk, **_srw_train_kwargs)
         _sharded_single_rst = make_sharded_srw(
@@ -4337,7 +4343,7 @@ def main():
                   f"; chunks attn_qk/attn_v/rst={n_chunks_qk}/{n_chunks_v}/{n_chunks_rst}"
                   f"; max_chunk attn_qk/attn_v/rst={attn_qk_max_chunk}/{attn_v_max_chunk}/{rst_max_chunk}"
                   f"; analysis kernels={'on' if _supports_analysis else 'off'}"
-                  f"; inline debug local={'on' if _train_local_diag else 'off'})")
+                  f"; inline local spikes={'on' if _train_local_diag else 'off'})")
 
     train_step_fn = create_train_step(
         model, optimizer, orth_weight, div_weight, lb_weight,
@@ -4351,7 +4357,8 @@ def main():
         exploration_bound_eps=exploration_bound_eps,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
-        debug_diagnostics=debug_mode)
+        debug_diagnostics=debug_mode,
+        debug_local_spikes=_train_local_diag)
     eval_step_fn = create_eval_step(model, sharded_fns=_sharded_fns)
     # v4.1: analysis_step is only meaningful when the full analysis
     # kernels exist. Older model versions skip it -analysis logging
@@ -4361,12 +4368,12 @@ def main():
             model, sharded_fns=_sharded_fns_analysis)
     else:
         analysis_step_fn = None
-    # No current-train-batch debug forward: --debug uses scalar-only inline
-    # diagnostics returned by train_step.
+    # No current-train-batch debug forward: --debug uses regular scalar
+    # train_step metrics. Local spike diagnostics require --debug-local-spikes.
     debug_forward_step_fn = None
     if debug_drop_compare and is_host0:
         print("  Drop compare requested, but current-train-batch debug "
-              "forwards are disabled; inline train diagnostics remain on.",
+              "forwards are disabled; regular train diagnostics remain on.",
               flush=True)
     geometry_step_fn = create_geometry_step(
         max_sample=int(tcfg.get(
@@ -4957,6 +4964,8 @@ def main():
             log_debug_message(f"Training log: {training_log_file}")
             log_debug_message(f"Debug interval: {debug_interval}")
             log_debug_message(
+                f"Local spike inline: {'on' if _train_local_diag else 'off'}")
+            log_debug_message(
                 f"Drop compare: {'on' if debug_drop_compare else 'off'}")
             log_debug_message(
                 f"Resume append: {_is_debug_log_resume}")
@@ -5034,6 +5043,7 @@ def main():
               f" geometry={LOG_GEOMETRY}"
               f" val={val_interval}"
               f" debug={'off' if not debug_mode else debug_interval}"
+              f" local_spikes={'on' if _train_local_diag else 'off'}"
               f" drop_compare={'on' if debug_drop_compare else 'off'}",
               flush=True)
 

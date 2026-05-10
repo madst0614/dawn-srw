@@ -357,8 +357,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         diag_vals_init = jnp.full(
             (1, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
 
-        def route_chunk(start):
+        def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
+            return ec
+
+        def route_rw_chunk(start):
+            ec = route_emb_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
@@ -375,7 +379,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
-                route, _, _ = route_chunk(s)
+                route = route_emb_chunk(s)
                 scores = h_bf @ route.T
                 scores_f = scores.astype(jnp.float32)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
@@ -396,7 +400,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             def stats_step(carry, i):
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
-                route, _, _ = route_chunk(s)
+                route = route_emb_chunk(s)
                 scores = h_bf @ route.T
                 scores_f = scores.astype(jnp.float32)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
@@ -455,7 +459,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_max, total_full_gate, total_kept_count,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
-                route, rc, wc = route_chunk(s)
+                route, rc, wc = route_rw_chunk(s)
                 scores = h_bf @ route.T
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
@@ -564,7 +568,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_max, total_full_gate, total_kept_count,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
-                route, rc, wc = route_chunk(s)
+                route, rc, wc = route_rw_chunk(s)
                 scores = h_bf @ route.T
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
@@ -859,7 +863,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 (metric_vals, metric_locs, top1_vals, top1_locs,
                  top1_details) = carry
                 s = i * cs
-                route, rc, wc = route_chunk(s)
+                route, rc, wc = route_rw_chunk(s)
                 scores = h_bf @ route.T
                 scores_f = scores.astype(jnp.float32)[:, :, None, :]
                 tau_r = tau[:, :, None, :]
@@ -1128,8 +1132,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         diag_vals_init = jnp.full(
             (2, LOCAL_SPIKE_METRIC_COUNT), diag_neg_inf)
 
-        def route_chunk(start):
+        def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
+            return ec
+
+        def route_rw_chunk(start):
+            ec = route_emb_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
             wc = jax.lax.dynamic_slice_in_dim(write_bf, start, cs, axis=0)
             rc_f = rc.astype(jnp.float32)
@@ -1146,7 +1154,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             def stats_step(carry, i):
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
-                route, _, _ = route_chunk(s)
+                route = route_emb_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
                 scores_f = scores.astype(jnp.float32)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
@@ -1167,7 +1175,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             def stats_step(carry, i):
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
-                route, _, _ = route_chunk(s)
+                route = route_emb_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
                 scores_f = scores.astype(jnp.float32)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
@@ -1223,7 +1231,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_max, total_full_gate, total_kept_count,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
-                route, rc, wc = route_chunk(s)
+                route, rc, wc = route_rw_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
@@ -1340,7 +1348,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_max, total_full_gate, total_kept_count,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
-                route, rc, wc = route_chunk(s)
+                route, rc, wc = route_rw_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
@@ -1643,7 +1651,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 (metric_vals, metric_locs, top1_vals, top1_locs,
                  top1_details) = carry
                 s = i * cs
-                route, rc, wc = route_chunk(s)
+                route, rc, wc = route_rw_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
                 scores_f = scores.astype(jnp.float32)
                 raw = scores_f - tau
