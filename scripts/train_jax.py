@@ -3457,8 +3457,10 @@ def _print_analysis_block(rec, ctx):
         f" z<030={rec['attn_z_lt_030']*100:.1f}%]"
     )
     log_message(
-        f"  saturation cap[attn={rec['attn_int_cap_frac']*100:.1f}%"
-        f" rst={rec['rst_int_cap_frac']*100:.1f}%]"
+        f"  saturation cap_frac[attn={_g('attn_int_cap_frac')*100:.4f}%"
+        f" rst={_g('rst_int_cap_frac')*100:.4f}%]"
+        f" | int_max[attn={_g('attn_int_max'):.3f}"
+        f" rst={_g('rst_int_max'):.3f}]"
         f" | emb_max rst={rec['rst_emb_norm_max']:.2f}"
         f" attn_qk={rec['attn_qk_emb_norm_max']:.2f}"
         f" attn_v={rec['attn_v_emb_norm_max']:.2f}"
