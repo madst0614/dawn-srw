@@ -3306,7 +3306,42 @@ def _build_analysis_record(base, metrics, ctx):
         'debug_v_norm': float(m.get('debug_v_norm', 0.0)),
         'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
         'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
+        'attn_q_norm_mean': float(m.get('attn_q_norm_mean', 0.0)),
+        'attn_q_norm_p95': float(m.get('attn_q_norm_p95', 0.0)),
+        'attn_q_norm_p99': float(m.get('attn_q_norm_p99', 0.0)),
+        'attn_q_norm_max': float(m.get('attn_q_norm_max', 0.0)),
+        'attn_k_norm_mean': float(m.get('attn_k_norm_mean', 0.0)),
+        'attn_k_norm_p95': float(m.get('attn_k_norm_p95', 0.0)),
+        'attn_k_norm_p99': float(m.get('attn_k_norm_p99', 0.0)),
+        'attn_k_norm_max': float(m.get('attn_k_norm_max', 0.0)),
+        'attn_logit_mean': float(m.get('attn_logit_mean', 0.0)),
+        'attn_logit_std': float(m.get('attn_logit_std', 0.0)),
+        'attn_logit_p95': float(m.get('attn_logit_p95', 0.0)),
+        'attn_logit_p99': float(m.get('attn_logit_p99', 0.0)),
+        'attn_logit_max': float(m.get('attn_logit_max', 0.0)),
+        'attn_softmax_top1_mean': float(m.get('attn_softmax_top1_mean', 0.0)),
+        'attn_softmax_top1_p95': float(m.get('attn_softmax_top1_p95', 0.0)),
+        'attn_softmax_top1_max': float(m.get('attn_softmax_top1_max', 0.0)),
+        'attn_logit_gap_top1_top2_mean': float(m.get(
+            'attn_logit_gap_top1_top2_mean', 0.0)),
+        'attn_logit_gap_top1_top2_p95': float(m.get(
+            'attn_logit_gap_top1_top2_p95', 0.0)),
+        'attn_logit_gap_top1_top2_max': float(m.get(
+            'attn_logit_gap_top1_top2_max', 0.0)),
+        'attn_softmax_entropy_mean': float(m.get(
+            'attn_softmax_entropy_mean', 0.0)),
+        'attn_softmax_entropy_min': float(m.get(
+            'attn_softmax_entropy_min', 0.0)),
+        'attn_o_input_norm_mean': float(m.get('attn_o_input_norm_mean', 0.0)),
+        'attn_o_input_norm_max': float(m.get('attn_o_input_norm_max', 0.0)),
+        'attn_o_output_norm_mean': float(m.get('attn_o_output_norm_mean', 0.0)),
+        'attn_o_output_norm_max': float(m.get('attn_o_output_norm_max', 0.0)),
     })
+    try:
+        rec['attn_logit_max_layer'] = int(jax.device_get(
+            m.get('attn_logit_max_layer', -1)))
+    except Exception:
+        rec['attn_logit_max_layer'] = -1
     # Full pool diagnostics emitted by _pool_param_diagnostics() use the
     # current SRW names: attn_qk_*, attn_v_*, rst_*.  Older analysis code
     # copied only legacy qk/v/know names, which made _print_analysis_block()
@@ -3488,6 +3523,41 @@ def _print_analysis_block(rec, ctx):
         f" logit_max={rec['debug_logit_max']:.1f}"
         f" o_in={rec['debug_o_input_norm']:.2f}"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.6':
+        log_message("[ATTN_QK_DIAG]")
+        log_message(
+            f"  logit[p99={_g('attn_logit_p99'):.2f}"
+            f" max={_g('attn_logit_max'):.2f}"
+            f" layer_max={int(rec.get('attn_logit_max_layer', -1))}]"
+        )
+        log_message(
+            f"  q_norm[p99={_g('attn_q_norm_p99'):.2f}"
+            f" max={_g('attn_q_norm_max'):.2f}]"
+        )
+        log_message(
+            f"  k_norm[p99={_g('attn_k_norm_p99'):.2f}"
+            f" max={_g('attn_k_norm_max'):.2f}]"
+        )
+        log_message(
+            f"  softmax_top1[mean={_g('attn_softmax_top1_mean'):.3f}"
+            f" p95={_g('attn_softmax_top1_p95'):.3f}"
+            f" max={_g('attn_softmax_top1_max'):.3f}]"
+        )
+        log_message(
+            f"  gap[top1_top2 mean={_g('attn_logit_gap_top1_top2_mean'):.2f}"
+            f" p95={_g('attn_logit_gap_top1_top2_p95'):.2f}"
+            f" max={_g('attn_logit_gap_top1_top2_max'):.2f}]"
+        )
+        log_message(
+            f"  entropy[mean={_g('attn_softmax_entropy_mean'):.2f}"
+            f" min={_g('attn_softmax_entropy_min'):.2f}]"
+        )
+        log_message(
+            f"  out[o_in={_g('attn_o_input_norm_mean'):.2f}"
+            f"/{_g('attn_o_input_norm_max'):.2f}"
+            f" o_out={_g('attn_o_output_norm_mean'):.2f}"
+            f"/{_g('attn_o_output_norm_max'):.2f}]"
+        )
     log_message(
         f"  grad_ratio qk[emb={rec['qk_emb_grad_ratio']:.2e}"
         f" r={rec['qk_read_grad_ratio']:.2e} w={rec['qk_write_grad_ratio']:.2e}]"
@@ -3952,6 +4022,10 @@ def main():
     # each param is touched at most once), then a single scale_by_lr.
 
     _MODEL_VERSION = cfg['model'].get('model_version', 'dawn_srw')
+    _FORWARD_UNIT_RW_VERSIONS = {
+        'spatial-r1-v4.1.5.2',
+        'spatial-r1-v4.1.5.6',
+    }
 
     _POOL_PARAM_NAMES = (
         'attn_qk_emb', 'attn_v_emb', 'rst_emb',
@@ -3973,7 +4047,7 @@ def main():
     )
 
     def _path_str(path):
-        return '/'.join(str(p) for p in path)
+        return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
 
     def _is_pool_param(path_str):
         return any(name in path_str for name in _POOL_PARAM_NAMES)
@@ -3993,8 +4067,8 @@ def main():
            or path_str.endswith('/attn_v_scale') \
            or path_str.endswith('/rst_scale'):
             return True  # learnable output_scale
-        if _MODEL_VERSION == 'spatial-r1-v4.1.5.2' and _is_rw_param(path_str):
-            return True  # v4.1.5.2 forward-normalizes read/write directions
+        if _MODEL_VERSION in _FORWARD_UNIT_RW_VERSIONS and _is_rw_param(path_str):
+            return True  # forward-normalized read/write directions
         return False
 
     def _wd_mask_base(params):
@@ -4050,6 +4124,25 @@ def main():
         _pool_paths = _collect_pool_paths(_pool_mask)
         if _pool_paths:
             print(f"    pool params: {_pool_paths[:9]}")
+        if _MODEL_VERSION == 'spatial-r1-v4.1.5.6':
+            _base_paths = _collect_pool_paths(_base_mask)
+            _emb_names = ('attn_qk_emb', 'attn_v_emb', 'rst_emb')
+            _rw_names = (
+                'attn_qk_read', 'attn_qk_write',
+                'attn_v_read', 'attn_v_write',
+                'rst_read', 'rst_write',
+            )
+            _scale_names = ('attn_qk_scale', 'attn_v_scale', 'rst_scale')
+            def _paths_with(paths, names):
+                return [name for name in names
+                        if any(name in path for path in paths)]
+            _pool_emb = _paths_with(_pool_paths, _emb_names)
+            _rw_wd = _paths_with(_pool_paths + _base_paths, _rw_names)
+            _scale_wd = _paths_with(_pool_paths + _base_paths, _scale_names)
+            print("  WD v4.1.5.6 check: "
+                  f"pool_embeddings={_pool_emb}, "
+                  f"read_write_excluded={not _rw_wd}, "
+                  f"pool_scale_excluded={not _scale_wd}")
 
     if grad_accum_steps > 1:
         optimizer = optax.MultiSteps(base_optimizer, every_k_schedule=grad_accum_steps)
