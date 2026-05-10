@@ -60,6 +60,7 @@ from models.dawn_srw import (
     DAWN as DAWN_SRW,
     migrate_legacy_v4155_params,
 )
+from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
 
 # ============================================================
 # Constants
@@ -326,6 +327,15 @@ MODEL_REGISTRY = {
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
     ),
+    'spatial-r1-v4.1.5.6': ModelSpec(
+        name='spatial-r1-v4.1.5.6',
+        module_path='models.dawn_srw_v4156',
+        cls=DAWN_SRW_V4156,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    ),
 }
 
 
@@ -348,7 +358,7 @@ def build_model_from_config(cfg):
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
     if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                   'dawn_srw'):
+                   'spatial-r1-v4.1.5.6', 'dawn_srw'):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -2326,7 +2336,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         except Exception:
             return []
 
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
+    is_v415 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+        'spatial-r1-v4.1.5.6', 'dawn_srw')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -2666,7 +2678,9 @@ def _print_regular_block(rec, ctx):
         f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
         f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
+    if ctx.get('model_version') in (
+            'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+            'spatial-r1-v4.1.5.6', 'dawn_srw'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
@@ -2677,7 +2691,9 @@ def _print_regular_block(rec, ctx):
         f" | tau_mean[attn={rec['attn_tau_mean']:+.3f} rst={rec['rst_tau_mean']:+.3f}]"
         f" abs[attn={rec['attn_tau_abs_mean']:.3f} rst={rec['rst_tau_abs_mean']:.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
+    if ctx.get('model_version') in (
+            'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+            'spatial-r1-v4.1.5.6', 'dawn_srw'):
         log_message(
             f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
             f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
@@ -3230,7 +3246,9 @@ def _build_analysis_record(base, metrics, ctx):
     those are pulled from analysis_result too.
     """
     m = metrics
-    is_v415 = ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
+    is_v415 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+        'spatial-r1-v4.1.5.6', 'dawn_srw')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -3439,7 +3457,9 @@ def _print_analysis_block(rec, ctx):
         f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
         f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
+    if ctx.get('model_version') in (
+            'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+            'spatial-r1-v4.1.5.6', 'dawn_srw'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" rst={rec['rst_gate_den_sum']:.1f}"
@@ -4068,7 +4088,9 @@ def main():
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw'):
+        if cfg['model'].get('model_version') in (
+                'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+                'spatial-r1-v4.1.5.6', 'dawn_srw'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -4151,6 +4173,7 @@ def main():
         'spatial-r1-v3.9.4',
         'spatial-r1-v4.1.5.2',
         'spatial-r1-v4.1.5.5',
+        'spatial-r1-v4.1.5.6',
         'dawn_srw',
     )
 
@@ -4447,7 +4470,9 @@ def main():
                     "baseline model has no DAWN neuron_pool/router")
 
             _is_sharded = _sharded_fns is not None
-            _uses_scan_offset = model_version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5', 'dawn_srw')
+            _uses_scan_offset = model_version in (
+                'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
+                'spatial-r1-v4.1.5.6', 'dawn_srw')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
