@@ -47,7 +47,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--resume-from CKPT_OR_RUN] [--debug [N]]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--debug [N]]"
             echo ""
             echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
             echo "  --zone     GCP zone            (default: $ZONE)"
@@ -55,6 +55,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
             echo "  --from-scratch  Start training from scratch (ignore checkpoints)"
+            echo "  --resume-from CKPT_OR_RUN  Resume from a .flax checkpoint file or run folder"
             echo "  --debug [N]  Enable train_jax.py debug diagnostics every N steps (default: 1)"
             echo "  --token    GitHub access token   (for private repos)"
             exit 0

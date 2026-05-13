@@ -60,7 +60,10 @@ from models.dawn_srw import (
     DAWN as DAWN_SRW,
     migrate_legacy_v4155_params,
 )
-from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
+try:
+    from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
+except ImportError:
+    DAWN_SRW_V4156 = None
 
 # ============================================================
 # Constants
@@ -279,9 +282,14 @@ def _dawn_srw_kwargs(cfg):
 
 
 def _v415_sharded_kwargs(cfg):
-    """Gate constants for the active v4.1.5 sharded SRW path."""
+    """Gate constants for the active v4.1.5 sharded SRW path.
+
+    route_emb_forward_norm is an optional v4.1.5.6 ablation kwarg.  Keep it
+    out of the kwargs unless explicitly enabled so v4.1.5.5's model factory
+    remains API-compatible while preserving raw route embeddings by default.
+    """
     t = cfg['training']
-    return dict(
+    kw = dict(
         dead_threshold=t.get('dead_penalty_threshold', 0.01),
         sharpness=t.get('sharpness', 500.0),
         activation_threshold=t.get('activation_threshold', 0.5),
@@ -290,8 +298,10 @@ def _v415_sharded_kwargs(cfg):
         max_intensity=t.get('max_intensity', 10.0),
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
-        route_emb_forward_norm=t.get('route_emb_forward_norm', False),
     )
+    if t.get('route_emb_forward_norm', False):
+        kw['route_emb_forward_norm'] = True
+    return kw
 
 
 MODEL_REGISTRY = {
@@ -336,7 +346,10 @@ MODEL_REGISTRY = {
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
     ),
-    'spatial-r1-v4.1.5.6': ModelSpec(
+}
+
+if DAWN_SRW_V4156 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.5.6'] = ModelSpec(
         name='spatial-r1-v4.1.5.6',
         module_path='models.dawn_srw_v4156',
         cls=DAWN_SRW_V4156,
@@ -344,8 +357,7 @@ MODEL_REGISTRY = {
         supports_sharded=True,
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
-    ),
-}
+    )
 
 
 def build_model_from_config(cfg):

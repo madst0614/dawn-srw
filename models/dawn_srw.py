@@ -163,8 +163,8 @@ def unit_norm_init(scale=1.0):
     return init
 
 
-LOCAL_SPIKE_METRIC_COUNT = 9
-LOCAL_SPIKE_TOP1_COUNT = 15
+LOCAL_SPIKE_METRIC_COUNT = 11
+LOCAL_SPIKE_TOP1_COUNT = 17
 ATTN_LOCAL_METRIC_COUNT = 7
 
 
@@ -486,6 +486,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.max(jnp.linalg.norm(
+                            jax.lax.stop_gradient(route.astype(jnp.float32)),
+                            axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -598,6 +602,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.max(jnp.linalg.norm(
+                            jax.lax.stop_gradient(route.astype(jnp.float32)),
+                            axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -726,11 +734,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 jax.lax.stop_gradient(out), axis=-1))
             residual_norm_max = jnp.max(jnp.linalg.norm(
                 jax.lax.stop_gradient(x), axis=-1))
+            h_norm_max = jnp.max(jnp.linalg.norm(
+                jax.lax.stop_gradient(h), axis=-1))
             token_vals = jnp.stack([
                 tau_abs_max, top1_share_max, gate_den_sum_max,
-                local_out_norm_max, residual_norm_max,
-            ]).reshape((1, 5))
-            token_slots = jnp.array([0, 2, 3, 7, 8], dtype=jnp.int32)
+                local_out_norm_max, residual_norm_max, h_norm_max,
+            ]).reshape((1, 6))
+            token_slots = jnp.array([0, 2, 3, 7, 8, 9], dtype=jnp.int32)
             metric_vals = diag_vals.at[:, token_slots].set(token_vals)
             metric_vals = jax.lax.stop_gradient(metric_vals)
             metric_vals = jax.lax.pmax(metric_vals, 'model')
@@ -746,6 +756,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
             top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
             top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_details = top1_details.at[:, 15].set(metric_vals[:, 9])
+            top1_details = top1_details.at[:, 16].set(metric_vals[:, 10])
             top1_locs = jnp.full((1, 3), -1, dtype=jnp.int32)
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
@@ -1260,6 +1272,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             xr_r + jnp.zeros_like(gate))), axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy, axis=(0, 1, 3)))
+                    _route_norm_max = jnp.max(jnp.linalg.norm(
+                        jax.lax.stop_gradient(route.astype(jnp.float32)),
+                        axis=-1))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1374,6 +1391,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             xr_r + jnp.zeros_like(gate))), axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy, axis=(0, 1, 3)))
+                    _route_norm_max = jnp.max(jnp.linalg.norm(
+                        jax.lax.stop_gradient(route.astype(jnp.float32)),
+                        axis=-1))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1510,11 +1532,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 jnp.max(jnp.linalg.norm(
                     jax.lax.stop_gradient(x), axis=-1)),
                 2)
+            h_norm_max = jnp.max(jnp.linalg.norm(
+                jax.lax.stop_gradient(h), axis=-1), axis=(0, 1))
             token_vals = jnp.stack([
                 tau_abs_max, top1_share_max, gate_den_sum_max,
-                local_out_norm_max, residual_norm_max,
+                local_out_norm_max, residual_norm_max, h_norm_max,
             ], axis=1)
-            token_slots = jnp.array([0, 2, 3, 7, 8], dtype=jnp.int32)
+            token_slots = jnp.array([0, 2, 3, 7, 8, 9], dtype=jnp.int32)
             metric_vals = diag_vals.at[:, token_slots].set(token_vals)
             metric_vals = jax.lax.stop_gradient(metric_vals)
             metric_vals = jax.lax.pmax(metric_vals, 'model')
@@ -1530,6 +1554,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
             top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
             top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_details = top1_details.at[:, 15].set(metric_vals[:, 9])
+            top1_details = top1_details.at[:, 16].set(metric_vals[:, 10])
             top1_locs = jnp.full((2, 3), -1, dtype=jnp.int32)
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
