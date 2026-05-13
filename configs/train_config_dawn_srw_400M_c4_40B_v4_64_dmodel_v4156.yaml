@@ -81,7 +81,7 @@ training:
   dead_penalty_threshold: 0.01
 
   # Control-side optimizer multipliers
-  # These are true LR multipliers applied after Adam update, not raw-grad scaling.
+  # These are true LR multipliers applied after Adam update, not loss weights.
   # Control params move routing boundaries/queries, so keep them finer than execution.
   tau_lr_mult: 0.10
   tau_grad_clip: 0.10
@@ -138,13 +138,17 @@ training:
   crash_snapshot_enabled: true
   stop_on_collapse: true
   crash_snapshot_save_post: false
+  crash_history_steps: 6
+  crash_snapshot_save_host_batches: true
 
   # Severe-collapse trigger thresholds.
-  # These are intentionally stricter than warning-level dead_spike detectors.
+  # Stop is CE/grad centered. Routing/top1/active/layer-out/dead diagnostics
+  # are kept for analysis but do not stop training by themselves.
   collapse_grad_threshold: 100.0
-  collapse_layer_out_threshold: 80.0
+  collapse_ce_extreme_threshold: 10.0
+  collapse_ce_grad_ce_threshold: 6.0
+  collapse_ce_grad_grad_threshold: 5.0
   collapse_loss_minus_ce_threshold: 10.0
-  collapse_active_frac_threshold: 0.50
 
 # -----------------------------------------------------------------------------
 # Runtime outputs

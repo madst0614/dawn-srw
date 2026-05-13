@@ -852,6 +852,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       dead_penalty_weighted_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
+                      router_proj_lr_mult=1.0,
+                      router_proj_grad_clip=0.0,
+                      router_scan_lr_mult=1.0,
+                      router_scan_grad_clip=0.0,
+                      route_emb_lr_mult=1.0,
+                      route_emb_grad_clip=0.0,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
@@ -914,6 +920,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
+    _router_proj_lr_mult = jnp.float32(router_proj_lr_mult)
+    _router_proj_grad_clip = jnp.float32(router_proj_grad_clip)
+    _router_scan_lr_mult = jnp.float32(router_scan_lr_mult)
+    _router_scan_grad_clip = jnp.float32(router_scan_grad_clip)
+    _route_emb_lr_mult = jnp.float32(route_emb_lr_mult)
+    _route_emb_grad_clip = jnp.float32(route_emb_grad_clip)
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
@@ -1180,29 +1192,102 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cur = cur[key]
             return cur
 
-        tau_grad_norm_raw = jnp.sqrt(
-            _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_attn'))
-            + _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_rst'))
-            + 1e-12)
-        tau_clip_scale = jnp.where(
-            _tau_grad_clip > 0.0,
-            jnp.minimum(1.0, _tau_grad_clip / (tau_grad_norm_raw + 1e-8)),
-            jnp.float32(1.0))
-        tau_total_scale = _tau_lr_mult * tau_clip_scale
-
         def _path_to_str(path):
             return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
 
-        def _scale_router_tau_grad(path, g):
-            ps = _path_to_str(path)
-            if ('router/tau_attn' in ps) or ('router/tau_rst' in ps):
-                return g * tau_total_scale.astype(g.dtype)
-            return g
+        # ------------------------------------------------------------------
+        # Control-side stabilisation.
+        #
+        # Important: LR multipliers are applied to Adam *updates*, not raw
+        # gradients. Scaling gradients before Adam is mostly cancelled by
+        # Adam's m/sqrt(v) normalisation and is therefore not a true LR
+        # multiplier. Raw-gradient clipping remains pre-Adam as a safety valve.
+        # ------------------------------------------------------------------
+        def _group_sq(tree, path_pred):
+            def _visit(path, leaf):
+                if path_pred(_path_to_str(path)):
+                    x = leaf.astype(jnp.float32)
+                    return jnp.sum(jnp.square(x))
+                return jnp.float32(0.0)
+            leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
+            if not leaves:
+                return jnp.float32(0.0)
+            return sum(leaves)
 
-        if (float(tau_lr_mult) != 1.0) or (float(tau_grad_clip) > 0.0):
-            grads = jax.tree.map_with_path(_scale_router_tau_grad, grads)
+        def _is_tau_path(ps):
+            return ('router/tau_attn' in ps) or ('router/tau_rst' in ps)
+
+        def _is_router_proj_path(ps):
+            return ('router/proj_attn' in ps) or ('router/proj_rst' in ps)
+
+        def _is_router_scan_path(ps):
+            return (('router/raw_scan_offset_attn' in ps)
+                    or ('router/raw_scan_offset_rst' in ps)
+                    or ('router/scan_attn' in ps)
+                    or ('router/scan_rst' in ps))
+
+        def _is_route_emb_path(ps):
+            return (('neuron_pool/attn_qk_emb' in ps)
+                    or ('neuron_pool/attn_v_emb' in ps)
+                    or ('neuron_pool/rst_emb' in ps)
+                    or ('neuron_pool/qk_emb' in ps)
+                    or ('neuron_pool/v_emb' in ps)
+                    or ('neuron_pool/know_emb' in ps))
+
+        def _clip_scale(group_norm, clip_value):
+            return jnp.where(
+                clip_value > 0.0,
+                jnp.minimum(1.0, clip_value / (group_norm + 1e-8)),
+                jnp.float32(1.0))
+
+        tau_grad_norm_raw = jnp.sqrt(_group_sq(grads, _is_tau_path) + 1e-12)
+        router_proj_grad_norm_raw = jnp.sqrt(
+            _group_sq(grads, _is_router_proj_path) + 1e-12)
+        router_scan_grad_norm_raw = jnp.sqrt(
+            _group_sq(grads, _is_router_scan_path) + 1e-12)
+        route_emb_grad_norm_raw = jnp.sqrt(
+            _group_sq(grads, _is_route_emb_path) + 1e-12)
+
+        tau_clip_scale = _clip_scale(tau_grad_norm_raw, _tau_grad_clip)
+        router_proj_clip_scale = _clip_scale(
+            router_proj_grad_norm_raw, _router_proj_grad_clip)
+        router_scan_clip_scale = _clip_scale(
+            router_scan_grad_norm_raw, _router_scan_grad_clip)
+        route_emb_clip_scale = _clip_scale(
+            route_emb_grad_norm_raw, _route_emb_grad_clip)
+
+        def _clip_control_grad(path, g):
+            ps = _path_to_str(path)
+            scale = jnp.float32(1.0)
+            scale = jnp.where(_is_tau_path(ps), tau_clip_scale, scale)
+            scale = jnp.where(_is_router_proj_path(ps), router_proj_clip_scale, scale)
+            scale = jnp.where(_is_router_scan_path(ps), router_scan_clip_scale, scale)
+            scale = jnp.where(_is_route_emb_path(ps), route_emb_clip_scale, scale)
+            return g * scale.astype(g.dtype)
+
+        if (float(tau_grad_clip) > 0.0
+                or float(router_proj_grad_clip) > 0.0
+                or float(router_scan_grad_clip) > 0.0
+                or float(route_emb_grad_clip) > 0.0):
+            grads = jax.tree.map_with_path(_clip_control_grad, grads)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
+
+        def _scale_control_update(path, u):
+            ps = _path_to_str(path)
+            mult = jnp.float32(1.0)
+            mult = jnp.where(_is_tau_path(ps), _tau_lr_mult, mult)
+            mult = jnp.where(_is_router_proj_path(ps), _router_proj_lr_mult, mult)
+            mult = jnp.where(_is_router_scan_path(ps), _router_scan_lr_mult, mult)
+            mult = jnp.where(_is_route_emb_path(ps), _route_emb_lr_mult, mult)
+            return u * mult.astype(u.dtype)
+
+        if (float(tau_lr_mult) != 1.0
+                or float(router_proj_lr_mult) != 1.0
+                or float(router_scan_lr_mult) != 1.0
+                or float(route_emb_lr_mult) != 1.0):
+            updates = jax.tree.map_with_path(_scale_control_update, updates)
+
         new_params = optax.apply_updates(params, updates)
 
         def _tree_sq(tree):
@@ -3048,32 +3133,125 @@ def _layer_out_max_from_rec(rec):
 
 
 def _severe_collapse_reasons(
-        rec, grad_threshold=100.0, layer_out_threshold=80.0,
-        loss_minus_ce_threshold=10.0, active_frac_threshold=0.50):
-    """Strict trigger for crash snapshots.
+        rec, grad_threshold=100.0,
+        loss_minus_ce_threshold=10.0,
+        ce_extreme_threshold=10.0,
+        ce_grad_ce_threshold=6.0,
+        ce_grad_grad_threshold=5.0):
+    """Strict trigger for crash snapshots/stopping.
 
-    _collapse_reasons is intentionally sensitive for debug warnings and can
-    fire on harmless dead-neuron storms. This stricter version is for
-    expensive checkpoint/batch snapshots and optional train-stop behavior.
+    Stop only on signals that indicate the optimization state is likely to be
+    unsafe: non-local gradient shock, extreme CE, CE+grad shock, or auxiliary
+    loss explosion. Structural diagnostics such as top1, active fraction,
+    layer-output max, and dead_spike remain warning/diagnostic-only because
+    sparse routing can produce high local values without harming CE/grad.
     """
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
 
     reasons = []
-    if _g('grad_global_preclip', _g('grad_norm')) > grad_threshold:
+    grad = _g('grad_global_preclip', _g('grad_norm'))
+    ce = _g('ce_loss')
+    if grad > grad_threshold:
         reasons.append('severe_grad_spike')
+    if ce > ce_extreme_threshold:
+        reasons.append('severe_ce_spike')
+    if ce > ce_grad_ce_threshold and grad > ce_grad_grad_threshold:
+        reasons.append('severe_ce_grad_spike')
     if _g('total_loss_minus_ce') > loss_minus_ce_threshold:
         reasons.append('severe_loss_minus_ce_spike')
-    if _layer_out_max_from_rec(rec) > layer_out_threshold:
-        reasons.append('severe_layer_out_high')
-    if max(_g('attn_qk_active'), _g('attn_v_active'), _g('rst_active')) > active_frac_threshold:
-        # Active flood alone can be a tail event, so keep it but make the
-        # threshold high. The snapshot payload tells whether it is cause/tail.
-        reasons.append('severe_active_flood')
-    if max(_g('attn_top1_gate_frac_max', _g('attn_top1_gate_frac')),
-           _g('rst_top1_gate_frac_max', _g('rst_top1_gate_frac'))) > 0.90:
-        reasons.append('severe_top1_collapse')
     return reasons
+
+
+CRASH_REASON_NAMES = (
+    'severe_grad_spike',
+    'severe_ce_spike',
+    'severe_ce_grad_spike',
+    'severe_loss_minus_ce_spike',
+    'nan_or_inf',
+)
+
+
+def _active_max_from_rec(rec):
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+    return max(_g('attn_qk_active'), _g('attn_v_active'), _g('rst_active'))
+
+
+def _top1_max_from_rec(rec):
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+    return max(_g('attn_top1_gate_frac_max', _g('attn_top1_gate_frac')),
+               _g('rst_top1_gate_frac_max', _g('rst_top1_gate_frac')))
+
+
+def _annotate_crash_record(rec, reasons=None):
+    """Add derived crash-sentinel fields to a JSON-safe metric record."""
+    out = dict(rec)
+    out['layer_out_max'] = _layer_out_max_from_rec(out)
+    out['active_frac_max'] = _active_max_from_rec(out)
+    out['top1_gate_frac_max_any'] = _top1_max_from_rec(out)
+    if reasons is not None:
+        out['severe_reasons'] = list(reasons)
+        out['severe_triggered'] = bool(reasons)
+    return out
+
+
+def _reason_bit_vector(reasons):
+    rs = set(reasons or [])
+    return [1.0 if name in rs else 0.0 for name in CRASH_REASON_NAMES]
+
+
+def _host_trigger_vector(process_index, rec, reasons):
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+    base = [
+        float(process_index),
+        1.0 if reasons else 0.0,
+        _g('grad_global_preclip', _g('grad_norm')),
+        _layer_out_max_from_rec(rec),
+        _g('total_loss_minus_ce'),
+        _active_max_from_rec(rec),
+        _top1_max_from_rec(rec),
+        _g('total_loss'),
+        _g('ce_loss'),
+    ]
+    return np.asarray(base + _reason_bit_vector(reasons), dtype=np.float64)
+
+
+def _decode_host_trigger_summary(arr):
+    rows = np.asarray(arr, dtype=np.float64).reshape(-1, 9 + len(CRASH_REASON_NAMES))
+    out = []
+    for row in rows:
+        reasons = [name for bit, name in zip(row[9:], CRASH_REASON_NAMES) if bit >= 0.5]
+        out.append({
+            'process_index': int(row[0]),
+            'triggered': bool(row[1] >= 0.5),
+            'reasons': reasons,
+            'grad_preclip': float(row[2]),
+            'layer_out_max': float(row[3]),
+            'loss_minus_ce': float(row[4]),
+            'active_frac_max': float(row[5]),
+            'top1_gate_frac_max': float(row[6]),
+            'total_loss': float(row[7]),
+            'ce_loss': float(row[8]),
+        })
+    return out
+
+
+def _full_metrics_record(metrics, step, epoch, process_index):
+    """JSON-safe full metrics dump. Called only on crash, so no steady-state cost."""
+    raw = jax.device_get(metrics)
+    out = {}
+    for k, v in raw.items():
+        out[k] = _jsonable_diag_value(v)
+    out.update({
+        'step': int(step),
+        'epoch': int(epoch),
+        'process_index': int(process_index),
+        'timestamp': datetime.now().isoformat(),
+    })
+    return _annotate_crash_record(out)
 
 
 def _write_json_file(path, obj):
@@ -3979,13 +4157,20 @@ def main():
     if stop_on_collapse:
         crash_snapshot_enabled = True
     crash_save_post_update = bool(tcfg.get('crash_snapshot_save_post', False))
+    # Host-local crash metric history. This stores already-materialized
+    # diagnostics and is written only when a severe trigger fires.
+    crash_history_steps = int(tcfg.get('crash_history_steps', 6))
+    crash_snapshot_save_host_batches = bool(
+        tcfg.get('crash_snapshot_save_host_batches', True))
     collapse_grad_threshold = float(tcfg.get('collapse_grad_threshold', 100.0))
-    collapse_layer_out_threshold = float(
-        tcfg.get('collapse_layer_out_threshold', 80.0))
     collapse_loss_minus_ce_threshold = float(
         tcfg.get('collapse_loss_minus_ce_threshold', 10.0))
-    collapse_active_frac_threshold = float(
-        tcfg.get('collapse_active_frac_threshold', 0.50))
+    collapse_ce_extreme_threshold = float(
+        tcfg.get('collapse_ce_extreme_threshold', 10.0))
+    collapse_ce_grad_ce_threshold = float(
+        tcfg.get('collapse_ce_grad_ce_threshold', 6.0))
+    collapse_ce_grad_grad_threshold = float(
+        tcfg.get('collapse_ce_grad_grad_threshold', 5.0))
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -4018,6 +4203,12 @@ def main():
         'dead_penalty_weighted_clip', tcfg.get('dead_w_clip', 0.0))
     tau_lr_mult = tcfg.get('tau_lr_mult', 1.0)
     tau_grad_clip = tcfg.get('tau_grad_clip', 0.0)
+    router_proj_lr_mult = tcfg.get('router_proj_lr_mult', 1.0)
+    router_proj_grad_clip = tcfg.get('router_proj_grad_clip', 0.0)
+    router_scan_lr_mult = tcfg.get('router_scan_lr_mult', 1.0)
+    router_scan_grad_clip = tcfg.get('router_scan_grad_clip', 0.0)
+    route_emb_lr_mult = tcfg.get('route_emb_lr_mult', 1.0)
+    route_emb_grad_clip = tcfg.get('route_emb_grad_clip', 0.0)
     restore_training_config_on_resume = tcfg.get(
         'restore_training_config_on_resume', True)
     # 2-tier logging cadence.
@@ -4244,6 +4435,18 @@ def main():
                 'tau_lr_mult', tau_lr_mult)
             tau_grad_clip = saved_training_config.get(
                 'tau_grad_clip', tau_grad_clip)
+            router_proj_lr_mult = saved_training_config.get(
+                'router_proj_lr_mult', router_proj_lr_mult)
+            router_proj_grad_clip = saved_training_config.get(
+                'router_proj_grad_clip', router_proj_grad_clip)
+            router_scan_lr_mult = saved_training_config.get(
+                'router_scan_lr_mult', router_scan_lr_mult)
+            router_scan_grad_clip = saved_training_config.get(
+                'router_scan_grad_clip', router_scan_grad_clip)
+            route_emb_lr_mult = saved_training_config.get(
+                'route_emb_lr_mult', route_emb_lr_mult)
+            route_emb_grad_clip = saved_training_config.get(
+                'route_emb_grad_clip', route_emb_grad_clip)
             log_interval = int(saved_training_config.get(
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
@@ -4280,6 +4483,12 @@ def main():
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
         'tau_lr_mult': tau_lr_mult,
         'tau_grad_clip': tau_grad_clip,
+        'router_proj_lr_mult': router_proj_lr_mult,
+        'router_proj_grad_clip': router_proj_grad_clip,
+        'router_scan_lr_mult': router_scan_lr_mult,
+        'router_scan_grad_clip': router_scan_grad_clip,
+        'route_emb_lr_mult': route_emb_lr_mult,
+        'route_emb_grad_clip': route_emb_grad_clip,
         'restore_training_config_on_resume': restore_training_config_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
@@ -4850,6 +5059,12 @@ def main():
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,
+        router_proj_lr_mult=router_proj_lr_mult,
+        router_proj_grad_clip=router_proj_grad_clip,
+        router_scan_lr_mult=router_scan_lr_mult,
+        router_scan_grad_clip=router_scan_grad_clip,
+        route_emb_lr_mult=route_emb_lr_mult,
+        route_emb_grad_clip=route_emb_grad_clip,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
@@ -5467,6 +5682,10 @@ def main():
                 f"Crash snapshot: {'on' if crash_snapshot_enabled else 'off'}")
             log_debug_message(
                 f"Stop on collapse: {'on' if stop_on_collapse else 'off'}")
+            if crash_snapshot_enabled:
+                log_debug_message(
+                    f"Crash history: last {crash_history_steps} local metric records; "
+                    f"host batches: {'on' if crash_snapshot_save_host_batches else 'off'}")
             log_debug_message(
                 f"Resume append: {_is_debug_log_resume}")
             log_debug_message("")
@@ -5495,15 +5714,14 @@ def main():
 
     def _save_crash_snapshot(step, epoch_idx, step_in_epoch, pre_params, pre_opt_state,
                              post_params, post_opt_state, batch_ids_np, mask_np,
-                             metrics_rec, reasons, host_trigger_summary=None,
-                             trigger_on_this_host=True, triggering_hosts=None):
+                             metrics_rec, reasons, local_history=None,
+                             full_metrics_rec=None, host_trigger_summary=None,
+                             trigger_on_this_host=False):
         """Collective crash snapshot writer. All hosts must enter.
 
-        Only host 0 writes the files.  In a multi-host run, a severe trigger
-        may happen on a nonzero host; in that case metrics.json and the saved
-        batch are host-0's local view, not necessarily the triggering host's
-        microbatch.  host_trigger_summary.json records which host(s) actually
-        triggered and the scalar trigger evidence.
+        Host 0 writes the replicated checkpoint. Every host writes its own
+        metric history/current metrics under a unique filename so an
+        other-host trigger is diagnosable without guessing from host-0 logs.
         """
         pre_params_single = _gather_for_save(pre_params)
         pre_opt_single = _gather_for_save(pre_opt_state)
@@ -5512,26 +5730,57 @@ def main():
         if crash_save_post_update:
             post_params_single = _gather_for_save(post_params)
             post_opt_single = _gather_for_save(post_opt_state)
+        # Per-host diagnostics. These are written only after a severe
+        # trigger, so there is no steady-state training cost.
+        host_prefix = f"host_{int(host_id):04d}"
+        local_payload = {
+            'type': 'crash_host_metrics',
+            'process_index': int(host_id),
+            'step': int(step),
+            'epoch': int(epoch_idx),
+            'step_in_epoch': int(step_in_epoch),
+            'trigger_on_this_host': bool(trigger_on_this_host),
+            'reasons': list(reasons),
+            'current_metrics': _annotate_crash_record(
+                full_metrics_rec if full_metrics_rec is not None else metrics_rec,
+                reasons if trigger_on_this_host else []),
+            'history': list(local_history or []),
+            'timestamp': datetime.now().isoformat(),
+        }
+        _write_json_file(_crash_path(step, f'{host_prefix}_history.json'),
+                         local_payload)
+        if full_metrics_rec is not None:
+            _write_json_file(_crash_path(step, f'{host_prefix}_current_metrics.json'),
+                             full_metrics_rec)
+        if crash_snapshot_save_host_batches and batch_ids_np is not None:
+            _write_npy_file(_crash_path(step, f'{host_prefix}_batch_input_ids.npy'),
+                            batch_ids_np)
+            _write_npy_file(_crash_path(step, f'{host_prefix}_batch_attention_mask.npy'),
+                            mask_np)
+
         if is_host0:
-            triggering_hosts = list(triggering_hosts or [])
             base_note = {
                 'type': 'crash_snapshot',
                 'step': int(step),
                 'epoch': int(epoch_idx),
                 'step_in_epoch': int(step_in_epoch),
                 'reasons': list(reasons),
-                'trigger_on_this_host': bool(trigger_on_this_host),
-                'triggering_hosts': [int(h) for h in triggering_hosts],
-                'metrics_are_from_process_index': int(host_id),
                 'timestamp': datetime.now().isoformat(),
                 'config_path': str(config_path),
                 'model_version': model_version,
+                'trigger_on_this_host': bool(trigger_on_this_host),
+                'triggering_hosts': [
+                    int(r['process_index']) for r in (host_trigger_summary or [])
+                    if r.get('triggered')
+                ],
+                'metrics_are_from_process_index': int(host_id),
                 'note': (
-                    'pre_update.flax is the replicated training state before the '
-                    'optimizer update. metrics.json and batch_input_ids.npy are '
-                    'written by host 0. If trigger_on_this_host is false, that '
-                    'batch is host 0 local data, not necessarily the triggering '
-                    'host microbatch; inspect host_trigger_summary.json.'),
+                    'pre_update.flax is the replicated training state before '
+                    'the optimizer update. Host-specific metric histories are '
+                    'stored as host_XXXX_history.json. If trigger_on_this_host '
+                    'is false, host_0000 batch files are not necessarily the '
+                    'triggering microbatch; inspect host_trigger_summary.json '
+                    'and the triggering host files.'),
             }
             _write_checkpoint_bytes(
                 _crash_path(step, 'pre_update.flax'),
@@ -5553,11 +5802,10 @@ def main():
             _write_npy_file(_crash_path(step, 'batch_input_ids.npy'), batch_ids_np)
             _write_npy_file(_crash_path(step, 'batch_attention_mask.npy'), mask_np)
             _write_json_file(_crash_path(step, 'metrics.json'), metrics_rec)
-            _write_json_file(_crash_path(step, 'trigger.json'), base_note)
             if host_trigger_summary is not None:
-                _write_json_file(
-                    _crash_path(step, 'host_trigger_summary.json'),
-                    host_trigger_summary)
+                _write_json_file(_crash_path(step, 'host_trigger_summary.json'),
+                                 host_trigger_summary)
+            _write_json_file(_crash_path(step, 'trigger.json'), base_note)
             _write_json_file(_crash_path(step, 'config.json'), cfg)
             log_message(
                 f"  [CRASH_SNAPSHOT] step={step} reasons={','.join(reasons)} "
@@ -5596,6 +5844,8 @@ def main():
 
     # ----------------------------------------------------------
     # Training loop
+    crash_metric_history = []
+
     # ----------------------------------------------------------
     if is_host0:
         print(f"\n{'='*60}")
@@ -5796,105 +6046,56 @@ def main():
                 _crash_rec = {
                     k: _jsonable_diag_value(v) for k, v in _crash_probe.items()
                 }
-                _crash_rec.update({'step': global_step, 'epoch': epoch})
+                _crash_rec.update({
+                    'step': global_step,
+                    'epoch': epoch,
+                    'process_index': int(host_id),
+                    'timestamp': datetime.now().isoformat(),
+                })
                 _crash_reasons = _severe_collapse_reasons(
                     _crash_rec,
                     grad_threshold=collapse_grad_threshold,
-                    layer_out_threshold=collapse_layer_out_threshold,
                     loss_minus_ce_threshold=collapse_loss_minus_ce_threshold,
-                    active_frac_threshold=collapse_active_frac_threshold)
+                    ce_extreme_threshold=collapse_ce_extreme_threshold,
+                    ce_grad_ce_threshold=collapse_ce_grad_ce_threshold,
+                    ce_grad_grad_threshold=collapse_ce_grad_grad_threshold)
+                _crash_rec = _annotate_crash_record(_crash_rec, _crash_reasons)
+                if crash_history_steps > 0:
+                    crash_metric_history.append(dict(_crash_rec))
+                    if len(crash_metric_history) > crash_history_steps:
+                        crash_metric_history = crash_metric_history[-crash_history_steps:]
 
-                def _reason_mask(reasons):
-                    mask = 0
-                    if 'severe_grad_spike' in reasons:
-                        mask |= 1
-                    if 'severe_loss_minus_ce_spike' in reasons:
-                        mask |= 2
-                    if 'severe_layer_out_high' in reasons:
-                        mask |= 4
-                    if 'severe_active_flood' in reasons:
-                        mask |= 8
-                    if 'severe_top1_collapse' in reasons:
-                        mask |= 16
-                    return mask
-
-                _layer_out_max = _layer_out_max_from_rec(_crash_rec)
-                _active_max = max(
-                    float(_crash_rec.get('attn_qk_active', 0.0) or 0.0),
-                    float(_crash_rec.get('attn_v_active', 0.0) or 0.0),
-                    float(_crash_rec.get('rst_active', 0.0) or 0.0))
-                _top1_max = max(
-                    float(_crash_rec.get('attn_top1_gate_frac_max', 0.0) or 0.0),
-                    float(_crash_rec.get('rst_top1_gate_frac_max', 0.0) or 0.0))
-                _host_trigger_vec = np.asarray([
-                    float(host_id),
-                    1.0 if _crash_reasons else 0.0,
-                    float(_reason_mask(_crash_reasons)),
-                    float(_crash_rec.get('grad_global_preclip',
-                                         _crash_rec.get('grad_norm', 0.0)) or 0.0),
-                    float(_layer_out_max),
-                    float(_crash_rec.get('total_loss_minus_ce', 0.0) or 0.0),
-                    float(_active_max),
-                    float(_top1_max),
-                    float(_crash_rec.get('total_loss', 0.0) or 0.0),
-                    float(_crash_rec.get('ce_loss', 0.0) or 0.0),
-                ], dtype=np.float32)
-                _host_trigger_all = np.asarray(
-                    process_allgather(_host_trigger_vec), dtype=np.float32
-                ).reshape(-1, 10)
-                _crash_any = bool(np.any(_host_trigger_all[:, 1] > 0.5))
+                _trigger_vec = _host_trigger_vector(
+                    host_id, _crash_rec, _crash_reasons)
+                _trigger_all = process_allgather(_trigger_vec)
+                _host_trigger_summary = _decode_host_trigger_summary(_trigger_all)
+                _crash_any = any(row.get('triggered') for row in _host_trigger_summary)
                 if _crash_any:
-                    reason_names = {
-                        1: 'severe_grad_spike',
-                        2: 'severe_loss_minus_ce_spike',
-                        4: 'severe_layer_out_high',
-                        8: 'severe_active_flood',
-                        16: 'severe_top1_collapse',
-                    }
-                    host_trigger_summary = []
-                    triggering_hosts = []
-                    for row in _host_trigger_all:
-                        proc = int(row[0])
-                        mask = int(row[2])
-                        row_reasons = [
-                            name for bit, name in reason_names.items()
-                            if mask & bit
-                        ]
-                        triggered = bool(row[1] > 0.5)
-                        if triggered:
-                            triggering_hosts.append(proc)
-                        host_trigger_summary.append({
-                            'process_index': proc,
-                            'triggered': triggered,
-                            'reasons': row_reasons,
-                            'grad_global_preclip': float(row[3]),
-                            'layer_out_max': float(row[4]),
-                            'total_loss_minus_ce': float(row[5]),
-                            'active_frac_max': float(row[6]),
-                            'top1_gate_frac_max': float(row[7]),
-                            'total_loss': float(row[8]),
-                            'ce_loss': float(row[9]),
-                        })
-                    trigger_on_this_host = bool(_crash_reasons)
-                    # All hosts enter the collective snapshot path. Only host 0
-                    # writes files; host_trigger_summary.json says which host(s)
-                    # actually triggered.
-                    if not _crash_reasons:
-                        _crash_reasons = ['collapse_on_other_host']
+                    # All hosts enter the collective snapshot path. Host 0
+                    # writes the replicated checkpoint; every host writes its
+                    # own metric history/current metrics for diagnosis.
+                    _trigger_on_this_host = bool(_crash_reasons)
+                    _save_reasons = (list(_crash_reasons) if _crash_reasons
+                                     else ['collapse_on_other_host'])
+                    _full_crash_metrics = _full_metrics_record(
+                        metrics, global_step, epoch, host_id)
+                    _full_crash_metrics = _annotate_crash_record(
+                        _full_crash_metrics,
+                        _crash_reasons if _trigger_on_this_host else [])
                     _save_crash_snapshot(
                         global_step, epoch, epoch_step_counter,
                         _pre_step_params, _pre_step_opt_state,
                         params, opt_state, _crash_batch_ids, _crash_batch_mask,
-                        _crash_rec, _crash_reasons,
-                        host_trigger_summary=host_trigger_summary,
-                        trigger_on_this_host=trigger_on_this_host,
-                        triggering_hosts=triggering_hosts)
+                        _crash_rec, _save_reasons,
+                        local_history=crash_metric_history,
+                        full_metrics_rec=_full_crash_metrics,
+                        host_trigger_summary=_host_trigger_summary,
+                        trigger_on_this_host=_trigger_on_this_host)
                     sync_logs()
                     if stop_on_collapse:
                         raise RuntimeError(
                             f"Severe collapse snapshot saved at step {global_step}: "
-                            f"{','.join(_crash_reasons)}; "
-                            f"triggering_hosts={triggering_hosts}")
+                            f"{','.join(_save_reasons)}")
 
             # ---- REGULAR periodic logging ----
             # ANALYSIS is driven from the val path (below), not from here -
