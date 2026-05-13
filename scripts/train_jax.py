@@ -279,9 +279,14 @@ def _dawn_srw_kwargs(cfg):
 
 
 def _v415_sharded_kwargs(cfg):
-    """Gate constants for the active v4.1.5 sharded SRW path."""
+    """Gate constants for the active v4.1.5 sharded SRW path.
+
+    Keep optional experimental kwargs out unless explicitly enabled.  This
+    preserves compatibility with older v4.1.5 factory functions when the
+    feature is disabled in config.
+    """
     t = cfg['training']
-    return dict(
+    kw = dict(
         dead_threshold=t.get('dead_penalty_threshold', 0.01),
         sharpness=t.get('sharpness', 500.0),
         activation_threshold=t.get('activation_threshold', 0.5),
@@ -290,8 +295,13 @@ def _v415_sharded_kwargs(cfg):
         max_intensity=t.get('max_intensity', 10.0),
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
-        route_emb_forward_norm=t.get('route_emb_forward_norm', False),
     )
+    # Default is raw route embeddings.  Only pass this kwarg when the
+    # experimental forward-normalization path is explicitly enabled; otherwise
+    # older model files that do not advertise the kwarg remain load-compatible.
+    if bool(t.get('route_emb_forward_norm', False)):
+        kw['route_emb_forward_norm'] = True
+    return kw
 
 
 MODEL_REGISTRY = {
