@@ -852,12 +852,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       dead_penalty_weighted_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
-                      router_proj_lr_mult=1.0,
-                      router_proj_grad_clip=0.0,
-                      router_scan_lr_mult=1.0,
-                      router_scan_grad_clip=0.0,
-                      route_emb_lr_mult=1.0,
-                      route_emb_grad_clip=0.0,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
@@ -920,12 +914,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
-    _router_proj_lr_mult = jnp.float32(router_proj_lr_mult)
-    _router_proj_grad_clip = jnp.float32(router_proj_grad_clip)
-    _router_scan_lr_mult = jnp.float32(router_scan_lr_mult)
-    _router_scan_grad_clip = jnp.float32(router_scan_grad_clip)
-    _route_emb_lr_mult = jnp.float32(route_emb_lr_mult)
-    _route_emb_grad_clip = jnp.float32(route_emb_grad_clip)
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
@@ -1192,102 +1180,29 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cur = cur[key]
             return cur
 
+        tau_grad_norm_raw = jnp.sqrt(
+            _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_attn'))
+            + _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_rst'))
+            + 1e-12)
+        tau_clip_scale = jnp.where(
+            _tau_grad_clip > 0.0,
+            jnp.minimum(1.0, _tau_grad_clip / (tau_grad_norm_raw + 1e-8)),
+            jnp.float32(1.0))
+        tau_total_scale = _tau_lr_mult * tau_clip_scale
+
         def _path_to_str(path):
             return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
 
-        # ------------------------------------------------------------------
-        # Control-side stabilisation.
-        #
-        # Important: LR multipliers are applied to Adam *updates*, not raw
-        # gradients. Scaling gradients before Adam is mostly cancelled by
-        # Adam's m/sqrt(v) normalisation and is therefore not a true LR
-        # multiplier. Raw-gradient clipping remains pre-Adam as a safety valve.
-        # ------------------------------------------------------------------
-        def _group_sq(tree, path_pred):
-            def _visit(path, leaf):
-                if path_pred(_path_to_str(path)):
-                    x = leaf.astype(jnp.float32)
-                    return jnp.sum(jnp.square(x))
-                return jnp.float32(0.0)
-            leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
-            if not leaves:
-                return jnp.float32(0.0)
-            return sum(leaves)
-
-        def _is_tau_path(ps):
-            return ('router/tau_attn' in ps) or ('router/tau_rst' in ps)
-
-        def _is_router_proj_path(ps):
-            return ('router/proj_attn' in ps) or ('router/proj_rst' in ps)
-
-        def _is_router_scan_path(ps):
-            return (('router/raw_scan_offset_attn' in ps)
-                    or ('router/raw_scan_offset_rst' in ps)
-                    or ('router/scan_attn' in ps)
-                    or ('router/scan_rst' in ps))
-
-        def _is_route_emb_path(ps):
-            return (('neuron_pool/attn_qk_emb' in ps)
-                    or ('neuron_pool/attn_v_emb' in ps)
-                    or ('neuron_pool/rst_emb' in ps)
-                    or ('neuron_pool/qk_emb' in ps)
-                    or ('neuron_pool/v_emb' in ps)
-                    or ('neuron_pool/know_emb' in ps))
-
-        def _clip_scale(group_norm, clip_value):
-            return jnp.where(
-                clip_value > 0.0,
-                jnp.minimum(1.0, clip_value / (group_norm + 1e-8)),
-                jnp.float32(1.0))
-
-        tau_grad_norm_raw = jnp.sqrt(_group_sq(grads, _is_tau_path) + 1e-12)
-        router_proj_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_router_proj_path) + 1e-12)
-        router_scan_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_router_scan_path) + 1e-12)
-        route_emb_grad_norm_raw = jnp.sqrt(
-            _group_sq(grads, _is_route_emb_path) + 1e-12)
-
-        tau_clip_scale = _clip_scale(tau_grad_norm_raw, _tau_grad_clip)
-        router_proj_clip_scale = _clip_scale(
-            router_proj_grad_norm_raw, _router_proj_grad_clip)
-        router_scan_clip_scale = _clip_scale(
-            router_scan_grad_norm_raw, _router_scan_grad_clip)
-        route_emb_clip_scale = _clip_scale(
-            route_emb_grad_norm_raw, _route_emb_grad_clip)
-
-        def _clip_control_grad(path, g):
+        def _scale_router_tau_grad(path, g):
             ps = _path_to_str(path)
-            scale = jnp.float32(1.0)
-            scale = jnp.where(_is_tau_path(ps), tau_clip_scale, scale)
-            scale = jnp.where(_is_router_proj_path(ps), router_proj_clip_scale, scale)
-            scale = jnp.where(_is_router_scan_path(ps), router_scan_clip_scale, scale)
-            scale = jnp.where(_is_route_emb_path(ps), route_emb_clip_scale, scale)
-            return g * scale.astype(g.dtype)
+            if ('router/tau_attn' in ps) or ('router/tau_rst' in ps):
+                return g * tau_total_scale.astype(g.dtype)
+            return g
 
-        if (float(tau_grad_clip) > 0.0
-                or float(router_proj_grad_clip) > 0.0
-                or float(router_scan_grad_clip) > 0.0
-                or float(route_emb_grad_clip) > 0.0):
-            grads = jax.tree.map_with_path(_clip_control_grad, grads)
+        if (float(tau_lr_mult) != 1.0) or (float(tau_grad_clip) > 0.0):
+            grads = jax.tree.map_with_path(_scale_router_tau_grad, grads)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
-
-        def _scale_control_update(path, u):
-            ps = _path_to_str(path)
-            mult = jnp.float32(1.0)
-            mult = jnp.where(_is_tau_path(ps), _tau_lr_mult, mult)
-            mult = jnp.where(_is_router_proj_path(ps), _router_proj_lr_mult, mult)
-            mult = jnp.where(_is_router_scan_path(ps), _router_scan_lr_mult, mult)
-            mult = jnp.where(_is_route_emb_path(ps), _route_emb_lr_mult, mult)
-            return u * mult.astype(u.dtype)
-
-        if (float(tau_lr_mult) != 1.0
-                or float(router_proj_lr_mult) != 1.0
-                or float(router_scan_lr_mult) != 1.0
-                or float(route_emb_lr_mult) != 1.0):
-            updates = jax.tree.map_with_path(_scale_control_update, updates)
-
         new_params = optax.apply_updates(params, updates)
 
         def _tree_sq(tree):
@@ -4103,12 +4018,6 @@ def main():
         'dead_penalty_weighted_clip', tcfg.get('dead_w_clip', 0.0))
     tau_lr_mult = tcfg.get('tau_lr_mult', 1.0)
     tau_grad_clip = tcfg.get('tau_grad_clip', 0.0)
-    router_proj_lr_mult = tcfg.get('router_proj_lr_mult', 1.0)
-    router_proj_grad_clip = tcfg.get('router_proj_grad_clip', 0.0)
-    router_scan_lr_mult = tcfg.get('router_scan_lr_mult', 1.0)
-    router_scan_grad_clip = tcfg.get('router_scan_grad_clip', 0.0)
-    route_emb_lr_mult = tcfg.get('route_emb_lr_mult', 1.0)
-    route_emb_grad_clip = tcfg.get('route_emb_grad_clip', 0.0)
     restore_training_config_on_resume = tcfg.get(
         'restore_training_config_on_resume', True)
     # 2-tier logging cadence.
@@ -4335,18 +4244,6 @@ def main():
                 'tau_lr_mult', tau_lr_mult)
             tau_grad_clip = saved_training_config.get(
                 'tau_grad_clip', tau_grad_clip)
-            router_proj_lr_mult = saved_training_config.get(
-                'router_proj_lr_mult', router_proj_lr_mult)
-            router_proj_grad_clip = saved_training_config.get(
-                'router_proj_grad_clip', router_proj_grad_clip)
-            router_scan_lr_mult = saved_training_config.get(
-                'router_scan_lr_mult', router_scan_lr_mult)
-            router_scan_grad_clip = saved_training_config.get(
-                'router_scan_grad_clip', router_scan_grad_clip)
-            route_emb_lr_mult = saved_training_config.get(
-                'route_emb_lr_mult', route_emb_lr_mult)
-            route_emb_grad_clip = saved_training_config.get(
-                'route_emb_grad_clip', route_emb_grad_clip)
             log_interval = int(saved_training_config.get(
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
@@ -4383,12 +4280,6 @@ def main():
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
         'tau_lr_mult': tau_lr_mult,
         'tau_grad_clip': tau_grad_clip,
-        'router_proj_lr_mult': router_proj_lr_mult,
-        'router_proj_grad_clip': router_proj_grad_clip,
-        'router_scan_lr_mult': router_scan_lr_mult,
-        'router_scan_grad_clip': router_scan_grad_clip,
-        'route_emb_lr_mult': route_emb_lr_mult,
-        'route_emb_grad_clip': route_emb_grad_clip,
         'restore_training_config_on_resume': restore_training_config_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
@@ -4959,12 +4850,6 @@ def main():
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,
-        router_proj_lr_mult=router_proj_lr_mult,
-        router_proj_grad_clip=router_proj_grad_clip,
-        router_scan_lr_mult=router_scan_lr_mult,
-        router_scan_grad_clip=router_scan_grad_clip,
-        route_emb_lr_mult=route_emb_lr_mult,
-        route_emb_grad_clip=route_emb_grad_clip,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
@@ -5610,8 +5495,16 @@ def main():
 
     def _save_crash_snapshot(step, epoch_idx, step_in_epoch, pre_params, pre_opt_state,
                              post_params, post_opt_state, batch_ids_np, mask_np,
-                             metrics_rec, reasons):
-        """Collective crash snapshot writer. All hosts must enter."""
+                             metrics_rec, reasons, host_trigger_summary=None,
+                             trigger_on_this_host=True, triggering_hosts=None):
+        """Collective crash snapshot writer. All hosts must enter.
+
+        Only host 0 writes the files.  In a multi-host run, a severe trigger
+        may happen on a nonzero host; in that case metrics.json and the saved
+        batch are host-0's local view, not necessarily the triggering host's
+        microbatch.  host_trigger_summary.json records which host(s) actually
+        triggered and the scalar trigger evidence.
+        """
         pre_params_single = _gather_for_save(pre_params)
         pre_opt_single = _gather_for_save(pre_opt_state)
         post_params_single = None
@@ -5620,19 +5513,25 @@ def main():
             post_params_single = _gather_for_save(post_params)
             post_opt_single = _gather_for_save(post_opt_state)
         if is_host0:
+            triggering_hosts = list(triggering_hosts or [])
             base_note = {
                 'type': 'crash_snapshot',
                 'step': int(step),
                 'epoch': int(epoch_idx),
                 'step_in_epoch': int(step_in_epoch),
                 'reasons': list(reasons),
+                'trigger_on_this_host': bool(trigger_on_this_host),
+                'triggering_hosts': [int(h) for h in triggering_hosts],
+                'metrics_are_from_process_index': int(host_id),
                 'timestamp': datetime.now().isoformat(),
                 'config_path': str(config_path),
                 'model_version': model_version,
                 'note': (
-                    'pre_update.flax is the state before the triggering optimizer '
-                    'update; batch_input_ids.npy and batch_attention_mask.npy '
-                    'replay the triggering microbatch.'),
+                    'pre_update.flax is the replicated training state before the '
+                    'optimizer update. metrics.json and batch_input_ids.npy are '
+                    'written by host 0. If trigger_on_this_host is false, that '
+                    'batch is host 0 local data, not necessarily the triggering '
+                    'host microbatch; inspect host_trigger_summary.json.'),
             }
             _write_checkpoint_bytes(
                 _crash_path(step, 'pre_update.flax'),
@@ -5655,6 +5554,10 @@ def main():
             _write_npy_file(_crash_path(step, 'batch_attention_mask.npy'), mask_np)
             _write_json_file(_crash_path(step, 'metrics.json'), metrics_rec)
             _write_json_file(_crash_path(step, 'trigger.json'), base_note)
+            if host_trigger_summary is not None:
+                _write_json_file(
+                    _crash_path(step, 'host_trigger_summary.json'),
+                    host_trigger_summary)
             _write_json_file(_crash_path(step, 'config.json'), cfg)
             log_message(
                 f"  [CRASH_SNAPSHOT] step={step} reasons={','.join(reasons)} "
@@ -5900,24 +5803,98 @@ def main():
                     layer_out_threshold=collapse_layer_out_threshold,
                     loss_minus_ce_threshold=collapse_loss_minus_ce_threshold,
                     active_frac_threshold=collapse_active_frac_threshold)
-                _crash_local = np.array([bool(_crash_reasons)], dtype=np.bool_)
-                _crash_any = bool(np.any(process_allgather(_crash_local)))
+
+                def _reason_mask(reasons):
+                    mask = 0
+                    if 'severe_grad_spike' in reasons:
+                        mask |= 1
+                    if 'severe_loss_minus_ce_spike' in reasons:
+                        mask |= 2
+                    if 'severe_layer_out_high' in reasons:
+                        mask |= 4
+                    if 'severe_active_flood' in reasons:
+                        mask |= 8
+                    if 'severe_top1_collapse' in reasons:
+                        mask |= 16
+                    return mask
+
+                _layer_out_max = _layer_out_max_from_rec(_crash_rec)
+                _active_max = max(
+                    float(_crash_rec.get('attn_qk_active', 0.0) or 0.0),
+                    float(_crash_rec.get('attn_v_active', 0.0) or 0.0),
+                    float(_crash_rec.get('rst_active', 0.0) or 0.0))
+                _top1_max = max(
+                    float(_crash_rec.get('attn_top1_gate_frac_max', 0.0) or 0.0),
+                    float(_crash_rec.get('rst_top1_gate_frac_max', 0.0) or 0.0))
+                _host_trigger_vec = np.asarray([
+                    float(host_id),
+                    1.0 if _crash_reasons else 0.0,
+                    float(_reason_mask(_crash_reasons)),
+                    float(_crash_rec.get('grad_global_preclip',
+                                         _crash_rec.get('grad_norm', 0.0)) or 0.0),
+                    float(_layer_out_max),
+                    float(_crash_rec.get('total_loss_minus_ce', 0.0) or 0.0),
+                    float(_active_max),
+                    float(_top1_max),
+                    float(_crash_rec.get('total_loss', 0.0) or 0.0),
+                    float(_crash_rec.get('ce_loss', 0.0) or 0.0),
+                ], dtype=np.float32)
+                _host_trigger_all = np.asarray(
+                    process_allgather(_host_trigger_vec), dtype=np.float32
+                ).reshape(-1, 10)
+                _crash_any = bool(np.any(_host_trigger_all[:, 1] > 0.5))
                 if _crash_any:
+                    reason_names = {
+                        1: 'severe_grad_spike',
+                        2: 'severe_loss_minus_ce_spike',
+                        4: 'severe_layer_out_high',
+                        8: 'severe_active_flood',
+                        16: 'severe_top1_collapse',
+                    }
+                    host_trigger_summary = []
+                    triggering_hosts = []
+                    for row in _host_trigger_all:
+                        proc = int(row[0])
+                        mask = int(row[2])
+                        row_reasons = [
+                            name for bit, name in reason_names.items()
+                            if mask & bit
+                        ]
+                        triggered = bool(row[1] > 0.5)
+                        if triggered:
+                            triggering_hosts.append(proc)
+                        host_trigger_summary.append({
+                            'process_index': proc,
+                            'triggered': triggered,
+                            'reasons': row_reasons,
+                            'grad_global_preclip': float(row[3]),
+                            'layer_out_max': float(row[4]),
+                            'total_loss_minus_ce': float(row[5]),
+                            'active_frac_max': float(row[6]),
+                            'top1_gate_frac_max': float(row[7]),
+                            'total_loss': float(row[8]),
+                            'ce_loss': float(row[9]),
+                        })
+                    trigger_on_this_host = bool(_crash_reasons)
                     # All hosts enter the collective snapshot path. Only host 0
-                    # writes files, but every host gathers the same pre-update
-                    # state and then optionally stops.
+                    # writes files; host_trigger_summary.json says which host(s)
+                    # actually triggered.
                     if not _crash_reasons:
                         _crash_reasons = ['collapse_on_other_host']
                     _save_crash_snapshot(
                         global_step, epoch, epoch_step_counter,
                         _pre_step_params, _pre_step_opt_state,
                         params, opt_state, _crash_batch_ids, _crash_batch_mask,
-                        _crash_rec, _crash_reasons)
+                        _crash_rec, _crash_reasons,
+                        host_trigger_summary=host_trigger_summary,
+                        trigger_on_this_host=trigger_on_this_host,
+                        triggering_hosts=triggering_hosts)
                     sync_logs()
                     if stop_on_collapse:
                         raise RuntimeError(
                             f"Severe collapse snapshot saved at step {global_step}: "
-                            f"{','.join(_crash_reasons)}")
+                            f"{','.join(_crash_reasons)}; "
+                            f"triggering_hosts={triggering_hosts}")
 
             # ---- REGULAR periodic logging ----
             # ANALYSIS is driven from the val path (below), not from here -
