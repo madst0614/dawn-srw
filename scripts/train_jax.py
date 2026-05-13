@@ -1374,7 +1374,13 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'raw_scan_offset_attn',
             params.get('router', {}).get('raw_scan_offset_attn', {})).get(
                 'bias', jnp.zeros(3))
-        explore_loss_weighted_metric = explore_loss_weighted
+        # loss_fn-local weighted aux variables are returned through
+        # explore_stats; keep metric/reconstruction paths JIT-safe even when
+        # exploration is disabled or have_explore=False.
+        explore_loss_weighted_metric = explore_stats['explore_loss_weighted_clipped']
+        explore_loss_weighted_unclipped_metric = explore_stats['explore_loss_weighted_unclipped']
+        dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
+        dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
 
         metrics = {
             'total_loss': total_loss,
@@ -1392,7 +1398,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'diversity_loss_raw': div_loss,
             'diversity_loss_weighted': div_weight * div_loss,
             'dead_penalty_weight': jnp.float32(dead_penalty_weight),
-            'dead_penalty_weighted_total': dead_penalty_weighted,
+            'dead_penalty_weighted_total': dead_penalty_weighted_metric,
             'exploration_warmup_factor': explore_stats['explore_active'],
             'exploration_weight_effective': (
                 jnp.float32(exploration_weight) * explore_stats['explore_active']),
@@ -1406,11 +1412,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'exploration_loss_weighted_rst': (
                 exploration_weight * explore_stats['explore_rst_raw']
                 * explore_stats['explore_active']),
-            'exploration_loss_weighted_total': explore_loss_weighted,
-            'exploration_loss_weighted_unclipped': explore_loss_weighted_unclipped,
-            'exploration_loss_weighted_clipped': explore_loss_weighted,
-            'dead_penalty_weighted_unclipped': dead_penalty_weighted_unclipped,
-            'dead_penalty_weighted_clipped': dead_penalty_weighted,
+            'exploration_loss_weighted_total': explore_loss_weighted_metric,
+            'exploration_loss_weighted_unclipped': explore_loss_weighted_unclipped_metric,
+            'exploration_loss_weighted_clipped': explore_loss_weighted_metric,
+            'dead_penalty_weighted_unclipped': dead_penalty_weighted_unclipped_metric,
+            'dead_penalty_weighted_clipped': dead_penalty_weighted_metric,
             'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
             'exploration_raw_post_bound': explore_stats['explore_loss_raw'],
             'exploration_attn_pre_bound': explore_stats['explore_attn_pre_bound'],
@@ -1424,7 +1430,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + tau_reg_weight * tau_reg
                 + orth_weight * orth_loss
                 + div_weight * div_loss
-                + dead_penalty_weighted
+                + dead_penalty_weighted_metric
                 + explore_loss_weighted_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
@@ -1581,7 +1587,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'explore_loss_raw': explore_stats['explore_loss_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
             'explore_rst_raw': explore_stats['explore_rst_raw'],
-            'explore_loss_weighted': explore_loss_weighted,
+            'explore_loss_weighted': explore_loss_weighted_metric,
             'explore_active': explore_stats['explore_active'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
             'explore_block_frac_k': explore_stats['block_frac_k'],
