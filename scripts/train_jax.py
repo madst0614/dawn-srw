@@ -269,7 +269,8 @@ def _dawn_srw_kwargs(cfg):
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
     # Optional train/eval-safe tau offset clipping. This adds no parameters,
     # so existing checkpoints remain load-compatible.
-    if (cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.6'
+    if (cfg['model'].get('model_version') in (
+            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6')
             and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
         kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
     return kw
