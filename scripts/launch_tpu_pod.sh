@@ -35,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --branch)   BRANCH="$2";   shift 2 ;;
         --config)   CONFIG="$2";   shift 2 ;;
         --token)    GH_TOKEN="$2"; shift 2 ;;
+        --resume-from) TRAIN_ARGS="$TRAIN_ARGS --resume-from $2"; shift 2 ;;
         --from-scratch) TRAIN_ARGS="$TRAIN_ARGS --from-scratch"; shift ;;
         --debug)
             if [[ $# -ge 2 && "$2" != --* ]]; then
@@ -46,13 +47,14 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -h|--help)
-            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--from-scratch] [--debug [N]]"
+            echo "Usage: $0 [--tpu NAME] [--zone ZONE] [--project PROJECT] [--branch BRANCH] [--config CONFIG] [--token GH_TOKEN] [--resume-from CKPT_OR_RUN] [--from-scratch] [--debug [N]]"
             echo ""
             echo "  --tpu      TPU VM name         (default: $TPU_NAME)"
             echo "  --zone     GCP zone            (default: $ZONE)"
             echo "  --project  GCP project          (default: $PROJECT)"
             echo "  --branch   Git branch to clone  (default: $BRANCH)"
             echo "  --config   Training config YAML (default: $CONFIG)"
+            echo "  --resume-from CKPT_OR_RUN  Resume from a .flax file or run folder"
             echo "  --from-scratch  Start training from scratch (ignore checkpoints)"
             echo "  --debug [N]  Enable train_jax.py debug diagnostics every N steps (default: 1)"
             echo "  --token    GitHub access token   (for private repos)"

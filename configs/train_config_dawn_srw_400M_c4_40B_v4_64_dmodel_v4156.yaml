@@ -6,8 +6,9 @@
 #   - Enable h/emb/top1 local-spike diagnostics from config.
 #
 # Recommended diagnostic launch:
-#   python scripts/train_jax.py \
-#     --config configs/train_config_dawn_srw_400M_c4_40B_v4_64_dmodel_v4156_diag.yaml \
+#   bash scripts/launch_tpu_pod.sh \
+#     --config configs/train_config_dawn_srw_400M_c4_40B_v4_64_dmodel_v4156.yaml \
+#     --resume-from gs://.../best_model.flax \
 #     --debug 10
 #
 # Notes:
@@ -138,10 +139,8 @@ training:
   collapse_active_frac_threshold: 0.50
 
 # -----------------------------------------------------------------------------
-# Resume / runtime outputs
+# Runtime outputs
 # -----------------------------------------------------------------------------
-# One-shot diagnostic resume target. Set to null/omit to use normal auto-resume.
-resume_from: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_400M_c4_40B_v4_64_dmodel_v4156/run_vspatial-r1-v4.1.5.6_20260510_190735_3201/best_model.flax
 
 use_amp: true
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_400M_c4_40B_v4_64_dmodel_v4156
