@@ -279,14 +279,9 @@ def _dawn_srw_kwargs(cfg):
 
 
 def _v415_sharded_kwargs(cfg):
-    """Gate constants for the active v4.1.5 sharded SRW path.
-
-    Keep optional experimental kwargs out unless explicitly enabled.  This
-    preserves compatibility with older v4.1.5 factory functions when the
-    feature is disabled in config.
-    """
+    """Gate constants for the active v4.1.5 sharded SRW path."""
     t = cfg['training']
-    kw = dict(
+    return dict(
         dead_threshold=t.get('dead_penalty_threshold', 0.01),
         sharpness=t.get('sharpness', 500.0),
         activation_threshold=t.get('activation_threshold', 0.5),
@@ -295,13 +290,8 @@ def _v415_sharded_kwargs(cfg):
         max_intensity=t.get('max_intensity', 10.0),
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
+        route_emb_forward_norm=t.get('route_emb_forward_norm', False),
     )
-    # Default is raw route embeddings.  Only pass this kwarg when the
-    # experimental forward-normalization path is explicitly enabled; otherwise
-    # older model files that do not advertise the kwarg remain load-compatible.
-    if bool(t.get('route_emb_forward_norm', False)):
-        kw['route_emb_forward_norm'] = True
-    return kw
 
 
 MODEL_REGISTRY = {
@@ -862,6 +852,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       dead_penalty_weighted_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
+                      router_proj_lr_mult=1.0,
+                      router_proj_grad_clip=0.0,
+                      router_scan_lr_mult=1.0,
+                      router_scan_grad_clip=0.0,
+                      route_emb_lr_mult=1.0,
+                      route_emb_grad_clip=0.0,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
@@ -924,6 +920,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
+    _router_proj_lr_mult = jnp.float32(router_proj_lr_mult)
+    _router_proj_grad_clip = jnp.float32(router_proj_grad_clip)
+    _router_scan_lr_mult = jnp.float32(router_scan_lr_mult)
+    _router_scan_grad_clip = jnp.float32(router_scan_grad_clip)
+    _route_emb_lr_mult = jnp.float32(route_emb_lr_mult)
+    _route_emb_grad_clip = jnp.float32(route_emb_grad_clip)
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
@@ -1190,29 +1192,102 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 cur = cur[key]
             return cur
 
-        tau_grad_norm_raw = jnp.sqrt(
-            _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_attn'))
-            + _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_rst'))
-            + 1e-12)
-        tau_clip_scale = jnp.where(
-            _tau_grad_clip > 0.0,
-            jnp.minimum(1.0, _tau_grad_clip / (tau_grad_norm_raw + 1e-8)),
-            jnp.float32(1.0))
-        tau_total_scale = _tau_lr_mult * tau_clip_scale
-
         def _path_to_str(path):
             return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
 
-        def _scale_router_tau_grad(path, g):
-            ps = _path_to_str(path)
-            if ('router/tau_attn' in ps) or ('router/tau_rst' in ps):
-                return g * tau_total_scale.astype(g.dtype)
-            return g
+        # ------------------------------------------------------------------
+        # Control-side stabilisation.
+        #
+        # Important: LR multipliers are applied to Adam *updates*, not raw
+        # gradients. Scaling gradients before Adam is mostly cancelled by
+        # Adam's m/sqrt(v) normalisation and is therefore not a true LR
+        # multiplier. Raw-gradient clipping remains pre-Adam as a safety valve.
+        # ------------------------------------------------------------------
+        def _group_sq(tree, path_pred):
+            def _visit(path, leaf):
+                if path_pred(_path_to_str(path)):
+                    x = leaf.astype(jnp.float32)
+                    return jnp.sum(jnp.square(x))
+                return jnp.float32(0.0)
+            leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
+            if not leaves:
+                return jnp.float32(0.0)
+            return sum(leaves)
 
-        if (float(tau_lr_mult) != 1.0) or (float(tau_grad_clip) > 0.0):
-            grads = jax.tree.map_with_path(_scale_router_tau_grad, grads)
+        def _is_tau_path(ps):
+            return ('router/tau_attn' in ps) or ('router/tau_rst' in ps)
+
+        def _is_router_proj_path(ps):
+            return ('router/proj_attn' in ps) or ('router/proj_rst' in ps)
+
+        def _is_router_scan_path(ps):
+            return (('router/raw_scan_offset_attn' in ps)
+                    or ('router/raw_scan_offset_rst' in ps)
+                    or ('router/scan_attn' in ps)
+                    or ('router/scan_rst' in ps))
+
+        def _is_route_emb_path(ps):
+            return (('neuron_pool/attn_qk_emb' in ps)
+                    or ('neuron_pool/attn_v_emb' in ps)
+                    or ('neuron_pool/rst_emb' in ps)
+                    or ('neuron_pool/qk_emb' in ps)
+                    or ('neuron_pool/v_emb' in ps)
+                    or ('neuron_pool/know_emb' in ps))
+
+        def _clip_scale(group_norm, clip_value):
+            return jnp.where(
+                clip_value > 0.0,
+                jnp.minimum(1.0, clip_value / (group_norm + 1e-8)),
+                jnp.float32(1.0))
+
+        tau_grad_norm_raw = jnp.sqrt(_group_sq(grads, _is_tau_path) + 1e-12)
+        router_proj_grad_norm_raw = jnp.sqrt(
+            _group_sq(grads, _is_router_proj_path) + 1e-12)
+        router_scan_grad_norm_raw = jnp.sqrt(
+            _group_sq(grads, _is_router_scan_path) + 1e-12)
+        route_emb_grad_norm_raw = jnp.sqrt(
+            _group_sq(grads, _is_route_emb_path) + 1e-12)
+
+        tau_clip_scale = _clip_scale(tau_grad_norm_raw, _tau_grad_clip)
+        router_proj_clip_scale = _clip_scale(
+            router_proj_grad_norm_raw, _router_proj_grad_clip)
+        router_scan_clip_scale = _clip_scale(
+            router_scan_grad_norm_raw, _router_scan_grad_clip)
+        route_emb_clip_scale = _clip_scale(
+            route_emb_grad_norm_raw, _route_emb_grad_clip)
+
+        def _clip_control_grad(path, g):
+            ps = _path_to_str(path)
+            scale = jnp.float32(1.0)
+            scale = jnp.where(_is_tau_path(ps), tau_clip_scale, scale)
+            scale = jnp.where(_is_router_proj_path(ps), router_proj_clip_scale, scale)
+            scale = jnp.where(_is_router_scan_path(ps), router_scan_clip_scale, scale)
+            scale = jnp.where(_is_route_emb_path(ps), route_emb_clip_scale, scale)
+            return g * scale.astype(g.dtype)
+
+        if (float(tau_grad_clip) > 0.0
+                or float(router_proj_grad_clip) > 0.0
+                or float(router_scan_grad_clip) > 0.0
+                or float(route_emb_grad_clip) > 0.0):
+            grads = jax.tree.map_with_path(_clip_control_grad, grads)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
+
+        def _scale_control_update(path, u):
+            ps = _path_to_str(path)
+            mult = jnp.float32(1.0)
+            mult = jnp.where(_is_tau_path(ps), _tau_lr_mult, mult)
+            mult = jnp.where(_is_router_proj_path(ps), _router_proj_lr_mult, mult)
+            mult = jnp.where(_is_router_scan_path(ps), _router_scan_lr_mult, mult)
+            mult = jnp.where(_is_route_emb_path(ps), _route_emb_lr_mult, mult)
+            return u * mult.astype(u.dtype)
+
+        if (float(tau_lr_mult) != 1.0
+                or float(router_proj_lr_mult) != 1.0
+                or float(router_scan_lr_mult) != 1.0
+                or float(route_emb_lr_mult) != 1.0):
+            updates = jax.tree.map_with_path(_scale_control_update, updates)
+
         new_params = optax.apply_updates(params, updates)
 
         def _tree_sq(tree):
@@ -4028,6 +4103,12 @@ def main():
         'dead_penalty_weighted_clip', tcfg.get('dead_w_clip', 0.0))
     tau_lr_mult = tcfg.get('tau_lr_mult', 1.0)
     tau_grad_clip = tcfg.get('tau_grad_clip', 0.0)
+    router_proj_lr_mult = tcfg.get('router_proj_lr_mult', 1.0)
+    router_proj_grad_clip = tcfg.get('router_proj_grad_clip', 0.0)
+    router_scan_lr_mult = tcfg.get('router_scan_lr_mult', 1.0)
+    router_scan_grad_clip = tcfg.get('router_scan_grad_clip', 0.0)
+    route_emb_lr_mult = tcfg.get('route_emb_lr_mult', 1.0)
+    route_emb_grad_clip = tcfg.get('route_emb_grad_clip', 0.0)
     restore_training_config_on_resume = tcfg.get(
         'restore_training_config_on_resume', True)
     # 2-tier logging cadence.
@@ -4254,6 +4335,18 @@ def main():
                 'tau_lr_mult', tau_lr_mult)
             tau_grad_clip = saved_training_config.get(
                 'tau_grad_clip', tau_grad_clip)
+            router_proj_lr_mult = saved_training_config.get(
+                'router_proj_lr_mult', router_proj_lr_mult)
+            router_proj_grad_clip = saved_training_config.get(
+                'router_proj_grad_clip', router_proj_grad_clip)
+            router_scan_lr_mult = saved_training_config.get(
+                'router_scan_lr_mult', router_scan_lr_mult)
+            router_scan_grad_clip = saved_training_config.get(
+                'router_scan_grad_clip', router_scan_grad_clip)
+            route_emb_lr_mult = saved_training_config.get(
+                'route_emb_lr_mult', route_emb_lr_mult)
+            route_emb_grad_clip = saved_training_config.get(
+                'route_emb_grad_clip', route_emb_grad_clip)
             log_interval = int(saved_training_config.get(
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
@@ -4290,6 +4383,12 @@ def main():
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
         'tau_lr_mult': tau_lr_mult,
         'tau_grad_clip': tau_grad_clip,
+        'router_proj_lr_mult': router_proj_lr_mult,
+        'router_proj_grad_clip': router_proj_grad_clip,
+        'router_scan_lr_mult': router_scan_lr_mult,
+        'router_scan_grad_clip': router_scan_grad_clip,
+        'route_emb_lr_mult': route_emb_lr_mult,
+        'route_emb_grad_clip': route_emb_grad_clip,
         'restore_training_config_on_resume': restore_training_config_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
@@ -4860,6 +4959,12 @@ def main():
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,
+        router_proj_lr_mult=router_proj_lr_mult,
+        router_proj_grad_clip=router_proj_grad_clip,
+        router_scan_lr_mult=router_scan_lr_mult,
+        router_scan_grad_clip=router_scan_grad_clip,
+        route_emb_lr_mult=route_emb_lr_mult,
+        route_emb_grad_clip=route_emb_grad_clip,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,

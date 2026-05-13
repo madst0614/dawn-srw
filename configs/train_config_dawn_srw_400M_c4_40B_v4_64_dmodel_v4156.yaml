@@ -80,9 +80,17 @@ training:
   dead_penalty_weight: 0.05
   dead_penalty_threshold: 0.01
 
-  # Tau / router stability controls
-  tau_lr_mult: 0.1
-  tau_grad_clip: 0.1
+  # Control-side optimizer multipliers
+  # These are true LR multipliers applied after Adam update, not raw-grad scaling.
+  # Control params move routing boundaries/queries, so keep them finer than execution.
+  tau_lr_mult: 0.10
+  tau_grad_clip: 0.10
+  router_scan_lr_mult: 0.10
+  router_scan_grad_clip: 0.10
+  router_proj_lr_mult: 0.25
+  router_proj_grad_clip: 1.00
+  route_emb_lr_mult: 0.30
+  route_emb_grad_clip: 1.00
   # tau_offset_clip: 6.0       # Optional stronger safety if tau_offset still spikes.
 
   # v4.1 gate physics
