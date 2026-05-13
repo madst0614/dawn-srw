@@ -124,7 +124,7 @@ training:
   crash_history_steps: 6
   crash_snapshot_save_host_batches: true
   collapse_grad_threshold: 100.0
-  collapse_ce_extreme_threshold: 10.0
+  collapse_ce_extreme_threshold: 50.0
   collapse_ce_grad_ce_threshold: 6.0
   collapse_ce_grad_grad_threshold: 5.0
   collapse_loss_minus_ce_threshold: 10.0
