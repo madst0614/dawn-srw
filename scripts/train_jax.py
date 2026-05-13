@@ -72,11 +72,13 @@ from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
 LOCAL_SPIKE_METRIC_NAMES = (
     'tau_abs', 'gate_raw', 'top1_share', 'gate_den_sum', 'intensity',
-    'read_abs', 'contrib_norm', 'out_norm', 'resid_norm')
+    'read_abs', 'contrib_norm', 'out_norm', 'resid_norm',
+    'h_norm', 'emb_norm')
 LOCAL_TOP1_FIELD_NAMES = (
     'top1', 'score', 'tau', 'margin', 'gate_raw', 'gate_norm',
     'gate_den', 'intensity', 'read_scalar', 'write_norm', 'read_norm',
-    'op_gain', 'contrib_norm', 'total_out_norm', 'contrib_frac')
+    'op_gain', 'contrib_norm', 'total_out_norm', 'contrib_frac',
+    'h_norm', 'emb_norm')
 ATTN_LOCAL_FIELD_NAMES = (
     'q_norm_max', 'k_norm_max', 'v_norm_max', 'attn_logit_max',
     'softmax_top1_max', 'o_in_norm_max', 'o_out_norm_max')
@@ -288,6 +290,7 @@ def _v415_sharded_kwargs(cfg):
         max_intensity=t.get('max_intensity', 10.0),
         scan_scale=t.get('scan_scale', 0.01),
         scan_std_floor=t.get('scan_std_floor', 0.5),
+        route_emb_forward_norm=t.get('route_emb_forward_norm', False),
     )
 
 
@@ -495,6 +498,32 @@ def _select_resume_checkpoint(folder):
         return (0, -1)
 
     return max(candidates, key=_step_key)
+
+
+def _checkpoint_parent_dir(path):
+    """Return the containing run folder for a checkpoint path."""
+    path_str = str(path).rstrip('/')
+    if '/' not in path_str:
+        return '.'
+    return path_str.rsplit('/', 1)[0]
+
+
+def _resolve_resume_from(resume_from):
+    """Resolve --resume-from to (checkpoint_file, checkpoint_dir).
+
+    Accepts either a run folder or a concrete .flax file.  Passing
+    best_model.flax is therefore explicit and will not be overridden by a
+    newer checkpoint_step*.flax in the same folder.
+    """
+    target = str(resume_from).rstrip('/')
+    if target.endswith('.flax'):
+        if not _file_exists(target):
+            return None, _checkpoint_parent_dir(target)
+        return target, _checkpoint_parent_dir(target)
+    selected = _select_resume_checkpoint(target)
+    if selected:
+        return selected, target
+    return None, target
 
 
 def _makedirs(path):
@@ -3007,6 +3036,59 @@ def _collapse_reasons(rec):
     return reasons
 
 
+def _layer_out_max_from_rec(rec):
+    layer_out_max = 0.0
+    for key in ('per_layer_attn_out_norm', 'per_layer_rst_out_norm'):
+        vals = rec.get(key, []) or []
+        try:
+            layer_out_max = max(layer_out_max, max(float(v) for v in vals))
+        except (TypeError, ValueError):
+            pass
+    return layer_out_max
+
+
+def _severe_collapse_reasons(
+        rec, grad_threshold=100.0, layer_out_threshold=80.0,
+        loss_minus_ce_threshold=10.0, active_frac_threshold=0.50):
+    """Strict trigger for crash snapshots.
+
+    _collapse_reasons is intentionally sensitive for debug warnings and can
+    fire on harmless dead-neuron storms. This stricter version is for
+    expensive checkpoint/batch snapshots and optional train-stop behavior.
+    """
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+
+    reasons = []
+    if _g('grad_global_preclip', _g('grad_norm')) > grad_threshold:
+        reasons.append('severe_grad_spike')
+    if _g('total_loss_minus_ce') > loss_minus_ce_threshold:
+        reasons.append('severe_loss_minus_ce_spike')
+    if _layer_out_max_from_rec(rec) > layer_out_threshold:
+        reasons.append('severe_layer_out_high')
+    if max(_g('attn_qk_active'), _g('attn_v_active'), _g('rst_active')) > active_frac_threshold:
+        # Active flood alone can be a tail event, so keep it but make the
+        # threshold high. The snapshot payload tells whether it is cause/tail.
+        reasons.append('severe_active_flood')
+    if max(_g('attn_top1_gate_frac_max', _g('attn_top1_gate_frac')),
+           _g('rst_top1_gate_frac_max', _g('rst_top1_gate_frac'))) > 0.90:
+        reasons.append('severe_top1_collapse')
+    return reasons
+
+
+def _write_json_file(path, obj):
+    with _open_file(path, 'w') as f:
+        f.write(json.dumps(obj, indent=2, default=str))
+
+
+def _write_npy_file(path, arr):
+    import io
+    bio = io.BytesIO()
+    np.save(bio, np.asarray(arr))
+    with _open_file(path, 'wb') as f:
+        f.write(bio.getvalue())
+
+
 def _jsonable_diag_value(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
@@ -3087,6 +3169,8 @@ def _print_local_spike_inline_block(rec):
     read_val, read_layer, read_pool = _metric('read_abs')
     contrib_val, contrib_layer, contrib_pool = _metric('contrib_norm')
     out_val, out_layer, out_pool = _metric('out_norm')
+    h_val, h_layer, h_pool = _metric('h_norm')
+    emb_val, emb_layer, emb_pool = _metric('emb_norm')
 
     attn_vals = _diag_array(rec, 'attn_local_layer_values', ndim=2)
     attn_logit = 0.0
@@ -3129,6 +3213,10 @@ def _print_local_spike_inline_block(rec):
         f"out_norm_max={out_val:.6f} out_layer={out_layer} "
         f"out_pool={_pool_name(out_pool)}")
     log_debug_message(
+        f"h_norm_max={h_val:.6f} h_layer={h_layer} "
+        f"h_pool={_pool_name(h_pool)} emb_norm_max={emb_val:.6f} "
+        f"emb_layer={emb_layer} emb_pool={_pool_name(emb_pool)}")
+    log_debug_message(
         f"attn_logit_max={attn_logit:.6f} "
         f"attn_logit_layer={attn_logit_layer} "
         f"softmax_top1_max={softmax_top1:.6f} "
@@ -3168,11 +3256,14 @@ def _print_local_spike_block(rec):
         f"op_gain={fields['op_gain']:.6f} "
         f"contrib={fields['contrib_norm']:.6f} "
         f"out_norm={fields['total_out_norm']:.6f} "
-        f"contrib_frac={fields['contrib_frac']:.6f}"
+        f"contrib_frac={fields['contrib_frac']:.6f} "
+        f"h_norm={fields.get('h_norm', 0.0):.6f} "
+        f"emb_norm={fields.get('emb_norm', 0.0):.6f}"
     )
 
     for metric in ('tau_abs', 'intensity', 'gate_raw', 'gate_den_sum',
-                   'read_abs', 'contrib_norm', 'out_norm', 'resid_norm'):
+                   'read_abs', 'contrib_norm', 'out_norm', 'resid_norm',
+                   'h_norm', 'emb_norm'):
         mi = LOCAL_SPIKE_METRIC_NAMES.index(metric)
         l, p, val = _best_from_values(values, mi)
         log_debug_message(
@@ -3368,6 +3459,9 @@ def _print_debug_block(rec, ctx):
         f"op_gain_max[qk={_g('attn_qk_op_gain_max'):.3f} "
         f"v={_g('attn_v_op_gain_max'):.3f} "
         f"rst={_g('rst_op_gain_max'):.3f}] "
+        f"emb_max[qk={_g('attn_qk_emb_norm_max'):.3f} "
+        f"v={_g('attn_v_emb_norm_max'):.3f} "
+        f"rst={_g('rst_emb_norm_max'):.3f}] "
         f"rw_max[qk_r={_g('attn_qk_read_norm_max'):.3f} "
         f"qk_w={_g('attn_qk_write_norm_max'):.3f} "
         f"v_r={_g('attn_v_read_norm_max'):.3f} "
@@ -3840,14 +3934,13 @@ def main():
     parser.add_argument('--debug', nargs='?', const=1, default=0, type=int,
                         help=('Write detailed diagnostics to a separate debug log '
                               'every N steps (default N=1 when flag is present)'))
-    parser.add_argument('--debug-local-spikes', action='store_true',
-                        help=('Opt into inline LOCAL_SPIKE diagnostics during '
-                              'train forward passes. Requires --debug to log them.'))
     parser.add_argument('--debug-drop-compare', action='store_true',
                         help=('Reserved for tiny opt-in debug/val forwards; '
                               'never runs on the current train batch.'))
     parser.add_argument('--resume-from', type=str, default=None,
-                        help='Resume from specific run folder path (e.g. gs://...../run_v...)')
+                        help=('Resume from a specific checkpoint file or run folder. '
+                              'Examples: gs://.../run_v.../best_model.flax or '
+                              'gs://.../run_v...'))
     cli_args = parser.parse_args()
 
     # ----------------------------------------------------------
@@ -3865,12 +3958,34 @@ def main():
     seed = cfg.get('seed', 42)
     set_seed(seed)
 
-    # Training params (from YAML first, may be overridden by checkpoint config below)
+    # Training params (from YAML first, may be overridden by checkpoint config below).
+    # Keep the CLI surface small: --debug controls cadence, while the diagnostic
+    # feature switches themselves live in training: config.
+    tcfg = cfg['training']
+    # Optional config-driven resume. CLI --resume-from remains as an override
+    # for ad-hoc launches, but diagnostic configs can now be one-shot.
+    configured_resume_from = (
+        cli_args.resume_from
+        or tcfg.get('resume_from')
+        or cfg.get('resume_from'))
     debug_interval = max(0, int(cli_args.debug or 0))
     debug_mode = debug_interval > 0
-    debug_local_spikes = bool(debug_mode and cli_args.debug_local_spikes)
-    debug_drop_compare = bool(cli_args.debug_drop_compare)
-    tcfg = cfg['training']
+    debug_local_spikes = bool(
+        debug_mode and tcfg.get('debug_local_spikes', False))
+    debug_drop_compare = bool(
+        tcfg.get('debug_drop_compare', False) or cli_args.debug_drop_compare)
+    crash_snapshot_enabled = bool(tcfg.get('crash_snapshot_enabled', False))
+    stop_on_collapse = bool(tcfg.get('stop_on_collapse', False))
+    if stop_on_collapse:
+        crash_snapshot_enabled = True
+    crash_save_post_update = bool(tcfg.get('crash_snapshot_save_post', False))
+    collapse_grad_threshold = float(tcfg.get('collapse_grad_threshold', 100.0))
+    collapse_layer_out_threshold = float(
+        tcfg.get('collapse_layer_out_threshold', 80.0))
+    collapse_loss_minus_ce_threshold = float(
+        tcfg.get('collapse_loss_minus_ce_threshold', 10.0))
+    collapse_active_frac_threshold = float(
+        tcfg.get('collapse_active_frac_threshold', 0.50))
     batch_size = cli_args.batch_size or tcfg['batch_size']  # global batch size
     num_epochs = cli_args.epochs or tcfg['num_epochs']
     lr = cli_args.lr or tcfg.get('lr', tcfg.get('learning_rate', 6.5e-4))
@@ -4006,17 +4121,23 @@ def main():
         _host0_explicit_missing = False
 
         if jax.process_index() == 0:
-            if cli_args.resume_from:
-                folder = cli_args.resume_from.rstrip('/')
-                selected = _select_resume_checkpoint(folder)
+            if configured_resume_from:
+                selected, folder = _resolve_resume_from(configured_resume_from)
                 if selected:
                     _host0_resume_path = selected
                     _host0_checkpoint_dir = folder
-                    print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
-                    print(f"  Resuming from: {_host0_resume_path}")
+                    if str(configured_resume_from).rstrip('/').endswith('.flax'):
+                        print(f"  Resume from specified checkpoint file: {_host0_resume_path}")
+                        print(f"  Checkpoint dir: {_host0_checkpoint_dir}")
+                    else:
+                        print(f"  Resume from specified folder: {_host0_checkpoint_dir}")
+                        print(f"  Resuming from: {_host0_resume_path}")
                 else:
                     _host0_explicit_missing = True
-                    print(f"  No .flax checkpoint found in {folder}")
+                    if str(configured_resume_from).rstrip('/').endswith('.flax'):
+                        print(f"  Specified checkpoint file does not exist: {configured_resume_from}")
+                    else:
+                        print(f"  No .flax checkpoint found in {folder}")
             else:
                 run_folders = _list_run_folders(base_checkpoint_dir)
                 for folder in reversed(run_folders):
@@ -4037,7 +4158,7 @@ def main():
             'MISSING' if _host0_explicit_missing else '')
         if _missing_signal == 'MISSING':
             raise FileNotFoundError(
-                f"No .flax checkpoint found in {cli_args.resume_from}")
+                f"No .flax checkpoint found in {configured_resume_from}")
 
     # Create new run folder if not resuming
     if checkpoint_dir is None:
@@ -4630,7 +4751,7 @@ def main():
     # Create shard_map functions if mesh_model > 1 or the model demands
     # the sharded path (v4.1 removed its non-sharded fallback).
     #
-    # v4.1: `_sharded_fns` = slim train path. --debug-local-spikes appends
+    # v4.1: `_sharded_fns` = slim train path. config debug_local_spikes appends
     # scalar-only inline local diagnostics to that same train kernel.
     # `_sharded_fns_analysis` = full observational stats, used only by
     # analysis_step at the configured analysis cadence.
@@ -4744,7 +4865,7 @@ def main():
     else:
         analysis_step_fn = None
     # No current-train-batch debug forward: --debug uses regular scalar
-    # train_step metrics. Local spike diagnostics require --debug-local-spikes.
+    # train_step metrics. Local spike diagnostics require training.debug_local_spikes=true.
     debug_forward_step_fn = None
     if debug_drop_compare and is_host0:
         print("  Drop compare requested, but current-train-batch debug "
@@ -5343,6 +5464,10 @@ def main():
             log_debug_message(
                 f"Drop compare: {'on' if debug_drop_compare else 'off'}")
             log_debug_message(
+                f"Crash snapshot: {'on' if crash_snapshot_enabled else 'off'}")
+            log_debug_message(
+                f"Stop on collapse: {'on' if stop_on_collapse else 'off'}")
+            log_debug_message(
                 f"Resume append: {_is_debug_log_resume}")
             log_debug_message("")
         log_message("")
@@ -5363,6 +5488,64 @@ def main():
 
     def _ckpt_path(name):
         return _join(checkpoint_dir, name)
+
+    def _crash_path(step, name):
+        return _join(_join(checkpoint_dir, 'crash_snapshots'),
+                     f"step_{int(step):08d}/{name}")
+
+    def _save_crash_snapshot(step, epoch_idx, step_in_epoch, pre_params, pre_opt_state,
+                             post_params, post_opt_state, batch_ids_np, mask_np,
+                             metrics_rec, reasons):
+        """Collective crash snapshot writer. All hosts must enter."""
+        pre_params_single = _gather_for_save(pre_params)
+        pre_opt_single = _gather_for_save(pre_opt_state)
+        post_params_single = None
+        post_opt_single = None
+        if crash_save_post_update:
+            post_params_single = _gather_for_save(post_params)
+            post_opt_single = _gather_for_save(post_opt_state)
+        if is_host0:
+            base_note = {
+                'type': 'crash_snapshot',
+                'step': int(step),
+                'epoch': int(epoch_idx),
+                'step_in_epoch': int(step_in_epoch),
+                'reasons': list(reasons),
+                'timestamp': datetime.now().isoformat(),
+                'config_path': str(config_path),
+                'model_version': model_version,
+                'note': (
+                    'pre_update.flax is the state before the triggering optimizer '
+                    'update; batch_input_ids.npy and batch_attention_mask.npy '
+                    'replay the triggering microbatch.'),
+            }
+            _write_checkpoint_bytes(
+                _crash_path(step, 'pre_update.flax'),
+                _serialize_checkpoint(
+                    pre_params_single, pre_opt_single, epoch_idx, step,
+                    best_val_loss, cfg['model'],
+                    step_in_epoch=step_in_epoch,
+                    steps_per_epoch=steps_per_epoch,
+                    training_config=training_config))
+            if crash_save_post_update and post_params_single is not None:
+                _write_checkpoint_bytes(
+                    _crash_path(step, 'post_update.flax'),
+                    _serialize_checkpoint(
+                        post_params_single, post_opt_single, epoch_idx, step,
+                        best_val_loss, cfg['model'],
+                        step_in_epoch=step_in_epoch,
+                        steps_per_epoch=steps_per_epoch,
+                        training_config=training_config))
+            _write_npy_file(_crash_path(step, 'batch_input_ids.npy'), batch_ids_np)
+            _write_npy_file(_crash_path(step, 'batch_attention_mask.npy'), mask_np)
+            _write_json_file(_crash_path(step, 'metrics.json'), metrics_rec)
+            _write_json_file(_crash_path(step, 'trigger.json'), base_note)
+            _write_json_file(_crash_path(step, 'config.json'), cfg)
+            log_message(
+                f"  [CRASH_SNAPSHOT] step={step} reasons={','.join(reasons)} "
+                f"saved under {_crash_path(step, '')}")
+            log_jsonl({**base_note, 'snapshot_dir': _crash_path(step, '')})
+        del pre_params_single, pre_opt_single, post_params_single, post_opt_single
 
     def handle_preemption(signum, frame):
         """Flag-only SIGTERM handler (spot preemption).
@@ -5476,9 +5659,16 @@ def main():
                     print("Preemption requested -- exiting training loop.", flush=True)
                 break
 
-            # Shard data and run train step
+            # Shard data and run train step.  Keep lightweight Python
+            # references to the pre-update state and raw batch only when crash
+            # snapshots are enabled; this lets a collapse be replayed even if
+            # regular checkpoint retention later deletes nearby checkpoints.
             rng, step_rng = jax.random.split(rng)
             step_rng = jax.random.fold_in(step_rng, host_id)  # per-host dropout
+            _crash_batch_ids = np.asarray(input_ids) if crash_snapshot_enabled else None
+            _crash_batch_mask = np.asarray(attention_mask) if crash_snapshot_enabled else None
+            _pre_step_params = params if crash_snapshot_enabled else None
+            _pre_step_opt_state = opt_state if crash_snapshot_enabled else None
             input_ids = shard_to_mesh(
                 input_ids, data_sharding, (batch_size, max_seq_len))
             attention_mask = shard_to_mesh(
@@ -5520,13 +5710,99 @@ def main():
             # Per-step NaN check on total_loss only. A single scalar sync
             # catches loss explosions immediately; the full 6-key check runs
             # at log boundary on already-materialized window averages.
-            _m_total_for_nan = float(metrics['total_loss'])
+            if crash_snapshot_enabled:
+                _crash_probe = jax.device_get({
+                    'total_loss': metrics['total_loss'],
+                    'ce_loss': metrics['ce_loss'],
+                    'total_loss_minus_ce': metrics.get(
+                        'total_loss_minus_ce', jnp.float32(0.0)),
+                    'grad_norm': metrics.get('grad_norm', jnp.float32(0.0)),
+                    'grad_global_preclip': metrics.get(
+                        'grad_global_preclip', metrics.get('grad_norm', jnp.float32(0.0))),
+                    'grad_global_postclip': metrics.get(
+                        'grad_global_postclip', jnp.float32(0.0)),
+                    'attn_qk_active': metrics.get('attn_qk_active', jnp.float32(0.0)),
+                    'attn_v_active': metrics.get('attn_v_active', jnp.float32(0.0)),
+                    'rst_active': metrics.get('rst_active', jnp.float32(0.0)),
+                    'attn_top1_gate_frac_max': metrics.get(
+                        'attn_top1_gate_frac_max', metrics.get('attn_top1_gate_frac', jnp.float32(0.0))),
+                    'rst_top1_gate_frac_max': metrics.get(
+                        'rst_top1_gate_frac_max', metrics.get('rst_top1_gate_frac', jnp.float32(0.0))),
+                    'per_layer_attn_out_norm': metrics.get(
+                        'per_layer_attn_out_norm', jnp.zeros(1)),
+                    'per_layer_rst_out_norm': metrics.get(
+                        'per_layer_rst_out_norm', jnp.zeros(1)),
+                    'attn_gate_den_sum_mean': metrics.get(
+                        'attn_gate_den_sum_mean', jnp.float32(0.0)),
+                    'rst_gate_den_sum_mean': metrics.get(
+                        'rst_gate_den_sum_mean', jnp.float32(0.0)),
+                    'attn_raw_gate_max': metrics.get('attn_raw_gate_max', jnp.float32(0.0)),
+                    'rst_raw_gate_max': metrics.get('rst_raw_gate_max', jnp.float32(0.0)),
+                    'attn_int_max': metrics.get('attn_int_max', jnp.float32(0.0)),
+                    'rst_int_max': metrics.get('rst_int_max', jnp.float32(0.0)),
+                    'grad_router_proj_attn': metrics.get(
+                        'grad_router_proj_attn', jnp.float32(0.0)),
+                    'grad_router_proj_rst': metrics.get(
+                        'grad_router_proj_rst', jnp.float32(0.0)),
+                    'grad_router_tau_attn': metrics.get(
+                        'grad_router_tau_attn', jnp.float32(0.0)),
+                    'grad_router_tau_rst': metrics.get(
+                        'grad_router_tau_rst', jnp.float32(0.0)),
+                    'grad_pool_rst_read': metrics.get(
+                        'grad_pool_rst_read', jnp.float32(0.0)),
+                    'grad_pool_rst_write': metrics.get(
+                        'grad_pool_rst_write', jnp.float32(0.0)),
+                    'grad_pool_emb': metrics.get('grad_pool_emb', jnp.float32(0.0)),
+                    'grad_pool_read': metrics.get('grad_pool_read', jnp.float32(0.0)),
+                    'grad_pool_write': metrics.get('grad_pool_write', jnp.float32(0.0)),
+                    'grad_expand_O': metrics.get('grad_expand_O', jnp.float32(0.0)),
+                    'attn_qk_emb_norm_max': metrics.get(
+                        'attn_qk_emb_norm_max', jnp.float32(0.0)),
+                    'attn_v_emb_norm_max': metrics.get(
+                        'attn_v_emb_norm_max', jnp.float32(0.0)),
+                    'rst_emb_norm_max': metrics.get(
+                        'rst_emb_norm_max', jnp.float32(0.0)),
+                })
+                _m_total_for_nan = float(_crash_probe['total_loss'])
+            else:
+                _crash_probe = None
+                _m_total_for_nan = float(metrics['total_loss'])
             if not np.isfinite(_m_total_for_nan):
                 raise ValueError(
                     f"NaN/INF total_loss at epoch {epoch}, step {global_step + 1}")
 
             global_step += 1
             epoch_step_counter += 1
+
+            if crash_snapshot_enabled and _crash_probe is not None:
+                _crash_rec = {
+                    k: _jsonable_diag_value(v) for k, v in _crash_probe.items()
+                }
+                _crash_rec.update({'step': global_step, 'epoch': epoch})
+                _crash_reasons = _severe_collapse_reasons(
+                    _crash_rec,
+                    grad_threshold=collapse_grad_threshold,
+                    layer_out_threshold=collapse_layer_out_threshold,
+                    loss_minus_ce_threshold=collapse_loss_minus_ce_threshold,
+                    active_frac_threshold=collapse_active_frac_threshold)
+                _crash_local = np.array([bool(_crash_reasons)], dtype=np.bool_)
+                _crash_any = bool(np.any(process_allgather(_crash_local)))
+                if _crash_any:
+                    # All hosts enter the collective snapshot path. Only host 0
+                    # writes files, but every host gathers the same pre-update
+                    # state and then optionally stops.
+                    if not _crash_reasons:
+                        _crash_reasons = ['collapse_on_other_host']
+                    _save_crash_snapshot(
+                        global_step, epoch, epoch_step_counter,
+                        _pre_step_params, _pre_step_opt_state,
+                        params, opt_state, _crash_batch_ids, _crash_batch_mask,
+                        _crash_rec, _crash_reasons)
+                    sync_logs()
+                    if stop_on_collapse:
+                        raise RuntimeError(
+                            f"Severe collapse snapshot saved at step {global_step}: "
+                            f"{','.join(_crash_reasons)}")
 
             # ---- REGULAR periodic logging ----
             # ANALYSIS is driven from the val path (below), not from here -

@@ -91,6 +91,9 @@ For each token and pool:
 Implementation notes
 --------------------
 * Routing is score-based in route space: scores = h @ emb.T.
+* v4.1.5.6 can forward-normalize route embeddings inside the sharded
+  SRW closures (default on for stability); stored signature parameters
+  remain raw and their norms remain diagnostics.
 * v4.1.5.6 uses forward unit-normalized read/write vectors: stored read/write
   parameters remain raw, but SRW execution uses their directions.
 * Raw read/write parameter norms and norm-product stats remain diagnostics.
@@ -175,8 +178,8 @@ def unit_norm_init(scale=1.0):
     return init
 
 
-LOCAL_SPIKE_METRIC_COUNT = 9
-LOCAL_SPIKE_TOP1_COUNT = 15
+LOCAL_SPIKE_METRIC_COUNT = 11
+LOCAL_SPIKE_TOP1_COUNT = 17
 ATTN_LOCAL_METRIC_COUNT = 7
 
 
@@ -205,7 +208,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      prune_scope="all",
                      prune_denominator="pruned",
                      return_prune_stats=False,
-                     local_diagnostics=False):
+                     local_diagnostics=False,
+                     route_emb_forward_norm=False):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
     2-pass chunked inside shard_map:
@@ -265,6 +269,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _denominator_is_full = (prune_denominator == "full")
     _return_prune_stats = bool(return_prune_stats)
     _local_diagnostics = bool(local_diagnostics)
+    # Default is raw route signatures. Forward-normalization is kept as an
+    # optional ablation only; it can reduce routing-strength freedom and may
+    # limit expressivity.
+    # Default is raw route signatures. Forward-normalization is kept as an
+    # optional ablation only; it can reduce routing-strength freedom and may
+    # limit expressivity.
+    _route_emb_forward_norm = bool(route_emb_forward_norm)
     _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
 
     # SLIM out_specs: train path.
@@ -359,6 +370,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
+            if _route_emb_forward_norm:
+                ec_f = ec.astype(jnp.float32)
+                ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
         def route_rw_chunk(start):
@@ -503,6 +517,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.max(jnp.linalg.norm(
+                            jax.lax.stop_gradient(route.astype(jnp.float32)),
+                            axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -615,6 +633,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.max(jnp.abs(jax.lax.stop_gradient(xr_f))))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.max(jnp.linalg.norm(
+                            jax.lax.stop_gradient(route.astype(jnp.float32)),
+                            axis=-1)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -743,11 +765,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 jax.lax.stop_gradient(out), axis=-1))
             residual_norm_max = jnp.max(jnp.linalg.norm(
                 jax.lax.stop_gradient(x), axis=-1))
+            h_norm_max = jnp.max(jnp.linalg.norm(
+                jax.lax.stop_gradient(h), axis=-1))
             token_vals = jnp.stack([
                 tau_abs_max, top1_share_max, gate_den_sum_max,
-                local_out_norm_max, residual_norm_max,
-            ]).reshape((1, 5))
-            token_slots = jnp.array([0, 2, 3, 7, 8], dtype=jnp.int32)
+                local_out_norm_max, residual_norm_max, h_norm_max,
+            ]).reshape((1, 6))
+            token_slots = jnp.array([0, 2, 3, 7, 8, 9], dtype=jnp.int32)
             metric_vals = diag_vals.at[:, token_slots].set(token_vals)
             metric_vals = jax.lax.stop_gradient(metric_vals)
             metric_vals = jax.lax.pmax(metric_vals, 'model')
@@ -763,6 +787,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
             top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
             top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_details = top1_details.at[:, 15].set(metric_vals[:, 9])
+            top1_details = top1_details.at[:, 16].set(metric_vals[:, 10])
             top1_locs = jnp.full((1, 3), -1, dtype=jnp.int32)
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
@@ -1003,7 +1029,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             prune_scope="all",
                             prune_denominator="pruned",
                             return_prune_stats=False,
-                            local_diagnostics=False):
+                            local_diagnostics=False,
+                            route_emb_forward_norm=False):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1041,6 +1068,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _denominator_is_full = (prune_denominator == "full")
     _return_prune_stats = bool(return_prune_stats)
     _local_diagnostics = bool(local_diagnostics)
+    _route_emb_forward_norm = bool(route_emb_forward_norm)
     _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
 
     _slim_out_specs = (
@@ -1134,6 +1162,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
+            if _route_emb_forward_norm:
+                ec_f = ec.astype(jnp.float32)
+                ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
         def route_rw_chunk(start):
@@ -1282,6 +1313,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             xr_r + jnp.zeros_like(gate))), axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy, axis=(0, 1, 3)))
+                    _route_norm_max = jnp.max(jnp.linalg.norm(
+                        jax.lax.stop_gradient(route.astype(jnp.float32)),
+                        axis=-1))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1396,6 +1432,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             xr_r + jnp.zeros_like(gate))), axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 6].set(
                         jnp.max(contrib_proxy, axis=(0, 1, 3)))
+                    _route_norm_max = jnp.max(jnp.linalg.norm(
+                        jax.lax.stop_gradient(route.astype(jnp.float32)),
+                        axis=-1))
+                    diag_chunk = diag_chunk.at[:, 10].set(
+                        jnp.repeat(_route_norm_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1532,11 +1573,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 jnp.max(jnp.linalg.norm(
                     jax.lax.stop_gradient(x), axis=-1)),
                 2)
+            h_norm_max = jnp.max(jnp.linalg.norm(
+                jax.lax.stop_gradient(h), axis=-1), axis=(0, 1))
             token_vals = jnp.stack([
                 tau_abs_max, top1_share_max, gate_den_sum_max,
-                local_out_norm_max, residual_norm_max,
+                local_out_norm_max, residual_norm_max, h_norm_max,
             ], axis=1)
-            token_slots = jnp.array([0, 2, 3, 7, 8], dtype=jnp.int32)
+            token_slots = jnp.array([0, 2, 3, 7, 8, 9], dtype=jnp.int32)
             metric_vals = diag_vals.at[:, token_slots].set(token_vals)
             metric_vals = jax.lax.stop_gradient(metric_vals)
             metric_vals = jax.lax.pmax(metric_vals, 'model')
@@ -1552,6 +1595,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
             top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
             top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_details = top1_details.at[:, 15].set(metric_vals[:, 9])
+            top1_details = top1_details.at[:, 16].set(metric_vals[:, 10])
             top1_locs = jnp.full((2, 3), -1, dtype=jnp.int32)
             local_diag_out = (
                 metric_vals.astype(jnp.float32), metric_locs,
@@ -1882,7 +1927,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     v_read = pool_params['attn_v_read']
     v_write = pool_params['attn_v_write']
 
-    # Route embeddings are used as-is; their norm is a routing-strength DoF.
+    # Raw signature params are passed into the sharded SRW closure.
+    # The closure can forward-normalize them for routing stability while
+    # retaining raw parameter norms as diagnostics.
     qk_emb_unit = qk_emb
     v_emb_unit = v_emb
 
@@ -2228,7 +2275,9 @@ def _rst_forward(x, pool_params, router_params, rng,
     h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
     h = safe_dropout(h, router_dropout, deterministic, rng_drop)
 
-    # Route embeddings are used as-is; their norm is a routing-strength DoF.
+    # Raw signature params are passed into the sharded SRW closure.
+    # The closure can forward-normalize them for routing stability while
+    # retaining raw parameter norms as diagnostics.
     rst_emb_unit = rst_emb
     tau = x @ router_params['tau_rst']['kernel'] + router_params['tau_rst']['bias']
     if tau_offset_clip is not None and tau_offset_clip > 0:
@@ -3169,8 +3218,8 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     d_head = d_model // n_heads
 
     # Route embeddings are used as-is, matching the training path.
-    qk_norm = pool_params['attn_qk_emb']
-    v_norm = pool_params['attn_v_emb']
+    qk_norm = _forward_unit_direction(pool_params['attn_qk_emb'].astype(jnp.float32))
+    v_norm = _forward_unit_direction(pool_params['attn_v_emb'].astype(jnp.float32))
     h_all = x @ router_params['proj_attn']['kernel'] + router_params['proj_attn']['bias']
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
@@ -3211,7 +3260,7 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 def _rst_forward_inference(x, pool_params, router_params):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
     # emb used as-is (matches training path).
-    rst_norm = pool_params['rst_emb']
+    rst_norm = _forward_unit_direction(pool_params['rst_emb'].astype(jnp.float32))
     h = x @ router_params['proj_rst']['kernel'] + router_params['proj_rst']['bias']
     tau = x @ router_params['tau_rst']['kernel'] + router_params['tau_rst']['bias']
     raw_scan_offset = x @ router_params['raw_scan_offset_rst']['kernel'] + router_params['raw_scan_offset_rst']['bias']
