@@ -1867,7 +1867,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_heads, d_model,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False, return_prune_stats=False,
-                  local_diagnostics=False):
+                  local_diagnostics=False, tau_offset_clip=None):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1905,6 +1905,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
+    if tau_offset_clip is not None and tau_offset_clip > 0:
+        tau_offset_clip_f = jnp.float32(tau_offset_clip)
+        tau_all = jnp.clip(tau_all, -tau_offset_clip_f, tau_offset_clip_f)
     raw_scan_offset_all = x @ router_params['raw_scan_offset_attn']['kernel'] + router_params['raw_scan_offset_attn']['bias']
     if analysis:
         _tau_all_sg = jax.lax.stop_gradient(tau_all)
@@ -2212,7 +2215,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False, return_prune_stats=False,
-                  local_diagnostics=False):
+                  local_diagnostics=False, tau_offset_clip=None):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -2228,6 +2231,9 @@ def _rst_forward(x, pool_params, router_params, rng,
     # Route embeddings are used as-is; their norm is a routing-strength DoF.
     rst_emb_unit = rst_emb
     tau = x @ router_params['tau_rst']['kernel'] + router_params['tau_rst']['bias']
+    if tau_offset_clip is not None and tau_offset_clip > 0:
+        tau_offset_clip_f = jnp.float32(tau_offset_clip)
+        tau = jnp.clip(tau, -tau_offset_clip_f, tau_offset_clip_f)
     raw_scan_offset = x @ router_params['raw_scan_offset_rst']['kernel'] + router_params['raw_scan_offset_rst']['bias']
     if analysis:
         rst_tau_std = jax.lax.stop_gradient(tau).std()
@@ -2396,6 +2402,10 @@ class DAWN(nn.Module):
     n_chunks_know: int = 1    # Legacy config alias; prefer n_chunks_rst.
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
     n_chunks_v: int = 1      # N-axis chunking for v pool
+    # Optional safety bound on the router-produced tau offsets. This is a
+    # forward-time clamp, not a new parameter, so old checkpoints remain
+    # compatible. Set to None/0 to preserve exact v4.1.5.6 behavior.
+    tau_offset_clip: Optional[float] = None
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -2551,7 +2561,8 @@ class DAWN(nn.Module):
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
                     return_prune_stats=return_prune_stats,
-                    local_diagnostics=local_diagnostics)
+                    local_diagnostics=local_diagnostics,
+                    tau_offset_clip=self.tau_offset_clip)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -2605,7 +2616,8 @@ class DAWN(nn.Module):
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
                     return_prune_stats=return_prune_stats,
-                    local_diagnostics=local_diagnostics)
+                    local_diagnostics=local_diagnostics,
+                    tau_offset_clip=self.tau_offset_clip)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_z_act, k_tau_abs,

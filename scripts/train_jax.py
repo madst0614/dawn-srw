@@ -267,6 +267,11 @@ def _dawn_srw_kwargs(cfg):
         kw['n_rst'] = m['n_rst']
         kw['n_know'] = m.get('n_know', None)
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
+    # Optional train/eval-safe tau offset clipping. This adds no parameters,
+    # so existing checkpoints remain load-compatible.
+    if (cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.6'
+            and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
+        kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
     return kw
 
 
@@ -809,6 +814,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_lower_bound=-0.5,
                       exploration_upper_bound=2.0,
                       exploration_bound_eps=1.0e-3,
+                      exploration_dev_mode='raw',
+                      exploration_ce_clip_std=2.0,
+                      exploration_z_clip=2.0,
+                      exploration_z_tanh=True,
+                      exploration_weighted_clip=0.0,
+                      dead_penalty_weighted_clip=0.0,
+                      tau_lr_mult=1.0,
+                      tau_grad_clip=0.0,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
@@ -830,29 +843,47 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     `mesh` is required when the v4.1 exploration loss is active -the
     per-batch global mean is computed via a small shard_map.
     """
-    # Shard_map'd valid-weighted global-mean reducer.  Inputs are sharded
-    # on 'data' (batch-parallel); psum aggregates across shards + hosts.
-    _global_mean_reducer = None
+    # Shard_map'd valid-weighted global statistics reducer. Inputs are
+    # sharded on 'data' (batch-parallel); psum aggregates across shards + hosts.
+    # The mean/std pair lets exploration use a bounded robust z-score instead
+    # of raw CE deviations, which prevents a few easy/hard outlier tokens from
+    # applying a very large auxiliary control signal to router tau.
+    _global_mean_std_reducer = None
     if mesh is not None:
         @partial(shard_map, mesh=mesh,
-                 in_specs=(P('data', None),       # per_token_ce [B, S-1]
-                           P('data', None)),      # valid_mask    [B, S-1]
-                 out_specs=P(),                    # scalar replicated
+                 in_specs=(P('data', None),       # values [B, S-1]
+                           P('data', None)),      # valid_mask [B, S-1]
+                 out_specs=(P(), P()),             # mean, std scalars replicated
                  check_rep=False)
-        def _mean_reducer_fn(pce, vmask):
+        def _mean_std_reducer_fn(values, vmask):
             vm_f = vmask.astype(jnp.float32)
-            local_sum = (pce * vm_f).sum()
+            vals_f = values.astype(jnp.float32)
             local_cnt = vm_f.sum()
-            g_sum = jax.lax.psum(local_sum, 'data')
+            local_sum = (vals_f * vm_f).sum()
+            local_sq = (jnp.square(vals_f) * vm_f).sum()
             g_cnt = jax.lax.psum(local_cnt, 'data')
-            return g_sum / (g_cnt + 1e-8)
-        _global_mean_reducer = _mean_reducer_fn
+            g_sum = jax.lax.psum(local_sum, 'data')
+            g_sq = jax.lax.psum(local_sq, 'data')
+            mean = g_sum / (g_cnt + 1e-8)
+            var = jnp.maximum(g_sq / (g_cnt + 1e-8) - jnp.square(mean), 0.0)
+            std = jnp.sqrt(var + 1e-8)
+            return mean, std
+        _global_mean_std_reducer = _mean_std_reducer_fn
 
     _asym = jnp.float32(exploration_asymmetry)
     _explore_lower = jnp.float32(exploration_lower_bound)
     _explore_upper = jnp.float32(exploration_upper_bound)
     _explore_eps = jnp.float32(exploration_bound_eps)
     _warmup_steps = jnp.int32(exploration_warmup_steps)
+    _explore_dev_mode = str(exploration_dev_mode).lower()
+    _explore_use_bounded_z = _explore_dev_mode in ('bounded_z', 'robust_z', 'z')
+    _explore_ce_clip_std = jnp.float32(exploration_ce_clip_std)
+    _explore_z_clip = jnp.float32(exploration_z_clip)
+    _explore_z_tanh = bool(exploration_z_tanh)
+    _explore_weighted_clip = jnp.float32(exploration_weighted_clip)
+    _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
+    _tau_lr_mult = jnp.float32(tau_lr_mult)
+    _tau_grad_clip = jnp.float32(tau_grad_clip)
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
@@ -893,17 +924,35 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                             and attn_tau_off is not None
                             and rst_tau_off is not None
                             and valid_mask is not None
-                            and _global_mean_reducer is not None)
+                            and _global_mean_std_reducer is not None)
             if have_explore:
                 vmask_f = valid_mask.astype(jnp.float32)
-                # Global mean CE across all valid tokens (multi-host safe).
-                global_mean_ce = jax.lax.stop_gradient(
-                    _global_mean_reducer(per_token_ce, valid_mask))
-                # RPE/easy-hard coefficient is measurement feedback only.
-                # Keep CE's own gradient path through ce_loss, not through RPE.
-                deviation = jax.lax.stop_gradient(
-                    per_token_ce - global_mean_ce)                   # [B, S-1]
-                # Asymmetric: full push on hard tokens, `asym`쨌push on easy ones.
+                # CE-based exploration is measurement feedback only. Keep CE's
+                # own gradient path through ce_loss, not through RPE/explore.
+                ce_sg = jax.lax.stop_gradient(per_token_ce.astype(jnp.float32))
+                mean_ce0, std_ce0 = _global_mean_std_reducer(ce_sg, valid_mask)
+                if _explore_use_bounded_z:
+                    # Robust center/scale: first clip extreme CE tokens using
+                    # global mean/std, then recompute a clipped mean/std.  This
+                    # prevents a few hard/easy tokens from shifting the batch
+                    # baseline and creating a huge one-step tau control signal.
+                    clip_lo = mean_ce0 - _explore_ce_clip_std * std_ce0
+                    clip_hi = mean_ce0 + _explore_ce_clip_std * std_ce0
+                    ce_clip = jnp.clip(ce_sg, clip_lo, clip_hi)
+                    global_mean_ce, global_std_ce = _global_mean_std_reducer(
+                        ce_clip, valid_mask)
+                    raw_deviation = ce_sg - jax.lax.stop_gradient(global_mean_ce)
+                    z = raw_deviation / (jax.lax.stop_gradient(global_std_ce) + 1e-8)
+                    if _explore_z_tanh:
+                        deviation = _explore_z_clip * jnp.tanh(z / _explore_z_clip)
+                    else:
+                        deviation = jnp.clip(z, -_explore_z_clip, _explore_z_clip)
+                    deviation = jax.lax.stop_gradient(deviation)
+                else:
+                    global_mean_ce = jax.lax.stop_gradient(mean_ce0)
+                    raw_deviation = ce_sg - global_mean_ce
+                    deviation = jax.lax.stop_gradient(raw_deviation)
+                # Asymmetric: full push on hard tokens, `asym`*push on easy ones.
                 signal = jax.lax.stop_gradient(
                     jnp.where(deviation > 0, deviation, _asym * deviation))
 
@@ -1011,7 +1060,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # W_sense needs time to settle before exploration signals become
             # meaningful; early CE-dominated learning keeps tau gradient clean.
             explore_active = (step >= _warmup_steps).astype(jnp.float32)
-            explore_loss_weighted = exploration_weight * explore_loss_raw * explore_active
+            explore_loss_weighted_unclipped = (
+                jnp.float32(exploration_weight)
+                * explore_loss_raw * explore_active)
+            explore_loss_weighted = jnp.where(
+                _explore_weighted_clip > 0.0,
+                jnp.clip(explore_loss_weighted_unclipped,
+                         -_explore_weighted_clip, _explore_weighted_clip),
+                explore_loss_weighted_unclipped)
+            dead_penalty_weighted_unclipped = (
+                jnp.float32(dead_penalty_weight) * dead_penalty)
+            dead_penalty_weighted = jnp.where(
+                _dead_weighted_clip > 0.0,
+                jnp.minimum(dead_penalty_weighted_unclipped, _dead_weighted_clip),
+                dead_penalty_weighted_unclipped)
 
             if is_baseline:
                 orth_loss = jnp.float32(0.0)
@@ -1024,7 +1086,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + lb_weight * aux_loss
                               + tau_reg_weight * tau_reg
                               + div_weight * div_loss
-                              + dead_penalty_weight * dead_penalty
+                              + dead_penalty_weighted
                               + explore_loss_weighted)
             else:
                 orth_loss = compute_orthogonality_loss(
@@ -1035,7 +1097,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + tau_reg_weight * tau_reg
                               + orth_weight * orth_loss
                               + div_weight * div_loss
-                              + dead_penalty_weight * dead_penalty
+                              + dead_penalty_weighted
                               + explore_loss_weighted)
 
             explore_stats = dict(
@@ -1056,6 +1118,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rst_tau_off_p99=rst_tau_off_p99, rst_tau_off_p01=rst_tau_off_p01,
                 rst_tau_off_neg_frac=rst_tau_off_neg_frac,
                 explore_active=explore_active,
+                explore_loss_weighted_unclipped=explore_loss_weighted_unclipped,
+                explore_loss_weighted_clipped=explore_loss_weighted,
+                dead_penalty_weighted_unclipped=dead_penalty_weighted_unclipped,
+                dead_penalty_weighted_clipped=dead_penalty_weighted,
                 step_in_train=step,
             )
             return total_loss, (ce_loss, aux_loss, tau_reg, orth_loss, div_loss,
@@ -1067,6 +1133,44 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
         # XLA SPMD handles gradient all-reduce automatically
         # (loss computed on sharded data -gradients consistent across shards)
+        raw_grads_before_tau_stabilize = grads
+
+        def _pre_tree_sq(tree):
+            leaves = jax.tree.leaves(tree)
+            if not leaves:
+                return jnp.float32(0.0)
+            return sum(jnp.sum(jnp.square(x.astype(jnp.float32)))
+                       for x in leaves)
+
+        def _pre_path_tree(tree, *keys):
+            cur = tree
+            for key in keys:
+                if not hasattr(cur, '__contains__') or key not in cur:
+                    return {}
+                cur = cur[key]
+            return cur
+
+        tau_grad_norm_raw = jnp.sqrt(
+            _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_attn'))
+            + _pre_tree_sq(_pre_path_tree(grads, 'router', 'tau_rst'))
+            + 1e-12)
+        tau_clip_scale = jnp.where(
+            _tau_grad_clip > 0.0,
+            jnp.minimum(1.0, _tau_grad_clip / (tau_grad_norm_raw + 1e-8)),
+            jnp.float32(1.0))
+        tau_total_scale = _tau_lr_mult * tau_clip_scale
+
+        def _path_to_str(path):
+            return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
+
+        def _scale_router_tau_grad(path, g):
+            ps = _path_to_str(path)
+            if ('router/tau_attn' in ps) or ('router/tau_rst' in ps):
+                return g * tau_total_scale.astype(g.dtype)
+            return g
+
+        if (float(tau_lr_mult) != 1.0) or (float(tau_grad_clip) > 0.0):
+            grads = jax.tree.map_with_path(_scale_router_tau_grad, grads)
 
         updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
@@ -1270,10 +1374,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'raw_scan_offset_attn',
             params.get('router', {}).get('raw_scan_offset_attn', {})).get(
                 'bias', jnp.zeros(3))
-        explore_loss_weighted_metric = (
-            jnp.float32(exploration_weight)
-            * explore_stats['explore_loss_raw']
-            * explore_stats['explore_active'])
+        explore_loss_weighted_metric = explore_loss_weighted
 
         metrics = {
             'total_loss': total_loss,
@@ -1291,7 +1392,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'diversity_loss_raw': div_loss,
             'diversity_loss_weighted': div_weight * div_loss,
             'dead_penalty_weight': jnp.float32(dead_penalty_weight),
-            'dead_penalty_weighted_total': dead_penalty_weight * dead_penalty,
+            'dead_penalty_weighted_total': dead_penalty_weighted,
             'exploration_warmup_factor': explore_stats['explore_active'],
             'exploration_weight_effective': (
                 jnp.float32(exploration_weight) * explore_stats['explore_active']),
@@ -1305,7 +1406,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'exploration_loss_weighted_rst': (
                 exploration_weight * explore_stats['explore_rst_raw']
                 * explore_stats['explore_active']),
-            'exploration_loss_weighted_total': explore_loss_weighted_metric,
+            'exploration_loss_weighted_total': explore_loss_weighted,
+            'exploration_loss_weighted_unclipped': explore_loss_weighted_unclipped,
+            'exploration_loss_weighted_clipped': explore_loss_weighted,
+            'dead_penalty_weighted_unclipped': dead_penalty_weighted_unclipped,
+            'dead_penalty_weighted_clipped': dead_penalty_weighted,
             'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
             'exploration_raw_post_bound': explore_stats['explore_loss_raw'],
             'exploration_attn_pre_bound': explore_stats['explore_attn_pre_bound'],
@@ -1319,7 +1424,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + tau_reg_weight * tau_reg
                 + orth_weight * orth_loss
                 + div_weight * div_loss
-                + dead_penalty_weight * dead_penalty
+                + dead_penalty_weighted
                 + explore_loss_weighted_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
@@ -1476,7 +1581,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'explore_loss_raw': explore_stats['explore_loss_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
             'explore_rst_raw': explore_stats['explore_rst_raw'],
-            'explore_loss_weighted': exploration_weight * explore_stats['explore_loss_raw'] * explore_stats['explore_active'],
+            'explore_loss_weighted': explore_loss_weighted,
             'explore_active': explore_stats['explore_active'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
             'explore_block_frac_k': explore_stats['block_frac_k'],
@@ -3781,6 +3886,18 @@ def main():
     exploration_lower_bound = tcfg.get('exploration_lower_bound', -0.5)
     exploration_upper_bound = tcfg.get('exploration_upper_bound', 2.0)
     exploration_bound_eps = tcfg.get('exploration_bound_eps', 1.0e-3)
+    exploration_dev_mode = tcfg.get('exploration_dev_mode', 'raw')
+    exploration_ce_clip_std = tcfg.get('exploration_ce_clip_std', 2.0)
+    exploration_z_clip = tcfg.get('exploration_z_clip', 2.0)
+    exploration_z_tanh = tcfg.get('exploration_z_tanh', True)
+    exploration_weighted_clip = tcfg.get(
+        'exploration_weighted_clip', tcfg.get('expl_w_clip', 0.0))
+    dead_penalty_weighted_clip = tcfg.get(
+        'dead_penalty_weighted_clip', tcfg.get('dead_w_clip', 0.0))
+    tau_lr_mult = tcfg.get('tau_lr_mult', 1.0)
+    tau_grad_clip = tcfg.get('tau_grad_clip', 0.0)
+    restore_training_config_on_resume = tcfg.get(
+        'restore_training_config_on_resume', True)
     # 2-tier logging cadence.
     log_interval = int(tcfg.get('log_interval', 100))
     log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
@@ -3954,7 +4071,7 @@ def main():
                     print(f"  Warning: Failed to read config.json: {e}")
                 saved_cfg = None
 
-        if saved_training_config:
+        if saved_training_config and restore_training_config_on_resume:
             # Apply checkpoint training config (CLI args take precedence)
             if cli_args.batch_size is None:
                 batch_size = saved_training_config.get('batch_size', batch_size)
@@ -3983,6 +4100,22 @@ def main():
                 'exploration_upper_bound', exploration_upper_bound)
             exploration_bound_eps = saved_training_config.get(
                 'exploration_bound_eps', exploration_bound_eps)
+            exploration_dev_mode = saved_training_config.get(
+                'exploration_dev_mode', exploration_dev_mode)
+            exploration_ce_clip_std = saved_training_config.get(
+                'exploration_ce_clip_std', exploration_ce_clip_std)
+            exploration_z_clip = saved_training_config.get(
+                'exploration_z_clip', exploration_z_clip)
+            exploration_z_tanh = saved_training_config.get(
+                'exploration_z_tanh', exploration_z_tanh)
+            exploration_weighted_clip = saved_training_config.get(
+                'exploration_weighted_clip', exploration_weighted_clip)
+            dead_penalty_weighted_clip = saved_training_config.get(
+                'dead_penalty_weighted_clip', dead_penalty_weighted_clip)
+            tau_lr_mult = saved_training_config.get(
+                'tau_lr_mult', tau_lr_mult)
+            tau_grad_clip = saved_training_config.get(
+                'tau_grad_clip', tau_grad_clip)
             log_interval = int(saved_training_config.get(
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
@@ -4011,6 +4144,15 @@ def main():
         'exploration_lower_bound': exploration_lower_bound,
         'exploration_upper_bound': exploration_upper_bound,
         'exploration_bound_eps': exploration_bound_eps,
+        'exploration_dev_mode': exploration_dev_mode,
+        'exploration_ce_clip_std': exploration_ce_clip_std,
+        'exploration_z_clip': exploration_z_clip,
+        'exploration_z_tanh': exploration_z_tanh,
+        'exploration_weighted_clip': exploration_weighted_clip,
+        'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
+        'tau_lr_mult': tau_lr_mult,
+        'tau_grad_clip': tau_grad_clip,
+        'restore_training_config_on_resume': restore_training_config_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
@@ -4283,6 +4425,12 @@ def main():
         print(f"  Total optimizer steps: {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
         print(f"  LR: {lr}")
+        print("  Stabilizers: "
+              f"tau_lr_mult={tau_lr_mult}, tau_grad_clip={tau_grad_clip}, "
+              f"expl_clip={exploration_weighted_clip}, "
+              f"dead_clip={dead_penalty_weighted_clip}, "
+              f"explore_dev_mode={exploration_dev_mode}, "
+              f"resume_restore_training_config={restore_training_config_on_resume}")
         print(f"  Weight decay: {weight_decay} (pool: {pool_weight_decay})")
         print(f"  Orth weight: {orth_weight}")
         print(f"  Div weight: {div_weight}")
@@ -4566,6 +4714,14 @@ def main():
         exploration_lower_bound=exploration_lower_bound,
         exploration_upper_bound=exploration_upper_bound,
         exploration_bound_eps=exploration_bound_eps,
+        exploration_dev_mode=exploration_dev_mode,
+        exploration_ce_clip_std=exploration_ce_clip_std,
+        exploration_z_clip=exploration_z_clip,
+        exploration_z_tanh=exploration_z_tanh,
+        exploration_weighted_clip=exploration_weighted_clip,
+        dead_penalty_weighted_clip=dead_penalty_weighted_clip,
+        tau_lr_mult=tau_lr_mult,
+        tau_grad_clip=tau_grad_clip,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
