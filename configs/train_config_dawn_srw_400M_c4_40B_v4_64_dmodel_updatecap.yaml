@@ -74,7 +74,7 @@ training:
   router_scan_grad_clip: 0.0
   route_emb_grad_clip: 0.0
   enable_control_update_caps: true
-  router_proj_update_ratio_cap: 1.0e-3
+  router_proj_update_ratio_cap: 2.0e-3
   route_emb_update_ratio_cap: 2.0e-3
   tau_update_abs_cap: 1.0e-3
   scan_update_abs_cap: 5.0e-4
