@@ -2585,6 +2585,18 @@ class DAWN(nn.Module):
             rst_gate_eff_ratio_all = _z
             rst_top1_gate_frac_all = _z
             rst_top1_gate_frac_max_all = _z
+            attn_state_sharpness_mean_all = _z
+            attn_state_sharpness_std_all = _z
+            attn_state_sharpness_min_all = _z
+            attn_state_sharpness_max_all = _z
+            attn_state_sharpness_range_q_all = _z
+            attn_state_sharpness_range_k_all = _z
+            attn_state_sharpness_range_v_all = _z
+            rst_state_sharpness_mean_all = _z
+            rst_state_sharpness_std_all = _z
+            rst_state_sharpness_min_all = _z
+            rst_state_sharpness_max_all = _z
+            rst_state_sharpness_range_all = _z
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
