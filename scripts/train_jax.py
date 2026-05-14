@@ -64,6 +64,10 @@ try:
     from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
 except ImportError:
     DAWN_SRW_V4156 = None
+try:
+    from models.dawn_srw_v4157 import DAWN as DAWN_SRW_V4157
+except ImportError:
+    DAWN_SRW_V4157 = None
 
 # ============================================================
 # Constants
@@ -275,9 +279,15 @@ def _dawn_srw_kwargs(cfg):
     # Optional train/eval-safe tau offset clipping. This adds no parameters,
     # so existing checkpoints remain load-compatible.
     if (cfg['model'].get('model_version') in (
-            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6')
+            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6',
+            'spatial-r1-v4.1.5.7')
             and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
         kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
+    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.7':
+        kw['state_sharpness_range_min'] = m.get(
+            'state_sharpness_range_min', t.get('state_sharpness_range_min', 1.25))
+        kw['state_sharpness_range_max'] = m.get(
+            'state_sharpness_range_max', t.get('state_sharpness_range_max', 4.0))
     return kw
 
 
@@ -301,6 +311,11 @@ def _v415_sharded_kwargs(cfg):
     )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
+    # v4.1.5.7 directional routing defaults.  Older factories ignore these
+    # unless their signature exposes the kwargs via ModelSpec dispatch.
+    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.7':
+        kw['use_direction_routing'] = t.get('use_direction_routing', True)
+        kw['use_route_intensity'] = t.get('use_route_intensity', False)
     return kw
 
 
@@ -359,6 +374,17 @@ if DAWN_SRW_V4156 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
+if DAWN_SRW_V4157 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.5.7'] = ModelSpec(
+        name='spatial-r1-v4.1.5.7',
+        module_path='models.dawn_srw_v4157',
+        cls=DAWN_SRW_V4157,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
 
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
@@ -379,7 +405,7 @@ def build_model_from_config(cfg):
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
     if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                   'spatial-r1-v4.1.5.6', 'dawn_srw'):
+                   'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -1334,6 +1360,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_router_tau_rst = _child_norm(_grouter, 'tau_rst')
         grad_router_scan_attn = _child_norm(_grouter, 'raw_scan_offset_attn')
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
+        grad_router_state_sharpness_attn = _child_norm(_grouter, 'state_sharpness_attn')
+        grad_router_state_sharpness_rst = _child_norm(_grouter, 'state_sharpness_rst')
+        grad_router_state_sharpness_range_attn = _child_norm(_grouter, 'state_sharpness_range_attn_raw')
+        grad_router_state_sharpness_range_rst = _child_norm(_grouter, 'state_sharpness_range_rst_raw')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
         grad_pool_attn_qk_read = _child_norm(_gpool, 'attn_qk_read')
         grad_pool_attn_qk_write = _child_norm(_gpool, 'attn_qk_write')
@@ -1417,6 +1447,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_tau_attn + grad_router_tau_rst)
         grad_router_scan = (
             grad_router_scan_attn + grad_router_scan_rst)
+        grad_router_state_sharpness = (
+            grad_router_state_sharpness_attn
+            + grad_router_state_sharpness_rst
+            + grad_router_state_sharpness_range_attn
+            + grad_router_state_sharpness_range_rst)
         grad_pool_emb = (
             grad_pool_attn_qk_emb + grad_pool_attn_v_emb
             + grad_pool_rst_emb)
@@ -1597,6 +1632,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_router_proj': grad_router_proj,
             'grad_router_tau': grad_router_tau,
             'grad_router_scan': grad_router_scan,
+            'grad_router_state_sharpness_attn': grad_router_state_sharpness_attn,
+            'grad_router_state_sharpness_rst': grad_router_state_sharpness_rst,
+            'grad_router_state_sharpness_range_attn': grad_router_state_sharpness_range_attn,
+            'grad_router_state_sharpness_range_rst': grad_router_state_sharpness_range_rst,
+            'grad_router_state_sharpness': grad_router_state_sharpness,
             'grad_pool_emb': grad_pool_emb,
             'grad_pool_read': grad_pool_read,
             'grad_pool_write': grad_pool_write,
@@ -1631,6 +1671,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_gate_eff_ratio': result.get('attn_gate_eff_ratio', jnp.float32(0.0)),
             'attn_top1_gate_frac': result.get('attn_top1_gate_frac', jnp.float32(0.0)),
             'attn_top1_gate_frac_max': result.get('attn_top1_gate_frac_max', jnp.float32(0.0)),
+            'attn_state_sharpness_mean': result.get('attn_state_sharpness_mean', jnp.float32(0.0)),
+            'attn_state_sharpness_std': result.get('attn_state_sharpness_std', jnp.float32(0.0)),
+            'attn_state_sharpness_min': result.get('attn_state_sharpness_min', jnp.float32(0.0)),
+            'attn_state_sharpness_max': result.get('attn_state_sharpness_max', jnp.float32(0.0)),
+            'attn_state_sharpness_range_q': result.get('attn_state_sharpness_range_q', jnp.float32(0.0)),
+            'attn_state_sharpness_range_k': result.get('attn_state_sharpness_range_k', jnp.float32(0.0)),
+            'attn_state_sharpness_range_v': result.get('attn_state_sharpness_range_v', jnp.float32(0.0)),
+            'rst_state_sharpness_mean': result.get('rst_state_sharpness_mean', jnp.float32(0.0)),
+            'rst_state_sharpness_std': result.get('rst_state_sharpness_std', jnp.float32(0.0)),
+            'rst_state_sharpness_min': result.get('rst_state_sharpness_min', jnp.float32(0.0)),
+            'rst_state_sharpness_max': result.get('rst_state_sharpness_max', jnp.float32(0.0)),
+            'rst_state_sharpness_range': result.get('rst_state_sharpness_range', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
@@ -2787,6 +2839,11 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_router_proj': float(m.get('grad_router_proj', 0.0)),
         'grad_router_tau': float(m.get('grad_router_tau', 0.0)),
         'grad_router_scan': float(m.get('grad_router_scan', 0.0)),
+        'grad_router_state_sharpness_attn': float(m.get('grad_router_state_sharpness_attn', 0.0)),
+        'grad_router_state_sharpness_rst': float(m.get('grad_router_state_sharpness_rst', 0.0)),
+        'grad_router_state_sharpness_range_attn': float(m.get('grad_router_state_sharpness_range_attn', 0.0)),
+        'grad_router_state_sharpness_range_rst': float(m.get('grad_router_state_sharpness_range_rst', 0.0)),
+        'grad_router_state_sharpness': float(m.get('grad_router_state_sharpness', 0.0)),
         'grad_pool_emb': float(m.get('grad_pool_emb', 0.0)),
         'grad_pool_read': float(m.get('grad_pool_read', 0.0)),
         'grad_pool_write': float(m.get('grad_pool_write', 0.0)),
@@ -2829,6 +2886,18 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_gate_eff_ratio': float(m.get('rst_gate_eff_ratio', 0.0)),
         'rst_top1_gate_frac': float(m.get('rst_top1_gate_frac', 0.0)),
         'rst_top1_gate_frac_max': float(m.get('rst_top1_gate_frac_max', 0.0)),
+        'attn_state_sharpness_mean': float(m.get('attn_state_sharpness_mean', 0.0)),
+        'attn_state_sharpness_std': float(m.get('attn_state_sharpness_std', 0.0)),
+        'attn_state_sharpness_min': float(m.get('attn_state_sharpness_min', 0.0)),
+        'attn_state_sharpness_max': float(m.get('attn_state_sharpness_max', 0.0)),
+        'attn_state_sharpness_range_q': float(m.get('attn_state_sharpness_range_q', 0.0)),
+        'attn_state_sharpness_range_k': float(m.get('attn_state_sharpness_range_k', 0.0)),
+        'attn_state_sharpness_range_v': float(m.get('attn_state_sharpness_range_v', 0.0)),
+        'rst_state_sharpness_mean': float(m.get('rst_state_sharpness_mean', 0.0)),
+        'rst_state_sharpness_std': float(m.get('rst_state_sharpness_std', 0.0)),
+        'rst_state_sharpness_min': float(m.get('rst_state_sharpness_min', 0.0)),
+        'rst_state_sharpness_max': float(m.get('rst_state_sharpness_max', 0.0)),
+        'rst_state_sharpness_range': float(m.get('rst_state_sharpness_range', 0.0)),
         'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
         'rst_dead_count': float(m.get('rst_dead_count', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
@@ -3020,7 +3089,7 @@ def _print_regular_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
@@ -3033,7 +3102,7 @@ def _print_regular_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
         log_message(
             f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
             f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
@@ -3055,6 +3124,27 @@ def _print_regular_block(rec, ctx):
         f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
         f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.7':
+        log_message(
+            f"  state_sharpness: attn[m={rec['attn_state_sharpness_mean']:.2f}"
+            f" s={rec['attn_state_sharpness_std']:.2f}"
+            f" min={rec['attn_state_sharpness_min']:.2f}"
+            f" max={rec['attn_state_sharpness_max']:.2f}]"
+            f" rst[m={rec['rst_state_sharpness_mean']:.2f}"
+            f" s={rec['rst_state_sharpness_std']:.2f}"
+            f" min={rec['rst_state_sharpness_min']:.2f}"
+            f" max={rec['rst_state_sharpness_max']:.2f}]"
+            f" | range[q={rec['attn_state_sharpness_range_q']:.2f}"
+            f" k={rec['attn_state_sharpness_range_k']:.2f}"
+            f" v={rec['attn_state_sharpness_range_v']:.2f}"
+            f" rst={rec['rst_state_sharpness_range']:.2f}]"
+        )
+        log_message(
+            f"  grad_state_sharpness: attn={rec['grad_router_state_sharpness_attn']:.2e}"
+            f" rst={rec['grad_router_state_sharpness_rst']:.2e}"
+            f" range_a={rec['grad_router_state_sharpness_range_attn']:.2e}"
+            f" range_rst={rec['grad_router_state_sharpness_range_rst']:.2e}"
+        )
     log_message(
         f"  rw_n: attn_qk r[m={rec['attn_qk_read_norm_mean']:.2f} s={rec['attn_qk_read_norm_std']:.2f}"
         f" max={rec['attn_qk_read_norm_max']:.2f}]"
@@ -4008,7 +4098,7 @@ def _print_analysis_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" rst={rec['rst_gate_den_sum']:.1f}"
@@ -4803,7 +4893,7 @@ def main():
         )
         if cfg['model'].get('model_version') in (
                 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'dawn_srw'):
+                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
