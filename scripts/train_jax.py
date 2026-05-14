@@ -3271,6 +3271,38 @@ def _print_regular_block(rec, ctx):
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
         )
+    _cap_scale_min = min(
+        rec.get('update_cap_proj_attn_scale', 1.0),
+        rec.get('update_cap_proj_rst_scale', 1.0),
+        rec.get('update_cap_emb_qk_scale', 1.0),
+        rec.get('update_cap_emb_v_scale', 1.0),
+        rec.get('update_cap_emb_rst_scale', 1.0),
+        rec.get('update_cap_tau_attn_scale', 1.0),
+        rec.get('update_cap_tau_rst_scale', 1.0),
+        rec.get('update_cap_scan_attn_scale', 1.0),
+        rec.get('update_cap_scan_rst_scale', 1.0),
+    )
+    log_message(
+        f"  update_cap: hit[pA={rec.get('update_cap_proj_attn_hit', 0.0):.0f}"
+        f" pR={rec.get('update_cap_proj_rst_hit', 0.0):.0f}"
+        f" eQ={rec.get('update_cap_emb_qk_hit', 0.0):.0f}"
+        f" eV={rec.get('update_cap_emb_v_hit', 0.0):.0f}"
+        f" eR={rec.get('update_cap_emb_rst_hit', 0.0):.0f}"
+        f" tA={rec.get('update_cap_tau_attn_hit', 0.0):.0f}"
+        f" tR={rec.get('update_cap_tau_rst_hit', 0.0):.0f}"
+        f" sA={rec.get('update_cap_scan_attn_hit', 0.0):.0f}"
+        f" sR={rec.get('update_cap_scan_rst_hit', 0.0):.0f}]"
+        f" scale_min={_cap_scale_min:.3f}"
+        f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
+        f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
+        f" emb_pre[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
+        f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
+        f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
+        f" tau_pre[a={rec.get('update_cap_tau_attn_abs_pre', 0.0):.1e}"
+        f" r={rec.get('update_cap_tau_rst_abs_pre', 0.0):.1e}]"
+        f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
+        f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
+    )
     log_message(
         f"  tau: rst_b={rec['tau_rst_bias']:+.2f}"
         f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
