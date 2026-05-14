@@ -107,7 +107,7 @@ training:
   exploration_ce_clip_std: 2.0
   exploration_z_clip: 3.0
   exploration_z_tanh: true
-  exploration_weighted_clip: 0.1
+  exploration_weighted_clip: 0.3
   dead_penalty_weighted_clip: 0.5
   # Optional forward-time safety clamp for router-produced tau offsets.
   # Keep at 0.0 for exact unclipped v4.1.5.5 behavior; set 6.0 only if tau max outliers reappear.
