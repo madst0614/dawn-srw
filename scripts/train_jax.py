@@ -2730,7 +2730,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 
     is_v415 = ctx.get('model_version') in (
         'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'dawn_srw')
+        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -3836,7 +3836,7 @@ def _build_analysis_record(base, metrics, ctx):
     m = metrics
     is_v415 = ctx.get('model_version') in (
         'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'dawn_srw')
+        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -4977,6 +4977,7 @@ def main():
         'spatial-r1-v4.1.5.2',
         'spatial-r1-v4.1.5.5',
         'spatial-r1-v4.1.5.6',
+        'spatial-r1-v4.1.5.7',
         'dawn_srw',
     )
 
@@ -5292,7 +5293,7 @@ def main():
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = model_version in (
                 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'dawn_srw')
+                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
