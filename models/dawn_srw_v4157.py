@@ -15,9 +15,12 @@ neurons, selects a sparse subset, and composes their operations. In DAWN-SRW:
 
 Routing is performed by directional signature matching with bounded state-dependent selection sharpness:
 
-    match_i = <normalize(h), normalize(emb_i)>
+    direction_match_i = <normalize(h), normalize(emb_i)>
+    raw_margin_i = direction_match_i - tau
     state_sharpness = exp(sharpness_range_pool * tanh(sharpness_raw(x)))
-    gate_i = sigmoid(base_sharpness * state_sharpness * (match_i - tau))
+    scaled_margin_i = state_sharpness * raw_margin_i
+    selection_margin_i = scaled_margin_i - activation_threshold
+    gate_i = sigmoid(hard_sharpness * selection_margin_i)
 
 The read vector extracts a scalar component from the residual state, and the
 write vector writes that scalar back to the residual stream:
@@ -69,17 +72,18 @@ SRW equations
 -------------
 For each token and pool:
 
-    match  = normalize(h) @ normalize(emb).T
-    s_mean = mean(match over neurons)
-    s_std  = std(match over neurons)
+    direction_match = normalize(h) @ normalize(emb).T
+    s_mean = mean(direction_match over neurons)
+    s_std  = std(direction_match over neurons)
 
     scan_offset = scan_scale * tanh(raw_scan_offset)
     tau  = s_mean + tau_offset * s_std - scan_offset / max(s_std, scan_std_floor)
 
-    raw             = match - tau
-    margin          = raw - activation_threshold
-    activation      = sigmoid(sharpness * state_sharpness * margin)
-    gate            = activation
+    raw_margin       = direction_match - tau
+    scaled_margin    = state_sharpness * raw_margin
+    selection_margin = scaled_margin - activation_threshold
+    activation       = sigmoid(sharpness * selection_margin)
+    gate             = activation
 
     O_i^RW(x) = <x, r_i> w_i
     out = sum_i gate_i * O_i^RW(x) / max(sum_i gate_i, 1.0)
@@ -87,7 +91,7 @@ For each token and pool:
 Implementation notes
 --------------------
 * Routing uses direction-normalized signature matching: match = normalize(h) @ normalize(emb).T.
-* State-dependent selection sharpness modulates selection temperature without changing execution magnitude.
+* State-dependent selection sharpness rescales raw selection margin before a fixed hard activation threshold.
 * Read/write vectors are used raw in SRW; norm/product stats are diagnostics.
 * The denominator remains the sum of selected gates: sum(gate).
 * Dynamic tau alpha parameters are not present; tau is relative threshold
@@ -109,16 +113,16 @@ from jax.experimental.shard_map import shard_map
 # ================================================================
 # V4.1 physical constants (defaults; overridable via config).
 #
-#   margin        = (score - tau) - ACTIVATION_THRESHOLD
-#   activation    = sigmoid(SHARPNESS * margin)
-#   active_margin = max(margin - ACTIVATION_CUTOFF, 0)
-#   intensity     = EPSILON + min(active_margin, MAX_INTENSITY)
-#   gate          = activation * intensity
-#   den           = max(sum(gate), 1.0)
+#   raw_margin       = direction_match - tau
+#   scaled_margin    = state_sharpness * raw_margin
+#   selection_margin = scaled_margin - ACTIVATION_THRESHOLD
+#   activation       = sigmoid(SHARPNESS * selection_margin)
+#   gate             = activation        # v4.1.5.7 default: no route intensity
+#   den              = max(sum(gate), 1.0)
 # ================================================================
 
-SHARPNESS = 60.0               # base selection sharpness for cosine-route v4.1.5.7
-ACTIVATION_THRESHOLD = 0.5     # raw must exceed tau by this to enter zone
+SHARPNESS = 500.0              # hard activation sharpness (near-binary selector)
+ACTIVATION_THRESHOLD = 0.05    # state-scaled directional margin required to select
 ACTIVATION_CUTOFF = 0.01       # intensity starts margin beyond this point
 EPSILON = 1e-4                 # minimum intensity floor
 MAX_INTENSITY = 1.0            # v4.1.5.7 uses gate=activation; kept for diagnostics/API
@@ -474,10 +478,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
                 scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
-                activation = jax.nn.sigmoid(_sharp * state_sharpness_f * margin)
-                active_margin = jnp.maximum(margin - _act_cut, 0.0)
+                raw_margin = scores_f - tau
+                scaled_margin = state_sharpness_f * raw_margin
+                selection_margin = scaled_margin - _act_thr
+                # Legacy diagnostic names: raw is the pre-threshold directional margin;
+                # margin is the final margin against the hard activation threshold.
+                raw = raw_margin
+                margin = selection_margin
+                activation = jax.nn.sigmoid(_sharp * selection_margin)
+                active_margin = jnp.maximum(selection_margin - _act_cut, 0.0)
                 if _use_route_intensity:
                     intensity = _eps + jnp.minimum(active_margin, _max_int)
                     base_gate = activation * intensity
@@ -591,10 +600,15 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 route, rc, wc = route_chunk(s)
                 scores = h_bf @ route.T
                 scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
-                activation = jax.nn.sigmoid(_sharp * state_sharpness_f * margin)
-                active_margin = jnp.maximum(margin - _act_cut, 0.0)
+                raw_margin = scores_f - tau
+                scaled_margin = state_sharpness_f * raw_margin
+                selection_margin = scaled_margin - _act_thr
+                # Legacy diagnostic names: raw is the pre-threshold directional margin;
+                # margin is the final margin against the hard activation threshold.
+                raw = raw_margin
+                margin = selection_margin
+                activation = jax.nn.sigmoid(_sharp * selection_margin)
+                active_margin = jnp.maximum(selection_margin - _act_cut, 0.0)
                 if _use_route_intensity:
                     intensity = _eps + jnp.minimum(active_margin, _max_int)
                     base_gate = activation * intensity
@@ -1268,10 +1282,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
                 scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
-                activation = jax.nn.sigmoid(_sharp * state_sharpness_f * margin)
-                active_margin = jnp.maximum(margin - _act_cut, 0.0)
+                raw_margin = scores_f - tau
+                scaled_margin = state_sharpness_f * raw_margin
+                selection_margin = scaled_margin - _act_thr
+                # Legacy diagnostic names: raw is the pre-threshold directional margin;
+                # margin is the final margin against the hard activation threshold.
+                raw = raw_margin
+                margin = selection_margin
+                activation = jax.nn.sigmoid(_sharp * selection_margin)
+                active_margin = jnp.maximum(selection_margin - _act_cut, 0.0)
                 if _use_route_intensity:
                     intensity = _eps + jnp.minimum(active_margin, _max_int)
                     base_gate = activation * intensity
@@ -1394,10 +1413,15 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 route, rc, wc = route_chunk(s)
                 scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
                 scores_f = scores.astype(jnp.float32)
-                raw = scores_f - tau
-                margin = raw - _act_thr
-                activation = jax.nn.sigmoid(_sharp * state_sharpness_f * margin)
-                active_margin = jnp.maximum(margin - _act_cut, 0.0)
+                raw_margin = scores_f - tau
+                scaled_margin = state_sharpness_f * raw_margin
+                selection_margin = scaled_margin - _act_thr
+                # Legacy diagnostic names: raw is the pre-threshold directional margin;
+                # margin is the final margin against the hard activation threshold.
+                raw = raw_margin
+                margin = selection_margin
+                activation = jax.nn.sigmoid(_sharp * selection_margin)
+                active_margin = jnp.maximum(selection_margin - _act_cut, 0.0)
                 if _use_route_intensity:
                     intensity = _eps + jnp.minimum(active_margin, _max_int)
                     base_gate = activation * intensity

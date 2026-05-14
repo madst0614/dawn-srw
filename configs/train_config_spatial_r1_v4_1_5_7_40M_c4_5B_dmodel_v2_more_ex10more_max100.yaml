@@ -64,11 +64,14 @@ training:
   load_balance_weight: 0.0
 
   # ---- v4.1.5.7 directional select + state_sharpness ----
-  # match = normalize(h) @ normalize(emb).T
-  # gate = sigmoid(sharpness * state_sharpness * (match - tau - threshold))
+  # direction_match = normalize(h) @ normalize(emb).T
+  # raw_margin = direction_match - tau
+  # scaled_margin = state_sharpness * raw_margin
+  # selection_margin = scaled_margin - activation_threshold
+  # gate = sigmoid(sharpness * selection_margin)
   # RW execution strength is handled by <x, r_i> w_i; route intensity is disabled.
-  sharpness: 60.0
-  activation_threshold: 0.5
+  sharpness: 500.0
+  activation_threshold: 0.05
   activation_cutoff: 0.01
   epsilon: 1.0e-4
   max_intensity: 1.0
