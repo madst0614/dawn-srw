@@ -64,10 +64,6 @@ try:
     from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
 except ImportError:
     DAWN_SRW_V4156 = None
-try:
-    from models.dawn_srw_v4157 import DAWN as DAWN_SRW_V4157
-except ImportError:
-    DAWN_SRW_V4157 = None
 
 # ============================================================
 # Constants
@@ -279,15 +275,9 @@ def _dawn_srw_kwargs(cfg):
     # Optional train/eval-safe tau offset clipping. This adds no parameters,
     # so existing checkpoints remain load-compatible.
     if (cfg['model'].get('model_version') in (
-            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6',
-            'spatial-r1-v4.1.5.7')
+            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6')
             and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
         kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
-    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.7':
-        kw['state_sharpness_range_min'] = m.get(
-            'state_sharpness_range_min', t.get('state_sharpness_range_min', 1.25))
-        kw['state_sharpness_range_max'] = m.get(
-            'state_sharpness_range_max', t.get('state_sharpness_range_max', 4.0))
     return kw
 
 
@@ -311,11 +301,6 @@ def _v415_sharded_kwargs(cfg):
     )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
-    # v4.1.5.7 directional routing defaults.  Older factories ignore these
-    # unless their signature exposes the kwargs via ModelSpec dispatch.
-    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.7':
-        kw['use_direction_routing'] = t.get('use_direction_routing', True)
-        kw['use_route_intensity'] = t.get('use_route_intensity', False)
     return kw
 
 
@@ -374,17 +359,6 @@ if DAWN_SRW_V4156 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
-if DAWN_SRW_V4157 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.5.7'] = ModelSpec(
-        name='spatial-r1-v4.1.5.7',
-        module_path='models.dawn_srw_v4157',
-        cls=DAWN_SRW_V4157,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
 
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
@@ -405,7 +379,7 @@ def build_model_from_config(cfg):
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
     if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                   'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
+                   'spatial-r1-v4.1.5.6', 'dawn_srw'):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -896,6 +870,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       router_scan_grad_clip=0.0,
                       route_emb_lr_mult=1.0,
                       route_emb_grad_clip=0.0,
+                      enable_control_update_caps=False,
+                      router_proj_update_ratio_cap=0.0,
+                      route_emb_update_ratio_cap=0.0,
+                      tau_update_abs_cap=0.0,
+                      scan_update_abs_cap=0.0,
                       is_baseline=False, is_spatial=False,
                       sharded_fns=None, mesh=None,
                       debug_diagnostics=False,
@@ -964,6 +943,11 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _router_scan_grad_clip = jnp.float32(router_scan_grad_clip)
     _route_emb_lr_mult = jnp.float32(route_emb_lr_mult)
     _route_emb_grad_clip = jnp.float32(route_emb_grad_clip)
+    _enable_control_update_caps = bool(enable_control_update_caps)
+    _router_proj_update_ratio_cap = jnp.float32(router_proj_update_ratio_cap)
+    _route_emb_update_ratio_cap = jnp.float32(route_emb_update_ratio_cap)
+    _tau_update_abs_cap = jnp.float32(tau_update_abs_cap)
+    _scan_update_abs_cap = jnp.float32(scan_update_abs_cap)
     _pass_analysis_kw = _model_accepts_analysis(model)
     _pass_local_kw = _model_accepts_local_diagnostics(model)
     _local_layers = int(getattr(model, 'n_layers', 1))
@@ -1272,6 +1256,51 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/v_emb' in ps)
                     or ('neuron_pool/know_emb' in ps))
 
+        def _is_router_proj_attn_path(ps):
+            return 'router/proj_attn' in ps
+
+        def _is_router_proj_rst_path(ps):
+            return 'router/proj_rst' in ps
+
+        def _is_route_emb_qk_path(ps):
+            return (('neuron_pool/attn_qk_emb' in ps)
+                    or ('neuron_pool/qk_emb' in ps))
+
+        def _is_route_emb_v_path(ps):
+            return (('neuron_pool/attn_v_emb' in ps)
+                    or ('neuron_pool/v_emb' in ps))
+
+        def _is_route_emb_rst_path(ps):
+            return (('neuron_pool/rst_emb' in ps)
+                    or ('neuron_pool/know_emb' in ps))
+
+        def _is_tau_attn_path(ps):
+            return 'router/tau_attn' in ps
+
+        def _is_tau_rst_path(ps):
+            return 'router/tau_rst' in ps
+
+        def _is_scan_attn_path(ps):
+            return (('router/raw_scan_offset_attn' in ps)
+                    or ('router/scan_attn' in ps))
+
+        def _is_scan_rst_path(ps):
+            return (('router/raw_scan_offset_rst' in ps)
+                    or ('router/scan_rst' in ps))
+
+        def _group_max_abs(tree, path_pred):
+            def _visit(path, leaf):
+                if path_pred(_path_to_str(path)):
+                    return jnp.max(jnp.abs(leaf.astype(jnp.float32)))
+                return jnp.float32(0.0)
+            leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
+            if not leaves:
+                return jnp.float32(0.0)
+            out = jnp.float32(0.0)
+            for leaf in leaves:
+                out = jnp.maximum(out, leaf)
+            return out
+
         def _clip_scale(group_norm, clip_value):
             return jnp.where(
                 clip_value > 0.0,
@@ -1326,6 +1355,123 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 or float(route_emb_lr_mult) != 1.0):
             updates = jax.tree.map_with_path(_scale_control_update, updates)
 
+        # ------------------------------------------------------------------
+        # Actual-update trust-region caps.
+        #
+        # These caps are applied *after* Adam and after the existing LR
+        # multipliers. They do not change the forward pass or the loss. They
+        # only prevent rare control-geometry jumps where the router projection,
+        # route embeddings, tau, or scan parameters move too far in one step.
+        # ------------------------------------------------------------------
+        def _ratio_cap_stats(params_tree, updates_tree, path_pred, cap):
+            p_sq = _group_sq(params_tree, path_pred)
+            u_sq = _group_sq(updates_tree, path_pred)
+            p_norm = jnp.sqrt(p_sq)
+            u_norm = jnp.sqrt(u_sq)
+            has_group = p_sq > 0.0
+            ratio_pre = jnp.where(
+                has_group,
+                u_norm / (p_norm + 1e-8),
+                jnp.float32(0.0))
+            active = cap > 0.0
+            scale = jnp.where(
+                active & has_group,
+                jnp.minimum(jnp.float32(1.0), cap / (ratio_pre + 1e-12)),
+                jnp.float32(1.0))
+            ratio_post = ratio_pre * scale
+            hit = jnp.where(active & has_group & (ratio_pre > cap),
+                            jnp.float32(1.0), jnp.float32(0.0))
+            return ratio_pre, ratio_post, scale, hit
+
+        def _abs_cap_stats(updates_tree, path_pred, cap):
+            abs_pre = _group_max_abs(updates_tree, path_pred)
+            active = cap > 0.0
+            scale = jnp.where(
+                active,
+                jnp.minimum(jnp.float32(1.0), cap / (abs_pre + 1e-12)),
+                jnp.float32(1.0))
+            abs_post = abs_pre * scale
+            hit = jnp.where(active & (abs_pre > cap), jnp.float32(1.0), jnp.float32(0.0))
+            return abs_pre, abs_post, scale, hit
+
+        if _enable_control_update_caps:
+            (upd_proj_attn_ratio_pre, upd_proj_attn_ratio_post,
+             upd_proj_attn_scale, upd_proj_attn_hit) = _ratio_cap_stats(
+                params, updates, _is_router_proj_attn_path,
+                _router_proj_update_ratio_cap)
+            (upd_proj_rst_ratio_pre, upd_proj_rst_ratio_post,
+             upd_proj_rst_scale, upd_proj_rst_hit) = _ratio_cap_stats(
+                params, updates, _is_router_proj_rst_path,
+                _router_proj_update_ratio_cap)
+            (upd_emb_qk_ratio_pre, upd_emb_qk_ratio_post,
+             upd_emb_qk_scale, upd_emb_qk_hit) = _ratio_cap_stats(
+                params, updates, _is_route_emb_qk_path,
+                _route_emb_update_ratio_cap)
+            (upd_emb_v_ratio_pre, upd_emb_v_ratio_post,
+             upd_emb_v_scale, upd_emb_v_hit) = _ratio_cap_stats(
+                params, updates, _is_route_emb_v_path,
+                _route_emb_update_ratio_cap)
+            (upd_emb_rst_ratio_pre, upd_emb_rst_ratio_post,
+             upd_emb_rst_scale, upd_emb_rst_hit) = _ratio_cap_stats(
+                params, updates, _is_route_emb_rst_path,
+                _route_emb_update_ratio_cap)
+            (upd_tau_attn_abs_pre, upd_tau_attn_abs_post,
+             upd_tau_attn_scale, upd_tau_attn_hit) = _abs_cap_stats(
+                updates, _is_tau_attn_path, _tau_update_abs_cap)
+            (upd_tau_rst_abs_pre, upd_tau_rst_abs_post,
+             upd_tau_rst_scale, upd_tau_rst_hit) = _abs_cap_stats(
+                updates, _is_tau_rst_path, _tau_update_abs_cap)
+            (upd_scan_attn_abs_pre, upd_scan_attn_abs_post,
+             upd_scan_attn_scale, upd_scan_attn_hit) = _abs_cap_stats(
+                updates, _is_scan_attn_path, _scan_update_abs_cap)
+            (upd_scan_rst_abs_pre, upd_scan_rst_abs_post,
+             upd_scan_rst_scale, upd_scan_rst_hit) = _abs_cap_stats(
+                updates, _is_scan_rst_path, _scan_update_abs_cap)
+
+            def _cap_control_update(path, u):
+                ps = _path_to_str(path)
+                scale = jnp.float32(1.0)
+                scale = jnp.where(_is_router_proj_attn_path(ps), upd_proj_attn_scale, scale)
+                scale = jnp.where(_is_router_proj_rst_path(ps), upd_proj_rst_scale, scale)
+                scale = jnp.where(_is_route_emb_qk_path(ps), upd_emb_qk_scale, scale)
+                scale = jnp.where(_is_route_emb_v_path(ps), upd_emb_v_scale, scale)
+                scale = jnp.where(_is_route_emb_rst_path(ps), upd_emb_rst_scale, scale)
+                scale = jnp.where(_is_tau_attn_path(ps), upd_tau_attn_scale, scale)
+                scale = jnp.where(_is_tau_rst_path(ps), upd_tau_rst_scale, scale)
+                scale = jnp.where(_is_scan_attn_path(ps), upd_scan_attn_scale, scale)
+                scale = jnp.where(_is_scan_rst_path(ps), upd_scan_rst_scale, scale)
+                return u * scale.astype(u.dtype)
+
+            updates = jax.tree.map_with_path(_cap_control_update, updates)
+        else:
+            upd_proj_attn_ratio_pre = upd_proj_attn_ratio_post = jnp.float32(0.0)
+            upd_proj_attn_scale = jnp.float32(1.0)
+            upd_proj_attn_hit = jnp.float32(0.0)
+            upd_proj_rst_ratio_pre = upd_proj_rst_ratio_post = jnp.float32(0.0)
+            upd_proj_rst_scale = jnp.float32(1.0)
+            upd_proj_rst_hit = jnp.float32(0.0)
+            upd_emb_qk_ratio_pre = upd_emb_qk_ratio_post = jnp.float32(0.0)
+            upd_emb_qk_scale = jnp.float32(1.0)
+            upd_emb_qk_hit = jnp.float32(0.0)
+            upd_emb_v_ratio_pre = upd_emb_v_ratio_post = jnp.float32(0.0)
+            upd_emb_v_scale = jnp.float32(1.0)
+            upd_emb_v_hit = jnp.float32(0.0)
+            upd_emb_rst_ratio_pre = upd_emb_rst_ratio_post = jnp.float32(0.0)
+            upd_emb_rst_scale = jnp.float32(1.0)
+            upd_emb_rst_hit = jnp.float32(0.0)
+            upd_tau_attn_abs_pre = upd_tau_attn_abs_post = jnp.float32(0.0)
+            upd_tau_attn_scale = jnp.float32(1.0)
+            upd_tau_attn_hit = jnp.float32(0.0)
+            upd_tau_rst_abs_pre = upd_tau_rst_abs_post = jnp.float32(0.0)
+            upd_tau_rst_scale = jnp.float32(1.0)
+            upd_tau_rst_hit = jnp.float32(0.0)
+            upd_scan_attn_abs_pre = upd_scan_attn_abs_post = jnp.float32(0.0)
+            upd_scan_attn_scale = jnp.float32(1.0)
+            upd_scan_attn_hit = jnp.float32(0.0)
+            upd_scan_rst_abs_pre = upd_scan_rst_abs_post = jnp.float32(0.0)
+            upd_scan_rst_scale = jnp.float32(1.0)
+            upd_scan_rst_hit = jnp.float32(0.0)
+
         new_params = optax.apply_updates(params, updates)
 
         def _tree_sq(tree):
@@ -1360,10 +1506,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         grad_router_tau_rst = _child_norm(_grouter, 'tau_rst')
         grad_router_scan_attn = _child_norm(_grouter, 'raw_scan_offset_attn')
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
-        grad_router_state_sharpness_attn = _child_norm(_grouter, 'state_sharpness_attn')
-        grad_router_state_sharpness_rst = _child_norm(_grouter, 'state_sharpness_rst')
-        grad_router_state_sharpness_range_attn = _child_norm(_grouter, 'state_sharpness_range_attn_raw')
-        grad_router_state_sharpness_range_rst = _child_norm(_grouter, 'state_sharpness_range_rst_raw')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
         grad_pool_attn_qk_read = _child_norm(_gpool, 'attn_qk_read')
         grad_pool_attn_qk_write = _child_norm(_gpool, 'attn_qk_write')
@@ -1447,11 +1589,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_tau_attn + grad_router_tau_rst)
         grad_router_scan = (
             grad_router_scan_attn + grad_router_scan_rst)
-        grad_router_state_sharpness = (
-            grad_router_state_sharpness_attn
-            + grad_router_state_sharpness_rst
-            + grad_router_state_sharpness_range_attn
-            + grad_router_state_sharpness_range_rst)
         grad_pool_emb = (
             grad_pool_attn_qk_emb + grad_pool_attn_v_emb
             + grad_pool_rst_emb)
@@ -1632,11 +1769,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_router_proj': grad_router_proj,
             'grad_router_tau': grad_router_tau,
             'grad_router_scan': grad_router_scan,
-            'grad_router_state_sharpness_attn': grad_router_state_sharpness_attn,
-            'grad_router_state_sharpness_rst': grad_router_state_sharpness_rst,
-            'grad_router_state_sharpness_range_attn': grad_router_state_sharpness_range_attn,
-            'grad_router_state_sharpness_range_rst': grad_router_state_sharpness_range_rst,
-            'grad_router_state_sharpness': grad_router_state_sharpness,
             'grad_pool_emb': grad_pool_emb,
             'grad_pool_read': grad_pool_read,
             'grad_pool_write': grad_pool_write,
@@ -1671,18 +1803,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_gate_eff_ratio': result.get('attn_gate_eff_ratio', jnp.float32(0.0)),
             'attn_top1_gate_frac': result.get('attn_top1_gate_frac', jnp.float32(0.0)),
             'attn_top1_gate_frac_max': result.get('attn_top1_gate_frac_max', jnp.float32(0.0)),
-            'attn_state_sharpness_mean': result.get('attn_state_sharpness_mean', jnp.float32(0.0)),
-            'attn_state_sharpness_std': result.get('attn_state_sharpness_std', jnp.float32(0.0)),
-            'attn_state_sharpness_min': result.get('attn_state_sharpness_min', jnp.float32(0.0)),
-            'attn_state_sharpness_max': result.get('attn_state_sharpness_max', jnp.float32(0.0)),
-            'attn_state_sharpness_range_q': result.get('attn_state_sharpness_range_q', jnp.float32(0.0)),
-            'attn_state_sharpness_range_k': result.get('attn_state_sharpness_range_k', jnp.float32(0.0)),
-            'attn_state_sharpness_range_v': result.get('attn_state_sharpness_range_v', jnp.float32(0.0)),
-            'rst_state_sharpness_mean': result.get('rst_state_sharpness_mean', jnp.float32(0.0)),
-            'rst_state_sharpness_std': result.get('rst_state_sharpness_std', jnp.float32(0.0)),
-            'rst_state_sharpness_min': result.get('rst_state_sharpness_min', jnp.float32(0.0)),
-            'rst_state_sharpness_max': result.get('rst_state_sharpness_max', jnp.float32(0.0)),
-            'rst_state_sharpness_range': result.get('rst_state_sharpness_range', jnp.float32(0.0)),
             'attn_out_norm': result.get('attn_out_norm', jnp.float32(0.0)),
             # tau structure.
             'attn_tau_mean': result.get('attn_tau_mean', jnp.float32(0.0)),
@@ -1803,6 +1923,44 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'drift_attn_qk_emb': drift_attn_qk_emb,
             'drift_attn_v_emb': drift_attn_v_emb,
             'drift_rst_emb': drift_rst_emb,
+            # Actual post-Adam control update caps. *_pre are measured after
+            # LR multipliers and before capping; *_post are after cap scaling.
+            'update_cap_proj_attn_ratio_pre': upd_proj_attn_ratio_pre,
+            'update_cap_proj_attn_ratio_post': upd_proj_attn_ratio_post,
+            'update_cap_proj_attn_scale': upd_proj_attn_scale,
+            'update_cap_proj_attn_hit': upd_proj_attn_hit,
+            'update_cap_proj_rst_ratio_pre': upd_proj_rst_ratio_pre,
+            'update_cap_proj_rst_ratio_post': upd_proj_rst_ratio_post,
+            'update_cap_proj_rst_scale': upd_proj_rst_scale,
+            'update_cap_proj_rst_hit': upd_proj_rst_hit,
+            'update_cap_emb_qk_ratio_pre': upd_emb_qk_ratio_pre,
+            'update_cap_emb_qk_ratio_post': upd_emb_qk_ratio_post,
+            'update_cap_emb_qk_scale': upd_emb_qk_scale,
+            'update_cap_emb_qk_hit': upd_emb_qk_hit,
+            'update_cap_emb_v_ratio_pre': upd_emb_v_ratio_pre,
+            'update_cap_emb_v_ratio_post': upd_emb_v_ratio_post,
+            'update_cap_emb_v_scale': upd_emb_v_scale,
+            'update_cap_emb_v_hit': upd_emb_v_hit,
+            'update_cap_emb_rst_ratio_pre': upd_emb_rst_ratio_pre,
+            'update_cap_emb_rst_ratio_post': upd_emb_rst_ratio_post,
+            'update_cap_emb_rst_scale': upd_emb_rst_scale,
+            'update_cap_emb_rst_hit': upd_emb_rst_hit,
+            'update_cap_tau_attn_abs_pre': upd_tau_attn_abs_pre,
+            'update_cap_tau_attn_abs_post': upd_tau_attn_abs_post,
+            'update_cap_tau_attn_scale': upd_tau_attn_scale,
+            'update_cap_tau_attn_hit': upd_tau_attn_hit,
+            'update_cap_tau_rst_abs_pre': upd_tau_rst_abs_pre,
+            'update_cap_tau_rst_abs_post': upd_tau_rst_abs_post,
+            'update_cap_tau_rst_scale': upd_tau_rst_scale,
+            'update_cap_tau_rst_hit': upd_tau_rst_hit,
+            'update_cap_scan_attn_abs_pre': upd_scan_attn_abs_pre,
+            'update_cap_scan_attn_abs_post': upd_scan_attn_abs_post,
+            'update_cap_scan_attn_scale': upd_scan_attn_scale,
+            'update_cap_scan_attn_hit': upd_scan_attn_hit,
+            'update_cap_scan_rst_abs_pre': upd_scan_rst_abs_pre,
+            'update_cap_scan_rst_abs_post': upd_scan_rst_abs_post,
+            'update_cap_scan_rst_scale': upd_scan_rst_scale,
+            'update_cap_scan_rst_hit': upd_scan_rst_hit,
         }
         if debug_local_spikes:
             metrics.update({
@@ -2730,7 +2888,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 
     is_v415 = ctx.get('model_version') in (
         'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw')
+        'spatial-r1-v4.1.5.6', 'dawn_srw')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -2839,14 +2997,45 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_router_proj': float(m.get('grad_router_proj', 0.0)),
         'grad_router_tau': float(m.get('grad_router_tau', 0.0)),
         'grad_router_scan': float(m.get('grad_router_scan', 0.0)),
-        'grad_router_state_sharpness_attn': float(m.get('grad_router_state_sharpness_attn', 0.0)),
-        'grad_router_state_sharpness_rst': float(m.get('grad_router_state_sharpness_rst', 0.0)),
-        'grad_router_state_sharpness_range_attn': float(m.get('grad_router_state_sharpness_range_attn', 0.0)),
-        'grad_router_state_sharpness_range_rst': float(m.get('grad_router_state_sharpness_range_rst', 0.0)),
-        'grad_router_state_sharpness': float(m.get('grad_router_state_sharpness', 0.0)),
         'grad_pool_emb': float(m.get('grad_pool_emb', 0.0)),
         'grad_pool_read': float(m.get('grad_pool_read', 0.0)),
         'grad_pool_write': float(m.get('grad_pool_write', 0.0)),
+        'update_cap_proj_attn_ratio_pre': float(m.get('update_cap_proj_attn_ratio_pre', 0.0)),
+        'update_cap_proj_attn_ratio_post': float(m.get('update_cap_proj_attn_ratio_post', 0.0)),
+        'update_cap_proj_attn_scale': float(m.get('update_cap_proj_attn_scale', 1.0)),
+        'update_cap_proj_attn_hit': float(m.get('update_cap_proj_attn_hit', 0.0)),
+        'update_cap_proj_rst_ratio_pre': float(m.get('update_cap_proj_rst_ratio_pre', 0.0)),
+        'update_cap_proj_rst_ratio_post': float(m.get('update_cap_proj_rst_ratio_post', 0.0)),
+        'update_cap_proj_rst_scale': float(m.get('update_cap_proj_rst_scale', 1.0)),
+        'update_cap_proj_rst_hit': float(m.get('update_cap_proj_rst_hit', 0.0)),
+        'update_cap_emb_qk_ratio_pre': float(m.get('update_cap_emb_qk_ratio_pre', 0.0)),
+        'update_cap_emb_qk_ratio_post': float(m.get('update_cap_emb_qk_ratio_post', 0.0)),
+        'update_cap_emb_qk_scale': float(m.get('update_cap_emb_qk_scale', 1.0)),
+        'update_cap_emb_qk_hit': float(m.get('update_cap_emb_qk_hit', 0.0)),
+        'update_cap_emb_v_ratio_pre': float(m.get('update_cap_emb_v_ratio_pre', 0.0)),
+        'update_cap_emb_v_ratio_post': float(m.get('update_cap_emb_v_ratio_post', 0.0)),
+        'update_cap_emb_v_scale': float(m.get('update_cap_emb_v_scale', 1.0)),
+        'update_cap_emb_v_hit': float(m.get('update_cap_emb_v_hit', 0.0)),
+        'update_cap_emb_rst_ratio_pre': float(m.get('update_cap_emb_rst_ratio_pre', 0.0)),
+        'update_cap_emb_rst_ratio_post': float(m.get('update_cap_emb_rst_ratio_post', 0.0)),
+        'update_cap_emb_rst_scale': float(m.get('update_cap_emb_rst_scale', 1.0)),
+        'update_cap_emb_rst_hit': float(m.get('update_cap_emb_rst_hit', 0.0)),
+        'update_cap_tau_attn_abs_pre': float(m.get('update_cap_tau_attn_abs_pre', 0.0)),
+        'update_cap_tau_attn_abs_post': float(m.get('update_cap_tau_attn_abs_post', 0.0)),
+        'update_cap_tau_attn_scale': float(m.get('update_cap_tau_attn_scale', 1.0)),
+        'update_cap_tau_attn_hit': float(m.get('update_cap_tau_attn_hit', 0.0)),
+        'update_cap_tau_rst_abs_pre': float(m.get('update_cap_tau_rst_abs_pre', 0.0)),
+        'update_cap_tau_rst_abs_post': float(m.get('update_cap_tau_rst_abs_post', 0.0)),
+        'update_cap_tau_rst_scale': float(m.get('update_cap_tau_rst_scale', 1.0)),
+        'update_cap_tau_rst_hit': float(m.get('update_cap_tau_rst_hit', 0.0)),
+        'update_cap_scan_attn_abs_pre': float(m.get('update_cap_scan_attn_abs_pre', 0.0)),
+        'update_cap_scan_attn_abs_post': float(m.get('update_cap_scan_attn_abs_post', 0.0)),
+        'update_cap_scan_attn_scale': float(m.get('update_cap_scan_attn_scale', 1.0)),
+        'update_cap_scan_attn_hit': float(m.get('update_cap_scan_attn_hit', 0.0)),
+        'update_cap_scan_rst_abs_pre': float(m.get('update_cap_scan_rst_abs_pre', 0.0)),
+        'update_cap_scan_rst_abs_post': float(m.get('update_cap_scan_rst_abs_post', 0.0)),
+        'update_cap_scan_rst_scale': float(m.get('update_cap_scan_rst_scale', 1.0)),
+        'update_cap_scan_rst_hit': float(m.get('update_cap_scan_rst_hit', 0.0)),
         'lr': ctx['current_lr'],
         'steps_per_sec': ctx['steps_per_sec'],
         'elapsed': ctx['total_elapsed'],
@@ -2886,18 +3075,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_gate_eff_ratio': float(m.get('rst_gate_eff_ratio', 0.0)),
         'rst_top1_gate_frac': float(m.get('rst_top1_gate_frac', 0.0)),
         'rst_top1_gate_frac_max': float(m.get('rst_top1_gate_frac_max', 0.0)),
-        'attn_state_sharpness_mean': float(m.get('attn_state_sharpness_mean', 0.0)),
-        'attn_state_sharpness_std': float(m.get('attn_state_sharpness_std', 0.0)),
-        'attn_state_sharpness_min': float(m.get('attn_state_sharpness_min', 0.0)),
-        'attn_state_sharpness_max': float(m.get('attn_state_sharpness_max', 0.0)),
-        'attn_state_sharpness_range_q': float(m.get('attn_state_sharpness_range_q', 0.0)),
-        'attn_state_sharpness_range_k': float(m.get('attn_state_sharpness_range_k', 0.0)),
-        'attn_state_sharpness_range_v': float(m.get('attn_state_sharpness_range_v', 0.0)),
-        'rst_state_sharpness_mean': float(m.get('rst_state_sharpness_mean', 0.0)),
-        'rst_state_sharpness_std': float(m.get('rst_state_sharpness_std', 0.0)),
-        'rst_state_sharpness_min': float(m.get('rst_state_sharpness_min', 0.0)),
-        'rst_state_sharpness_max': float(m.get('rst_state_sharpness_max', 0.0)),
-        'rst_state_sharpness_range': float(m.get('rst_state_sharpness_range', 0.0)),
         'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
         'rst_dead_count': float(m.get('rst_dead_count', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
@@ -3089,7 +3266,7 @@ def _print_regular_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'dawn_srw'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
@@ -3102,7 +3279,7 @@ def _print_regular_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'dawn_srw'):
         log_message(
             f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
             f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
@@ -3124,27 +3301,6 @@ def _print_regular_block(rec, ctx):
         f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
         f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.7':
-        log_message(
-            f"  state_sharpness: attn[m={rec['attn_state_sharpness_mean']:.2f}"
-            f" s={rec['attn_state_sharpness_std']:.2f}"
-            f" min={rec['attn_state_sharpness_min']:.2f}"
-            f" max={rec['attn_state_sharpness_max']:.2f}]"
-            f" rst[m={rec['rst_state_sharpness_mean']:.2f}"
-            f" s={rec['rst_state_sharpness_std']:.2f}"
-            f" min={rec['rst_state_sharpness_min']:.2f}"
-            f" max={rec['rst_state_sharpness_max']:.2f}]"
-            f" | range[q={rec['attn_state_sharpness_range_q']:.2f}"
-            f" k={rec['attn_state_sharpness_range_k']:.2f}"
-            f" v={rec['attn_state_sharpness_range_v']:.2f}"
-            f" rst={rec['rst_state_sharpness_range']:.2f}]"
-        )
-        log_message(
-            f"  grad_state_sharpness: attn={rec['grad_router_state_sharpness_attn']:.2e}"
-            f" rst={rec['grad_router_state_sharpness_rst']:.2e}"
-            f" range_a={rec['grad_router_state_sharpness_range_attn']:.2e}"
-            f" range_rst={rec['grad_router_state_sharpness_range_rst']:.2e}"
-        )
     log_message(
         f"  rw_n: attn_qk r[m={rec['attn_qk_read_norm_mean']:.2f} s={rec['attn_qk_read_norm_std']:.2f}"
         f" max={rec['attn_qk_read_norm_max']:.2f}]"
@@ -3782,6 +3938,37 @@ def _print_debug_block(rec, ctx):
         f"ln={_g('grad_layernorms'):.6f} "
         f"lm_head_or_token_tied={_g('grad_lm_head_or_token_tied'):.6f}"
     )
+    log_debug_message(
+        f"update_cap: proj[a pre={_g('update_cap_proj_attn_ratio_pre'):.2e} "
+        f"post={_g('update_cap_proj_attn_ratio_post'):.2e} "
+        f"s={_g('update_cap_proj_attn_scale', 1.0):.2e} "
+        f"hit={_g('update_cap_proj_attn_hit'):.0f}; "
+        f"rst pre={_g('update_cap_proj_rst_ratio_pre'):.2e} "
+        f"post={_g('update_cap_proj_rst_ratio_post'):.2e} "
+        f"s={_g('update_cap_proj_rst_scale', 1.0):.2e} "
+        f"hit={_g('update_cap_proj_rst_hit'):.0f}] "
+        f"emb[qk pre={_g('update_cap_emb_qk_ratio_pre'):.2e} "
+        f"post={_g('update_cap_emb_qk_ratio_post'):.2e} "
+        f"hit={_g('update_cap_emb_qk_hit'):.0f}; "
+        f"v pre={_g('update_cap_emb_v_ratio_pre'):.2e} "
+        f"post={_g('update_cap_emb_v_ratio_post'):.2e} "
+        f"hit={_g('update_cap_emb_v_hit'):.0f}; "
+        f"rst pre={_g('update_cap_emb_rst_ratio_pre'):.2e} "
+        f"post={_g('update_cap_emb_rst_ratio_post'):.2e} "
+        f"hit={_g('update_cap_emb_rst_hit'):.0f}] "
+        f"tau[a pre={_g('update_cap_tau_attn_abs_pre'):.2e} "
+        f"post={_g('update_cap_tau_attn_abs_post'):.2e} "
+        f"hit={_g('update_cap_tau_attn_hit'):.0f}; "
+        f"rst pre={_g('update_cap_tau_rst_abs_pre'):.2e} "
+        f"post={_g('update_cap_tau_rst_abs_post'):.2e} "
+        f"hit={_g('update_cap_tau_rst_hit'):.0f}] "
+        f"scan[a pre={_g('update_cap_scan_attn_abs_pre'):.2e} "
+        f"post={_g('update_cap_scan_attn_abs_post'):.2e} "
+        f"hit={_g('update_cap_scan_attn_hit'):.0f}; "
+        f"rst pre={_g('update_cap_scan_rst_abs_pre'):.2e} "
+        f"post={_g('update_cap_scan_rst_abs_post'):.2e} "
+        f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
+    )
     _print_grad_layer_block(rec)
     _print_drop_compare_block(rec)
     reasons = _collapse_reasons(rec)
@@ -3836,7 +4023,7 @@ def _build_analysis_record(base, metrics, ctx):
     m = metrics
     is_v415 = ctx.get('model_version') in (
         'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw')
+        'spatial-r1-v4.1.5.6', 'dawn_srw')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -4098,7 +4285,7 @@ def _print_analysis_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'dawn_srw'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" rst={rec['rst_gate_den_sum']:.1f}"
@@ -4311,6 +4498,11 @@ def main():
     router_scan_grad_clip = tcfg.get('router_scan_grad_clip', 0.0)
     route_emb_lr_mult = tcfg.get('route_emb_lr_mult', 1.0)
     route_emb_grad_clip = tcfg.get('route_emb_grad_clip', 0.0)
+    enable_control_update_caps = tcfg.get('enable_control_update_caps', False)
+    router_proj_update_ratio_cap = tcfg.get('router_proj_update_ratio_cap', 0.0)
+    route_emb_update_ratio_cap = tcfg.get('route_emb_update_ratio_cap', 0.0)
+    tau_update_abs_cap = tcfg.get('tau_update_abs_cap', 0.0)
+    scan_update_abs_cap = tcfg.get('scan_update_abs_cap', 0.0)
     restore_training_config_on_resume = tcfg.get(
         'restore_training_config_on_resume', True)
     # 2-tier logging cadence.
@@ -4549,6 +4741,16 @@ def main():
                 'route_emb_lr_mult', route_emb_lr_mult)
             route_emb_grad_clip = saved_training_config.get(
                 'route_emb_grad_clip', route_emb_grad_clip)
+            enable_control_update_caps = saved_training_config.get(
+                'enable_control_update_caps', enable_control_update_caps)
+            router_proj_update_ratio_cap = saved_training_config.get(
+                'router_proj_update_ratio_cap', router_proj_update_ratio_cap)
+            route_emb_update_ratio_cap = saved_training_config.get(
+                'route_emb_update_ratio_cap', route_emb_update_ratio_cap)
+            tau_update_abs_cap = saved_training_config.get(
+                'tau_update_abs_cap', tau_update_abs_cap)
+            scan_update_abs_cap = saved_training_config.get(
+                'scan_update_abs_cap', scan_update_abs_cap)
             log_interval = int(saved_training_config.get(
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
@@ -4591,6 +4793,11 @@ def main():
         'router_scan_grad_clip': router_scan_grad_clip,
         'route_emb_lr_mult': route_emb_lr_mult,
         'route_emb_grad_clip': route_emb_grad_clip,
+        'enable_control_update_caps': enable_control_update_caps,
+        'router_proj_update_ratio_cap': router_proj_update_ratio_cap,
+        'route_emb_update_ratio_cap': route_emb_update_ratio_cap,
+        'tau_update_abs_cap': tau_update_abs_cap,
+        'scan_update_abs_cap': scan_update_abs_cap,
         'restore_training_config_on_resume': restore_training_config_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
@@ -4866,10 +5073,18 @@ def main():
         print(f"  LR: {lr}")
         print("  Stabilizers: "
               f"tau_lr_mult={tau_lr_mult}, tau_grad_clip={tau_grad_clip}, "
+              f"router_proj_lr_mult={router_proj_lr_mult}, "
+              f"router_scan_lr_mult={router_scan_lr_mult}, "
+              f"route_emb_lr_mult={route_emb_lr_mult}, "
               f"expl_clip={exploration_weighted_clip}, "
               f"dead_clip={dead_penalty_weighted_clip}, "
               f"explore_dev_mode={exploration_dev_mode}, "
               f"resume_restore_training_config={restore_training_config_on_resume}")
+        print("  Control update caps: "
+              f"enabled={enable_control_update_caps}, "
+              f"proj_ratio={router_proj_update_ratio_cap}, "
+              f"emb_ratio={route_emb_update_ratio_cap}, "
+              f"tau_abs={tau_update_abs_cap}, scan_abs={scan_update_abs_cap}")
         print(f"  Weight decay: {weight_decay} (pool: {pool_weight_decay})")
         print(f"  Orth weight: {orth_weight}")
         print(f"  Div weight: {div_weight}")
@@ -4893,7 +5108,7 @@ def main():
         )
         if cfg['model'].get('model_version') in (
                 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw'):
+                'spatial-r1-v4.1.5.6', 'dawn_srw'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -4977,7 +5192,6 @@ def main():
         'spatial-r1-v4.1.5.2',
         'spatial-r1-v4.1.5.5',
         'spatial-r1-v4.1.5.6',
-        'spatial-r1-v4.1.5.7',
         'dawn_srw',
     )
 
@@ -5168,6 +5382,11 @@ def main():
         router_scan_grad_clip=router_scan_grad_clip,
         route_emb_lr_mult=route_emb_lr_mult,
         route_emb_grad_clip=route_emb_grad_clip,
+        enable_control_update_caps=enable_control_update_caps,
+        router_proj_update_ratio_cap=router_proj_update_ratio_cap,
+        route_emb_update_ratio_cap=route_emb_update_ratio_cap,
+        tau_update_abs_cap=tau_update_abs_cap,
+        scan_update_abs_cap=scan_update_abs_cap,
         is_baseline=is_baseline, is_spatial=is_spatial,
         sharded_fns=_sharded_fns, mesh=mesh,
         debug_diagnostics=debug_mode,
@@ -5293,7 +5512,7 @@ def main():
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = model_version in (
                 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.7', 'dawn_srw')
+                'spatial-r1-v4.1.5.6', 'dawn_srw')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
