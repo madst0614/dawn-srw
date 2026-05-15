@@ -42,6 +42,22 @@ def _dense(x, dense_params):
     return x @ dense_params["kernel"] + dense_params["bias"]
 
 
+def _pool_output_scales(mod, pool_params, model_cfg):
+    if hasattr(mod, "_effective_pool_output_scales"):
+        fixed = (
+            mod._model_cfg_uses_fixed_depth_pool_scale(model_cfg)
+            if hasattr(mod, "_model_cfg_uses_fixed_depth_pool_scale")
+            else bool(model_cfg.get("fixed_depth_pool_scale", False))
+        )
+        return mod._effective_pool_output_scales(
+            pool_params, model_cfg["d_model"], model_cfg["n_layers"], fixed)
+    return (
+        pool_params["attn_qk_scale"],
+        pool_params["attn_v_scale"],
+        pool_params["rst_scale"],
+    )
+
+
 def _attention_step(mod, params, model_cfg, x, layer_index: int):
     """Run only the Attention Layer of block layer_index."""
     pp = params["neuron_pool"]
@@ -57,10 +73,11 @@ def _attention_step(mod, params, model_cfg, x, layer_index: int):
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
     tau_all = _dense(normed, rp["tau_attn"])
     raw_scan_all = _dense(normed, rp["raw_scan_offset_attn"])
+    qk_scale, v_scale, _ = _pool_output_scales(mod, pp, model_cfg)
 
-    Q = mod._srw_inference(normed, h_Q, pp["attn_qk_emb"], tau_all[:, :, 0:1], raw_scan_all[:, :, 0:1], pp["attn_qk_read"], pp["attn_qk_write"]) * pp["attn_qk_scale"]
-    K = mod._srw_inference(normed, h_K, pp["attn_qk_emb"], tau_all[:, :, 1:2], raw_scan_all[:, :, 1:2], pp["attn_qk_read"], pp["attn_qk_write"]) * pp["attn_qk_scale"]
-    V = mod._srw_inference(normed, h_V, pp["attn_v_emb"], tau_all[:, :, 2:3], raw_scan_all[:, :, 2:3], pp["attn_v_read"], pp["attn_v_write"]) * pp["attn_v_scale"]
+    Q = mod._srw_inference(normed, h_Q, pp["attn_qk_emb"], tau_all[:, :, 0:1], raw_scan_all[:, :, 0:1], pp["attn_qk_read"], pp["attn_qk_write"]) * qk_scale
+    K = mod._srw_inference(normed, h_K, pp["attn_qk_emb"], tau_all[:, :, 1:2], raw_scan_all[:, :, 1:2], pp["attn_qk_read"], pp["attn_qk_write"]) * qk_scale
+    V = mod._srw_inference(normed, h_V, pp["attn_v_emb"], tau_all[:, :, 2:3], raw_scan_all[:, :, 2:3], pp["attn_v_read"], pp["attn_v_write"]) * v_scale
 
     Qr = Q.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
     Kr = K.reshape(B, S, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -76,7 +93,7 @@ def _attention_step(mod, params, model_cfg, x, layer_index: int):
     return x + attn_out, attn_out
 
 
-def _rst_step(mod, params, x_after_attn, layer_index: int):
+def _rst_step(mod, params, model_cfg, x_after_attn, layer_index: int):
     """Run the RST Layer of block layer_index."""
     pp = params["neuron_pool"]
     rp = params["router"]
@@ -85,7 +102,8 @@ def _rst_step(mod, params, x_after_attn, layer_index: int):
     h = _dense(normed, rp["proj_rst"])
     tau = _dense(normed, rp["tau_rst"])
     raw_scan = _dense(normed, rp["raw_scan_offset_rst"])
-    rst_out = mod._srw_inference(normed, h, pp["rst_emb"], tau, raw_scan, pp["rst_read"], pp["rst_write"]) * pp["rst_scale"]
+    _, _, rst_scale = _pool_output_scales(mod, pp, model_cfg)
+    rst_out = mod._srw_inference(normed, h, pp["rst_emb"], tau, raw_scan, pp["rst_read"], pp["rst_write"]) * rst_scale
     return x_after_attn + rst_out, rst_out, normed, h, tau, raw_scan
 
 
@@ -96,9 +114,9 @@ def forward_to_rst_input(mod, params, model_cfg, input_ids, layer_index: int):
     x = params["token_emb"]["embedding"][input_ids] + params["pos_emb"]["embedding"][positions]
     for i in range(layer_index):
         x_after_attn, _ = _attention_step(mod, params, model_cfg, x, i)
-        x, _, _, _, _, _ = _rst_step(mod, params, x_after_attn, i)
+        x, _, _, _, _, _ = _rst_step(mod, params, model_cfg, x_after_attn, i)
     x_after_attn, attn_out = _attention_step(mod, params, model_cfg, x, layer_index)
-    x_next, rst_out, normed, h, tau_offset, raw_scan_offset = _rst_step(mod, params, x_after_attn, layer_index)
+    x_next, rst_out, normed, h, tau_offset, raw_scan_offset = _rst_step(mod, params, model_cfg, x_after_attn, layer_index)
     return {
         "x_before_attention": x,
         "x_after_attention": x_after_attn,
@@ -112,7 +130,7 @@ def forward_to_rst_input(mod, params, model_cfg, input_ids, layer_index: int):
     }
 
 
-def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, sort_by: str = "projection"):
+def compute_rst_decision(mod, params, model_cfg, state, token_index: int, top_k: int = 20, sort_by: str = "projection"):
     """Extract an implementation-faithful RST model-decision trace.
 
     DAWN-SRW's RST output is a vector sum, not a scalar ranking:
@@ -142,7 +160,7 @@ def compute_rst_decision(mod, params, state, token_index: int, top_k: int = 20, 
     emb = pp["rst_emb"].astype(jnp.float32)
     read = pp["rst_read"].astype(jnp.float32)
     write = pp["rst_write"].astype(jnp.float32)
-    rst_scale = jnp.asarray(pp.get("rst_scale", jnp.asarray([1.0])), dtype=jnp.float32).reshape(() if jnp.asarray(pp.get("rst_scale", jnp.asarray([1.0]))).shape == () else (-1,))[0]
+    _, _, rst_scale = _pool_output_scales(mod, pp, model_cfg)
 
     # Select: route query -> signature matching -> relative tau -> gate.
     scores = h @ emb.T
@@ -295,7 +313,7 @@ def run_probe(config_path, checkpoint, prompt, target_token, layer, top_k, sort_
     cfg = load_config(config_path)
     model = build_model(cfg)
     params, meta = load_checkpoint_params(checkpoint, cfg, model=model)
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     model_cfg = model_cfg_from_config(cfg)
     tokenizer = load_tokenizer(tokenizer_name)
     ids = encode_prompt(tokenizer, prompt, model_cfg["max_seq_len"])
@@ -307,7 +325,7 @@ def run_probe(config_path, checkpoint, prompt, target_token, layer, top_k, sort_
     results = []
     for li in layers:
         state = forward_to_rst_input(mod, params, model_cfg, input_ids, li)
-        summary, top = compute_rst_decision(mod, params, state, token_index, top_k, sort_by)
+        summary, top = compute_rst_decision(mod, params, model_cfg, state, token_index, top_k, sort_by)
         item = {
             "prompt": prompt,
             "tokens": tokens,

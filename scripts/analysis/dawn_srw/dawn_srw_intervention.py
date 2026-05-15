@@ -84,7 +84,7 @@ def main():
     cfg = load_config(args.config)
     model = build_model(cfg)
     params, meta = load_checkpoint_params(args.checkpoint, cfg, model=model)
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     model_cfg = model_cfg_from_config(cfg)
     tokenizer = load_tokenizer(args.tokenizer)
 
@@ -93,7 +93,9 @@ def main():
     token_index = find_token_index(tokens, args.target_token, default="last")
 
     state = forward_to_rst_input(mod, params, model_cfg, jnp.asarray([ids], dtype=jnp.int32), args.layer)
-    summary, top = compute_rst_decision(mod, params, state, token_index, top_k=args.top_k, sort_by=args.sort_by)
+    summary, top = compute_rst_decision(
+        mod, params, model_cfg, state, token_index,
+        top_k=args.top_k, sort_by=args.sort_by)
     selected = [int(r["neuron_id"]) for r in top[:args.top_k]]
     n_rst = int(params["neuron_pool"]["rst_emb"].shape[0])
     mask = np.zeros(n_rst, dtype=bool)

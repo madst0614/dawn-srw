@@ -46,8 +46,19 @@ import numpy as np
 import yaml
 
 
-def import_dawn_srw():
+FIXED_DEPTH_POOL_SCALE_VERSIONS = {
+    "spatial-r1-v4.1.5.6-depthscale",
+    "spatial-r1-v4.1.5.9",
+}
+V4156_VERSIONS = {"spatial-r1-v4.1.5.6", *FIXED_DEPTH_POOL_SCALE_VERSIONS}
+
+
+def import_dawn_srw(model_version: str | None = None):
     import importlib
+    if model_version in V4156_VERSIONS:
+        return importlib.import_module("models.dawn_srw_v4156")
+    if model_version == "spatial-r1-v4.1.5.8":
+        return importlib.import_module("models.dawn_srw_v4158")
     return importlib.import_module("models.dawn_srw")
 
 
@@ -180,11 +191,11 @@ def select_checkpoint(checkpoint: str | os.PathLike[str]) -> str:
 
 
 def build_model(cfg: Dict[str, Any]):
-    mod = import_dawn_srw()
-    apply_gate_constants_from_config(cfg, mod, verbose=True)
     m = cfg["model"]
+    mod = import_dawn_srw(m.get("model_version"))
+    apply_gate_constants_from_config(cfg, mod, verbose=True)
     t = cfg.get("training", {})
-    return mod.DAWN(
+    kwargs = dict(
         vocab_size=m.get("vocab_size", 30522),
         d_model=m.get("d_model", 384),
         n_layers=m.get("n_layers", 12),
@@ -203,6 +214,18 @@ def build_model(cfg: Dict[str, Any]):
         n_chunks_qk=t.get("n_chunks_qk", 1),
         n_chunks_v=t.get("n_chunks_v", 1),
     )
+    fixed_depth = (
+        bool(m.get("fixed_depth_pool_scale", False))
+        or str(m.get("pool_scale_mode", "learned")).lower()
+        in ("fixed", "fixed_depth", "depthscale")
+        or m.get("model_version") in FIXED_DEPTH_POOL_SCALE_VERSIONS
+    )
+    if fixed_depth and "fixed_depth_pool_scale" in getattr(
+            mod.DAWN, "__dataclass_fields__", {}):
+        kwargs["fixed_depth_pool_scale"] = True
+    if "model_version_name" in getattr(mod.DAWN, "__dataclass_fields__", {}):
+        kwargs["model_version_name"] = m.get("model_version", "dawn_srw")
+    return mod.DAWN(**kwargs)
 
 
 def model_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -214,6 +237,9 @@ def model_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "n_layers": m.get("n_layers", 12),
         "n_heads": m.get("n_heads", 6),
         "max_seq_len": m.get("max_seq_len", 512),
+        "model_version": m.get("model_version", "dawn_srw"),
+        "fixed_depth_pool_scale": bool(m.get("fixed_depth_pool_scale", False)),
+        "pool_scale_mode": m.get("pool_scale_mode", "learned"),
         "d_route": m.get("d_route", m.get("d_bottleneck", 128)),
         "n_qk": m.get("n_qk", 1580),
         "n_v": m.get("n_v", 2600),
@@ -248,7 +274,7 @@ def load_checkpoint_params(checkpoint: str | os.PathLike[str], cfg: Dict[str, An
     Returns:
         params, meta
     """
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     apply_gate_constants_from_config(cfg, mod, verbose=False)
     if model is None:
         model = build_model(cfg)

@@ -76,6 +76,22 @@ except ImportError:
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
 # in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
 
+FIXED_DEPTH_POOL_SCALE_VERSIONS = (
+    'spatial-r1-v4.1.5.6-depthscale',
+    'spatial-r1-v4.1.5.9',
+)
+V4156_POOL_SCALE_CAPABLE_VERSIONS = (
+    'spatial-r1-v4.1.5.6',
+    *FIXED_DEPTH_POOL_SCALE_VERSIONS,
+)
+SRW_ACTIVE_MODEL_VERSIONS = (
+    'dawn_srw',
+    'spatial-r1-v4.1.5.5',
+    'spatial-r1-v4.1.5.6',
+    *FIXED_DEPTH_POOL_SCALE_VERSIONS,
+    'spatial-r1-v4.1.5.8',
+)
+
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
 # These names must match model local_spike_values slots. Top1-only fields
 # live in LOCAL_TOP1_FIELD_NAMES.
@@ -407,17 +423,30 @@ def _dawn_srw_kwargs(cfg):
     kw = _dawn_v4152_kwargs(cfg)
     m = cfg['model']
     t = cfg['training']
+    version = cfg['model'].get('model_version', 'dawn_srw')
     if 'n_rst' in m:
         kw['n_rst'] = m['n_rst']
         kw['n_know'] = m.get('n_know', None)
+    if version in V4156_POOL_SCALE_CAPABLE_VERSIONS:
+        kw['model_version_name'] = version
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
     # Optional train/eval-safe tau offset clipping. This adds no parameters,
     # so existing checkpoints remain load-compatible.
-    if (cfg['model'].get('model_version') in (
-            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6',
-            'spatial-r1-v4.1.5.8')
+    if (version in SRW_ACTIVE_MODEL_VERSIONS
             and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
         kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
+    pool_scale_mode = str(m.get('pool_scale_mode', 'fixed_depth')).lower()
+    learned_scale_requested = (
+        pool_scale_mode in ('learned', 'learnable', 'trainable', 'param', 'parameter')
+        or bool(m.get('learned_pool_scale', False))
+        or ('fixed_depth_pool_scale' in m and not bool(m['fixed_depth_pool_scale']))
+    )
+    fixed_depth_requested = (
+        version in V4156_POOL_SCALE_CAPABLE_VERSIONS
+        and not learned_scale_requested
+    )
+    if fixed_depth_requested:
+        kw['fixed_depth_pool_scale'] = True
     return kw
 
 
@@ -500,6 +529,16 @@ if DAWN_SRW_V4156 is not None:
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
     )
+    for _depthscale_version in FIXED_DEPTH_POOL_SCALE_VERSIONS:
+        MODEL_REGISTRY[_depthscale_version] = ModelSpec(
+            name=_depthscale_version,
+            module_path='models.dawn_srw_v4156',
+            cls=DAWN_SRW_V4156,
+            build_kwargs=_dawn_srw_kwargs,
+            supports_sharded=True,
+            force_sharded=True,
+            sharded_kwargs=_v415_sharded_kwargs,
+        )
 
 if DAWN_SRW_V4158 is not None:
     MODEL_REGISTRY['spatial-r1-v4.1.5.8'] = ModelSpec(
@@ -531,9 +570,7 @@ def build_model_from_config(cfg):
             f"ModelSpec entry to MODEL_REGISTRY. See models/legacy/README.md.")
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
-    if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                   'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8',
-                   'dawn_srw'):
+    if version in ('spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -955,16 +992,53 @@ def _op_gain_stats(read, write, prefix, full=False):
     return out
 
 
-def _pool_param_diagnostics(params, full=False):
+def _fixed_depth_pool_scale_enabled(model=None, model_cfg=None):
+    if model is not None:
+        return bool(getattr(model, 'fixed_depth_pool_scale', True))
+    if isinstance(model_cfg, dict):
+        mode = str(model_cfg.get('pool_scale_mode', 'fixed_depth')).lower()
+        if 'fixed_depth_pool_scale' in model_cfg:
+            return bool(model_cfg['fixed_depth_pool_scale'])
+        if mode in ('learned', 'learnable', 'trainable', 'param', 'parameter'):
+            return False
+        return (
+            mode in ('fixed', 'fixed_depth', 'depthscale')
+            or model_cfg.get('model_version') in FIXED_DEPTH_POOL_SCALE_VERSIONS
+            or True
+        )
+    return True
+
+
+def _fixed_depth_pool_scales_for(model=None, model_cfg=None):
+    if model is not None:
+        d_model = getattr(model, 'd_model')
+        n_layers = getattr(model, 'n_layers')
+    else:
+        d_model = model_cfg['d_model']
+        n_layers = model_cfg['n_layers']
+    dm = jnp.asarray(d_model, dtype=jnp.float32)
+    nl = jnp.asarray(n_layers, dtype=jnp.float32)
+    return (
+        jax.lax.stop_gradient(jnp.sqrt(dm / (jnp.float32(2.0) * nl))),
+        jax.lax.stop_gradient(jnp.sqrt(dm / nl)),
+        jax.lax.stop_gradient(jnp.sqrt(dm / nl)),
+    )
+
+
+def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     """Observational pool norm/gain diagnostics; never feeds loss."""
     pool = params.get('neuron_pool', {})
     out = {}
+    fixed_depth_pool_scale = _fixed_depth_pool_scale_enabled(model, model_cfg)
+    fixed_scales = (
+        _fixed_depth_pool_scales_for(model, model_cfg)
+        if fixed_depth_pool_scale else None)
     specs = (
         ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write', 'attn_qk_scale'),
         ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write', 'attn_v_scale'),
         ('rst', 'rst_emb', 'rst_read', 'rst_write', 'rst_scale'),
     )
-    for name, emb_key, read_key, write_key, scale_key in specs:
+    for i, (name, emb_key, read_key, write_key, scale_key) in enumerate(specs):
         if emb_key in pool:
             out.update(_row_norm_stats(pool[emb_key], f'{name}_emb_norm', full))
         if read_key in pool:
@@ -975,7 +1049,13 @@ def _pool_param_diagnostics(params, full=False):
             out.update(_op_gain_stats(pool[read_key], pool[write_key],
                                       f'{name}_op_gain', full))
         if scale_key in pool:
-            out[f'{name}_pool_scale'] = _scalar0(pool[scale_key])
+            if fixed_depth_pool_scale:
+                out[f'{name}_pool_scale'] = fixed_scales[i]
+                if full:
+                    out[f'{name}_learned_pool_scale_unused'] = _scalar0(
+                        pool[scale_key])
+            else:
+                out[f'{name}_pool_scale'] = _scalar0(pool[scale_key])
     return out
 
 
@@ -1771,7 +1851,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         else:
             pool_weight_decay_loss = jnp.float32(0.0)
             normal_weight_decay_loss = jnp.float32(0.0)
-        pool_diag = _pool_param_diagnostics(params, full=False)
+        pool_diag = _pool_param_diagnostics(params, full=False, model=model)
         pool_update_diag = _pool_update_diagnostics(params, grads)
 
         # Emb drift is computed inside jit so every host participates in the
@@ -2273,7 +2353,7 @@ def create_analysis_step(model, sharded_fns=None):
             **extra_kw,
         )
         result = dict(result)
-        result.update(_pool_param_diagnostics(params, full=True))
+        result.update(_pool_param_diagnostics(params, full=True, model=model))
         return result
 
     return analysis_step
@@ -3093,8 +3173,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             return []
 
     is_v415 = ctx.get('model_version') in (
-        'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw')
+        'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS)
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -3554,8 +3633,7 @@ def _print_regular_block(rec, ctx):
         f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
     )
     if ctx.get('model_version') in (
-            'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
+            'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
@@ -3604,8 +3682,7 @@ def _print_regular_block(rec, ctx):
         f" abs[attn={rec['attn_tau_abs_mean']:.3f} rst={rec['rst_tau_abs_mean']:.3f}]"
     )
     if ctx.get('model_version') in (
-            'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
+            'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         log_message(
             f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
             f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
@@ -4453,8 +4530,7 @@ def _build_analysis_record(base, metrics, ctx):
     """
     m = metrics
     is_v415 = ctx.get('model_version') in (
-        'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw')
+        'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS)
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -4761,8 +4837,7 @@ def _print_analysis_block(rec, ctx):
         f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
     )
     if ctx.get('model_version') in (
-            'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
+            'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" rst={rec['rst_gate_den_sum']:.1f}"
@@ -4792,7 +4867,7 @@ def _print_analysis_block(rec, ctx):
         f" logit_max={rec['debug_logit_max']:.1f}"
         f" o_in={rec['debug_o_input_norm']:.2f}"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.6':
+    if ctx.get('model_version') in V4156_POOL_SCALE_CAPABLE_VERSIONS:
         log_message("[ATTN_QK_DIAG]")
         log_message(
             f"  logit[mean={_g('attn_logit_mean'):.2f}"
@@ -5411,6 +5486,7 @@ def main():
     _FORWARD_UNIT_RW_VERSIONS = {
         'spatial-r1-v4.1.5.2',
         'spatial-r1-v4.1.5.6',
+        *FIXED_DEPTH_POOL_SCALE_VERSIONS,
     }
 
     _POOL_PARAM_NAMES = (
@@ -5510,7 +5586,7 @@ def main():
         _pool_paths = _collect_pool_paths(_pool_mask)
         if _pool_paths:
             print(f"    pool params: {_pool_paths[:9]}")
-        if _MODEL_VERSION == 'spatial-r1-v4.1.5.6':
+        if _MODEL_VERSION in V4156_POOL_SCALE_CAPABLE_VERSIONS:
             _base_paths = _collect_pool_paths(_base_mask)
             _emb_names = ('attn_qk_emb', 'attn_v_emb', 'rst_emb')
             _rw_names = (
@@ -5525,7 +5601,7 @@ def main():
             _pool_emb = _paths_with(_pool_paths, _emb_names)
             _rw_wd = _paths_with(_pool_paths + _base_paths, _rw_names)
             _scale_wd = _paths_with(_pool_paths + _base_paths, _scale_names)
-            print("  WD v4.1.5.6 check: "
+            print("  WD v4.1.5.6/depthscale check: "
                   f"pool_embeddings={_pool_emb}, "
                   f"read_write_excluded={not _rw_wd}, "
                   f"pool_scale_excluded={not _scale_wd}")
@@ -5587,8 +5663,7 @@ def main():
             f"max_int={tcfg.get('max_intensity', 10.0)}"
         )
         if cfg['model'].get('model_version') in (
-                'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
+                'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
@@ -5683,10 +5758,7 @@ def main():
     is_spatial = model_version in (
         'spatial-r1-v3.9.4',
         'spatial-r1-v4.1.5.2',
-        'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6',
-        'spatial-r1-v4.1.5.8',
-        'dawn_srw',
+        *SRW_ACTIVE_MODEL_VERSIONS,
     )
 
     mesh_model = cfg['training'].get('mesh_model', 1)
@@ -6005,8 +6077,7 @@ def main():
 
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = model_version in (
-                'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw')
+                'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS)
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",

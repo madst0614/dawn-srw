@@ -128,6 +128,18 @@ def make_batch_stats_fn(mod, params, model_cfg: Dict[str, Any], active_eps: floa
     qk_route = pool_params["attn_qk_emb"]
     v_route = pool_params["attn_v_emb"]
     rst_route = pool_params["rst_emb"]
+    if hasattr(mod, "_effective_pool_output_scales"):
+        fixed_depth = (
+            mod._model_cfg_uses_fixed_depth_pool_scale(model_cfg)
+            if hasattr(mod, "_model_cfg_uses_fixed_depth_pool_scale")
+            else bool(model_cfg.get("fixed_depth_pool_scale", False))
+        )
+        qk_scale_eff, v_scale_eff, rst_scale_eff = mod._effective_pool_output_scales(
+            pool_params, d_model, n_layers, fixed_depth)
+    else:
+        qk_scale_eff = pool_params["attn_qk_scale"]
+        v_scale_eff = pool_params["attn_v_scale"]
+        rst_scale_eff = pool_params["rst_scale"]
     block_params = [params[f"block_{i}"] for i in range(n_layers)]
     stacked = jax.tree.map(lambda *arrays: jnp.stack(arrays), *block_params)
 
@@ -189,9 +201,9 @@ def make_batch_stats_fn(mod, params, model_cfg: Dict[str, Any], active_eps: floa
                 pool_params["attn_v_read"],
                 pool_params["attn_v_write"],
             )
-            Q = Q * pool_params["attn_qk_scale"]
-            K = K * pool_params["attn_qk_scale"]
-            V = V * pool_params["attn_v_scale"]
+            Q = Q * qk_scale_eff
+            K = K * qk_scale_eff
+            V = V * v_scale_eff
 
             d_head = d_model // n_heads
             Qr = Q.reshape(bsz, seq_len, n_heads, d_head).transpose(0, 2, 1, 3)
@@ -223,7 +235,7 @@ def make_batch_stats_fn(mod, params, model_cfg: Dict[str, Any], active_eps: floa
                 pool_params["rst_read"],
                 pool_params["rst_write"],
             )
-            rst_out = rst_out * pool_params["rst_scale"]
+            rst_out = rst_out * rst_scale_eff
             rst_out_norm_sum = jnp.linalg.norm(rst_out, axis=-1).sum()
             x = x + rst_out
 
@@ -366,7 +378,7 @@ def main() -> None:
     cfg = load_config(args.config)
     model = build_model(cfg)
     params, meta = load_checkpoint_params(args.checkpoint, cfg, model=model)
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     model_cfg = model_cfg_from_config(cfg)
     seq_len = min(int(args.seq_len), int(model_cfg["max_seq_len"]))
     sequences = load_sequences(args.val_data, seq_len, args.max_val_tokens, args.batch_size, args.max_batches)

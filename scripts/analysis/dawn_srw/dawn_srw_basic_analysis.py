@@ -73,7 +73,7 @@ def summarize_model(params, cfg, meta, output_dir):
 
 def analyze_validation(params, cfg, val_data, output_dir, max_tokens, batch_size, max_batches):
     print("\nA2. Validation loss / perplexity / accuracy")
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     model_cfg = model_cfg_from_config(cfg)
     max_seq = model_cfg["max_seq_len"]
     tokens = load_val_tokens(val_data, max_tokens=max_tokens)
@@ -150,7 +150,7 @@ def sample_from_logits(logits, rng, temperature=0.8, top_k=50):
 
 def generate_samples(params, cfg, prompts, output_dir, max_new_tokens, temperature, top_k, tokenizer_name):
     print("\nA5. Generation samples")
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     tok = load_tokenizer(tokenizer_name)
     model_cfg = model_cfg_from_config(cfg)
     max_seq = model_cfg["max_seq_len"]

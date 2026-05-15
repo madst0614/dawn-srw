@@ -87,7 +87,7 @@ def main():
     cfg = load_config(args.config)
     model = build_model(cfg)
     params, meta = load_checkpoint_params(args.checkpoint, cfg, model=model)
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     model_cfg = model_cfg_from_config(cfg)
     tokenizer = load_tokenizer(args.tokenizer)
 

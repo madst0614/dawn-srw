@@ -175,7 +175,17 @@ def _write_matplotlib_figure(plt, output_dir: str, filename: str, dpi: int = 180
     return dest
 
 
-def _rst_scale_scalar(pool_params) -> jnp.ndarray:
+def _rst_scale_scalar(pool_params, mod=None, model_cfg=None) -> jnp.ndarray:
+    if mod is not None and model_cfg is not None and hasattr(
+            mod, "_effective_pool_output_scales"):
+        fixed = (
+            mod._model_cfg_uses_fixed_depth_pool_scale(model_cfg)
+            if hasattr(mod, "_model_cfg_uses_fixed_depth_pool_scale")
+            else bool(model_cfg.get("fixed_depth_pool_scale", False))
+        )
+        _, _, rst_scale = mod._effective_pool_output_scales(
+            pool_params, model_cfg["d_model"], model_cfg["n_layers"], fixed)
+        return jnp.asarray(rst_scale, dtype=jnp.float32).reshape(-1)[0]
     val = pool_params.get("rst_scale", jnp.asarray([1.0]))
     arr = jnp.asarray(val, dtype=jnp.float32)
     return arr.reshape(-1)[0]
@@ -262,6 +272,7 @@ def _sample_without_replacement(
 def compute_rst_contribution_vectors(
     mod,
     params,
+    model_cfg: Dict[str, Any],
     state: Dict[str, jnp.ndarray],
     token_index: int,
     *,
@@ -284,7 +295,7 @@ def compute_rst_contribution_vectors(
     emb = pp["rst_emb"].astype(jnp.float32)
     read = pp["rst_read"].astype(jnp.float32)
     write = pp["rst_write"].astype(jnp.float32)
-    rst_scale = _rst_scale_scalar(pp)
+    rst_scale = _rst_scale_scalar(pp, mod, model_cfg)
 
     scores = h @ emb.T
     s_mean = scores.mean()
@@ -538,6 +549,7 @@ def run_case(
         decision = compute_rst_contribution_vectors(
             mod,
             params,
+            model_cfg,
             state,
             token_index,
             active_threshold=active_threshold,
@@ -766,7 +778,7 @@ def main():
     cfg = load_config(args.config)
     model = build_model(cfg)
     params, meta = load_checkpoint_params(args.checkpoint, cfg, model=model)
-    mod = import_dawn_srw()
+    mod = import_dawn_srw(cfg.get("model", {}).get("model_version"))
     model_cfg = model_cfg_from_config(cfg)
     tokenizer = load_tokenizer(args.tokenizer)
 

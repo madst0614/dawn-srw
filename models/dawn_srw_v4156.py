@@ -113,6 +113,64 @@ from functools import partial
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
+_FIXED_DEPTH_POOL_SCALE_VERSION_ALIASES = (
+    'spatial-r1-v4.1.5.6-depthscale',
+    'spatial-r1-v4.1.5.9',
+)
+
+
+def _pool_scale_mode_is_fixed(mode) -> bool:
+    return str(mode).lower() in ('fixed', 'fixed_depth', 'depthscale')
+
+
+def _pool_scale_mode_is_learned(mode) -> bool:
+    return str(mode).lower() in (
+        'learned', 'learnable', 'trainable', 'param', 'parameter')
+
+
+def _model_cfg_uses_fixed_depth_pool_scale(model_cfg) -> bool:
+    # Default policy: fixed depth-scaled pool scales.
+    # To opt back into learned sqrt(d_model)-initialized pool scales, set:
+    #   model.pool_scale_mode: learned
+    # or explicitly set:
+    #   model.fixed_depth_pool_scale: false
+    if not isinstance(model_cfg, dict):
+        return True
+    if 'fixed_depth_pool_scale' in model_cfg:
+        return bool(model_cfg['fixed_depth_pool_scale'])
+    mode = model_cfg.get('pool_scale_mode', 'fixed_depth')
+    if _pool_scale_mode_is_learned(mode):
+        return False
+    return (
+        _pool_scale_mode_is_fixed(mode)
+        or model_cfg.get('model_version') in _FIXED_DEPTH_POOL_SCALE_VERSION_ALIASES
+        or True
+    )
+
+
+def _fixed_depth_pool_output_scales(d_model, n_layers):
+    dm = jnp.asarray(d_model, dtype=jnp.float32)
+    nl = jnp.asarray(n_layers, dtype=jnp.float32)
+    qk_scale = jnp.sqrt(dm / (jnp.float32(2.0) * nl))
+    v_scale = jnp.sqrt(dm / nl)
+    rst_scale = jnp.sqrt(dm / nl)
+    return (
+        jax.lax.stop_gradient(qk_scale),
+        jax.lax.stop_gradient(v_scale),
+        jax.lax.stop_gradient(rst_scale),
+    )
+
+
+def _effective_pool_output_scales(pool_params, d_model, n_layers,
+                                  fixed_depth_pool_scale=False):
+    if fixed_depth_pool_scale:
+        return _fixed_depth_pool_output_scales(d_model, n_layers)
+    return (
+        pool_params['attn_qk_scale'],
+        pool_params['attn_v_scale'],
+        pool_params['rst_scale'],
+    )
+
 
 # ================================================================
 # V4.1 physical constants (defaults; overridable via config).
@@ -1909,10 +1967,11 @@ class Router(nn.Module):
 
 def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
-                  n_heads, d_model,
+                  n_heads, d_model, n_layers,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False, return_prune_stats=False,
-                  local_diagnostics=False, tau_offset_clip=None):
+                  local_diagnostics=False, tau_offset_clip=None,
+                  fixed_depth_pool_scale=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -1962,8 +2021,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         attn_tau_kernel_norm = jnp.sqrt(
             jnp.sum(jax.lax.stop_gradient(router_params['tau_attn']['kernel']) ** 2) + 1e-12)
 
-    qk_scale = pool_params['attn_qk_scale']
-    v_scale = pool_params['attn_v_scale']
+    qk_scale, v_scale, _ = _effective_pool_output_scales(
+        pool_params, d_model, n_layers, fixed_depth_pool_scale)
 
     if isinstance(sharded_fns, dict):
         fused_paired = sharded_fns.get('attn_qk_paired', sharded_fns.get('qk_paired', sharded_fns['paired']))
@@ -2262,7 +2321,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
                   sharded_fns, analysis=False, return_prune_stats=False,
-                  local_diagnostics=False, tau_offset_clip=None):
+                  local_diagnostics=False, tau_offset_clip=None,
+                  d_model=None, n_layers=None,
+                  fixed_depth_pool_scale=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -2289,7 +2350,13 @@ def _rst_forward(x, pool_params, router_params, rng,
         rst_tau_kernel_norm = jnp.sqrt(
             jnp.sum(jax.lax.stop_gradient(router_params['tau_rst']['kernel']) ** 2) + 1e-12)
 
-    rst_scale = pool_params['rst_scale']
+    if fixed_depth_pool_scale:
+        if d_model is None or n_layers is None:
+            raise ValueError(
+                "fixed_depth_pool_scale requires d_model and n_layers.")
+        _, _, rst_scale = _fixed_depth_pool_output_scales(d_model, n_layers)
+    else:
+        rst_scale = pool_params['rst_scale']
 
     if isinstance(sharded_fns, dict):
         fused_single = sharded_fns.get('rst_single', sharded_fns['single'])
@@ -2432,6 +2499,7 @@ class DAWNBlock(nn.Module):
 class DAWN(nn.Module):
     """DAWN-SRW v4.1.5.6 with Attention Layers and RST Layers."""
     __version__ = "spatial-r1-v4.1.5.6"
+    model_version_name: str = "spatial-r1-v4.1.5.6"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -2455,6 +2523,9 @@ class DAWN(nn.Module):
     # forward-time clamp, not a new parameter, so old checkpoints remain
     # compatible. Set to None/0 to preserve exact v4.1.5.6 behavior.
     tau_offset_clip: Optional[float] = None
+    # Checkpoint-compatible ablation: keep scale params in NeuronPool, but
+    # ignore them in forward/inference and use depth-scaled constants.
+    fixed_depth_pool_scale: bool = True
 
     def setup(self):
         if self.d_model % self.n_heads != 0:
@@ -2606,12 +2677,13 @@ class DAWN(nn.Module):
                     normed, pool_params, router_params,
                     bp['attn']['expand_O']['kernel'], rng_attn,
                     self.n_qk, self.n_v,
-                    self.n_heads, self.d_model,
+                    self.n_heads, self.d_model, self.n_layers,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
                     return_prune_stats=return_prune_stats,
                     local_diagnostics=local_diagnostics,
-                    tau_offset_clip=self.tau_offset_clip)
+                    tau_offset_clip=self.tau_offset_clip,
+                    fixed_depth_pool_scale=self.fixed_depth_pool_scale)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -2666,7 +2738,9 @@ class DAWN(nn.Module):
                     sharded_fns=_sharded, analysis=analysis,
                     return_prune_stats=return_prune_stats,
                     local_diagnostics=local_diagnostics,
-                    tau_offset_clip=self.tau_offset_clip)
+                    tau_offset_clip=self.tau_offset_clip,
+                    d_model=self.d_model, n_layers=self.n_layers,
+                    fixed_depth_pool_scale=self.fixed_depth_pool_scale)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_z_act, k_tau_abs,
@@ -3113,24 +3187,31 @@ class DAWN(nn.Module):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
         return {
-            'model_version': self.__version__,
+            'model_version': self.model_version_name,
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
             'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
+            'fixed_depth_pool_scale': self.fixed_depth_pool_scale,
         }
 
     def get_model_info(self):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
+        qk_scale, v_scale, rst_scale = _fixed_depth_pool_output_scales(
+            self.d_model, self.n_layers)
         return [
-            f"DAWN-SRW ({self.__version__})",
+            f"DAWN-SRW ({self.model_version_name})",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",
             f"  Route: learned d_route embedding [{self.d_route}]",
+            "  Pool scales: fixed depth-scaled "
+            f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
+            f"rst={float(rst_scale):.6g})" if self.fixed_depth_pool_scale
+            else "  Pool scales: learned sqrt(d_model)-initialized params",
         ]
 
 
@@ -3211,8 +3292,9 @@ def _srw_inference_with_gates(x, h, emb, tau_offset, raw_scan_offset, w_read, w_
 
 
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
-                         n_heads, d_model,
-                         cache_K, cache_V, cache_len):
+                         n_heads, d_model, n_layers,
+                         cache_K, cache_V, cache_len,
+                         fixed_depth_pool_scale=False):
     """Cached attention decode step. x: [B, 1, D]."""
     B = x.shape[0]
     d_head = d_model // n_heads
@@ -3231,8 +3313,8 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                            pool_params['attn_qk_read'], pool_params['attn_qk_write'])
     V_new = _srw_inference(x, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                            pool_params['attn_v_read'], pool_params['attn_v_write'])
-    _qk_s = pool_params['attn_qk_scale']
-    _v_s = pool_params['attn_v_scale']
+    _qk_s, _v_s, _ = _effective_pool_output_scales(
+        pool_params, d_model, n_layers, fixed_depth_pool_scale)
     Q = Q * _qk_s
     K_new = K_new * _qk_s
     V_new = V_new * _v_s
@@ -3257,7 +3339,9 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
     return out, cache_K, cache_V
 
 
-def _rst_forward_inference(x, pool_params, router_params):
+def _rst_forward_inference(x, pool_params, router_params,
+                           d_model=None, n_layers=None,
+                           fixed_depth_pool_scale=False):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
     # emb used as-is (matches training path).
     rst_norm = _forward_unit_direction(pool_params['rst_emb'].astype(jnp.float32))
@@ -3266,7 +3350,14 @@ def _rst_forward_inference(x, pool_params, router_params):
     raw_scan_offset = x @ router_params['raw_scan_offset_rst']['kernel'] + router_params['raw_scan_offset_rst']['bias']
     out = _srw_inference(x, h, rst_norm, tau, raw_scan_offset,
                          pool_params['rst_read'], pool_params['rst_write'])
-    return out * pool_params['rst_scale']
+    if fixed_depth_pool_scale:
+        if d_model is None or n_layers is None:
+            raise ValueError(
+                "fixed_depth_pool_scale requires d_model and n_layers.")
+        _, _, rst_scale = _fixed_depth_pool_output_scales(d_model, n_layers)
+    else:
+        rst_scale = pool_params['rst_scale']
+    return out * rst_scale
 
 
 
@@ -3281,11 +3372,14 @@ def prefill(params, model_cfg, input_ids):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
+    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
     max_seq = model_cfg['max_seq_len']
     d_head = d_model // n_heads
 
     pool_params = params['neuron_pool']
     router_params = params['router']
+    qk_scale_eff, v_scale_eff, _ = _effective_pool_output_scales(
+        pool_params, d_model, n_layers, fixed_depth_pool_scale)
 
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
@@ -3317,8 +3411,8 @@ def prefill(params, model_cfg, input_ids):
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'])
         V_val = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                pool_params['attn_v_read'], pool_params['attn_v_write'])
-        _qk_s = pool_params['attn_qk_scale']
-        _v_s = pool_params['attn_v_scale']
+        _qk_s = qk_scale_eff
+        _v_s = v_scale_eff
         Q = Q * _qk_s
         K_val = K_val * _qk_s
         V_val = V_val * _v_s
@@ -3341,7 +3435,10 @@ def prefill(params, model_cfg, input_ids):
         x = x + attn_out
 
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-        rst_out = _rst_forward_inference(normed, pool_params, router_params)
+        rst_out = _rst_forward_inference(
+            normed, pool_params, router_params,
+            d_model=d_model, n_layers=n_layers,
+            fixed_depth_pool_scale=fixed_depth_pool_scale)
         x = x + rst_out
         return (x, cK, cV), None
 
@@ -3362,6 +3459,7 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
+    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
@@ -3381,13 +3479,18 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
         attn_out, new_cK, new_cV = _attn_forward_cached(
             normed, pool_params, router_params,
             bp['attn']['expand_O']['kernel'],
-            n_heads, d_model, cK[layer_idx], cV[layer_idx], pos)
+            n_heads, d_model, n_layers,
+            cK[layer_idx], cV[layer_idx], pos,
+            fixed_depth_pool_scale=fixed_depth_pool_scale)
         cK = cK.at[layer_idx].set(new_cK)
         cV = cV.at[layer_idx].set(new_cV)
         x = x + attn_out
 
         normed = _layer_norm(x, bp['norm2']['scale'], bp['norm2']['bias'])
-        rst_out = _rst_forward_inference(normed, pool_params, router_params)
+        rst_out = _rst_forward_inference(
+            normed, pool_params, router_params,
+            d_model=d_model, n_layers=n_layers,
+            fixed_depth_pool_scale=fixed_depth_pool_scale)
         x = x + rst_out
         return (x, cK, cV, pos), None
 
@@ -3420,9 +3523,12 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
     max_seq = model_cfg['max_seq_len']
+    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
+    qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
+        pool_params, d_model, n_layers, fixed_depth_pool_scale)
     norm_params = params['norm']
     emb_matrix = jnp.asarray(params['token_emb']['embedding'])
     pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
@@ -3453,8 +3559,8 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
                                pool_params['attn_qk_read'], pool_params['attn_qk_write'])
             V = _srw_inference(normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
                                pool_params['attn_v_read'], pool_params['attn_v_write'])
-            _qk_s = pool_params['attn_qk_scale']
-            _v_s = pool_params['attn_v_scale']
+            _qk_s = qk_scale_eff
+            _v_s = v_scale_eff
             Q = Q * _qk_s
             K = K * _qk_s
             V = V * _v_s
@@ -3480,7 +3586,7 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
             raw_scan_offset_k = normed @ router_params['raw_scan_offset_rst']['kernel'] + router_params['raw_scan_offset_rst']['bias']
             rst_out = _srw_inference(normed, h_k, rst_norm, tau_k, raw_scan_offset_k,
                                      pool_params['rst_read'], pool_params['rst_write'])
-            x = x + rst_out * pool_params['rst_scale']
+            x = x + rst_out * rst_scale_eff
             return x, None
 
         x, _ = jax.lax.scan(layer_fn, x, stacked)
@@ -3607,9 +3713,12 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
+    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
+    qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
+        pool_params, d_model, n_layers, fixed_depth_pool_scale)
 
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
@@ -3643,8 +3752,8 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         V, gate_V_raw, gate_V = _srw_inference_with_gates(
             normed, h_V, v_norm, tau_all[:, :, 2:3], raw_scan_offset_all[:, :, 2:3],
             pool_params['attn_v_read'], pool_params['attn_v_write'])
-        _qk_s = pool_params['attn_qk_scale']
-        _v_s = pool_params['attn_v_scale']
+        _qk_s = qk_scale_eff
+        _v_s = v_scale_eff
         Q = Q * _qk_s
         K = K * _qk_s
         V = V * _v_s
@@ -3671,7 +3780,7 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
         rst_out, gate_RST_raw, gate_RST = _srw_inference_with_gates(
             normed, h_k, rst_norm_w, tau_k, raw_scan_offset_k,
             pool_params['rst_read'], pool_params['rst_write'])
-        rst_out = rst_out * pool_params['rst_scale']
+        rst_out = rst_out * rst_scale_eff
         rst_out_norm = jnp.linalg.norm(rst_out, axis=-1).mean()
         x = x + rst_out
 
@@ -3750,8 +3859,11 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         n_layers = model_cfg['n_layers']
         n_heads = model_cfg['n_heads']
         d_head = d_model // n_heads
+        fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
         pp = params['neuron_pool']
         rp = params['router']
+        qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
+            pp, d_model, n_layers, fixed_depth_pool_scale)
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
@@ -3771,8 +3883,8 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             Q = _srw_sup(normed, h_Q, qk_n, tau_all[:,:,0:1], raw_scan_offset_all[:,:,0:1], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
             K = _srw_sup(normed, h_K, qk_n, tau_all[:,:,1:2], raw_scan_offset_all[:,:,1:2], pp['attn_qk_read'], pp['attn_qk_write'], qk_mult)
             V = _srw_sup(normed, h_V, v_n, tau_all[:,:,2:3], raw_scan_offset_all[:,:,2:3], pp['attn_v_read'], pp['attn_v_write'], v_mult)
-            _qk_s = pp['attn_qk_scale']
-            _v_s = pp['attn_v_scale']
+            _qk_s = qk_scale_eff
+            _v_s = v_scale_eff
             Q = Q * _qk_s
             K = K * _qk_s
             V = V * _v_s
@@ -3793,7 +3905,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
             h_k = normed @ rp['proj_rst']['kernel'] + rp['proj_rst']['bias']
             tau_k = normed @ rp['tau_rst']['kernel'] + rp['tau_rst']['bias']
             raw_scan_offset_k = normed @ rp['raw_scan_offset_rst']['kernel'] + rp['raw_scan_offset_rst']['bias']
-            x = x + _srw_sup(normed, h_k, kn_n, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * pp['rst_scale']
+            x = x + _srw_sup(normed, h_k, kn_n, tau_k, raw_scan_offset_k, pp['rst_read'], pp['rst_write'], rst_mult) * rst_scale_eff
 
         norm_p = params['norm']
         x = _layer_norm(x, norm_p['scale'], norm_p['bias'])
