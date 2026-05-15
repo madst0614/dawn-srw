@@ -3,6 +3,15 @@
 This document preserves model history that should not live inside active model
 source files. Active source files describe current behavior only.
 
+## spatial-r1-v4.1.5.8
+
+- Replace gate-sum SRW denominator with RW contribution denominator.
+- Denominator: `sum gate_i * abs(read_i(x)) * ||write_i||`.
+- Keep raw read/write vectors and full denominator gradients.
+- RWCompose now represents bounded transition direction/coherence; learnable
+  pool scales control step size.
+- Add lightweight `contrib_den` / compose-coherence diagnostics.
+
 ## dawn_srw
 
 - Active implementation: `models/dawn_srw.py`

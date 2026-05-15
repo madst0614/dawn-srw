@@ -64,6 +64,10 @@ try:
     from models.dawn_srw_v4156 import DAWN as DAWN_SRW_V4156
 except ImportError:
     DAWN_SRW_V4156 = None
+try:
+    from models.dawn_srw_v4158 import DAWN as DAWN_SRW_V4158
+except ImportError:
+    DAWN_SRW_V4158 = None
 
 # ============================================================
 # Constants
@@ -275,7 +279,8 @@ def _dawn_srw_kwargs(cfg):
     # Optional train/eval-safe tau offset clipping. This adds no parameters,
     # so existing checkpoints remain load-compatible.
     if (cfg['model'].get('model_version') in (
-            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6')
+            'dawn_srw', 'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6',
+            'spatial-r1-v4.1.5.8')
             and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
         kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
     return kw
@@ -301,6 +306,8 @@ def _v415_sharded_kwargs(cfg):
     )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
+    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
+        kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
     return kw
 
 
@@ -359,6 +366,17 @@ if DAWN_SRW_V4156 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
+if DAWN_SRW_V4158 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.5.8'] = ModelSpec(
+        name='spatial-r1-v4.1.5.8',
+        module_path='models.dawn_srw_v4158',
+        cls=DAWN_SRW_V4158,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
 
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
@@ -379,7 +397,8 @@ def build_model_from_config(cfg):
     spec = MODEL_REGISTRY[version]
     kwargs = spec.build_kwargs(cfg)
     if version in ('spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                   'spatial-r1-v4.1.5.6', 'dawn_srw'):
+                   'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8',
+                   'dawn_srw'):
         print(f"route dims: d_route={kwargs['d_route']}")
     return spec.cls(**kwargs)
 
@@ -1913,6 +1932,22 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_intensity_sum_mean': result.get('rst_intensity_sum_mean', jnp.float32(0.0)),
             'attn_gate_den_sum_mean': result.get('attn_gate_den_sum_mean', jnp.float32(0.0)),
             'rst_gate_den_sum_mean': result.get('rst_gate_den_sum_mean', jnp.float32(0.0)),
+            'attn_contrib_den_sum': result.get('attn_contrib_den_sum', jnp.float32(0.0)),
+            'rst_contrib_den_sum': result.get('rst_contrib_den_sum', jnp.float32(0.0)),
+            'attn_contrib_den': result.get('attn_contrib_den', jnp.float32(0.0)),
+            'rst_contrib_den': result.get('rst_contrib_den', jnp.float32(0.0)),
+            'attn_contrib_den_max': result.get('attn_contrib_den_max', jnp.float32(0.0)),
+            'rst_contrib_den_max': result.get('rst_contrib_den_max', jnp.float32(0.0)),
+            'attn_compose_norm': result.get('attn_compose_norm', jnp.float32(0.0)),
+            'rst_compose_norm': result.get('rst_compose_norm', jnp.float32(0.0)),
+            'attn_compose_norm_max': result.get('attn_compose_norm_max', jnp.float32(0.0)),
+            'rst_compose_norm_max': result.get('rst_compose_norm_max', jnp.float32(0.0)),
+            'attn_coherence': result.get('attn_coherence', jnp.float32(0.0)),
+            'rst_coherence': result.get('rst_coherence', jnp.float32(0.0)),
+            'attn_coherence_max': result.get('attn_coherence_max', jnp.float32(0.0)),
+            'rst_coherence_max': result.get('rst_coherence_max', jnp.float32(0.0)),
+            'attn_den_ratio': result.get('attn_den_ratio', jnp.float32(0.0)),
+            'rst_den_ratio': result.get('rst_den_ratio', jnp.float32(0.0)),
             'attn_den_cost_mean': result.get('attn_den_cost_mean', jnp.float32(0.0)),
             'rst_den_cost_mean': result.get('rst_den_cost_mean', jnp.float32(0.0)),
             'attn_act_cost_mean': result.get('attn_act_cost_mean', jnp.float32(0.0)),
@@ -2888,7 +2923,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
 
     is_v415 = ctx.get('model_version') in (
         'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'dawn_srw')
+        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw')
     rec = {
         'step': global_step,
         'epoch': epoch,
@@ -3059,6 +3094,22 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_int_cap_frac': float(m.get('rst_int_cap_frac', 0.0)),
         'attn_den_cost_mean': float(m.get('attn_den_cost_mean', 0.0)),
         'rst_den_cost_mean': float(m.get('rst_den_cost_mean', 0.0)),
+        'attn_contrib_den_sum': float(m.get('attn_contrib_den_sum', 0.0)),
+        'rst_contrib_den_sum': float(m.get('rst_contrib_den_sum', 0.0)),
+        'attn_contrib_den': float(m.get('attn_contrib_den', 0.0)),
+        'rst_contrib_den': float(m.get('rst_contrib_den', 0.0)),
+        'attn_contrib_den_max': float(m.get('attn_contrib_den_max', 0.0)),
+        'rst_contrib_den_max': float(m.get('rst_contrib_den_max', 0.0)),
+        'attn_compose_norm': float(m.get('attn_compose_norm', 0.0)),
+        'rst_compose_norm': float(m.get('rst_compose_norm', 0.0)),
+        'attn_compose_norm_max': float(m.get('attn_compose_norm_max', 0.0)),
+        'rst_compose_norm_max': float(m.get('rst_compose_norm_max', 0.0)),
+        'attn_coherence': float(m.get('attn_coherence', 0.0)),
+        'rst_coherence': float(m.get('rst_coherence', 0.0)),
+        'attn_coherence_max': float(m.get('attn_coherence_max', 0.0)),
+        'rst_coherence_max': float(m.get('rst_coherence_max', 0.0)),
+        'attn_den_ratio': float(m.get('attn_den_ratio', 0.0)),
+        'rst_den_ratio': float(m.get('rst_den_ratio', 0.0)),
         'attn_act_cost_mean': float(m.get('attn_act_cost_mean', 0.0)),
         'rst_act_cost_mean': float(m.get('rst_act_cost_mean', 0.0)),
         'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
@@ -3266,10 +3317,25 @@ def _print_regular_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
         log_message(
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
+        )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+        log_message(
+            f"  den: a_gate={rec['attn_gate_den_sum_mean']:.1f}"
+            f" a_contrib={rec['attn_contrib_den_sum']:.1f}"
+            f" rst_gate={rec['rst_gate_den_sum_mean']:.1f}"
+            f" rst_contrib={rec['rst_contrib_den_sum']:.1f}"
+            f" ratio[a={rec['attn_den_ratio']:.3f}"
+            f" rst={rec['rst_den_ratio']:.3f}]"
+        )
+        log_message(
+            f"  compose: a={rec['attn_compose_norm']:.3f}"
+            f" rst={rec['rst_compose_norm']:.3f}"
+            f" | coh_max[a={rec['attn_coherence_max']:.3f}"
+            f" rst={rec['rst_coherence_max']:.3f}]"
         )
     _cap_scale_min = min(
         rec.get('update_cap_proj_attn_scale', 1.0),
@@ -3311,7 +3377,7 @@ def _print_regular_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
         log_message(
             f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
             f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
@@ -3892,6 +3958,12 @@ def _print_debug_block(rec, ctx):
         f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
         f"den[attn={_g('attn_gate_den_sum_mean'):.3f} "
         f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
+        f"contrib[attn={_g('attn_contrib_den_sum'):.3f} "
+        f"rst={_g('rst_contrib_den_sum'):.3f}] "
+        f"compose[attn={_g('attn_compose_norm'):.4f} "
+        f"rst={_g('rst_compose_norm'):.4f}] "
+        f"den_ratio[attn={_g('attn_den_ratio'):.4f} "
+        f"rst={_g('rst_den_ratio'):.4f}] "
         f"eff[attn={_g('attn_gate_eff_n'):.3f}/{_g('attn_gate_eff_ratio'):.4f} "
         f"rst={_g('rst_gate_eff_n'):.3f}/{_g('rst_gate_eff_ratio'):.4f}] "
         f"top1[attn_m={_g('attn_top1_gate_frac'):.4f} "
@@ -4031,6 +4103,10 @@ def _print_debug_analysis_block(rec, ctx):
         f"rst={_g('rst_raw_out_norm'):.6f}] "
         f"normalized_out_norm[attn={_g('attn_out_norm'):.6f} "
         f"rst={_g('rst_out_norm'):.6f}] "
+        f"contrib_den[attn={_g('attn_contrib_den_sum'):.6f} "
+        f"rst={_g('rst_contrib_den_sum'):.6f}] "
+        f"compose[attn={_g('attn_compose_norm'):.6f} "
+        f"rst={_g('rst_compose_norm'):.6f}] "
         f"final_resid={_g('debug_residual_norm'):.6f} "
         f"logit_max={_g('debug_logit_max'):.6f} "
         f"logit_norm_mean={_g('debug_emb_norm'):.6f}"
@@ -4055,7 +4131,7 @@ def _build_analysis_record(base, metrics, ctx):
     m = metrics
     is_v415 = ctx.get('model_version') in (
         'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-        'spatial-r1-v4.1.5.6', 'dawn_srw')
+        'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw')
     rec = dict(base)
     # tau per-route std (attn [3]) -materialise once.
     try:
@@ -4119,6 +4195,22 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_z_sum': float(m.get('rst_z_sum', 0.0)),
         'attn_den_cost': float(m.get('attn_den_cost', 0.0)),
         'rst_den_cost': float(m.get('rst_den_cost', 0.0)),
+        'attn_contrib_den_sum': float(m.get('attn_contrib_den_sum', 0.0)),
+        'rst_contrib_den_sum': float(m.get('rst_contrib_den_sum', 0.0)),
+        'attn_contrib_den': float(m.get('attn_contrib_den', 0.0)),
+        'rst_contrib_den': float(m.get('rst_contrib_den', 0.0)),
+        'attn_contrib_den_max': float(m.get('attn_contrib_den_max', 0.0)),
+        'rst_contrib_den_max': float(m.get('rst_contrib_den_max', 0.0)),
+        'attn_compose_norm': float(m.get('attn_compose_norm', 0.0)),
+        'rst_compose_norm': float(m.get('rst_compose_norm', 0.0)),
+        'attn_compose_norm_max': float(m.get('attn_compose_norm_max', 0.0)),
+        'rst_compose_norm_max': float(m.get('rst_compose_norm_max', 0.0)),
+        'attn_coherence': float(m.get('attn_coherence', 0.0)),
+        'rst_coherence': float(m.get('rst_coherence', 0.0)),
+        'attn_coherence_max': float(m.get('attn_coherence_max', 0.0)),
+        'rst_coherence_max': float(m.get('rst_coherence_max', 0.0)),
+        'attn_den_ratio': float(m.get('attn_den_ratio', 0.0)),
+        'rst_den_ratio': float(m.get('rst_den_ratio', 0.0)),
         'attn_activation_cost': float(m.get('attn_activation_cost', 0.0)),
         'rst_activation_cost': float(m.get('rst_activation_cost', 0.0)),
         'attn_current_cost': float(m.get('attn_current_cost', 0.0)),
@@ -4317,10 +4409,25 @@ def _print_analysis_block(rec, ctx):
     )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-            'spatial-r1-v4.1.5.6', 'dawn_srw'):
+            'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
         log_message(
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" rst={rec['rst_gate_den_sum']:.1f}"
+        )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+        log_message(
+            f"  contrib_den: a={_g('attn_contrib_den_sum'):.1f}"
+            f" rst={_g('rst_contrib_den_sum'):.1f}"
+            f" max[a={_g('attn_contrib_den_max'):.1f}"
+            f" rst={_g('rst_contrib_den_max'):.1f}]"
+            f" ratio[a={_g('attn_den_ratio'):.3f}"
+            f" rst={_g('rst_den_ratio'):.3f}]"
+        )
+        log_message(
+            f"  compose_n: a={_g('attn_compose_norm'):.3f}"
+            f" rst={_g('rst_compose_norm'):.3f}"
+            f" max[a={_g('attn_compose_norm_max'):.3f}"
+            f" rst={_g('rst_compose_norm_max'):.3f}]"
         )
     log_message(
         f"  tau_struct k_std={rec['rst_tau_std']:.2f}"
@@ -5140,10 +5247,14 @@ def main():
         )
         if cfg['model'].get('model_version') in (
                 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'dawn_srw'):
+                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw'):
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
+            )
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
+            gate_msg += (
+                f" rw_contrib_den_floor={tcfg.get('rw_contrib_den_floor', 1.0)}"
             )
         print(gate_msg)
 
@@ -5224,6 +5335,7 @@ def main():
         'spatial-r1-v4.1.5.2',
         'spatial-r1-v4.1.5.5',
         'spatial-r1-v4.1.5.6',
+        'spatial-r1-v4.1.5.8',
         'dawn_srw',
     )
 
@@ -5544,7 +5656,7 @@ def main():
             _is_sharded = _sharded_fns is not None
             _uses_scan_offset = model_version in (
                 'spatial-r1-v4.1.5.2', 'spatial-r1-v4.1.5.5',
-                'spatial-r1-v4.1.5.6', 'dawn_srw')
+                'spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'dawn_srw')
             if is_host0:
                 print(f"\n  === Step-time breakdown (1 layer, "
                       f"{'sharded' if _is_sharded else 'single-device'}) ===",
