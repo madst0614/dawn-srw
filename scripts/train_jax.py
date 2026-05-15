@@ -90,6 +90,121 @@ ATTN_LOCAL_FIELD_NAMES = (
     'q_norm_max', 'k_norm_max', 'v_norm_max', 'attn_logit_max',
     'softmax_top1_max', 'o_in_norm_max', 'o_out_norm_max')
 
+UPDATE_CAP_GROUP_SPECS = (
+    ('proj_attn', 'pA', 'update_cap_proj_attn_hit',
+     'update_cap_proj_attn_ratio_pre', 'update_cap_proj_attn_scale',
+     'ratio_pre'),
+    ('proj_rst', 'pR', 'update_cap_proj_rst_hit',
+     'update_cap_proj_rst_ratio_pre', 'update_cap_proj_rst_scale',
+     'ratio_pre'),
+    ('emb_qk', 'eQ', 'update_cap_emb_qk_hit',
+     'update_cap_emb_qk_ratio_pre', 'update_cap_emb_qk_scale',
+     'ratio_pre'),
+    ('emb_v', 'eV', 'update_cap_emb_v_hit',
+     'update_cap_emb_v_ratio_pre', 'update_cap_emb_v_scale',
+     'ratio_pre'),
+    ('emb_rst', 'eR', 'update_cap_emb_rst_hit',
+     'update_cap_emb_rst_ratio_pre', 'update_cap_emb_rst_scale',
+     'ratio_pre'),
+    ('tau_attn', 'tA', 'update_cap_tau_attn_hit',
+     'update_cap_tau_attn_abs_pre', 'update_cap_tau_attn_scale',
+     'abs_pre'),
+    ('tau_rst', 'tR', 'update_cap_tau_rst_hit',
+     'update_cap_tau_rst_abs_pre', 'update_cap_tau_rst_scale',
+     'abs_pre'),
+    ('scan_attn', 'sA', 'update_cap_scan_attn_hit',
+     'update_cap_scan_attn_abs_pre', 'update_cap_scan_attn_scale',
+     'abs_pre'),
+    ('scan_rst', 'sR', 'update_cap_scan_rst_hit',
+     'update_cap_scan_rst_abs_pre', 'update_cap_scan_rst_scale',
+     'abs_pre'),
+)
+
+
+def _cap_window_hit_key(group_name):
+    return f'update_cap_window_{group_name}_hit_count'
+
+
+def _cap_window_pre_max_key(group_name, pre_kind):
+    return f'update_cap_window_{group_name}_{pre_kind}_max'
+
+
+def _cap_window_scale_min_key(group_name):
+    return f'update_cap_window_{group_name}_scale_min'
+
+
+def _init_update_cap_window_stats():
+    stats = {'update_cap_window_steps': jnp.int32(0)}
+    for group_name, _, _, _, _, pre_kind in UPDATE_CAP_GROUP_SPECS:
+        stats[_cap_window_hit_key(group_name)] = jnp.float32(0.0)
+        stats[_cap_window_pre_max_key(group_name, pre_kind)] = jnp.float32(0.0)
+        stats[_cap_window_scale_min_key(group_name)] = jnp.float32(1.0)
+    return stats
+
+
+def _accumulate_update_cap_window_stats(window_stats, metrics):
+    out = {'update_cap_window_steps':
+           window_stats['update_cap_window_steps'] + jnp.int32(1)}
+    for (group_name, _, hit_key, pre_key, scale_key,
+         pre_kind) in UPDATE_CAP_GROUP_SPECS:
+        win_hit_key = _cap_window_hit_key(group_name)
+        win_pre_key = _cap_window_pre_max_key(group_name, pre_kind)
+        win_scale_key = _cap_window_scale_min_key(group_name)
+        out[win_hit_key] = (
+            window_stats[win_hit_key]
+            + metrics.get(hit_key, jnp.float32(0.0)))
+        out[win_pre_key] = jnp.maximum(
+            window_stats[win_pre_key],
+            metrics.get(pre_key, jnp.float32(0.0)))
+        out[win_scale_key] = jnp.minimum(
+            window_stats[win_scale_key],
+            metrics.get(scale_key, jnp.float32(1.0)))
+    return out
+
+
+def _attach_update_cap_window_stats(rec, window_stats):
+    if not window_stats:
+        return rec
+    rec['update_cap_window_steps'] = int(
+        window_stats.get('update_cap_window_steps', 0))
+    for group_name, _, _, _, _, pre_kind in UPDATE_CAP_GROUP_SPECS:
+        hit_key = _cap_window_hit_key(group_name)
+        pre_key = _cap_window_pre_max_key(group_name, pre_kind)
+        scale_key = _cap_window_scale_min_key(group_name)
+        rec[hit_key] = float(window_stats.get(hit_key, 0.0))
+        rec[pre_key] = float(window_stats.get(pre_key, 0.0))
+        rec[scale_key] = float(window_stats.get(scale_key, 1.0))
+    return rec
+
+
+def _format_update_cap_window_line(rec, indent="  "):
+    def _g(key, default=0.0):
+        val = rec.get(key, default)
+        if val is None:
+            return float(default)
+        return float(val)
+
+    steps = int(_g('update_cap_window_steps', 0.0))
+    if steps <= 0:
+        return None
+    hit_parts = []
+    pre_parts = []
+    scale_parts = []
+    for group_name, label, _, _, _, pre_kind in UPDATE_CAP_GROUP_SPECS:
+        hit_parts.append(
+            f"{label}={_g(_cap_window_hit_key(group_name)):.0f}")
+        pre_parts.append(
+            f"{label}={_g(_cap_window_pre_max_key(group_name, pre_kind)):.1e}")
+        scale_parts.append(
+            (label, _g(_cap_window_scale_min_key(group_name), 1.0)))
+    min_scale_label, min_scale = min(scale_parts, key=lambda item: item[1])
+    return (
+        f"{indent}update_cap_window: steps={steps} "
+        f"hit[{' '.join(hit_parts)}] "
+        f"min_scale={min_scale:.3f}@{min_scale_label} "
+        f"max_pre[{' '.join(pre_parts)}]"
+    )
+
 
 
 # ============================================================
@@ -3369,6 +3484,9 @@ def _print_regular_block(rec, ctx):
         f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
         f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
     )
+    _cap_window_line = _format_update_cap_window_line(rec, indent="  ")
+    if _cap_window_line:
+        log_message(_cap_window_line)
     log_message(
         f"  tau: rst_b={rec['tau_rst_bias']:+.2f}"
         f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
@@ -4073,6 +4191,9 @@ def _print_debug_block(rec, ctx):
         f"post={_g('update_cap_scan_rst_abs_post'):.2e} "
         f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
     )
+    _cap_window_line = _format_update_cap_window_line(rec, indent="")
+    if _cap_window_line:
+        log_debug_message(_cap_window_line)
     _print_grad_layer_block(rec)
     _print_drop_compare_block(rec)
     reasons = _collapse_reasons(rec)
@@ -6366,6 +6487,8 @@ def main():
         _win_div_jax = jnp.float32(0.0)
         _win_correct_jax = jnp.int32(0)
         _win_valid_jax = jnp.int32(0)
+        _regular_cap_window_jax = _init_update_cap_window_stats()
+        _debug_cap_window_jax = _init_update_cap_window_stats()
         win_count = 0
         win_start_time = time.time()
 
@@ -6433,6 +6556,10 @@ def main():
             _win_div_jax = _win_div_jax + metrics['div_loss'] * _valid_f
             _win_correct_jax = _win_correct_jax + metrics['correct']
             _win_valid_jax = _win_valid_jax + metrics['valid_count']
+            _regular_cap_window_jax = _accumulate_update_cap_window_stats(
+                _regular_cap_window_jax, metrics)
+            _debug_cap_window_jax = _accumulate_update_cap_window_stats(
+                _debug_cap_window_jax, metrics)
 
             _epoch_loss_jax = _epoch_loss_jax + metrics['ce_loss'] * _valid_f
             _epoch_correct_jax = _epoch_correct_jax + metrics['correct']
@@ -6646,6 +6773,8 @@ def main():
                         'model_version': model_version,
                     }
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
+                    rec = _attach_update_cap_window_stats(
+                        rec, jax.device_get(_regular_cap_window_jax))
                     _print_regular_block(rec, ctx)
                     log_jsonl({'type': 'train', **rec})
                     sync_logs()
@@ -6659,6 +6788,7 @@ def main():
                 _win_div_jax = jnp.float32(0.0)
                 _win_correct_jax = jnp.int32(0)
                 _win_valid_jax = jnp.int32(0)
+                _regular_cap_window_jax = _init_update_cap_window_stats()
                 win_count = 0
                 win_start_time = time.time()
 
@@ -6720,12 +6850,16 @@ def main():
                 debug_metrics = jax.device_get(metrics)
                 debug_rec = _build_regular_record(
                     debug_metrics, debug_avgs, debug_ctx, global_step, epoch)
+                debug_rec = _attach_update_cap_window_stats(
+                    debug_rec, jax.device_get(_debug_cap_window_jax))
                 if debug_forward_result is not None:
                     debug_rec = _attach_debug_forward_record(
                         debug_rec, jax.device_get(debug_forward_result))
                 _print_debug_block(debug_rec, debug_ctx)
                 log_debug_jsonl({'type': 'debug_train', **debug_rec})
                 sync_logs()
+            if is_debug_log:
+                _debug_cap_window_jax = _init_update_cap_window_stats()
 
             # ---- Mid-epoch validation (all hosts run eval, host 0 saves/logs) ----
             _do_val = (global_step % val_interval == 0 and global_step > 0)
