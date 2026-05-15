@@ -77,10 +77,13 @@ except ImportError:
 # in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
+# These names must match model local_spike_values slots. Top1-only fields
+# live in LOCAL_TOP1_FIELD_NAMES.
 LOCAL_SPIKE_METRIC_NAMES = (
     'tau_abs', 'gate_raw', 'top1_share', 'gate_den_sum', 'intensity',
     'read_abs', 'contrib_norm', 'out_norm', 'resid_norm',
-    'h_norm', 'emb_norm')
+    'h_norm', 'emb_norm', 'score', 'margin', 'write_norm',
+    'read_norm', 'op_gain')
 LOCAL_TOP1_FIELD_NAMES = (
     'top1', 'score', 'tau', 'margin', 'gate_raw', 'gate_norm',
     'gate_den', 'intensity', 'read_scalar', 'write_norm', 'read_norm',
@@ -204,6 +207,23 @@ def _format_update_cap_window_line(rec, indent="  "):
         f"min_scale={min_scale:.3f}@{min_scale_label} "
         f"max_pre[{' '.join(pre_parts)}]"
     )
+
+
+def _collapse_warn_context(tcfg):
+    return {
+        'max_intensity': float(tcfg.get('max_intensity', 10.0)),
+        'rw_contrib_den_floor': float(tcfg.get('rw_contrib_den_floor', 1.0)),
+        'collapse_warn_compose_norm_threshold': float(
+            tcfg.get('collapse_warn_compose_norm_threshold', 1.2)),
+        'collapse_warn_top1_threshold': float(
+            tcfg.get('collapse_warn_top1_threshold', 0.999)),
+        'collapse_warn_low_den_floor_frac_threshold': float(
+            tcfg.get('collapse_warn_low_den_floor_frac_threshold', 0.001)),
+        # Disabled by default because scaled-pool/output ratios are model-size
+        # dependent; set >0 in config to enable the warning.
+        'collapse_warn_scaled_out_threshold': float(
+            tcfg.get('collapse_warn_scaled_out_threshold', 0.0)),
+    }
 
 
 
@@ -2049,12 +2069,28 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_gate_den_sum_mean': result.get('rst_gate_den_sum_mean', jnp.float32(0.0)),
             'attn_contrib_den_sum': result.get('attn_contrib_den_sum', jnp.float32(0.0)),
             'rst_contrib_den_sum': result.get('rst_contrib_den_sum', jnp.float32(0.0)),
+            'attn_contrib_den_mean': result.get(
+                'attn_contrib_den_mean',
+                result.get('attn_contrib_den_sum', jnp.float32(0.0))),
+            'rst_contrib_den_mean': result.get(
+                'rst_contrib_den_mean',
+                result.get('rst_contrib_den_sum', jnp.float32(0.0))),
             'attn_contrib_den': result.get('attn_contrib_den', jnp.float32(0.0)),
             'rst_contrib_den': result.get('rst_contrib_den', jnp.float32(0.0)),
             'attn_contrib_den_max': result.get('attn_contrib_den_max', jnp.float32(0.0)),
             'rst_contrib_den_max': result.get('rst_contrib_den_max', jnp.float32(0.0)),
+            'attn_contrib_den_min': result.get('attn_contrib_den_min', jnp.float32(0.0)),
+            'rst_contrib_den_min': result.get('rst_contrib_den_min', jnp.float32(0.0)),
+            'attn_contrib_den_floor_frac': result.get('attn_contrib_den_floor_frac', jnp.float32(0.0)),
+            'rst_contrib_den_floor_frac': result.get('rst_contrib_den_floor_frac', jnp.float32(0.0)),
             'attn_compose_norm': result.get('attn_compose_norm', jnp.float32(0.0)),
             'rst_compose_norm': result.get('rst_compose_norm', jnp.float32(0.0)),
+            'attn_compose_norm_mean': result.get(
+                'attn_compose_norm_mean',
+                result.get('attn_compose_norm', jnp.float32(0.0))),
+            'rst_compose_norm_mean': result.get(
+                'rst_compose_norm_mean',
+                result.get('rst_compose_norm', jnp.float32(0.0))),
             'attn_compose_norm_max': result.get('attn_compose_norm_max', jnp.float32(0.0)),
             'rst_compose_norm_max': result.get('rst_compose_norm_max', jnp.float32(0.0)),
             'attn_coherence': result.get('attn_coherence', jnp.float32(0.0)),
@@ -2063,6 +2099,26 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_coherence_max': result.get('rst_coherence_max', jnp.float32(0.0)),
             'attn_den_ratio': result.get('attn_den_ratio', jnp.float32(0.0)),
             'rst_den_ratio': result.get('rst_den_ratio', jnp.float32(0.0)),
+            'attn_den_ratio_mean': result.get(
+                'attn_den_ratio_mean',
+                result.get('attn_den_ratio', jnp.float32(0.0))),
+            'rst_den_ratio_mean': result.get(
+                'rst_den_ratio_mean',
+                result.get('rst_den_ratio', jnp.float32(0.0))),
+            'attn_den_ratio_max': result.get('attn_den_ratio_max', jnp.float32(0.0)),
+            'rst_den_ratio_max': result.get('rst_den_ratio_max', jnp.float32(0.0)),
+            'attn_raw_out_norm_mean': result.get('attn_raw_out_norm_mean', jnp.float32(0.0)),
+            'rst_raw_out_norm_mean': result.get('rst_raw_out_norm_mean', jnp.float32(0.0)),
+            'attn_raw_out_norm_max': result.get('attn_raw_out_norm_max', jnp.float32(0.0)),
+            'rst_raw_out_norm_max': result.get('rst_raw_out_norm_max', jnp.float32(0.0)),
+            'attn_normalized_out_norm_mean': result.get('attn_normalized_out_norm_mean', jnp.float32(0.0)),
+            'rst_normalized_out_norm_mean': result.get('rst_normalized_out_norm_mean', jnp.float32(0.0)),
+            'attn_normalized_out_norm_max': result.get('attn_normalized_out_norm_max', jnp.float32(0.0)),
+            'rst_normalized_out_norm_max': result.get('rst_normalized_out_norm_max', jnp.float32(0.0)),
+            'attn_scaled_out_norm_mean': result.get('attn_scaled_out_norm_mean', jnp.float32(0.0)),
+            'rst_scaled_out_norm_mean': result.get('rst_scaled_out_norm_mean', jnp.float32(0.0)),
+            'attn_scaled_out_norm_max': result.get('attn_scaled_out_norm_max', jnp.float32(0.0)),
+            'rst_scaled_out_norm_max': result.get('rst_scaled_out_norm_max', jnp.float32(0.0)),
             'attn_den_cost_mean': result.get('attn_den_cost_mean', jnp.float32(0.0)),
             'rst_den_cost_mean': result.get('rst_den_cost_mean', jnp.float32(0.0)),
             'attn_act_cost_mean': result.get('attn_act_cost_mean', jnp.float32(0.0)),
@@ -3211,12 +3267,24 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_den_cost_mean': float(m.get('rst_den_cost_mean', 0.0)),
         'attn_contrib_den_sum': float(m.get('attn_contrib_den_sum', 0.0)),
         'rst_contrib_den_sum': float(m.get('rst_contrib_den_sum', 0.0)),
+        'attn_contrib_den_mean': float(m.get(
+            'attn_contrib_den_mean', m.get('attn_contrib_den_sum', 0.0))),
+        'rst_contrib_den_mean': float(m.get(
+            'rst_contrib_den_mean', m.get('rst_contrib_den_sum', 0.0))),
         'attn_contrib_den': float(m.get('attn_contrib_den', 0.0)),
         'rst_contrib_den': float(m.get('rst_contrib_den', 0.0)),
         'attn_contrib_den_max': float(m.get('attn_contrib_den_max', 0.0)),
         'rst_contrib_den_max': float(m.get('rst_contrib_den_max', 0.0)),
+        'attn_contrib_den_min': float(m.get('attn_contrib_den_min', 0.0)),
+        'rst_contrib_den_min': float(m.get('rst_contrib_den_min', 0.0)),
+        'attn_contrib_den_floor_frac': float(m.get('attn_contrib_den_floor_frac', 0.0)),
+        'rst_contrib_den_floor_frac': float(m.get('rst_contrib_den_floor_frac', 0.0)),
         'attn_compose_norm': float(m.get('attn_compose_norm', 0.0)),
         'rst_compose_norm': float(m.get('rst_compose_norm', 0.0)),
+        'attn_compose_norm_mean': float(m.get(
+            'attn_compose_norm_mean', m.get('attn_compose_norm', 0.0))),
+        'rst_compose_norm_mean': float(m.get(
+            'rst_compose_norm_mean', m.get('rst_compose_norm', 0.0))),
         'attn_compose_norm_max': float(m.get('attn_compose_norm_max', 0.0)),
         'rst_compose_norm_max': float(m.get('rst_compose_norm_max', 0.0)),
         'attn_coherence': float(m.get('attn_coherence', 0.0)),
@@ -3225,6 +3293,24 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_coherence_max': float(m.get('rst_coherence_max', 0.0)),
         'attn_den_ratio': float(m.get('attn_den_ratio', 0.0)),
         'rst_den_ratio': float(m.get('rst_den_ratio', 0.0)),
+        'attn_den_ratio_mean': float(m.get(
+            'attn_den_ratio_mean', m.get('attn_den_ratio', 0.0))),
+        'rst_den_ratio_mean': float(m.get(
+            'rst_den_ratio_mean', m.get('rst_den_ratio', 0.0))),
+        'attn_den_ratio_max': float(m.get('attn_den_ratio_max', 0.0)),
+        'rst_den_ratio_max': float(m.get('rst_den_ratio_max', 0.0)),
+        'attn_raw_out_norm_mean': float(m.get('attn_raw_out_norm_mean', 0.0)),
+        'rst_raw_out_norm_mean': float(m.get('rst_raw_out_norm_mean', 0.0)),
+        'attn_raw_out_norm_max': float(m.get('attn_raw_out_norm_max', 0.0)),
+        'rst_raw_out_norm_max': float(m.get('rst_raw_out_norm_max', 0.0)),
+        'attn_normalized_out_norm_mean': float(m.get('attn_normalized_out_norm_mean', 0.0)),
+        'rst_normalized_out_norm_mean': float(m.get('rst_normalized_out_norm_mean', 0.0)),
+        'attn_normalized_out_norm_max': float(m.get('attn_normalized_out_norm_max', 0.0)),
+        'rst_normalized_out_norm_max': float(m.get('rst_normalized_out_norm_max', 0.0)),
+        'attn_scaled_out_norm_mean': float(m.get('attn_scaled_out_norm_mean', 0.0)),
+        'rst_scaled_out_norm_mean': float(m.get('rst_scaled_out_norm_mean', 0.0)),
+        'attn_scaled_out_norm_max': float(m.get('attn_scaled_out_norm_max', 0.0)),
+        'rst_scaled_out_norm_max': float(m.get('rst_scaled_out_norm_max', 0.0)),
         'attn_act_cost_mean': float(m.get('attn_act_cost_mean', 0.0)),
         'rst_act_cost_mean': float(m.get('rst_act_cost_mean', 0.0)),
         'attn_current_cost_mean': float(m.get('attn_current_cost_mean', 0.0)),
@@ -3395,6 +3481,43 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
     return rec
 
 
+def _format_output_stab_line(rec, indent="  "):
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+
+    return (
+        f"{indent}output_stab: "
+        f"contrib_den[a={_g('attn_contrib_den_mean', _g('attn_contrib_den_sum')):.2g}/"
+        f"{_g('attn_contrib_den_max'):.2g}/"
+        f"{_g('attn_contrib_den_min'):.2g}/"
+        f"{_g('attn_contrib_den_floor_frac'):.1e} "
+        f"rst={_g('rst_contrib_den_mean', _g('rst_contrib_den_sum')):.2g}/"
+        f"{_g('rst_contrib_den_max'):.2g}/"
+        f"{_g('rst_contrib_den_min'):.2g}/"
+        f"{_g('rst_contrib_den_floor_frac'):.1e}] "
+        f"compose[a={_g('attn_compose_norm_mean', _g('attn_compose_norm')):.3f}/"
+        f"{_g('attn_compose_norm_max'):.3f} "
+        f"rst={_g('rst_compose_norm_mean', _g('rst_compose_norm')):.3f}/"
+        f"{_g('rst_compose_norm_max'):.3f}] "
+        f"den_ratio[a={_g('attn_den_ratio_mean', _g('attn_den_ratio')):.3f}/"
+        f"{_g('attn_den_ratio_max'):.3f} "
+        f"rst={_g('rst_den_ratio_mean', _g('rst_den_ratio')):.3f}/"
+        f"{_g('rst_den_ratio_max'):.3f}] "
+        f"out_norm raw[a={_g('attn_raw_out_norm_mean'):.3f}/"
+        f"{_g('attn_raw_out_norm_max'):.3f} "
+        f"rst={_g('rst_raw_out_norm_mean'):.3f}/"
+        f"{_g('rst_raw_out_norm_max'):.3f}] "
+        f"normed[a={_g('attn_normalized_out_norm_mean'):.3f}/"
+        f"{_g('attn_normalized_out_norm_max'):.3f} "
+        f"rst={_g('rst_normalized_out_norm_mean'):.3f}/"
+        f"{_g('rst_normalized_out_norm_max'):.3f}] "
+        f"scaled[a={_g('attn_scaled_out_norm_mean'):.3f}/"
+        f"{_g('attn_scaled_out_norm_max'):.3f} "
+        f"rst={_g('rst_scaled_out_norm_mean'):.3f}/"
+        f"{_g('rst_scaled_out_norm_max'):.3f}]"
+    )
+
+
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     log_message(
@@ -3438,20 +3561,7 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
         )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
-        log_message(
-            f"  den: a_gate={rec['attn_gate_den_sum_mean']:.1f}"
-            f" a_contrib={rec['attn_contrib_den_sum']:.1f}"
-            f" rst_gate={rec['rst_gate_den_sum_mean']:.1f}"
-            f" rst_contrib={rec['rst_contrib_den_sum']:.1f}"
-            f" ratio[a={rec['attn_den_ratio']:.3f}"
-            f" rst={rec['rst_den_ratio']:.3f}]"
-        )
-        log_message(
-            f"  compose: a={rec['attn_compose_norm']:.3f}"
-            f" rst={rec['rst_compose_norm']:.3f}"
-            f" | coh_max[a={rec['attn_coherence_max']:.3f}"
-            f" rst={rec['rst_coherence_max']:.3f}]"
-        )
+        log_message(_format_output_stab_line(rec, indent="  "))
     _cap_scale_min = min(
         rec.get('update_cap_proj_attn_scale', 1.0),
         rec.get('update_cap_proj_rst_scale', 1.0),
@@ -3562,9 +3672,16 @@ def _print_regular_block(rec, ctx):
     )
 
 
-def _collapse_reasons(rec):
+def _collapse_reasons(rec, ctx=None):
+    ctx = ctx or {}
+
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
+
+    def _positive_min(*keys):
+        vals = [_g(key, 0.0) for key in keys]
+        vals = [v for v in vals if v > 0.0]
+        return min(vals) if vals else float('inf')
 
     reasons = []
     if _g('grad_global_preclip', _g('grad_norm')) > 50.0:
@@ -3575,6 +3692,9 @@ def _collapse_reasons(rec):
         reasons.append('dead_spike')
     if max(_g('attn_int_cap_frac'), _g('rst_int_cap_frac')) > 0.001:
         reasons.append('int_cap_hit')
+    max_intensity = float(ctx.get('max_intensity', 10.0))
+    if max(_g('attn_int_max'), _g('rst_int_max')) >= max_intensity - 1.0e-3:
+        reasons.append('intensity_saturated')
     if max(_g('attn_qk_op_gain_max'), _g('attn_v_op_gain_max'),
            _g('rst_op_gain_max')) > 20.0:
         reasons.append('op_gain_high')
@@ -3589,6 +3709,32 @@ def _collapse_reasons(rec):
         reasons.append('late_layer_out_high')
     if max(_g('attn_top1_gate_frac'), _g('rst_top1_gate_frac')) > 0.5:
         reasons.append('top1_gate_high')
+    top1_threshold = float(ctx.get('collapse_warn_top1_threshold', 0.999))
+    if max(_g('attn_top1_gate_frac_max', _g('attn_top1_gate_frac')),
+           _g('rst_top1_gate_frac_max', _g('rst_top1_gate_frac'))) >= top1_threshold:
+        reasons.append('local_top1_saturated')
+    compose_threshold = float(
+        ctx.get('collapse_warn_compose_norm_threshold', 1.2))
+    if max(_g('attn_compose_norm_max'), _g('rst_compose_norm_max')) > compose_threshold:
+        reasons.append('compose_high')
+    low_den_threshold = float(
+        ctx.get('collapse_warn_low_den_floor_frac_threshold', 0.001))
+    den_floor = float(ctx.get('rw_contrib_den_floor', 1.0))
+    den_floor_frac = max(_g('attn_contrib_den_floor_frac'),
+                         _g('rst_contrib_den_floor_frac'))
+    den_min = _positive_min('attn_contrib_den_min', 'rst_contrib_den_min')
+    if den_floor_frac > low_den_threshold or den_min <= den_floor + 1.0e-6:
+        reasons.append('low_contrib_den')
+    scaled_threshold = float(ctx.get('collapse_warn_scaled_out_threshold', 0.0))
+    if scaled_threshold > 0.0:
+        attn_scaled_ratio = (
+            _g('attn_scaled_out_norm_max')
+            / max(_g('attn_out_norm'), 1.0e-8))
+        rst_scaled_ratio = (
+            _g('rst_scaled_out_norm_max')
+            / max(_g('rst_out_norm'), 1.0e-8))
+        if max(attn_scaled_ratio, rst_scaled_ratio) > scaled_threshold:
+            reasons.append('scaled_out_high')
     if min(_g('attn_gate_eff_ratio', 1.0),
            _g('rst_gate_eff_ratio', 1.0)) < 0.05:
         reasons.append('gate_eff_low')
@@ -3806,7 +3952,11 @@ def _print_local_spike_inline_block(rec):
         return
 
     def _metric(name):
+        if name not in LOCAL_SPIKE_METRIC_NAMES:
+            return 0.0, -1, -1
         idx = LOCAL_SPIKE_METRIC_NAMES.index(name)
+        if idx >= values.shape[2]:
+            return 0.0, -1, -1
         layer, pool, val = _best_from_values(values, idx)
         return val, layer, pool
 
@@ -3814,11 +3964,16 @@ def _print_local_spike_inline_block(rec):
         return LOCAL_SPIKE_POOL_NAMES[pool] if 0 <= pool < len(LOCAL_SPIKE_POOL_NAMES) else 'NA'
 
     top1_val, top1_layer, top1_pool = _metric('top1_share')
+    score_val, score_layer, score_pool = _metric('score')
     int_val, int_layer, int_pool = _metric('intensity')
     tau_val, tau_layer, tau_pool = _metric('tau_abs')
-    margin_val, margin_layer, margin_pool = _metric('gate_raw')
+    gate_raw_val, gate_raw_layer, gate_raw_pool = _metric('gate_raw')
+    margin_val, margin_layer, margin_pool = _metric('margin')
     den_val, den_layer, den_pool = _metric('gate_den_sum')
     read_val, read_layer, read_pool = _metric('read_abs')
+    write_norm_val, write_norm_layer, write_norm_pool = _metric('write_norm')
+    read_norm_val, read_norm_layer, read_norm_pool = _metric('read_norm')
+    op_gain_val, op_gain_layer, op_gain_pool = _metric('op_gain')
     contrib_val, contrib_layer, contrib_pool = _metric('contrib_norm')
     out_val, out_layer, out_pool = _metric('out_norm')
     h_val, h_layer, h_pool = _metric('h_norm')
@@ -3843,12 +3998,17 @@ def _print_local_spike_inline_block(rec):
         f"top1_max={top1_val:.6f} top1_layer={top1_layer} "
         f"top1_pool={_pool_name(top1_pool)}")
     log_debug_message(
+        f"score_max={score_val:.6f} score_layer={score_layer} "
+        f"score_pool={_pool_name(score_pool)}")
+    log_debug_message(
         f"int_max={int_val:.6f} int_layer={int_layer} "
         f"int_pool={_pool_name(int_pool)}")
     log_debug_message(
         f"tau_abs_max={tau_val:.6f} tau_layer={tau_layer} "
         f"tau_pool={_pool_name(tau_pool)}")
     log_debug_message(
+        f"gate_raw_max={gate_raw_val:.6f} gate_raw_layer={gate_raw_layer} "
+        f"gate_raw_pool={_pool_name(gate_raw_pool)} "
         f"margin_max={margin_val:.6f} margin_layer={margin_layer} "
         f"margin_pool={_pool_name(margin_pool)}")
     log_debug_message(
@@ -3857,6 +4017,16 @@ def _print_local_spike_inline_block(rec):
     log_debug_message(
         f"read_abs_max={read_val:.6f} read_layer={read_layer} "
         f"read_pool={_pool_name(read_pool)}")
+    log_debug_message(
+        f"write_norm_max={write_norm_val:.6f} "
+        f"write_norm_layer={write_norm_layer} "
+        f"write_norm_pool={_pool_name(write_norm_pool)} "
+        f"read_norm_max={read_norm_val:.6f} "
+        f"read_norm_layer={read_norm_layer} "
+        f"read_norm_pool={_pool_name(read_norm_pool)} "
+        f"op_gain_max={op_gain_val:.6f} "
+        f"op_gain_layer={op_gain_layer} "
+        f"op_gain_pool={_pool_name(op_gain_pool)}")
     log_debug_message(
         f"contrib_proxy_max={contrib_val:.6f} "
         f"contrib_layer={contrib_layer} "
@@ -3881,8 +4051,6 @@ def _print_local_spike_block(rec):
     top1_values = _diag_array(rec, 'local_top1_values', ndim=3)
     top1_locs = _diag_array(rec, 'local_top1_locs', ndim=3)
     if values is None or locs is None or top1_values is None or top1_locs is None:
-        return
-    if np.all(locs < 0):
         return
 
     top1_idx = LOCAL_TOP1_FIELD_NAMES.index('top1')
@@ -3913,10 +4081,15 @@ def _print_local_spike_block(rec):
         f"emb_norm={fields.get('emb_norm', 0.0):.6f}"
     )
 
-    for metric in ('tau_abs', 'intensity', 'gate_raw', 'gate_den_sum',
-                   'read_abs', 'contrib_norm', 'out_norm', 'resid_norm',
-                   'h_norm', 'emb_norm'):
+    for metric in ('top1_share', 'score', 'gate_raw', 'margin',
+                   'gate_den_sum', 'intensity', 'read_abs', 'write_norm',
+                   'read_norm', 'op_gain', 'contrib_norm', 'out_norm',
+                   'resid_norm', 'h_norm', 'emb_norm'):
+        if metric not in LOCAL_SPIKE_METRIC_NAMES:
+            continue
         mi = LOCAL_SPIKE_METRIC_NAMES.index(metric)
+        if mi >= values.shape[2]:
+            continue
         l, p, val = _best_from_values(values, mi)
         log_debug_message(
             f"{metric}_max: pool={LOCAL_SPIKE_POOL_NAMES[p]} "
@@ -3924,13 +4097,38 @@ def _print_local_spike_block(rec):
 
     for p, pool_name in enumerate(LOCAL_SPIKE_POOL_NAMES):
         parts = []
-        for metric in LOCAL_SPIKE_METRIC_NAMES:
-            mi = LOCAL_SPIKE_METRIC_NAMES.index(metric)
+        for mi, metric in enumerate(LOCAL_SPIKE_METRIC_NAMES):
+            if mi >= values.shape[2]:
+                continue
             l = int(np.nanargmax(values[:, p, mi]))
             parts.append(
                 f"{metric}=L{l}:{values[l, p, mi]:.4g}"
                 f"@{_format_loc(locs[l, p, mi])}")
         log_debug_message(f"pool_max[{pool_name}]: " + " ".join(parts))
+        top1_layer = int(np.nanargmax(top1_values[:, p, top1_idx]))
+        top1_fields = {
+            name: float(top1_values[top1_layer, p, i])
+            for i, name in enumerate(LOCAL_TOP1_FIELD_NAMES)
+        }
+        log_debug_message(
+            f"pool_top1[{pool_name}]: layer={top1_layer} "
+            f"{_format_loc(top1_locs[top1_layer, p])} "
+            f"top1={top1_fields['top1']:.6f} "
+            f"score={top1_fields['score']:.6f} "
+            f"margin={top1_fields['margin']:.6f} "
+            f"gate_raw={top1_fields['gate_raw']:.6f} "
+            f"gate_norm={top1_fields['gate_norm']:.6f} "
+            f"gate_den={top1_fields['gate_den']:.6f} "
+            f"intensity={top1_fields['intensity']:.6f} "
+            f"read_scalar_abs={abs(top1_fields['read_scalar']):.6f} "
+            f"write_norm={top1_fields['write_norm']:.6f} "
+            f"read_norm={top1_fields['read_norm']:.6f} "
+            f"op_gain={top1_fields['op_gain']:.6f} "
+            f"contrib_norm={top1_fields['contrib_norm']:.6f} "
+            f"total_out_norm={top1_fields['total_out_norm']:.6f} "
+            f"contrib_frac={top1_fields['contrib_frac']:.6f} "
+            f"h_norm={top1_fields['h_norm']:.6f} "
+            f"emb_norm={top1_fields['emb_norm']:.6f}")
 
 
 def _print_attention_local_block(rec):
@@ -4091,6 +4289,8 @@ def _print_debug_block(rec, ctx):
         f"gate_max[attn={_g('attn_raw_gate_max'):.3f} "
         f"rst={_g('rst_raw_gate_max'):.3f}]"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+        log_debug_message(_format_output_stab_line(rec, indent=""))
     log_debug_message(
         f"tau_diag: score_std[attn={_g('attn_score_std'):.4f} "
         f"rst={_g('rst_score_std'):.4f}] "
@@ -4196,7 +4396,7 @@ def _print_debug_block(rec, ctx):
         log_debug_message(_cap_window_line)
     _print_grad_layer_block(rec)
     _print_drop_compare_block(rec)
-    reasons = _collapse_reasons(rec)
+    reasons = _collapse_reasons(rec, ctx)
     if reasons:
         log_debug_message(
             f"[COLLAPSE_WARN] step={step} reasons={','.join(reasons)}")
@@ -4232,7 +4432,9 @@ def _print_debug_analysis_block(rec, ctx):
         f"logit_max={_g('debug_logit_max'):.6f} "
         f"logit_norm_mean={_g('debug_emb_norm'):.6f}"
     )
-    reasons = _collapse_reasons(rec)
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+        log_debug_message(_format_output_stab_line(rec, indent=""))
+    reasons = _collapse_reasons(rec, ctx)
     if reasons:
         log_debug_message(
             f"[COLLAPSE_WARN] step={rec.get('step', 0)} reasons={','.join(reasons)}")
@@ -4318,12 +4520,24 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_den_cost': float(m.get('rst_den_cost', 0.0)),
         'attn_contrib_den_sum': float(m.get('attn_contrib_den_sum', 0.0)),
         'rst_contrib_den_sum': float(m.get('rst_contrib_den_sum', 0.0)),
+        'attn_contrib_den_mean': float(m.get(
+            'attn_contrib_den_mean', m.get('attn_contrib_den_sum', 0.0))),
+        'rst_contrib_den_mean': float(m.get(
+            'rst_contrib_den_mean', m.get('rst_contrib_den_sum', 0.0))),
         'attn_contrib_den': float(m.get('attn_contrib_den', 0.0)),
         'rst_contrib_den': float(m.get('rst_contrib_den', 0.0)),
         'attn_contrib_den_max': float(m.get('attn_contrib_den_max', 0.0)),
         'rst_contrib_den_max': float(m.get('rst_contrib_den_max', 0.0)),
+        'attn_contrib_den_min': float(m.get('attn_contrib_den_min', 0.0)),
+        'rst_contrib_den_min': float(m.get('rst_contrib_den_min', 0.0)),
+        'attn_contrib_den_floor_frac': float(m.get('attn_contrib_den_floor_frac', 0.0)),
+        'rst_contrib_den_floor_frac': float(m.get('rst_contrib_den_floor_frac', 0.0)),
         'attn_compose_norm': float(m.get('attn_compose_norm', 0.0)),
         'rst_compose_norm': float(m.get('rst_compose_norm', 0.0)),
+        'attn_compose_norm_mean': float(m.get(
+            'attn_compose_norm_mean', m.get('attn_compose_norm', 0.0))),
+        'rst_compose_norm_mean': float(m.get(
+            'rst_compose_norm_mean', m.get('rst_compose_norm', 0.0))),
         'attn_compose_norm_max': float(m.get('attn_compose_norm_max', 0.0)),
         'rst_compose_norm_max': float(m.get('rst_compose_norm_max', 0.0)),
         'attn_coherence': float(m.get('attn_coherence', 0.0)),
@@ -4332,6 +4546,24 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_coherence_max': float(m.get('rst_coherence_max', 0.0)),
         'attn_den_ratio': float(m.get('attn_den_ratio', 0.0)),
         'rst_den_ratio': float(m.get('rst_den_ratio', 0.0)),
+        'attn_den_ratio_mean': float(m.get(
+            'attn_den_ratio_mean', m.get('attn_den_ratio', 0.0))),
+        'rst_den_ratio_mean': float(m.get(
+            'rst_den_ratio_mean', m.get('rst_den_ratio', 0.0))),
+        'attn_den_ratio_max': float(m.get('attn_den_ratio_max', 0.0)),
+        'rst_den_ratio_max': float(m.get('rst_den_ratio_max', 0.0)),
+        'attn_raw_out_norm_mean': float(m.get('attn_raw_out_norm_mean', 0.0)),
+        'rst_raw_out_norm_mean': float(m.get('rst_raw_out_norm_mean', 0.0)),
+        'attn_raw_out_norm_max': float(m.get('attn_raw_out_norm_max', 0.0)),
+        'rst_raw_out_norm_max': float(m.get('rst_raw_out_norm_max', 0.0)),
+        'attn_normalized_out_norm_mean': float(m.get('attn_normalized_out_norm_mean', 0.0)),
+        'rst_normalized_out_norm_mean': float(m.get('rst_normalized_out_norm_mean', 0.0)),
+        'attn_normalized_out_norm_max': float(m.get('attn_normalized_out_norm_max', 0.0)),
+        'rst_normalized_out_norm_max': float(m.get('rst_normalized_out_norm_max', 0.0)),
+        'attn_scaled_out_norm_mean': float(m.get('attn_scaled_out_norm_mean', 0.0)),
+        'rst_scaled_out_norm_mean': float(m.get('rst_scaled_out_norm_mean', 0.0)),
+        'attn_scaled_out_norm_max': float(m.get('attn_scaled_out_norm_max', 0.0)),
+        'rst_scaled_out_norm_max': float(m.get('rst_scaled_out_norm_max', 0.0)),
         'attn_activation_cost': float(m.get('attn_activation_cost', 0.0)),
         'rst_activation_cost': float(m.get('rst_activation_cost', 0.0)),
         'attn_current_cost': float(m.get('attn_current_cost', 0.0)),
@@ -4536,20 +4768,7 @@ def _print_analysis_block(rec, ctx):
             f" rst={rec['rst_gate_den_sum']:.1f}"
         )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
-        log_message(
-            f"  contrib_den: a={_g('attn_contrib_den_sum'):.1f}"
-            f" rst={_g('rst_contrib_den_sum'):.1f}"
-            f" max[a={_g('attn_contrib_den_max'):.1f}"
-            f" rst={_g('rst_contrib_den_max'):.1f}]"
-            f" ratio[a={_g('attn_den_ratio'):.3f}"
-            f" rst={_g('rst_den_ratio'):.3f}]"
-        )
-        log_message(
-            f"  compose_n: a={_g('attn_compose_norm'):.3f}"
-            f" rst={_g('rst_compose_norm'):.3f}"
-            f" max[a={_g('attn_compose_norm_max'):.3f}"
-            f" rst={_g('rst_compose_norm_max'):.3f}]"
-        )
+        log_message(_format_output_stab_line(rec, indent="  "))
     log_message(
         f"  tau_struct k_std={rec['rst_tau_std']:.2f}"
         f" a_std=[{rec['attn_tau_std_q']:.2f} {rec['attn_tau_std_k']:.2f} {rec['attn_tau_std_v']:.2f}]"
@@ -4701,6 +4920,7 @@ def main():
         debug_mode and tcfg.get('debug_local_spikes', False))
     debug_drop_compare = bool(
         tcfg.get('debug_drop_compare', False) or cli_args.debug_drop_compare)
+    collapse_warn_ctx = _collapse_warn_context(tcfg)
     crash_snapshot_enabled = bool(tcfg.get('crash_snapshot_enabled', False))
     stop_on_collapse = bool(tcfg.get('stop_on_collapse', False))
     if stop_on_collapse:
@@ -5378,6 +5598,15 @@ def main():
                 f" rw_contrib_den_floor={tcfg.get('rw_contrib_den_floor', 1.0)}"
             )
         print(gate_msg)
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
+            print(
+                "  v4158 diagnostics: "
+                f"debug_local_spikes={debug_local_spikes} "
+                f"warn_compose={collapse_warn_ctx['collapse_warn_compose_norm_threshold']} "
+                f"warn_top1={collapse_warn_ctx['collapse_warn_top1_threshold']} "
+                f"warn_low_den_frac={collapse_warn_ctx['collapse_warn_low_den_floor_frac_threshold']} "
+                f"warn_scaled_out={collapse_warn_ctx['collapse_warn_scaled_out_threshold']}"
+            )
 
     # ----------------------------------------------------------
     # Resume from checkpoint (resume_path detected earlier for config override)
@@ -6772,6 +7001,7 @@ def main():
                         'progress': _progress,
                         'model_version': model_version,
                     }
+                    ctx.update(collapse_warn_ctx)
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
                     rec = _attach_update_cap_window_stats(
                         rec, jax.device_get(_regular_cap_window_jax))
@@ -6847,6 +7077,7 @@ def main():
                     'progress': _progress,
                     'model_version': model_version,
                 }
+                debug_ctx.update(collapse_warn_ctx)
                 debug_metrics = jax.device_get(metrics)
                 debug_rec = _build_regular_record(
                     debug_metrics, debug_avgs, debug_ctx, global_step, epoch)
@@ -6945,6 +7176,7 @@ def main():
                                 'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
                             }
+                            _ctx_a.update(collapse_warn_ctx)
                             analysis_payload = dict(analysis_result)
                             if _latest_val_dead_step == global_step \
                                     and _latest_val_dead_stats is not None:

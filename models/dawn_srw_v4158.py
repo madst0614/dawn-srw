@@ -169,7 +169,8 @@ def unit_norm_init(scale=1.0):
     return init
 
 
-LOCAL_SPIKE_METRIC_COUNT = 11
+# Mirrors scripts/train_jax.py LOCAL_SPIKE_METRIC_NAMES.
+LOCAL_SPIKE_METRIC_COUNT = 16
 LOCAL_SPIKE_TOP1_COUNT = 17
 ATTN_LOCAL_METRIC_COUNT = 7
 
@@ -287,6 +288,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                     # compose_norm_mean scalar
         P(),                     # compose_norm_max scalar
         P(),                     # den_ratio_mean scalar
+        P(),                     # contrib_den_min scalar
+        P(),                     # contrib_den_floor_frac scalar
+        P(),                     # den_ratio_max scalar
+        P(),                     # raw_out_norm_mean scalar
+        P(),                     # raw_out_norm_max scalar
+        P(),                     # normalized_out_norm_mean scalar
+        P(),                     # normalized_out_norm_max scalar
     )
     # ANALYSIS extras appended after slim.
     _analysis_extra_specs = (
@@ -491,12 +499,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
                 chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
+                    read_norm = jnp.sqrt(
+                        jnp.sum(jnp.square(rc.astype(jnp.float32)), axis=-1)
+                        + jnp.float32(1e-8))
+                    op_gain = read_norm * write_norm
                     contrib_proxy = (
                         jnp.abs(jax.lax.stop_gradient(gate * xr_f))
                         * write_norm[None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
-                        jnp.max(jax.lax.stop_gradient(margin)))
+                        jnp.max(jax.lax.stop_gradient(raw)))
                     diag_chunk = diag_chunk.at[:, 4].set(
                         jnp.max(jax.lax.stop_gradient(intensity)))
                     diag_chunk = diag_chunk.at[:, 5].set(
@@ -507,6 +519,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.max(jnp.linalg.norm(
                             jax.lax.stop_gradient(route.astype(jnp.float32)),
                             axis=-1)))
+                    diag_chunk = diag_chunk.at[:, 11].set(
+                        jnp.max(jax.lax.stop_gradient(scores_f)))
+                    diag_chunk = diag_chunk.at[:, 12].set(
+                        jnp.max(jax.lax.stop_gradient(margin)))
+                    diag_chunk = diag_chunk.at[:, 13].set(
+                        jnp.max(jax.lax.stop_gradient(write_norm)))
+                    diag_chunk = diag_chunk.at[:, 14].set(
+                        jnp.max(jax.lax.stop_gradient(read_norm)))
+                    diag_chunk = diag_chunk.at[:, 15].set(
+                        jnp.max(jax.lax.stop_gradient(op_gain)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -611,12 +633,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     else chunk_weighted)
                 chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
+                    read_norm = jnp.sqrt(
+                        jnp.sum(jnp.square(rc.astype(jnp.float32)), axis=-1)
+                        + jnp.float32(1e-8))
+                    op_gain = read_norm * write_norm
                     contrib_proxy = (
                         jnp.abs(jax.lax.stop_gradient(gate * xr_f))
                         * write_norm[None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
-                        jnp.max(jax.lax.stop_gradient(margin)))
+                        jnp.max(jax.lax.stop_gradient(raw)))
                     diag_chunk = diag_chunk.at[:, 4].set(
                         jnp.max(jax.lax.stop_gradient(intensity)))
                     diag_chunk = diag_chunk.at[:, 5].set(
@@ -627,6 +653,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.max(jnp.linalg.norm(
                             jax.lax.stop_gradient(route.astype(jnp.float32)),
                             axis=-1)))
+                    diag_chunk = diag_chunk.at[:, 11].set(
+                        jnp.max(jax.lax.stop_gradient(scores_f)))
+                    diag_chunk = diag_chunk.at[:, 12].set(
+                        jnp.max(jax.lax.stop_gradient(margin)))
+                    diag_chunk = diag_chunk.at[:, 13].set(
+                        jnp.max(jax.lax.stop_gradient(write_norm)))
+                    diag_chunk = diag_chunk.at[:, 14].set(
+                        jnp.max(jax.lax.stop_gradient(read_norm)))
+                    diag_chunk = diag_chunk.at[:, 15].set(
+                        jnp.max(jax.lax.stop_gradient(op_gain)))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -723,20 +759,34 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         current_cost_mean = global_current_cost_m.mean()
         contrib_den_mean = global_contrib_den_m.mean()
         contrib_den_max = global_contrib_den_m.max()
-        compose_norm_tokens = jnp.linalg.norm(
-            jax.lax.stop_gradient(out.astype(jnp.float32)), axis=-1)
+        contrib_den_min = global_contrib_den_m.min()
+        contrib_den_floor_frac = (
+            global_contrib_den_m <= (_rw_den_floor + jnp.float32(1e-6))
+        ).astype(jnp.float32).mean()
+        den_m = jnp.maximum(global_contrib_den_m, _rw_den_floor)
+        normalized_out = jax.lax.stop_gradient(out.astype(jnp.float32))
+        compose_norm_tokens = jnp.linalg.norm(normalized_out, axis=-1)
         compose_norm_mean = compose_norm_tokens.mean()
         compose_norm_max = compose_norm_tokens.max()
-        den_ratio_mean = (
-            global_contrib_den_m / jnp.maximum(global_weighted_cost_m, 1e-8)
-        ).mean()
+        den_ratio_tokens = (
+            global_contrib_den_m / jnp.maximum(global_weighted_cost_m, 1e-8))
+        den_ratio_mean = den_ratio_tokens.mean()
+        den_ratio_max = den_ratio_tokens.max()
+        raw_out_norm_tokens = compose_norm_tokens * jnp.squeeze(den_m, axis=-1)
+        raw_out_norm_mean = raw_out_norm_tokens.mean()
+        raw_out_norm_max = raw_out_norm_tokens.max()
+        normalized_out_norm_mean = compose_norm_mean
+        normalized_out_norm_max = compose_norm_max
 
         slim_out = (out.astype(jnp.float32), active_frac, global_gate_max, score_lb,
                     score_std_out, es_out, active_n_mean, strong_frac, z_mean_active,
                     tau_abs_mean, dead_penalty_out, dead_count_out, int_max_out,
                     den_cost_mean, activation_cost_mean, current_cost_mean,
                     contrib_den_mean, contrib_den_max,
-                    compose_norm_mean, compose_norm_max, den_ratio_mean)
+                    compose_norm_mean, compose_norm_max, den_ratio_mean,
+                    contrib_den_min, contrib_den_floor_frac, den_ratio_max,
+                    raw_out_norm_mean, raw_out_norm_max,
+                    normalized_out_norm_mean, normalized_out_norm_max)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
         prune_out = ()
@@ -785,12 +835,21 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             top1_details = jnp.zeros(
                 (1, LOCAL_SPIKE_TOP1_COUNT), dtype=jnp.float32)
             top1_details = top1_details.at[:, 0].set(metric_vals[:, 2])
+            top1_details = top1_details.at[:, 1].set(metric_vals[:, 11])
+            top1_details = top1_details.at[:, 2].set(metric_vals[:, 0])
+            top1_details = top1_details.at[:, 3].set(metric_vals[:, 12])
             top1_details = top1_details.at[:, 4].set(metric_vals[:, 1])
+            top1_details = top1_details.at[:, 5].set(metric_vals[:, 2])
             top1_details = top1_details.at[:, 6].set(metric_vals[:, 3])
             top1_details = top1_details.at[:, 7].set(metric_vals[:, 4])
             top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
+            top1_details = top1_details.at[:, 9].set(metric_vals[:, 13])
+            top1_details = top1_details.at[:, 10].set(metric_vals[:, 14])
+            top1_details = top1_details.at[:, 11].set(metric_vals[:, 15])
             top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
             top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_details = top1_details.at[:, 14].set(
+                metric_vals[:, 6] / jnp.maximum(metric_vals[:, 7], 1e-8))
             top1_details = top1_details.at[:, 15].set(metric_vals[:, 9])
             top1_details = top1_details.at[:, 16].set(metric_vals[:, 10])
             top1_locs = jnp.full((1, 3), -1, dtype=jnp.int32)
@@ -1098,6 +1157,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                          # compose_norm_mean scalar
         P(),                          # compose_norm_max scalar
         P(),                          # den_ratio_mean scalar
+        P(),                          # contrib_den_min scalar
+        P(),                          # contrib_den_floor_frac scalar
+        P(),                          # den_ratio_max scalar
+        P(),                          # raw_out_norm_mean scalar
+        P(),                          # raw_out_norm_max scalar
+        P(),                          # normalized_out_norm_mean scalar
+        P(),                          # normalized_out_norm_max scalar
     )
     _analysis_extra_specs = (
         P('data', None, None),        # phi_binary [B,S,1]
@@ -1303,13 +1369,17 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     else chunk_weighted)
                 chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
+                    read_norm = jnp.sqrt(
+                        jnp.sum(jnp.square(rc.astype(jnp.float32)), axis=-1)
+                        + jnp.float32(1e-8))
+                    op_gain = read_norm * write_norm
                     xr_r = xr_f[:, :, None, :]
                     contrib_proxy = (
                         jnp.abs(jax.lax.stop_gradient(gate * xr_r))
                         * write_norm[None, None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
-                        jnp.max(jax.lax.stop_gradient(margin),
+                        jnp.max(jax.lax.stop_gradient(raw),
                                 axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 4].set(
                         jnp.max(jax.lax.stop_gradient(intensity),
@@ -1324,6 +1394,23 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         axis=-1))
                     diag_chunk = diag_chunk.at[:, 10].set(
                         jnp.repeat(_route_norm_max, 2))
+                    diag_chunk = diag_chunk.at[:, 11].set(
+                        jnp.max(jax.lax.stop_gradient(scores_f),
+                                axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 12].set(
+                        jnp.max(jax.lax.stop_gradient(margin),
+                                axis=(0, 1, 3)))
+                    _write_norm_max = jnp.max(
+                        jax.lax.stop_gradient(write_norm))
+                    _read_norm_max = jnp.max(
+                        jax.lax.stop_gradient(read_norm))
+                    _op_gain_max = jnp.max(jax.lax.stop_gradient(op_gain))
+                    diag_chunk = diag_chunk.at[:, 13].set(
+                        jnp.repeat(_write_norm_max, 2))
+                    diag_chunk = diag_chunk.at[:, 14].set(
+                        jnp.repeat(_read_norm_max, 2))
+                    diag_chunk = diag_chunk.at[:, 15].set(
+                        jnp.repeat(_op_gain_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1427,13 +1514,17 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
                 chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
+                    read_norm = jnp.sqrt(
+                        jnp.sum(jnp.square(rc.astype(jnp.float32)), axis=-1)
+                        + jnp.float32(1e-8))
+                    op_gain = read_norm * write_norm
                     xr_r = xr_f[:, :, None, :]
                     contrib_proxy = (
                         jnp.abs(jax.lax.stop_gradient(gate * xr_r))
                         * write_norm[None, None, None, :])
                     diag_chunk = jnp.full_like(diag_vals, diag_neg_inf)
                     diag_chunk = diag_chunk.at[:, 1].set(
-                        jnp.max(jax.lax.stop_gradient(margin),
+                        jnp.max(jax.lax.stop_gradient(raw),
                                 axis=(0, 1, 3)))
                     diag_chunk = diag_chunk.at[:, 4].set(
                         jnp.max(jax.lax.stop_gradient(intensity),
@@ -1448,6 +1539,23 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         axis=-1))
                     diag_chunk = diag_chunk.at[:, 10].set(
                         jnp.repeat(_route_norm_max, 2))
+                    diag_chunk = diag_chunk.at[:, 11].set(
+                        jnp.max(jax.lax.stop_gradient(scores_f),
+                                axis=(0, 1, 3)))
+                    diag_chunk = diag_chunk.at[:, 12].set(
+                        jnp.max(jax.lax.stop_gradient(margin),
+                                axis=(0, 1, 3)))
+                    _write_norm_max = jnp.max(
+                        jax.lax.stop_gradient(write_norm))
+                    _read_norm_max = jnp.max(
+                        jax.lax.stop_gradient(read_norm))
+                    _op_gain_max = jnp.max(jax.lax.stop_gradient(op_gain))
+                    diag_chunk = diag_chunk.at[:, 13].set(
+                        jnp.repeat(_write_norm_max, 2))
+                    diag_chunk = diag_chunk.at[:, 14].set(
+                        jnp.repeat(_read_norm_max, 2))
+                    diag_chunk = diag_chunk.at[:, 15].set(
+                        jnp.repeat(_op_gain_max, 2))
                     diag_vals = jnp.maximum(diag_vals, diag_chunk)
                 chunk_active = (activation > 0.5).astype(jnp.float32).sum(axis=-1, keepdims=True)
                 chunk_strong = (activation > 0.9).astype(jnp.float32).sum(axis=-1, keepdims=True)
@@ -1546,20 +1654,34 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         current_cost_mean = global_current_cost_m.mean()
         contrib_den_mean = global_contrib_den_m.mean()
         contrib_den_max = global_contrib_den_m.max()
-        compose_norm_tokens = jnp.linalg.norm(
-            jax.lax.stop_gradient(out.astype(jnp.float32)), axis=-1)
+        contrib_den_min = global_contrib_den_m.min()
+        contrib_den_floor_frac = (
+            global_contrib_den_m <= (_rw_den_floor + jnp.float32(1e-6))
+        ).astype(jnp.float32).mean()
+        den_m = jnp.maximum(global_contrib_den_m, _rw_den_floor)
+        normalized_out = jax.lax.stop_gradient(out.astype(jnp.float32))
+        compose_norm_tokens = jnp.linalg.norm(normalized_out, axis=-1)
         compose_norm_mean = compose_norm_tokens.mean()
         compose_norm_max = compose_norm_tokens.max()
-        den_ratio_mean = (
-            global_contrib_den_m / jnp.maximum(global_weighted_cost_m, 1e-8)
-        ).mean()
+        den_ratio_tokens = (
+            global_contrib_den_m / jnp.maximum(global_weighted_cost_m, 1e-8))
+        den_ratio_mean = den_ratio_tokens.mean()
+        den_ratio_max = den_ratio_tokens.max()
+        raw_out_norm_tokens = compose_norm_tokens * jnp.squeeze(den_m, axis=-1)
+        raw_out_norm_mean = raw_out_norm_tokens.mean()
+        raw_out_norm_max = raw_out_norm_tokens.max()
+        normalized_out_norm_mean = compose_norm_mean
+        normalized_out_norm_max = compose_norm_max
 
         slim_out = (out.astype(jnp.float32), active_frac_mean, raw_gate_max_mean, score_lb,
                     score_std_out, es_out, active_n_mean, strong_frac_mean,
                     z_mean_active_mean, tau_abs_mean, dead_penalty_out, dead_count_out,
                     int_max_out, den_cost_mean, activation_cost_mean, current_cost_mean,
                     contrib_den_mean, contrib_den_max,
-                    compose_norm_mean, compose_norm_max, den_ratio_mean)
+                    compose_norm_mean, compose_norm_max, den_ratio_mean,
+                    contrib_den_min, contrib_den_floor_frac, den_ratio_max,
+                    raw_out_norm_mean, raw_out_norm_max,
+                    normalized_out_norm_mean, normalized_out_norm_max)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
         prune_out = ()
@@ -1614,12 +1736,21 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             top1_details = jnp.zeros(
                 (2, LOCAL_SPIKE_TOP1_COUNT), dtype=jnp.float32)
             top1_details = top1_details.at[:, 0].set(metric_vals[:, 2])
+            top1_details = top1_details.at[:, 1].set(metric_vals[:, 11])
+            top1_details = top1_details.at[:, 2].set(metric_vals[:, 0])
+            top1_details = top1_details.at[:, 3].set(metric_vals[:, 12])
             top1_details = top1_details.at[:, 4].set(metric_vals[:, 1])
+            top1_details = top1_details.at[:, 5].set(metric_vals[:, 2])
             top1_details = top1_details.at[:, 6].set(metric_vals[:, 3])
             top1_details = top1_details.at[:, 7].set(metric_vals[:, 4])
             top1_details = top1_details.at[:, 8].set(metric_vals[:, 5])
+            top1_details = top1_details.at[:, 9].set(metric_vals[:, 13])
+            top1_details = top1_details.at[:, 10].set(metric_vals[:, 14])
+            top1_details = top1_details.at[:, 11].set(metric_vals[:, 15])
             top1_details = top1_details.at[:, 12].set(metric_vals[:, 6])
             top1_details = top1_details.at[:, 13].set(metric_vals[:, 7])
+            top1_details = top1_details.at[:, 14].set(
+                metric_vals[:, 6] / jnp.maximum(metric_vals[:, 7], 1e-8))
             top1_details = top1_details.at[:, 15].set(metric_vals[:, 9])
             top1_details = top1_details.at[:, 16].set(metric_vals[:, 10])
             top1_locs = jnp.full((2, 3), -1, dtype=jnp.int32)
@@ -2003,21 +2134,28 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_dead_pen, qk_dead_cnt, qk_int_max,
      qk_den_cost_mean, qk_activation_cost_mean, qk_current_cost_mean,
      qk_contrib_den_mean, qk_contrib_den_max,
-     qk_compose_norm, qk_compose_norm_max, qk_den_ratio) = qk_ret[:21]
+     qk_compose_norm, qk_compose_norm_max, qk_den_ratio,
+     qk_contrib_den_min, qk_contrib_den_floor_frac, qk_den_ratio_max,
+     qk_raw_out_norm_mean, qk_raw_out_norm_max,
+     qk_normalized_out_norm_mean,
+     qk_normalized_out_norm_max) = qk_ret[:28]
     (qk_gate_eff_n, qk_gate_eff_ratio,
-     qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[21:25]
+     qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[28:32]
     if return_prune_stats:
         (qk_kept_count, qk_kept_frac, qk_full_gate_sum, qk_kept_gate_sum,
          qk_retained_gate_mass, qk_int_cap_frac,
-         qk_gate_max_mean) = qk_ret[25:32]
+         qk_gate_max_mean) = qk_ret[32:39]
     if analysis:
         (qk_phi_bin, qk_z075, qk_z030, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_activation_cost, qk_current_cost,
-         qk_kurt, qk_int_cap) = qk_ret[25:36]
+         qk_kurt, qk_int_cap) = qk_ret[32:43]
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
     if local_diagnostics:
         (qk_local_values, qk_local_locs,
          qk_top1_values, qk_top1_locs) = qk_ret[-4:]
+    qk_scale_abs = jnp.abs(jax.lax.stop_gradient(qk_scale))
+    qk_scaled_out_norm_mean = qk_normalized_out_norm_mean * qk_scale_abs
+    qk_scaled_out_norm_max = qk_normalized_out_norm_max * qk_scale_abs
     Q = QK_out[:, :, 0, :] * qk_scale
     K = QK_out[:, :, 1, :] * qk_scale
     v_ret = fused_single_v(x, h_V, v_emb_unit, tau_all[:, :, 2:3],
@@ -2027,21 +2165,28 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_dead_pen, v_dead_cnt, v_int_max,
      v_den_cost_mean, v_activation_cost_mean, v_current_cost_mean,
      v_contrib_den_mean, v_contrib_den_max,
-     v_compose_norm, v_compose_norm_max, v_den_ratio) = v_ret[:21]
+     v_compose_norm, v_compose_norm_max, v_den_ratio,
+     v_contrib_den_min, v_contrib_den_floor_frac, v_den_ratio_max,
+     v_raw_out_norm_mean, v_raw_out_norm_max,
+     v_normalized_out_norm_mean,
+     v_normalized_out_norm_max) = v_ret[:28]
     (v_gate_eff_n, v_gate_eff_ratio,
-     v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[21:25]
+     v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[28:32]
     if return_prune_stats:
         (v_kept_count, v_kept_frac, v_full_gate_sum, v_kept_gate_sum,
          v_retained_gate_mass, v_int_cap_frac,
-         v_gate_max_mean) = v_ret[25:32]
+         v_gate_max_mean) = v_ret[32:39]
     if analysis:
         (v_phi_bin, v_z075, v_z030, v_skew, v_apt_std, v_entropy,
          v_den_cost, v_activation_cost, v_current_cost,
-         v_kurt, v_int_cap) = v_ret[25:36]
+         v_kurt, v_int_cap) = v_ret[32:43]
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
     if local_diagnostics:
         (v_local_values, v_local_locs,
          v_top1_values, v_top1_locs) = v_ret[-4:]
+    v_scale_abs = jnp.abs(jax.lax.stop_gradient(v_scale))
+    v_scaled_out_norm_mean = v_normalized_out_norm_mean * v_scale_abs
+    v_scaled_out_norm_max = v_normalized_out_norm_max * v_scale_abs
     V = V * v_scale
 
     d_head = d_model // n_heads
@@ -2119,9 +2264,26 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     attn_current_cost_mean = (qk_current_cost_mean + v_current_cost_mean) / 2
     attn_contrib_den_mean = (qk_contrib_den_mean + v_contrib_den_mean) / 2
     attn_contrib_den_max = jnp.maximum(qk_contrib_den_max, v_contrib_den_max)
+    attn_contrib_den_min = jnp.minimum(qk_contrib_den_min,
+                                       v_contrib_den_min)
+    attn_contrib_den_floor_frac = (
+        qk_contrib_den_floor_frac + v_contrib_den_floor_frac) / 2
     attn_compose_norm = (qk_compose_norm + v_compose_norm) / 2
     attn_compose_norm_max = jnp.maximum(qk_compose_norm_max, v_compose_norm_max)
     attn_den_ratio = (qk_den_ratio + v_den_ratio) / 2
+    attn_den_ratio_max = jnp.maximum(qk_den_ratio_max, v_den_ratio_max)
+    attn_raw_out_norm_mean = (
+        qk_raw_out_norm_mean + v_raw_out_norm_mean) / 2
+    attn_raw_out_norm_max = jnp.maximum(qk_raw_out_norm_max,
+                                        v_raw_out_norm_max)
+    attn_normalized_out_norm_mean = (
+        qk_normalized_out_norm_mean + v_normalized_out_norm_mean) / 2
+    attn_normalized_out_norm_max = jnp.maximum(
+        qk_normalized_out_norm_max, v_normalized_out_norm_max)
+    attn_scaled_out_norm_mean = (
+        qk_scaled_out_norm_mean + v_scaled_out_norm_mean) / 2
+    attn_scaled_out_norm_max = jnp.maximum(qk_scaled_out_norm_max,
+                                           v_scaled_out_norm_max)
     attn_gate_eff_n = (qk_gate_eff_n + v_gate_eff_n) / 2
     attn_gate_eff_ratio = (qk_gate_eff_ratio + v_gate_eff_ratio) / 2
     attn_top1_gate_frac = (qk_top1_gate_frac + v_top1_gate_frac) / 2
@@ -2146,6 +2308,11 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_current_cost_mean,
                 attn_contrib_den_mean, attn_contrib_den_max,
                 attn_compose_norm, attn_compose_norm_max, attn_den_ratio,
+                attn_contrib_den_min, attn_contrib_den_floor_frac,
+                attn_den_ratio_max,
+                attn_raw_out_norm_mean, attn_raw_out_norm_max,
+                attn_normalized_out_norm_mean, attn_normalized_out_norm_max,
+                attn_scaled_out_norm_mean, attn_scaled_out_norm_max,
                 attn_gate_eff_n, attn_gate_eff_ratio,
                 attn_top1_gate_frac, attn_top1_gate_frac_max)
     if not analysis:
@@ -2264,23 +2431,31 @@ def _rst_forward(x, pool_params, router_params, rng,
      rst_dead_penalty, rst_dead_count, rst_int_max,
      rst_den_cost_mean, rst_activation_cost_mean, rst_current_cost_mean,
      rst_contrib_den_mean, rst_contrib_den_max,
-     rst_compose_norm, rst_compose_norm_max, rst_den_ratio) = rst_ret[:21]
+     rst_compose_norm, rst_compose_norm_max, rst_den_ratio,
+     rst_contrib_den_min, rst_contrib_den_floor_frac, rst_den_ratio_max,
+     rst_raw_out_norm_mean, rst_raw_out_norm_max,
+     rst_normalized_out_norm_mean,
+     rst_normalized_out_norm_max) = rst_ret[:28]
     (rst_gate_eff_n, rst_gate_eff_ratio,
-     rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[21:25]
+     rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[28:32]
     if return_prune_stats:
         (rst_kept_count, rst_kept_frac, rst_full_gate_sum,
          rst_kept_gate_sum, rst_retained_gate_mass, rst_int_cap_frac,
-         rst_gate_max_mean) = rst_ret[25:32]
+         rst_gate_max_mean) = rst_ret[32:39]
     if analysis:
         (phi_binary_frac, rst_z_lt_075_frac, rst_z_lt_030_frac,
          rst_score_skew, rst_active_per_token_std, rst_gate_entropy,
          rst_den_cost, rst_activation_cost, rst_current_cost,
-         rst_score_kurt, rst_int_cap_frac) = rst_ret[25:36]
+         rst_score_kurt, rst_int_cap_frac) = rst_ret[32:43]
         rst_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     if local_diagnostics:
         (rst_local_values, rst_local_locs,
          rst_top1_values, rst_top1_locs) = rst_ret[-4:]
     out = out * rst_scale
+    rst_scale_abs = jnp.abs(jax.lax.stop_gradient(rst_scale))
+    rst_scaled_out_norm_mean = (
+        rst_normalized_out_norm_mean * rst_scale_abs)
+    rst_scaled_out_norm_max = rst_normalized_out_norm_max * rst_scale_abs
     rst_out_norm = jnp.linalg.norm(out, axis=-1).mean()
     rng, rng_out = jax.random.split(rng)
     out = safe_dropout(out, dropout_rate, deterministic, rng_out)
@@ -2310,6 +2485,11 @@ def _rst_forward(x, pool_params, router_params, rng,
                 rst_current_cost_mean,
                 rst_contrib_den_mean, rst_contrib_den_max,
                 rst_compose_norm, rst_compose_norm_max, rst_den_ratio,
+                rst_contrib_den_min, rst_contrib_den_floor_frac,
+                rst_den_ratio_max,
+                rst_raw_out_norm_mean, rst_raw_out_norm_max,
+                rst_normalized_out_norm_mean, rst_normalized_out_norm_max,
+                rst_scaled_out_norm_mean, rst_scaled_out_norm_max,
                 rst_gate_eff_n, rst_gate_eff_ratio,
                 rst_top1_gate_frac, rst_top1_gate_frac_max)
     if not analysis:
@@ -2527,12 +2707,30 @@ class DAWN(nn.Module):
             rst_contrib_den_sum_all = _z
             attn_contrib_den_max_all = _z
             rst_contrib_den_max_all = _z
+            attn_contrib_den_min_all = _z
+            rst_contrib_den_min_all = _z
+            attn_contrib_den_floor_frac_all = _z
+            rst_contrib_den_floor_frac_all = _z
             attn_compose_norm_all = _z
             rst_compose_norm_all = _z
             attn_compose_norm_max_all = _z
             rst_compose_norm_max_all = _z
             attn_den_ratio_all = _z
             rst_den_ratio_all = _z
+            attn_den_ratio_max_all = _z
+            rst_den_ratio_max_all = _z
+            attn_raw_out_norm_mean_all = _z
+            rst_raw_out_norm_mean_all = _z
+            attn_raw_out_norm_max_all = _z
+            rst_raw_out_norm_max_all = _z
+            attn_normalized_out_norm_mean_all = _z
+            rst_normalized_out_norm_mean_all = _z
+            attn_normalized_out_norm_max_all = _z
+            rst_normalized_out_norm_max_all = _z
+            attn_scaled_out_norm_mean_all = _z
+            rst_scaled_out_norm_mean_all = _z
+            attn_scaled_out_norm_max_all = _z
+            rst_scaled_out_norm_max_all = _z
             attn_gate_eff_n_all = _z
             attn_gate_eff_ratio_all = _z
             attn_top1_gate_frac_all = _z
@@ -2604,15 +2802,20 @@ class DAWN(nn.Module):
                  a_current_cost_mean,
                  a_contrib_den_sum, a_contrib_den_max,
                  a_compose_norm, a_compose_norm_max, a_den_ratio,
+                 a_contrib_den_min, a_contrib_den_floor_frac,
+                 a_den_ratio_max,
+                 a_raw_out_norm_mean, a_raw_out_norm_max,
+                 a_normalized_out_norm_mean, a_normalized_out_norm_max,
+                 a_scaled_out_norm_mean, a_scaled_out_norm_max,
                  a_gate_eff_n, a_gate_eff_ratio,
-                 a_top1_gate_frac, a_top1_gate_frac_max) = attn_ret[:38]
+                 a_top1_gate_frac, a_top1_gate_frac_max) = attn_ret[:47]
                 if return_prune_stats:
                     (a_qk_kept_count, a_qk_kept_frac, a_qk_full_gate_sum,
                      a_qk_kept_gate_sum, a_qk_retained_gate_mass,
                      a_qk_int_cap_frac, a_qk_gate_max_mean,
                      a_v_kept_count, a_v_kept_frac, a_v_full_gate_sum,
                      a_v_kept_gate_sum, a_v_retained_gate_mass,
-                     a_v_int_cap_frac, a_v_gate_max_mean) = attn_ret[38:52]
+                     a_v_int_cap_frac, a_v_gate_max_mean) = attn_ret[47:61]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -2622,7 +2825,7 @@ class DAWN(nn.Module):
                      a_skew, a_apt_std, a_entropy,
                      a_den_cost, a_activation_cost, a_current_cost,
                      a_qk_emb_n_max, a_v_emb_n_max,
-                     a_score_kurt, a_int_cap_frac) = attn_ret[38:61]
+                     a_score_kurt, a_int_cap_frac) = attn_ret[47:70]
                 if local_diagnostics:
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
@@ -2649,12 +2852,17 @@ class DAWN(nn.Module):
                  k_current_cost_mean,
                  k_contrib_den_sum, k_contrib_den_max,
                  k_compose_norm, k_compose_norm_max, k_den_ratio,
+                 k_contrib_den_min, k_contrib_den_floor_frac,
+                 k_den_ratio_max,
+                 k_raw_out_norm_mean, k_raw_out_norm_max,
+                 k_normalized_out_norm_mean, k_normalized_out_norm_max,
+                 k_scaled_out_norm_mean, k_scaled_out_norm_max,
                  k_gate_eff_n, k_gate_eff_ratio,
-                 k_top1_gate_frac, k_top1_gate_frac_max) = rst_ret[:33]
+                 k_top1_gate_frac, k_top1_gate_frac_max) = rst_ret[:42]
                 if return_prune_stats:
                     (k_kept_count, k_kept_frac, k_full_gate_sum,
                      k_kept_gate_sum, k_retained_gate_mass,
-                     k_int_cap_frac, k_gate_max_mean) = rst_ret[33:40]
+                     k_int_cap_frac, k_gate_max_mean) = rst_ret[42:49]
                 if analysis:
                     (k_raw_out_norm,
                      k_tau_std, k_tau_kernel_norm,
@@ -2662,7 +2870,7 @@ class DAWN(nn.Module):
                      k_skew, k_apt_std, k_entropy,
                      k_den_cost, k_activation_cost, k_current_cost,
                      k_emb_n_max, k_score_kurt, k_phi_bin,
-                     k_int_cap_frac) = rst_ret[33:48]
+                     k_int_cap_frac) = rst_ret[42:57]
                 if local_diagnostics:
                     (k_local_values, k_local_locs,
                      k_top1_values, k_top1_locs) = rst_ret[-4:]
@@ -2695,6 +2903,15 @@ class DAWN(nn.Module):
                            a_compose_norm, k_compose_norm,
                            a_compose_norm_max, k_compose_norm_max,
                            a_den_ratio, k_den_ratio,
+                           a_contrib_den_min, k_contrib_den_min,
+                           a_contrib_den_floor_frac, k_contrib_den_floor_frac,
+                           a_den_ratio_max, k_den_ratio_max,
+                           a_raw_out_norm_mean, k_raw_out_norm_mean,
+                           a_raw_out_norm_max, k_raw_out_norm_max,
+                           a_normalized_out_norm_mean, k_normalized_out_norm_mean,
+                           a_normalized_out_norm_max, k_normalized_out_norm_max,
+                           a_scaled_out_norm_mean, k_scaled_out_norm_mean,
+                           a_scaled_out_norm_max, k_scaled_out_norm_max,
                            a_gate_eff_n, a_gate_eff_ratio,
                            a_top1_gate_frac, a_top1_gate_frac_max,
                            k_gate_eff_n, k_gate_eff_ratio,
@@ -2787,11 +3004,20 @@ class DAWN(nn.Module):
             attn_compose_norm_all, rst_compose_norm_all,
             attn_compose_norm_max_all, rst_compose_norm_max_all,
             attn_den_ratio_all, rst_den_ratio_all,
+            attn_contrib_den_min_all, rst_contrib_den_min_all,
+            attn_contrib_den_floor_frac_all, rst_contrib_den_floor_frac_all,
+            attn_den_ratio_max_all, rst_den_ratio_max_all,
+            attn_raw_out_norm_mean_all, rst_raw_out_norm_mean_all,
+            attn_raw_out_norm_max_all, rst_raw_out_norm_max_all,
+            attn_normalized_out_norm_mean_all, rst_normalized_out_norm_mean_all,
+            attn_normalized_out_norm_max_all, rst_normalized_out_norm_max_all,
+            attn_scaled_out_norm_mean_all, rst_scaled_out_norm_mean_all,
+            attn_scaled_out_norm_max_all, rst_scaled_out_norm_max_all,
             attn_gate_eff_n_all, attn_gate_eff_ratio_all,
             attn_top1_gate_frac_all, attn_top1_gate_frac_max_all,
             rst_gate_eff_n_all, rst_gate_eff_ratio_all,
-            rst_top1_gate_frac_all, rst_top1_gate_frac_max_all) = scan_ys[:69]
-            _scan_offset = 69
+            rst_top1_gate_frac_all, rst_top1_gate_frac_max_all) = scan_ys[:87]
+            _scan_offset = 87
             if return_prune_stats:
                 (attn_qk_kept_count_all, attn_qk_kept_frac_all,
                  attn_qk_full_gate_sum_all, attn_qk_kept_gate_sum_all,
@@ -2907,12 +3133,20 @@ class DAWN(nn.Module):
             'rst_gate_den_sum_mean': rst_den_cost_mean_all.mean(),
             'attn_contrib_den_sum': attn_contrib_den_sum_all.mean(),
             'rst_contrib_den_sum': rst_contrib_den_sum_all.mean(),
+            'attn_contrib_den_mean': attn_contrib_den_sum_all.mean(),
+            'rst_contrib_den_mean': rst_contrib_den_sum_all.mean(),
             'attn_contrib_den': attn_contrib_den_sum_all.mean(),
             'rst_contrib_den': rst_contrib_den_sum_all.mean(),
             'attn_contrib_den_max': attn_contrib_den_max_all.max(),
             'rst_contrib_den_max': rst_contrib_den_max_all.max(),
+            'attn_contrib_den_min': attn_contrib_den_min_all.min(),
+            'rst_contrib_den_min': rst_contrib_den_min_all.min(),
+            'attn_contrib_den_floor_frac': attn_contrib_den_floor_frac_all.mean(),
+            'rst_contrib_den_floor_frac': rst_contrib_den_floor_frac_all.mean(),
             'attn_compose_norm': attn_compose_norm_all.mean(),
             'rst_compose_norm': rst_compose_norm_all.mean(),
+            'attn_compose_norm_mean': attn_compose_norm_all.mean(),
+            'rst_compose_norm_mean': rst_compose_norm_all.mean(),
             'attn_coherence': attn_compose_norm_all.mean(),
             'rst_coherence': rst_compose_norm_all.mean(),
             'attn_compose_norm_max': attn_compose_norm_max_all.max(),
@@ -2921,6 +3155,22 @@ class DAWN(nn.Module):
             'rst_coherence_max': rst_compose_norm_max_all.max(),
             'attn_den_ratio': attn_den_ratio_all.mean(),
             'rst_den_ratio': rst_den_ratio_all.mean(),
+            'attn_den_ratio_mean': attn_den_ratio_all.mean(),
+            'rst_den_ratio_mean': rst_den_ratio_all.mean(),
+            'attn_den_ratio_max': attn_den_ratio_max_all.max(),
+            'rst_den_ratio_max': rst_den_ratio_max_all.max(),
+            'attn_raw_out_norm_mean': attn_raw_out_norm_mean_all.mean(),
+            'rst_raw_out_norm_mean': rst_raw_out_norm_mean_all.mean(),
+            'attn_raw_out_norm_max': attn_raw_out_norm_max_all.max(),
+            'rst_raw_out_norm_max': rst_raw_out_norm_max_all.max(),
+            'attn_normalized_out_norm_mean': attn_normalized_out_norm_mean_all.mean(),
+            'rst_normalized_out_norm_mean': rst_normalized_out_norm_mean_all.mean(),
+            'attn_normalized_out_norm_max': attn_normalized_out_norm_max_all.max(),
+            'rst_normalized_out_norm_max': rst_normalized_out_norm_max_all.max(),
+            'attn_scaled_out_norm_mean': attn_scaled_out_norm_mean_all.mean(),
+            'rst_scaled_out_norm_mean': rst_scaled_out_norm_mean_all.mean(),
+            'attn_scaled_out_norm_max': attn_scaled_out_norm_max_all.max(),
+            'rst_scaled_out_norm_max': rst_scaled_out_norm_max_all.max(),
             'attn_gate_eff_n': attn_gate_eff_n_all.mean(),
             'attn_gate_eff_ratio': attn_gate_eff_ratio_all.mean(),
             'attn_top1_gate_frac': attn_top1_gate_frac_all.mean(),
