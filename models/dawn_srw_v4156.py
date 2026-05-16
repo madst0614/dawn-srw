@@ -137,7 +137,7 @@ def _model_cfg_uses_fixed_depth_pool_scale(model_cfg) -> bool:
 def _fixed_depth_pool_output_scales(d_model, n_layers):
     dm = jnp.asarray(d_model, dtype=jnp.float32)
     nl = jnp.asarray(n_layers, dtype=jnp.float32)
-    qk_scale = jnp.sqrt(dm / (jnp.float32(2.0) * nl))
+    qk_scale = jnp.sqrt(dm / nl)
     v_scale = jnp.sqrt(dm / nl)
     rst_scale = jnp.sqrt(dm / nl)
     return (

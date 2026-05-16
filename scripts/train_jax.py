@@ -990,7 +990,7 @@ def _fixed_depth_pool_scales_for(model=None, model_cfg=None):
     dm = jnp.asarray(d_model, dtype=jnp.float32)
     nl = jnp.asarray(n_layers, dtype=jnp.float32)
     return (
-        jax.lax.stop_gradient(jnp.sqrt(dm / (jnp.float32(2.0) * nl))),
+        jax.lax.stop_gradient(jnp.sqrt(dm / nl)),
         jax.lax.stop_gradient(jnp.sqrt(dm / nl)),
         jax.lax.stop_gradient(jnp.sqrt(dm / nl)),
     )
