@@ -69,7 +69,7 @@ training:
   activation_threshold: 0.5
   activation_cutoff: 0.01
   epsilon: 1.0e-4
-  max_intensity: 100.0
+  max_intensity: 1000.0
   scan_scale: 0.01
   scan_std_floor: 0.5
 
