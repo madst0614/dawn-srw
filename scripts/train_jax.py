@@ -13,6 +13,9 @@ Usage:
     # Just provide config - auto-resumes if checkpoint exists, otherwise starts fresh
     python scripts/train_jax.py --config configs/train_config_tpu.yaml
 
+    # Resume from a specific run folder or .flax checkpoint
+    python scripts/train_jax.py --config configs/train_config_tpu.yaml --resume gs://.../run_v...
+
     # Force start from scratch (ignores existing checkpoints)
     python scripts/train_jax.py --config configs/train_config_tpu.yaml --from-scratch
 """
@@ -687,7 +690,7 @@ def _checkpoint_parent_dir(path):
 
 
 def _resolve_resume_from(resume_from):
-    """Resolve --resume-from to (checkpoint_file, checkpoint_dir).
+    """Resolve --resume to (checkpoint_file, checkpoint_dir).
 
     Accepts either a run folder or a concrete .flax file.  Passing
     best_model.flax is therefore explicit and will not be overridden by a
@@ -1067,6 +1070,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_z_tanh=True,
                       exploration_weighted_clip=0.0,
                       dead_penalty_weighted_clip=0.0,
+                      global_grad_clip=0.0,
                       tau_lr_mult=1.0,
                       tau_grad_clip=0.0,
                       router_proj_lr_mult=1.0,
@@ -1140,6 +1144,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _explore_z_tanh = bool(exploration_z_tanh)
     _explore_weighted_clip = jnp.float32(exploration_weighted_clip)
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
+    _global_grad_clip = jnp.float32(global_grad_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
     _tau_grad_clip = jnp.float32(tau_grad_clip)
     _router_proj_lr_mult = jnp.float32(router_proj_lr_mult)
@@ -1701,7 +1706,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return cur
 
         grad_norm = _tree_norm(grads)
-        grad_global_postclip = jnp.minimum(grad_norm, jnp.float32(1.0))
+        if float(global_grad_clip) > 0.0:
+            grad_global_postclip = jnp.minimum(grad_norm, _global_grad_clip)
+        else:
+            grad_global_postclip = grad_norm
 
         _grouter = grads.get('router', {})
         _gpool = grads.get('neuron_pool', {})
@@ -4929,8 +4937,8 @@ def main():
     parser.add_argument('--debug-drop-compare', action='store_true',
                         help=('Reserved for tiny opt-in debug/val forwards; '
                               'never runs on the current train batch.'))
-    parser.add_argument('--resume-from', type=str, default=None,
-                        help=('Resume from a specific checkpoint file or run folder. '
+    parser.add_argument('--resume', type=str, default=None,
+                        help=('Resume from a checkpoint file or run folder. '
                               'Examples: gs://.../run_v.../best_model.flax or '
                               'gs://.../run_v...'))
     cli_args = parser.parse_args()
@@ -4954,10 +4962,10 @@ def main():
     # Keep the CLI surface small: --debug controls cadence, while the diagnostic
     # feature switches themselves live in training: config.
     tcfg = cfg['training']
-    # Optional config-driven resume. CLI --resume-from remains as an override
-    # for ad-hoc launches, but diagnostic configs can now be one-shot.
+    # Optional config-driven resume. CLI --resume remains an override for
+    # ad-hoc launches, but diagnostic configs can be one-shot.
     configured_resume_from = (
-        cli_args.resume_from
+        cli_args.resume
         or tcfg.get('resume_from')
         or cfg.get('resume_from'))
     debug_interval = max(0, int(cli_args.debug or 0))
@@ -5016,6 +5024,7 @@ def main():
         'exploration_weighted_clip', tcfg.get('expl_w_clip', 0.0))
     dead_penalty_weighted_clip = tcfg.get(
         'dead_penalty_weighted_clip', tcfg.get('dead_w_clip', 0.0))
+    global_grad_clip = tcfg.get('global_grad_clip', 0.0)
     tau_lr_mult = tcfg.get('tau_lr_mult', 1.0)
     tau_grad_clip = tcfg.get('tau_grad_clip', 0.0)
     router_proj_lr_mult = tcfg.get('router_proj_lr_mult', 1.0)
@@ -5119,7 +5128,7 @@ def main():
         return result if result else None
 
     # Auto-resume: find latest run folder with checkpoints (unless --from-scratch)
-    # --resume-from takes priority: resume from a specific run folder.
+    # --resume takes priority: resume from a specific run folder or file.
     #
     # Only host 0 lists GCS; the resulting (resume_path, checkpoint_dir)
     # is broadcast to all hosts. Independent per-host listing can diverge
@@ -5251,6 +5260,8 @@ def main():
                 'exploration_weighted_clip', exploration_weighted_clip)
             dead_penalty_weighted_clip = saved_training_config.get(
                 'dead_penalty_weighted_clip', dead_penalty_weighted_clip)
+            global_grad_clip = saved_training_config.get(
+                'global_grad_clip', global_grad_clip)
             tau_lr_mult = saved_training_config.get(
                 'tau_lr_mult', tau_lr_mult)
             tau_grad_clip = saved_training_config.get(
@@ -5311,6 +5322,7 @@ def main():
         'exploration_z_tanh': exploration_z_tanh,
         'exploration_weighted_clip': exploration_weighted_clip,
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
+        'global_grad_clip': global_grad_clip,
         'tau_lr_mult': tau_lr_mult,
         'tau_grad_clip': tau_grad_clip,
         'router_proj_lr_mult': router_proj_lr_mult,
@@ -5522,15 +5534,19 @@ def main():
     def _no_param_mask(params):
         return jax.tree.map(lambda _: False, params)
 
-    base_optimizer = optax.chain(
+    optimizer_parts = [
         optax.masked(optax.set_to_zero(), mask=_no_param_mask),
-        optax.clip_by_global_norm(1.0),
+    ]
+    if float(global_grad_clip) > 0.0:
+        optimizer_parts.append(optax.clip_by_global_norm(global_grad_clip))
+    optimizer_parts.extend([
         optax.scale_by_adam(b2=0.95),
         optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
         optax.add_decayed_weights(pool_weight_decay, mask=_wd_mask_pool),
         optax.scale_by_learning_rate(schedule),
         optax.masked(optax.set_to_zero(), mask=_no_param_mask),
-    )
+    ])
+    base_optimizer = optax.chain(*optimizer_parts)
 
     if is_host0:
         def _count_true(mask):
@@ -5598,6 +5614,7 @@ def main():
         print(f"  Warmup steps: {warmup_steps}")
         print(f"  LR: {lr}")
         print("  Stabilizers: "
+              f"global_grad_clip={global_grad_clip}, "
               f"tau_lr_mult={tau_lr_mult}, tau_grad_clip={tau_grad_clip}, "
               f"router_proj_lr_mult={router_proj_lr_mult}, "
               f"router_scan_lr_mult={router_scan_lr_mult}, "
@@ -5910,6 +5927,7 @@ def main():
         exploration_z_tanh=exploration_z_tanh,
         exploration_weighted_clip=exploration_weighted_clip,
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
+        global_grad_clip=global_grad_clip,
         tau_lr_mult=tau_lr_mult,
         tau_grad_clip=tau_grad_clip,
         router_proj_lr_mult=router_proj_lr_mult,
