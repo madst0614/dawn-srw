@@ -2834,6 +2834,61 @@ def _migrate_v4152_route_params(raw, target):
     return raw
 
 
+def _align_opt_state_slot_count(raw, target_opt_state):
+    """Handle optimizer-chain slot additions/removals around no-op transforms.
+
+    The global-grad-clip slot is kept for checkpoint compatibility.  This
+    helper also accepts any short-lived checkpoints saved while that slot was
+    absent by inserting the current target slot state at index 1.
+    """
+    if 'opt_state' not in raw:
+        return raw
+    import flax.serialization as serialization
+
+    state = raw['opt_state']
+    target_state = serialization.to_state_dict(target_opt_state)
+
+    def _is_numeric_seq_dict(x):
+        return (isinstance(x, dict)
+                and all(str(k).isdigit() for k in x.keys()))
+
+    def _to_items(x):
+        if _is_numeric_seq_dict(x):
+            return [x[k] for k in sorted(x.keys(), key=lambda k: int(str(k)))]
+        if isinstance(x, (list, tuple)):
+            return list(x)
+        return None
+
+    def _from_items(items, like):
+        if _is_numeric_seq_dict(like):
+            return {str(i): item for i, item in enumerate(items)}
+        if isinstance(like, tuple):
+            return tuple(items)
+        if isinstance(like, list):
+            return items
+        return like
+
+    state_items = _to_items(state)
+    target_items = _to_items(target_state)
+    if state_items is None or target_items is None:
+        return raw
+    if len(state_items) == len(target_items):
+        return raw
+
+    # Slot 1 is the legacy global-clip/current no-op compatibility transform.
+    compat_slot_index = 1
+    if len(state_items) + 1 == len(target_items):
+        state_items.insert(compat_slot_index, target_items[compat_slot_index])
+    elif len(state_items) - 1 == len(target_items):
+        del state_items[compat_slot_index]
+    else:
+        return raw
+
+    raw = dict(raw)
+    raw['opt_state'] = _from_items(state_items, state)
+    return raw
+
+
 def load_checkpoint(path, target_params, target_opt_state):
     """Load checkpoint using flax serialization. Supports local and GCS paths."""
     import flax.serialization as serialization
@@ -2853,6 +2908,7 @@ def load_checkpoint(path, target_params, target_opt_state):
     raw = serialization.msgpack_restore(bytes_data)
     raw = migrate_legacy_v4155_params(raw)
     migrated = _migrate_v4152_route_params(raw, target)
+    migrated = _align_opt_state_slot_count(migrated, target_opt_state)
     ckpt = serialization.from_state_dict(target, migrated)
     if jax.process_index() == 0:
         print(f"  Checkpoint loaded: {path}")
