@@ -107,7 +107,7 @@ training:
   log_interval: 100
   log_analysis_multiplier: 10
   heavy_geometry_multiplier: 10
-  val_interval: 200
+  val_interval: 1000
   checkpoint_interval: 200
   restore_training_config_on_resume: false
 
