@@ -116,22 +116,6 @@ training:
   debug_local_spikes: true
   debug_drop_compare: false
 
-  # Collapse diagnostics / replay support
-  crash_snapshot_enabled: true
-  stop_on_collapse: true
-  crash_snapshot_save_post: false
-  crash_history_steps: 6
-  crash_snapshot_save_host_batches: true
-
-  # Severe-collapse trigger thresholds.
-  # Stop is CE/grad centered. Routing/top1/active/layer-out/dead diagnostics
-  # are kept for analysis but do not stop training by themselves.
-  collapse_grad_threshold: 100.0
-  collapse_ce_extreme_threshold: 10.0
-  collapse_ce_grad_ce_threshold: 6.0
-  collapse_ce_grad_grad_threshold: 5.0
-  collapse_loss_minus_ce_threshold: 10.0
-
 # -----------------------------------------------------------------------------
 # Runtime outputs
 # -----------------------------------------------------------------------------
