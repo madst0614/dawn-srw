@@ -113,7 +113,7 @@ training:
 
   # Debug diagnostics
   # --debug controls cadence only; this config controls which debug payloads are collected.
-  debug_local_spikes: true
+  debug_local_spikes: false
   debug_drop_compare: false
 
 # -----------------------------------------------------------------------------
