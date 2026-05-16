@@ -5539,6 +5539,10 @@ def main():
     ]
     if float(global_grad_clip) > 0.0:
         optimizer_parts.append(optax.clip_by_global_norm(global_grad_clip))
+    else:
+        # Keep the old global-clip opt_state slot for checkpoint compatibility,
+        # but make it an exact no-op unless config explicitly enables clipping.
+        optimizer_parts.append(optax.scale(1.0))
     optimizer_parts.extend([
         optax.scale_by_adam(b2=0.95),
         optax.add_decayed_weights(weight_decay, mask=_wd_mask_base),
