@@ -113,16 +113,6 @@ from functools import partial
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-_FIXED_DEPTH_POOL_SCALE_VERSION_ALIASES = (
-    'spatial-r1-v4.1.5.6-depthscale',
-    'spatial-r1-v4.1.5.9',
-)
-
-
-def _pool_scale_mode_is_fixed(mode) -> bool:
-    return str(mode).lower() in ('fixed', 'fixed_depth', 'depthscale')
-
-
 def _pool_scale_mode_is_learned(mode) -> bool:
     return str(mode).lower() in (
         'learned', 'learnable', 'trainable', 'param', 'parameter')
@@ -141,11 +131,7 @@ def _model_cfg_uses_fixed_depth_pool_scale(model_cfg) -> bool:
     mode = model_cfg.get('pool_scale_mode', 'fixed_depth')
     if _pool_scale_mode_is_learned(mode):
         return False
-    return (
-        _pool_scale_mode_is_fixed(mode)
-        or model_cfg.get('model_version') in _FIXED_DEPTH_POOL_SCALE_VERSION_ALIASES
-        or True
-    )
+    return True
 
 
 def _fixed_depth_pool_output_scales(d_model, n_layers):
@@ -2499,7 +2485,6 @@ class DAWNBlock(nn.Module):
 class DAWN(nn.Module):
     """DAWN-SRW v4.1.5.6 with Attention Layers and RST Layers."""
     __version__ = "spatial-r1-v4.1.5.6"
-    model_version_name: str = "spatial-r1-v4.1.5.6"
 
     vocab_size: int = 30000
     d_model: int = 384
@@ -3187,7 +3172,7 @@ class DAWN(nn.Module):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
         return {
-            'model_version': self.model_version_name,
+            'model_version': self.__version__,
             'vocab_size': self.vocab_size, 'd_model': self.d_model,
             'n_layers': self.n_layers, 'n_heads': self.n_heads,
             'max_seq_len': self.max_seq_len,
@@ -3203,7 +3188,7 @@ class DAWN(nn.Module):
         qk_scale, v_scale, rst_scale = _fixed_depth_pool_output_scales(
             self.d_model, self.n_layers)
         return [
-            f"DAWN-SRW ({self.model_version_name})",
+            f"DAWN-SRW ({self.__version__})",
             f"  d_model={self.d_model}, d_route={self.d_route}, "
             f"n_layers={self.n_layers}, n_heads={self.n_heads}",
             f"  Attention-QK: {self.n_qk}, Attention-V: {self.n_v}, RST: {n_rst_eff}",

@@ -46,16 +46,9 @@ import numpy as np
 import yaml
 
 
-FIXED_DEPTH_POOL_SCALE_VERSIONS = {
-    "spatial-r1-v4.1.5.6-depthscale",
-    "spatial-r1-v4.1.5.9",
-}
-V4156_VERSIONS = {"spatial-r1-v4.1.5.6", *FIXED_DEPTH_POOL_SCALE_VERSIONS}
-
-
 def import_dawn_srw(model_version: str | None = None):
     import importlib
-    if model_version in V4156_VERSIONS:
+    if model_version == "spatial-r1-v4.1.5.6":
         return importlib.import_module("models.dawn_srw_v4156")
     if model_version == "spatial-r1-v4.1.5.8":
         return importlib.import_module("models.dawn_srw_v4158")
@@ -214,17 +207,17 @@ def build_model(cfg: Dict[str, Any]):
         n_chunks_qk=t.get("n_chunks_qk", 1),
         n_chunks_v=t.get("n_chunks_v", 1),
     )
-    fixed_depth = (
-        bool(m.get("fixed_depth_pool_scale", False))
-        or str(m.get("pool_scale_mode", "learned")).lower()
-        in ("fixed", "fixed_depth", "depthscale")
-        or m.get("model_version") in FIXED_DEPTH_POOL_SCALE_VERSIONS
+    mode = str(m.get("pool_scale_mode", "fixed_depth")).lower()
+    learned_scale_requested = (
+        mode in ("learned", "learnable", "trainable", "param", "parameter")
+        or bool(m.get("learned_pool_scale", False))
+        or ("fixed_depth_pool_scale" in m
+            and not bool(m["fixed_depth_pool_scale"]))
     )
-    if fixed_depth and "fixed_depth_pool_scale" in getattr(
+    fixed_depth = not learned_scale_requested
+    if "fixed_depth_pool_scale" in getattr(
             mod.DAWN, "__dataclass_fields__", {}):
-        kwargs["fixed_depth_pool_scale"] = True
-    if "model_version_name" in getattr(mod.DAWN, "__dataclass_fields__", {}):
-        kwargs["model_version_name"] = m.get("model_version", "dawn_srw")
+        kwargs["fixed_depth_pool_scale"] = fixed_depth
     return mod.DAWN(**kwargs)
 
 
@@ -238,8 +231,8 @@ def model_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "n_heads": m.get("n_heads", 6),
         "max_seq_len": m.get("max_seq_len", 512),
         "model_version": m.get("model_version", "dawn_srw"),
-        "fixed_depth_pool_scale": bool(m.get("fixed_depth_pool_scale", False)),
-        "pool_scale_mode": m.get("pool_scale_mode", "learned"),
+        "fixed_depth_pool_scale": bool(m.get("fixed_depth_pool_scale", True)),
+        "pool_scale_mode": m.get("pool_scale_mode", "fixed_depth"),
         "d_route": m.get("d_route", m.get("d_bottleneck", 128)),
         "n_qk": m.get("n_qk", 1580),
         "n_v": m.get("n_v", 2600),

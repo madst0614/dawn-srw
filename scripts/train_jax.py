@@ -76,19 +76,10 @@ except ImportError:
 # Log cadence is config-driven: see log_interval / log_analysis_multiplier
 # in `training:`. The legacy module-level LOG_INTERVAL constant was removed.
 
-FIXED_DEPTH_POOL_SCALE_VERSIONS = (
-    'spatial-r1-v4.1.5.6-depthscale',
-    'spatial-r1-v4.1.5.9',
-)
-V4156_POOL_SCALE_CAPABLE_VERSIONS = (
-    'spatial-r1-v4.1.5.6',
-    *FIXED_DEPTH_POOL_SCALE_VERSIONS,
-)
 SRW_ACTIVE_MODEL_VERSIONS = (
     'dawn_srw',
     'spatial-r1-v4.1.5.5',
     'spatial-r1-v4.1.5.6',
-    *FIXED_DEPTH_POOL_SCALE_VERSIONS,
     'spatial-r1-v4.1.5.8',
 )
 
@@ -427,8 +418,6 @@ def _dawn_srw_kwargs(cfg):
     if 'n_rst' in m:
         kw['n_rst'] = m['n_rst']
         kw['n_know'] = m.get('n_know', None)
-    if version in V4156_POOL_SCALE_CAPABLE_VERSIONS:
-        kw['model_version_name'] = version
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
     # Optional train/eval-safe tau offset clipping. This adds no parameters,
     # so existing checkpoints remain load-compatible.
@@ -441,12 +430,8 @@ def _dawn_srw_kwargs(cfg):
         or bool(m.get('learned_pool_scale', False))
         or ('fixed_depth_pool_scale' in m and not bool(m['fixed_depth_pool_scale']))
     )
-    fixed_depth_requested = (
-        version in V4156_POOL_SCALE_CAPABLE_VERSIONS
-        and not learned_scale_requested
-    )
-    if fixed_depth_requested:
-        kw['fixed_depth_pool_scale'] = True
+    if version == 'spatial-r1-v4.1.5.6':
+        kw['fixed_depth_pool_scale'] = not learned_scale_requested
     return kw
 
 
@@ -529,16 +514,6 @@ if DAWN_SRW_V4156 is not None:
         force_sharded=True,
         sharded_kwargs=_v415_sharded_kwargs,
     )
-    for _depthscale_version in FIXED_DEPTH_POOL_SCALE_VERSIONS:
-        MODEL_REGISTRY[_depthscale_version] = ModelSpec(
-            name=_depthscale_version,
-            module_path='models.dawn_srw_v4156',
-            cls=DAWN_SRW_V4156,
-            build_kwargs=_dawn_srw_kwargs,
-            supports_sharded=True,
-            force_sharded=True,
-            sharded_kwargs=_v415_sharded_kwargs,
-        )
 
 if DAWN_SRW_V4158 is not None:
     MODEL_REGISTRY['spatial-r1-v4.1.5.8'] = ModelSpec(
@@ -1001,11 +976,7 @@ def _fixed_depth_pool_scale_enabled(model=None, model_cfg=None):
             return bool(model_cfg['fixed_depth_pool_scale'])
         if mode in ('learned', 'learnable', 'trainable', 'param', 'parameter'):
             return False
-        return (
-            mode in ('fixed', 'fixed_depth', 'depthscale')
-            or model_cfg.get('model_version') in FIXED_DEPTH_POOL_SCALE_VERSIONS
-            or True
-        )
+        return True
     return True
 
 
@@ -4867,7 +4838,7 @@ def _print_analysis_block(rec, ctx):
         f" logit_max={rec['debug_logit_max']:.1f}"
         f" o_in={rec['debug_o_input_norm']:.2f}"
     )
-    if ctx.get('model_version') in V4156_POOL_SCALE_CAPABLE_VERSIONS:
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.6':
         log_message("[ATTN_QK_DIAG]")
         log_message(
             f"  logit[mean={_g('attn_logit_mean'):.2f}"
@@ -5059,7 +5030,7 @@ def main():
     tau_update_abs_cap = tcfg.get('tau_update_abs_cap', 0.0)
     scan_update_abs_cap = tcfg.get('scan_update_abs_cap', 0.0)
     restore_training_config_on_resume = tcfg.get(
-        'restore_training_config_on_resume', True)
+        'restore_training_config_on_resume', False)
     # 2-tier logging cadence.
     log_interval = int(tcfg.get('log_interval', 100))
     log_analysis_multiplier = int(tcfg.get('log_analysis_multiplier', 20))
@@ -5486,7 +5457,6 @@ def main():
     _FORWARD_UNIT_RW_VERSIONS = {
         'spatial-r1-v4.1.5.2',
         'spatial-r1-v4.1.5.6',
-        *FIXED_DEPTH_POOL_SCALE_VERSIONS,
     }
 
     _POOL_PARAM_NAMES = (
@@ -5586,7 +5556,7 @@ def main():
         _pool_paths = _collect_pool_paths(_pool_mask)
         if _pool_paths:
             print(f"    pool params: {_pool_paths[:9]}")
-        if _MODEL_VERSION in V4156_POOL_SCALE_CAPABLE_VERSIONS:
+        if _MODEL_VERSION == 'spatial-r1-v4.1.5.6':
             _base_paths = _collect_pool_paths(_base_mask)
             _emb_names = ('attn_qk_emb', 'attn_v_emb', 'rst_emb')
             _rw_names = (
@@ -5601,7 +5571,7 @@ def main():
             _pool_emb = _paths_with(_pool_paths, _emb_names)
             _rw_wd = _paths_with(_pool_paths + _base_paths, _rw_names)
             _scale_wd = _paths_with(_pool_paths + _base_paths, _scale_names)
-            print("  WD v4.1.5.6/depthscale check: "
+            print("  WD v4.1.5.6 check: "
                   f"pool_embeddings={_pool_emb}, "
                   f"read_write_excluded={not _rw_wd}, "
                   f"pool_scale_excluded={not _scale_wd}")

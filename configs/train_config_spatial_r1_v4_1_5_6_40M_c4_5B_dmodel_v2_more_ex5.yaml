@@ -1,17 +1,15 @@
-# DAWN-SRW -- d_route-only tag routing / v4.1.5.9 depth-scale ablation
+# DAWN-SRW -- d_route-only tag routing / v4.1.5.6 fixed depth-scale
 #
 # Copy of train_config_spatial_r1_v4_1_5_5_40M_c4_5B_dmodel_v2_more_ex5.yaml
 # with model_version pointed at the v4.1.5.6 stability variant,
 # max_intensity reduced to 10.0, and fixed depth-scaled pool output scales.
-# train_jax.py maps model_version: "spatial-r1-v4.1.5.9" to:
-#   models/dawn_srw_v4156.py with fixed_depth_pool_scale=true
 #
 # This keeps the baseline v4.1 training hyperparameters fixed while using
 # the d_route-only route convention:
 #   scan = scan_scale * tanh(scan_bias)
 #   tau = s_mean + tau_offset * s_std - scan / max(s_std, scan_std_floor)
 #
-# v4.1.5.9 train_jax default:
+# v4.1.5.6 train_jax default:
 #   route_width=d_route
 #
 # Route interpretation:
@@ -31,7 +29,7 @@ data:
   local_cache_dir: /tmp/data
 
 model:
-  model_version: "spatial-r1-v4.1.5.9"
+  model_version: "spatial-r1-v4.1.5.6"
   d_model: 432
   n_layers: 12
   n_heads: 6
@@ -40,6 +38,8 @@ model:
   # drowning the signal. 40M@5B has no overfit pressure.
   dropout: 0.0
   gradient_checkpointing: true
+  # Default is fixed depth-scaled pool scales. Set this false, or set
+  # pool_scale_mode: learned, to opt back into learnable scale parameters.
   fixed_depth_pool_scale: true
 
   d_route: 128
@@ -55,6 +55,7 @@ model:
 training:
   batch_size: 128
   gradient_accumulation_steps: 1
+  restore_training_config_on_resume: false
   num_epochs: 1
   lr: 0.00065
   weight_decay: 0.1
@@ -103,5 +104,5 @@ training:
   heavy_geometry_multiplier: 10
 
 use_amp: true
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_dmodel_v2_more_ex5_v4159_depthscale
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_40M_c4_5B_dmodel_v2_more_ex5_v4159_depthscale
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_40M_c4_5B_dmodel_v2_more_ex5_v4156
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_40M_c4_5B_dmodel_v2_more_ex5_v4156
