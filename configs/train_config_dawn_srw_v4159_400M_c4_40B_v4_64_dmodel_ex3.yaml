@@ -78,7 +78,7 @@ training:
   # Loss weights
   diversity_weight: 0.1
   load_balance_weight: 0.0
-  dead_penalty_weight: 0.005
+  dead_penalty_weight: 0.01
   dead_penalty_threshold: 0.01
 
   # v4.1 two-channel gate physics
