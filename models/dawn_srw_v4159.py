@@ -1920,17 +1920,19 @@ class Router(nn.Module):
     n_rst: Optional[int] = None
     n_know: Optional[int] = None  # Legacy alias accepted from older configs.
     router_dropout: float = 0.1
+    tau_offset_init: float = -0.5
 
     def setup(self):
         db = self.d_route
+        tau_init = float(self.tau_offset_init)
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_rst = nn.Dense(db, name='proj_rst')
         self.tau_attn = nn.Dense(3, name='tau_attn',
             kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: jnp.full(s, -0.5))
+            bias_init=lambda k, s, d: jnp.full(s, tau_init, d))
         self.tau_rst = nn.Dense(1, name='tau_rst',
             kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: jnp.full(s, -0.5))
+            bias_init=lambda k, s, d: jnp.full(s, tau_init, d))
         # Raw learned parameters for bounded scan offsets.
         # Zero-init preserves old behavior at step 0.
         self.raw_scan_offset_attn = nn.Dense(3, name='raw_scan_offset_attn',
@@ -2502,6 +2504,8 @@ class DAWN(nn.Module):
     # forward-time clamp, not a new parameter, so old checkpoints remain
     # compatible. Set to None/0 to preserve exact v4.1.5.9 behavior.
     tau_offset_clip: Optional[float] = None
+    # Initial bias for tau_attn/tau_rst relative threshold offsets.
+    tau_offset_init: float = -0.5
     # Checkpoint-compatible ablation: keep scale params in NeuronPool, but
     # ignore them in forward/inference and use depth-scaled constants.
     fixed_depth_pool_scale: bool = True
@@ -2523,7 +2527,8 @@ class DAWN(nn.Module):
         self.router = Router(
             d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
-            router_dropout=self.router_dropout)
+            router_dropout=self.router_dropout,
+            tau_offset_init=self.tau_offset_init)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
                       dropout_rate=self.dropout_rate, name=f'block_{i}')

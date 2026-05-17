@@ -432,6 +432,10 @@ def _dawn_srw_kwargs(cfg):
     if (version in SRW_ACTIVE_MODEL_VERSIONS
             and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
         kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
+    if (version == 'spatial-r1-v4.1.5.9'
+            and ('tau_offset_init' in m or 'tau_offset_init' in t)):
+        kw['tau_offset_init'] = m.get(
+            'tau_offset_init', t.get('tau_offset_init'))
     pool_scale_mode = str(m.get('pool_scale_mode', 'fixed_depth')).lower()
     learned_scale_requested = (
         pool_scale_mode in ('learned', 'learnable', 'trainable', 'param', 'parameter')
@@ -5432,6 +5436,8 @@ def main():
         'route_emb_update_ratio_cap': route_emb_update_ratio_cap,
         'tau_update_abs_cap': tau_update_abs_cap,
         'scan_update_abs_cap': scan_update_abs_cap,
+        'tau_offset_init': tcfg.get(
+            'tau_offset_init', cfg['model'].get('tau_offset_init', -0.5)),
         'oom_check': run_oom_check,
         'speed_check': run_speed_check,
         'restore_training_config_on_resume': restore_training_config_on_resume,
@@ -5759,6 +5765,10 @@ def main():
             gate_msg += (
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
+            )
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.9':
+            gate_msg += (
+                f" tau_offset_init={tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))}"
             )
         if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
             gate_msg += (

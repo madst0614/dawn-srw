@@ -89,6 +89,7 @@ training:
   activation_cutoff: 0.01
   epsilon: 0.000001
   max_intensity: 1000.0
+  tau_offset_init: -0.5
   scan_scale: 0.01
   scan_std_floor: 0.5
 
