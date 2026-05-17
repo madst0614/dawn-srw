@@ -1,0 +1,128 @@
+# DAWN-SRW v4.1.5.9 400M diagnostic config
+# Purpose:
+#   - Keep model behavior close to the current/raw-route run.
+#   - Do NOT enable route-embedding forward normalization by default.
+#   - Enable crash snapshots so a collapse step can be replayed from pre-update state.
+#   - Enable h/emb/top1 local-spike diagnostics from config.
+#
+# Recommended diagnostic launch:
+#   bash scripts/launch_tpu_pod.sh \
+#     --config configs/train_config_dawn_srw_400M_c4_40B_v4_64_dmodel_v4159.yaml \
+#     --resume-from gs://.../best_model.flax \
+#     --debug 10
+#
+# Notes:
+#   - route_emb_forward_norm: false keeps routing signatures raw.
+#   - router_dropout: 0.0 removes routing noise during diagnosis.
+#   - debug_local_spikes / crash_snapshots / stop_on_collapse are config-driven.
+#   - crash_snapshots/ are separate from normal checkpoint cleanup.
+
+seed: 1
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+# -----------------------------------------------------------------------------
+# Model shape / capacity
+# -----------------------------------------------------------------------------
+model:
+  model_version: spatial-r1-v4.1.5.9
+
+  # Transformer-scale backbone
+  d_model: 2304
+  n_layers: 18
+  n_heads: 36
+  max_seq_len: 512
+
+  # Routing / SRW pool sizes
+  d_route: 256
+  n_qk: 2330
+  n_v: 14640
+  n_know: 29130
+
+  # Regularization / execution options
+  dropout: 0.0
+  router_dropout: 0.0        # Diagnostic run: keep h deterministic; avoid routing-noise ambiguity.
+  gradient_checkpointing: true
+  fixed_depth_pool_scale: true
+
+# -----------------------------------------------------------------------------
+# Training system / sharding
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 1024
+  mesh_model: 2
+  mesh_data: 16
+  gradient_accumulation_steps: 1
+  num_epochs: 1
+  use_amp: true
+
+  # Chunking
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_know: 4
+
+  # Optimizer / schedule
+  lr: 0.0003
+  warmup_ratio: 0.08
+  weight_decay: 0.1
+  pool_weight_decay: 0.02
+
+  # Loss weights
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  dead_penalty_weight: 0.005
+  dead_penalty_threshold: 0.01
+
+  # v4.1 gate physics
+  # v4.1.5.9 uses clipped-linear activation over raw / activation_threshold
+  # and detaches tau only in the intensity branch. sharpness is kept for API compatibility.
+  sharpness: 500.0
+  activation_threshold: 0.0
+  activation_cutoff: 0.0
+  epsilon: 0.000001
+  max_intensity: 1000.0
+  tau_offset_init: 1.0
+  scan_scale: 0.01
+  scan_std_floor: 0.5
+
+  # Route signature execution mode
+  # false = raw route embeddings, preserving current expressive routing behavior.
+  # true  = ablation only: score uses normalized route embeddings, closer to v3.9.4.
+  route_emb_forward_norm: false
+
+  # Exploration / RPE feedback
+  exploration_weight: 0.001
+  exploration_asymmetry: 1.0
+  exploration_warmup_steps: 1000
+  exploration_lower_bound: -0.5
+  exploration_upper_bound: 2.0
+  exploration_bound_eps: 0.001
+
+  # Logging / validation cadence
+  log_interval: 100
+  log_analysis_multiplier: 10
+  heavy_geometry_multiplier: 10
+  val_interval: 1000
+  checkpoint_interval: 200
+  restore_training_config_on_resume: false
+
+  # Debug diagnostics
+  # --debug controls cadence only; this config controls which debug payloads are collected.
+  debug_local_spikes: false
+  debug_drop_compare: false
+
+# -----------------------------------------------------------------------------
+# Runtime outputs
+# -----------------------------------------------------------------------------
+
+use_amp: true
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4159_400M_c4_40B_v4_64_dmodel_exp
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4159_400M_c4_40B_v4_64_dmodel_exp
