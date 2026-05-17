@@ -5009,6 +5009,14 @@ def main():
     parser.add_argument('--debug-drop-compare', action='store_true',
                         help=('Reserved for tiny opt-in debug/val forwards; '
                               'never runs on the current train batch.'))
+    parser.add_argument('--oom-check', action='store_true',
+                        help=('Run the startup OOM/JIT train_step probe '
+                              '(disabled by default; can also set '
+                              'training.oom_check: true).'))
+    parser.add_argument('--speed-check', action='store_true',
+                        help=('Run the startup step-time/profiling check '
+                              '(disabled by default; implies --oom-check; '
+                              'can also set training.speed_check: true).'))
     parser.add_argument('--resume', type=str, default=None,
                         help=('Resume from a checkpoint file or run folder. '
                               'Examples: gs://.../run_v.../best_model.flax or '
@@ -5046,6 +5054,13 @@ def main():
         debug_mode and tcfg.get('debug_local_spikes', False))
     debug_drop_compare = bool(
         tcfg.get('debug_drop_compare', False) or cli_args.debug_drop_compare)
+    run_speed_check = bool(
+        cli_args.speed_check
+        or tcfg.get('speed_check', tcfg.get('run_speed_check', False)))
+    run_oom_check = bool(
+        cli_args.oom_check
+        or run_speed_check
+        or tcfg.get('oom_check', tcfg.get('run_oom_check', False)))
     collapse_warn_ctx = _collapse_warn_context(tcfg)
     crash_snapshot_enabled = bool(tcfg.get('crash_snapshot_enabled', False))
     stop_on_collapse = bool(tcfg.get('stop_on_collapse', False))
@@ -5360,6 +5375,15 @@ def main():
                 'tau_update_abs_cap', tau_update_abs_cap)
             scan_update_abs_cap = saved_training_config.get(
                 'scan_update_abs_cap', scan_update_abs_cap)
+            if not cli_args.oom_check:
+                run_oom_check = bool(saved_training_config.get(
+                    'oom_check',
+                    saved_training_config.get('run_oom_check', run_oom_check)))
+            if not cli_args.speed_check:
+                run_speed_check = bool(saved_training_config.get(
+                    'speed_check',
+                    saved_training_config.get('run_speed_check', run_speed_check)))
+            run_oom_check = bool(run_oom_check or run_speed_check)
             log_interval = int(saved_training_config.get(
                 'log_interval', log_interval))
             log_analysis_multiplier = int(saved_training_config.get(
@@ -5408,6 +5432,8 @@ def main():
         'route_emb_update_ratio_cap': route_emb_update_ratio_cap,
         'tau_update_abs_cap': tau_update_abs_cap,
         'scan_update_abs_cap': scan_update_abs_cap,
+        'oom_check': run_oom_check,
+        'speed_check': run_speed_check,
         'restore_training_config_on_resume': restore_training_config_on_resume,
         'log_interval': log_interval,
         'log_analysis_multiplier': log_analysis_multiplier,
@@ -5685,6 +5711,9 @@ def main():
         print(f"  Total devices: {jax.device_count()}")
         print(f"  Grad accum steps: {grad_accum_steps}")
         print(f"  Effective batch size: {batch_size * grad_accum_steps}")
+        print("  Startup checks: "
+              f"oom={'on' if run_oom_check else 'off'}, "
+              f"speed={'on' if run_speed_check else 'off'}")
         print(f"  Steps/epoch: {steps_per_epoch}")
         print(f"  Total optimizer steps: {total_steps}")
         print(f"  Warmup steps: {warmup_steps}")
@@ -6059,10 +6088,21 @@ def main():
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
     # ----------------------------------------------------------
-    if is_host0:
+    class _SkipStartupCheck(Exception):
+        pass
+
+    if is_host0 and run_oom_check:
         print(f"\n=== OOM check: real train_step (forward+backward) "
               f"per_device_batch={per_device_batch}, seq_len={max_seq_len} ===", flush=True)
     try:
+        if not run_oom_check:
+            if is_host0:
+                print("\n=== Startup OOM/speed checks skipped (disabled by default) ===", flush=True)
+                print("  Use --oom-check for the startup train_step probe, "
+                      "or --speed-check for the post-JIT timing breakdown.",
+                      flush=True)
+            raise _SkipStartupCheck()
+
         global_shape = (batch_size, max_seq_len)
         dummy_ids = shard_to_mesh(
             jnp.zeros((per_host_batch, max_seq_len), dtype=jnp.int32),
@@ -6114,21 +6154,28 @@ def main():
         jit_loss = float(dummy_metrics['total_loss'])
         if is_host0:
             print(f"  JIT compile: {jit_time:.1f}s", flush=True)
-
-        # Free first step outputs before second call
-        del _dp, _do, dummy_metrics
-
-        # Second call: measure actual step time (post-JIT)
-        rng, dummy_step_rng2 = jax.random.split(rng)
-        step_start = time.time()
-        _dp2, _do2, dummy_metrics2 = train_step_fn(
-            params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
-            _dummy_emb_snap, jnp.asarray(0, jnp.int32))
-        jax.block_until_ready(dummy_metrics2['total_loss'])
-        step_time = time.time() - step_start
-        if is_host0:
             print(f"  train_step OK -- loss={jit_loss:.4f}", flush=True)
-            print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
+
+        if run_speed_check:
+            # Free first step outputs before second call
+            del _dp, _do, dummy_metrics
+
+            # Second call: measure actual step time (post-JIT)
+            rng, dummy_step_rng2 = jax.random.split(rng)
+            step_start = time.time()
+            _dp2, _do2, dummy_metrics2 = train_step_fn(
+                params, opt_state, dummy_ids, dummy_mask, dummy_step_rng2,
+                _dummy_emb_snap, jnp.asarray(0, jnp.int32))
+            jax.block_until_ready(dummy_metrics2['total_loss'])
+            step_time = time.time() - step_start
+        else:
+            step_time = None
+
+        if is_host0:
+            if run_speed_check:
+                print(f"  Step time: {step_time*1000:.1f}ms/batch", flush=True)
+            else:
+                print("  Speed check skipped (disabled by default)", flush=True)
 
             # Show memory usage after JIT compilation
             try:
@@ -6148,6 +6195,9 @@ def main():
             pass
 
         try:
+            if not run_speed_check:
+                raise _SkipBreakdown("speed check disabled")
+
             if is_baseline:
                 raise _SkipBreakdown(
                     "baseline model has no DAWN neuron_pool/router")
@@ -6531,7 +6581,7 @@ def main():
         gc.collect()
         jax.clear_caches()
 
-        if is_host0:
+        if is_host0 and run_speed_check:
             # Estimate total training time
             total_steps = len(train_loader) * num_epochs
             remaining_steps = total_steps - global_step
@@ -6540,9 +6590,14 @@ def main():
             print(f"  Estimated time: {est_hours:.1f}h ({remaining_steps:,} steps @ {step_time*1000:.1f}ms)", flush=True)
 
         del dummy_ids, dummy_mask
-        del _dp2, _do2, dummy_metrics2
+        if run_speed_check:
+            del _dp2, _do2, dummy_metrics2
+        else:
+            del _dp, _do, dummy_metrics
         if is_host0:
             print("=== OOM check passed (JIT compiled) ===\n", flush=True)
+    except _SkipStartupCheck:
+        pass
     except Exception as e:
         if is_host0:
             msg = str(e)
@@ -6561,10 +6616,9 @@ def main():
                 print("  This is not necessarily OOM; it is a code/runtime error during the dummy train_step.")
         raise
 
-    # The OOM/JIT probe intentionally consumes two RNG splits before the
-    # training loop on both fresh and resumed runs. After a resume, advance
-    # from that same post-probe RNG state by the number of completed training
-    # micro-steps so dropout keys line up with an uninterrupted run.
+    # Resume from the current startup RNG state. Startup checks may consume
+    # zero, one (OOM/JIT), or two (OOM/JIT + speed) splits, so the completed
+    # training-step advance starts after whichever checks were selected.
     if _is_resuming and global_step > 0:
         if is_host0:
             print(
