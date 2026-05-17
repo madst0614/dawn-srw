@@ -79,9 +79,7 @@ For each token and pool:
     raw           = scores - tau
     margin        = raw - activation_threshold
     activation    = clip(raw / activation_threshold, 0, 1)
-    raw_for_intensity = scores - stop_gradient(tau)
-    active_margin = max(raw_for_intensity - activation_threshold - activation_cutoff, 0)
-    intensity     = epsilon + min(active_margin, max_intensity)
+    intensity     = min(max(scores, 0), max_intensity)
     gate          = activation * intensity
 
     rhat_i = r_i / ||r_i||
@@ -100,8 +98,8 @@ Implementation notes
 * Raw read/write parameter norms and norm-product stats remain diagnostics.
 * The denominator remains activation-weighted intensity: sum(gate).
 * v4.1.5.9 uses a clipped-linear activation transition over raw / activation_threshold
-  and detaches tau only in the intensity branch, so tau still controls
-  activation while intensity no longer sends gradient back to tau.
+  and uses pure score-based intensity; tau controls activation only
+  and no longer appears in the intensity branch.
 * Dynamic tau alpha parameters are not present; tau is relative threshold
   plus bounded scan offset.
 * The neuron pool and router are shared across layers.  Per-layer parameters
@@ -167,9 +165,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers,
 #
 #   margin        = (score - tau) - ACTIVATION_THRESHOLD
 #   activation    = clip(raw / ACTIVATION_THRESHOLD, 0, 1)
-#   raw_for_intensity = score - stop_gradient(tau)
-#   active_margin = max(raw_for_intensity - ACTIVATION_THRESHOLD - ACTIVATION_CUTOFF, 0)
-#   intensity     = EPSILON + min(active_margin, MAX_INTENSITY)
+#   intensity     = min(max(score, 0), MAX_INTENSITY)
 #   gate          = activation * intensity
 #   den           = max(sum(gate), 1.0)
 # ================================================================
@@ -269,9 +265,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         raw           = score - tau
         margin        = raw - activation_threshold
         activation    = clip(raw / activation_threshold, 0, 1)
-        raw_for_intensity = score - stop_gradient(tau)
-        active_margin = max(raw_for_intensity - activation_threshold - activation_cutoff, 0)
-        intensity     = epsilon + min(active_margin, max_intensity)
+        intensity     = min(max(score, 0), max_intensity)
         gate          = activation * intensity
         den           = max(sum(gate), 1.0)
 
@@ -529,10 +523,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                raw_for_intensity = scores_f - jax.lax.stop_gradient(tau)
-                active_margin = jnp.maximum(
-                    raw_for_intensity - _act_thr - _act_cut, 0.0)
-                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -644,10 +635,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                raw_for_intensity = scores_f - jax.lax.stop_gradient(tau)
-                active_margin = jnp.maximum(
-                    raw_for_intensity - _act_thr - _act_cut, 0.0)
-                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -950,10 +938,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 raw = scores_f - tau_r
                 gate_raw = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                raw_for_intensity = scores_f - jax.lax.stop_gradient(tau_r)
-                active_margin = jnp.maximum(
-                    raw_for_intensity - _act_thr - _act_cut, 0.0)
-                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1324,10 +1309,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                raw_for_intensity = scores_f - jax.lax.stop_gradient(tau)
-                active_margin = jnp.maximum(
-                    raw_for_intensity - _act_thr - _act_cut, 0.0)
-                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1448,10 +1430,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                raw_for_intensity = scores_f - jax.lax.stop_gradient(tau)
-                active_margin = jnp.maximum(
-                    raw_for_intensity - _act_thr - _act_cut, 0.0)
-                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1762,10 +1741,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 raw = scores_f - tau
                 gate_raw = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                raw_for_intensity = scores_f - jax.lax.stop_gradient(tau)
-                active_margin = jnp.maximum(
-                    raw_for_intensity - _act_thr - _act_cut, 0.0)
-                intensity = _eps + jnp.minimum(active_margin, _max_int)
+                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -3252,10 +3228,7 @@ def _srw_inference(x, h, emb, tau_offset, raw_scan_offset, w_read, w_write):
     raw = scores_f32 - tau
     margin = raw - ACTIVATION_THRESHOLD
     activation = jnp.clip(raw.astype(jnp.float32) / ACTIVATION_THRESHOLD, 0.0, 1.0)
-    raw_for_intensity = scores_f32 - jax.lax.stop_gradient(tau)
-    active_margin = jnp.maximum(
-        raw_for_intensity - ACTIVATION_THRESHOLD - ACTIVATION_CUTOFF, 0.0)
-    intensity = EPSILON + jnp.minimum(active_margin, MAX_INTENSITY)
+    intensity = jnp.minimum(jnp.maximum(scores_f32, 0.0), MAX_INTENSITY)
     gate = activation * intensity
 
     xr = x.astype(jnp.float32) @ r_n.T
@@ -3282,10 +3255,7 @@ def _srw_inference_with_gates(x, h, emb, tau_offset, raw_scan_offset, w_read, w_
     raw = scores_f32 - tau
     margin = raw - ACTIVATION_THRESHOLD
     activation = jnp.clip(raw.astype(jnp.float32) / ACTIVATION_THRESHOLD, 0.0, 1.0)
-    raw_for_intensity = scores_f32 - jax.lax.stop_gradient(tau)
-    active_margin = jnp.maximum(
-        raw_for_intensity - ACTIVATION_THRESHOLD - ACTIVATION_CUTOFF, 0.0)
-    intensity = EPSILON + jnp.minimum(active_margin, MAX_INTENSITY)
+    intensity = jnp.minimum(jnp.maximum(scores_f32, 0.0), MAX_INTENSITY)
     gate = activation * intensity
     gate_norm = gate / jnp.maximum(gate.sum(axis=-1, keepdims=True), 1e-8)
 
@@ -3848,10 +3818,7 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         raw = scores - tau.astype(scores.dtype)
         margin = raw.astype(jnp.float32) - ACTIVATION_THRESHOLD
         activation = jnp.clip(raw.astype(jnp.float32) / ACTIVATION_THRESHOLD, 0.0, 1.0)
-        raw_for_intensity = sf - jax.lax.stop_gradient(tau)
-        active_margin = jnp.maximum(
-            raw_for_intensity - ACTIVATION_THRESHOLD - ACTIVATION_CUTOFF, 0.0)
-        intensity = EPSILON + jnp.minimum(active_margin, MAX_INTENSITY)
+        intensity = jnp.minimum(jnp.maximum(sf, 0.0), MAX_INTENSITY)
         gate = activation * intensity
         if mult is not None:
             gate = gate * mult[None, None, :]
