@@ -455,6 +455,11 @@ def _v415_sharded_kwargs(cfg):
     remains API-compatible while preserving raw route embeddings by default.
     """
     t = cfg['training']
+    version = cfg['model'].get('model_version')
+    if version == 'spatial-r1-v4.1.5.9' and t.get('activation_threshold', 0.5) <= 0:
+        raise ValueError(
+            "spatial-r1-v4.1.5.9 requires training.activation_threshold > 0 "
+            "because activation uses raw / activation_threshold.")
     kw = dict(
         dead_threshold=t.get('dead_penalty_threshold', 0.01),
         sharpness=t.get('sharpness', 500.0),
@@ -5530,8 +5535,23 @@ def main():
         deterministic=True,
     )
     params = variables['params']
+
+    def _print_v4159_tau_bias(label, p):
+        if not is_host0 or cfg['model'].get('model_version') != 'spatial-r1-v4.1.5.9':
+            return
+        tau_attn_bias = np.asarray(p['router']['tau_attn']['bias'])
+        tau_rst_bias = np.asarray(p['router']['tau_rst']['bias'])
+        print(
+            f"  v4159 {label} tau bias: "
+            f"attn={tau_attn_bias.tolist()} rst={tau_rst_bias.tolist()} "
+            f"(config tau_offset_init="
+            f"{tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))})",
+            flush=True,
+        )
+
     if is_host0:
         print("=== model.init done ===", flush=True)
+        _print_v4159_tau_bias("init", params)
 
         n_params = count_parameters(params)
         print(f"\nModel parameters: {n_params:,}")
@@ -5824,6 +5844,7 @@ def main():
                 print("\nNo checkpoint found. Starting from scratch.")
             else:
                 print("\nStarting from scratch (--from-scratch).")
+    _print_v4159_tau_bias("effective pre-shard", params)
 
     # Fail-fast check: global_step must match across hosts after resume.
     # broadcast handles the common path but we still verify -if it ever
