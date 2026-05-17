@@ -98,8 +98,8 @@ training:
   route_emb_forward_norm: false
 
   # Exploration / RPE feedback
-  exploration_weight: 0.0001
-  exploration_asymmetry: 1.2
+  exploration_weight: 0.001
+  exploration_asymmetry: 1.1
   exploration_warmup_steps: 1000
   exploration_lower_bound: -0.5
   exploration_upper_bound: 2.0
