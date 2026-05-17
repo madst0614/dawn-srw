@@ -6085,6 +6085,36 @@ def main():
             'geometry_max_sample',
             tcfg.get('heavy_geometry_max_sample', 512))))
 
+    # Initial emb-drift snapshot: pytree of sharded refs matching
+    # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
+    def _drift_snap(p):
+        if is_baseline or 'neuron_pool' not in p:
+            z = jnp.float32(0.0)
+            return {
+                'attn_qk_emb': z,
+                'attn_v_emb': z,
+                'rst_emb': z,
+            }
+
+        pool = p['neuron_pool']
+        if 'attn_qk_emb' in pool:
+            return {
+                'attn_qk_emb': pool['attn_qk_emb'],
+                'attn_v_emb': pool['attn_v_emb'],
+                'rst_emb': pool['rst_emb'],
+            }
+        if 'qk_emb' in pool:
+            return {
+                'attn_qk_emb': pool['qk_emb'],
+                'attn_v_emb': pool['v_emb'],
+                'rst_emb': pool['rst_emb'],
+            }
+        return {
+            'attn_qk_emb': pool['q_read'],
+            'attn_v_emb': pool['v_read'],
+            'rst_emb': pool['rst_read'],
+        }
+
     # ----------------------------------------------------------
     # OOM check + JIT pre-compile
     # ----------------------------------------------------------
@@ -6111,36 +6141,6 @@ def main():
             jnp.ones((per_host_batch, max_seq_len), dtype=jnp.int32),
             data_sharding, global_shape)
         rng, dummy_step_rng = jax.random.split(rng)
-
-        # Initial emb-drift snapshot: pytree of sharded refs matching
-        # params['neuron_pool'][*_emb]. Identity here -drift=0 on first step.
-        def _drift_snap(p):
-            if is_baseline or 'neuron_pool' not in p:
-                z = jnp.float32(0.0)
-                return {
-                    'attn_qk_emb': z,
-                    'attn_v_emb': z,
-                    'rst_emb': z,
-                }
-
-            pool = p['neuron_pool']
-            if 'attn_qk_emb' in pool:
-                return {
-                    'attn_qk_emb': pool['attn_qk_emb'],
-                    'attn_v_emb': pool['attn_v_emb'],
-                    'rst_emb': pool['rst_emb'],
-                }
-            if 'qk_emb' in pool:
-                return {
-                    'attn_qk_emb': pool['qk_emb'],
-                    'attn_v_emb': pool['v_emb'],
-                    'rst_emb': pool['rst_emb'],
-                }
-            return {
-                'attn_qk_emb': pool['q_read'],
-                'attn_v_emb': pool['v_read'],
-                'rst_emb': pool['rst_read'],
-            }
 
         _dummy_emb_snap = _drift_snap(params)
 
