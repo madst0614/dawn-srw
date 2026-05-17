@@ -478,7 +478,8 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         N_total = N_local * _model_axis_size
 
         s_mean = global_sum / N_total
-        s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
+        s_var = jnp.maximum(global_sq / N_total - s_mean ** 2, 0.0)
+        s_std = jnp.sqrt(s_var) + 1e-8
         scan_offset = _scan_scale * jnp.tanh(raw_scan_offset)
         tau = s_mean + tau_offset * s_std - scan_offset / jnp.maximum(s_std, _scan_std_floor)
 
@@ -501,7 +502,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         global_ns_sum = jax.lax.psum(ns_sum, 'model')
         global_ns_sq = jax.lax.psum(ns_sq, 'model')
         mean_score = global_ns_sum / N_total
-        var_score = global_ns_sq / N_total - mean_score ** 2
+        var_score = jnp.maximum(global_ns_sq / N_total - mean_score ** 2, 0.0)
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         # --- Pass 2: gate + srw fused (scan + checkpoint) ---
@@ -1267,7 +1268,8 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         N_total = N_local * _model_axis_size
 
         s_mean = global_sum / N_total      # [B,S,2,1]
-        s_std = jnp.sqrt(global_sq / N_total - s_mean ** 2) + 1e-8
+        s_var = jnp.maximum(global_sq / N_total - s_mean ** 2, 0.0)
+        s_std = jnp.sqrt(s_var) + 1e-8
         scan_offset = _scan_scale * jnp.tanh(raw_scan_offset)
         tau = s_mean + tau_offset * s_std - scan_offset / jnp.maximum(s_std, _scan_std_floor)
 
@@ -1288,7 +1290,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         global_ns_sum = jax.lax.psum(ns_sum, 'model')
         global_ns_sq = jax.lax.psum(ns_sq, 'model')
         mean_score = global_ns_sum / N_total
-        var_score = global_ns_sq / N_total - mean_score ** 2
+        var_score = jnp.maximum(global_ns_sq / N_total - mean_score ** 2, 0.0)
         score_lb = var_score / (mean_score ** 2 + var_score + 1e-2)
 
         # --- Pass 2: gate + srw fused ---
