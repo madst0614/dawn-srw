@@ -71,6 +71,10 @@ try:
     from models.dawn_srw_v4158 import DAWN as DAWN_SRW_V4158
 except ImportError:
     DAWN_SRW_V4158 = None
+try:
+    from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
+except ImportError:
+    DAWN_SRW_V4159 = None
 
 # ============================================================
 # Constants
@@ -84,6 +88,7 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.5.5',
     'spatial-r1-v4.1.5.6',
     'spatial-r1-v4.1.5.8',
+    'spatial-r1-v4.1.5.9',
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -433,7 +438,7 @@ def _dawn_srw_kwargs(cfg):
         or bool(m.get('learned_pool_scale', False))
         or ('fixed_depth_pool_scale' in m and not bool(m['fixed_depth_pool_scale']))
     )
-    if version == 'spatial-r1-v4.1.5.6':
+    if version in ('spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
         kw['fixed_depth_pool_scale'] = not learned_scale_requested
     return kw
 
@@ -458,7 +463,7 @@ def _v415_sharded_kwargs(cfg):
     )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
-    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
+    if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
         kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
     return kw
 
@@ -523,6 +528,17 @@ if DAWN_SRW_V4158 is not None:
         name='spatial-r1-v4.1.5.8',
         module_path='models.dawn_srw_v4158',
         cls=DAWN_SRW_V4158,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
+if DAWN_SRW_V4159 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.5.9'] = ModelSpec(
+        name='spatial-r1-v4.1.5.9',
+        module_path='models.dawn_srw_v4159',
+        cls=DAWN_SRW_V4159,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -3673,7 +3689,7 @@ def _print_regular_block(rec, ctx):
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
         log_message(_format_output_stab_line(rec, indent="  "))
     _cap_scale_min = min(
         rec.get('update_cap_proj_attn_scale', 1.0),
@@ -4401,7 +4417,7 @@ def _print_debug_block(rec, ctx):
         f"gate_max[attn={_g('attn_raw_gate_max'):.3f} "
         f"rst={_g('rst_raw_gate_max'):.3f}]"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
         log_debug_message(_format_output_stab_line(rec, indent=""))
     log_debug_message(
         f"tau_diag: score_std[attn={_g('attn_score_std'):.4f} "
@@ -4544,7 +4560,7 @@ def _print_debug_analysis_block(rec, ctx):
         f"logit_max={_g('debug_logit_max'):.6f} "
         f"logit_norm_mean={_g('debug_emb_norm'):.6f}"
     )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
         log_debug_message(_format_output_stab_line(rec, indent=""))
     reasons = _collapse_reasons(rec, ctx)
     if reasons:
@@ -4877,7 +4893,7 @@ def _print_analysis_block(rec, ctx):
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" rst={rec['rst_gate_den_sum']:.1f}"
         )
-    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
+    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
         log_message(_format_output_stab_line(rec, indent="  "))
     log_message(
         f"  tau_struct k_std={rec['rst_tau_std']:.2f}"
@@ -5715,14 +5731,14 @@ def main():
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
             )
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
             gate_msg += (
                 f" rw_contrib_den_floor={tcfg.get('rw_contrib_den_floor', 1.0)}"
             )
         print(gate_msg)
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
+        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
             print(
-                "  v4158 diagnostics: "
+                "  v4158/v4159 diagnostics: "
                 f"debug_local_spikes={debug_local_spikes} "
                 f"warn_compose={collapse_warn_ctx['collapse_warn_compose_norm_threshold']} "
                 f"warn_top1={collapse_warn_ctx['collapse_warn_top1_threshold']} "
