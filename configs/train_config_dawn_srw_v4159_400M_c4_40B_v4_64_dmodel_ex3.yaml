@@ -81,15 +81,19 @@ training:
   dead_penalty_weight: 0.005
   dead_penalty_threshold: 0.01
 
-  # v4.1 gate physics
-  # v4.1.5.9 uses clipped-linear activation over raw / activation_threshold
-  # and detaches tau only in the intensity branch. sharpness is kept for API compatibility.
+  # v4.1 two-channel gate physics
+  # Split d_route=256 into selection/address dims and strength/mixture dims.
+  # selection: normalized cosine relation over d_sel=192
+  # strength: positive mixture reweighting over d_str=64
+  # weight = select * exp(strength_beta * tanh(strength_raw)); den still normalizes sum(weight).
   sharpness: 500.0
-  activation_threshold: 0.5
+  activation_threshold: 0.05
   activation_cutoff: 0.01
   epsilon: 0.000001
   max_intensity: 1000.0
-  tau_offset_init: -0.5
+  strength_route_dim: 64
+  strength_beta: 0.5
+  tau_offset_init: 2.0
   scan_scale: 0.01
   scan_std_floor: 0.5
 

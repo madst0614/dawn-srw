@@ -472,6 +472,13 @@ def _v415_sharded_kwargs(cfg):
     )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
+    # v4.1.5.9+ optional split two-channel routing:
+    # selection/address uses d_route - strength_route_dim dims;
+    # strength/mixture reweighting uses strength_route_dim dims.
+    # Keep this in sharded kwargs because the fused SRW closures own gate physics.
+    if int(t.get('strength_route_dim', 0) or 0) > 0:
+        kw['strength_route_dim'] = int(t.get('strength_route_dim'))
+        kw['strength_beta'] = float(t.get('strength_beta', 0.5))
     if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
         kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
     return kw

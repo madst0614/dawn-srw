@@ -254,7 +254,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      prune_denominator="pruned",
                      return_prune_stats=False,
                      local_diagnostics=False,
-                     route_emb_forward_norm=False):
+                     route_emb_forward_norm=False,
+                     strength_route_dim=0,
+                     strength_beta=0.5):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
     2-pass chunked inside shard_map:
@@ -320,6 +322,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     # optional ablation only; it can reduce routing-strength freedom and may
     # limit expressivity.
     _route_emb_forward_norm = bool(route_emb_forward_norm)
+    _strength_route_dim = int(strength_route_dim or 0)
+    _two_channel_strength = _strength_route_dim > 0
+    _strength_beta = jnp.float32(strength_beta)
     _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
 
     # SLIM out_specs: train path.
@@ -419,6 +424,31 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
+        def route_relation_and_strength(h_in, route):
+            # Two-channel mode: split the existing route dimension into
+            # selection/address dims and strength/mixture dims.  This keeps
+            # the dense routing dot cost approximately unchanged:
+            #   d_sel + d_str == d_route.
+            if _two_channel_strength:
+                d_total = h_in.shape[-1]
+                d_str = min(max(_strength_route_dim, 1), d_total - 1)
+                d_sel = d_total - d_str
+                h_sel = h_in[..., :d_sel].astype(jnp.float32)
+                route_sel = route[:, :d_sel].astype(jnp.float32)
+                h_sel = _forward_unit_direction(h_sel).astype(jnp.bfloat16)
+                route_sel = _forward_unit_direction(route_sel).astype(jnp.bfloat16)
+                relation = (h_sel @ route_sel.T).astype(jnp.float32)
+
+                h_str = h_in[..., d_sel:].astype(jnp.bfloat16)
+                route_str = route[:, d_sel:].astype(jnp.bfloat16)
+                strength_raw = (h_str @ route_str.T).astype(jnp.float32)
+                strength = jnp.exp(_strength_beta * jnp.tanh(strength_raw))
+                return relation, strength
+
+            scores = (h_in @ route.T).astype(jnp.float32)
+            intensity = jnp.minimum(jnp.maximum(scores, 0.0), _max_int)
+            return scores, intensity
+
         def route_rw_chunk(start):
             ec = route_emb_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
@@ -438,8 +468,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
+                scores_f, _ = route_relation_and_strength(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
@@ -459,8 +488,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
+                scores_f, _ = route_relation_and_strength(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
@@ -519,12 +547,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
+                scores_f, intensity = route_relation_and_strength(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -631,12 +657,10 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)
+                scores_f, intensity = route_relation_and_strength(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -933,13 +957,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  top1_details) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores = h_bf @ route.T
-                scores_f = scores.astype(jnp.float32)[:, :, None, :]
+                scores_base, intensity_base = route_relation_and_strength(h_bf, route)
+                scores_f = scores_base[:, :, None, :]
+                intensity = intensity_base[:, :, None, :]
                 tau_r = tau[:, :, None, :]
                 raw = scores_f - tau_r
                 gate_raw = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1072,7 +1096,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             prune_denominator="pruned",
                             return_prune_stats=False,
                             local_diagnostics=False,
-                            route_emb_forward_norm=False):
+                            route_emb_forward_norm=False,
+                            strength_route_dim=0,
+                            strength_beta=0.5):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1111,6 +1137,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _return_prune_stats = bool(return_prune_stats)
     _local_diagnostics = bool(local_diagnostics)
     _route_emb_forward_norm = bool(route_emb_forward_norm)
+    _strength_route_dim = int(strength_route_dim or 0)
+    _two_channel_strength = _strength_route_dim > 0
+    _strength_beta = jnp.float32(strength_beta)
     _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
 
     _slim_out_specs = (
@@ -1209,6 +1238,30 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
+        def route_relation_and_strength(h_in, route):
+            # Two-channel mode for paired Q/K routes.  Selection uses a
+            # normalized relation space; strength is a positive mixture
+            # reweighting computed only from the reserved strength dims.
+            if _two_channel_strength:
+                d_total = h_in.shape[-1]
+                d_str = min(max(_strength_route_dim, 1), d_total - 1)
+                d_sel = d_total - d_str
+                h_sel = h_in[..., :d_sel].astype(jnp.float32)
+                route_sel = route[:, :d_sel].astype(jnp.float32)
+                h_sel = _forward_unit_direction(h_sel).astype(jnp.bfloat16)
+                route_sel = _forward_unit_direction(route_sel).astype(jnp.bfloat16)
+                relation = jnp.einsum('bsrd,nd->bsrn', h_sel, route_sel).astype(jnp.float32)
+
+                h_str = h_in[..., d_sel:].astype(jnp.bfloat16)
+                route_str = route[:, d_sel:].astype(jnp.bfloat16)
+                strength_raw = jnp.einsum('bsrd,nd->bsrn', h_str, route_str).astype(jnp.float32)
+                strength = jnp.exp(_strength_beta * jnp.tanh(strength_raw))
+                return relation, strength
+
+            scores = jnp.einsum('bsrd,nd->bsrn', h_in, route).astype(jnp.float32)
+            intensity = jnp.minimum(jnp.maximum(scores, 0.0), _max_int)
+            return scores, intensity
+
         def route_rw_chunk(start):
             ec = route_emb_chunk(start)
             rc = jax.lax.dynamic_slice_in_dim(read_bf, start, cs, axis=0)
@@ -1228,8 +1281,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
+                scores_f, _ = route_relation_and_strength(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
@@ -1249,8 +1301,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
+                scores_f, _ = route_relation_and_strength(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 per_neuron_score = scores_f.mean(axis=(0, 1, 2))  # [cs]
@@ -1306,12 +1357,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
+                scores_f, intensity = route_relation_and_strength(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1427,12 +1476,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
+                scores_f, intensity = route_relation_and_strength(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1738,12 +1785,10 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  top1_details) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores = jnp.einsum('bsrd,nd->bsrn', h_bf, route)
-                scores_f = scores.astype(jnp.float32)
+                scores_f, intensity = route_relation_and_strength(h_bf, route)
                 raw = scores_f - tau
                 gate_raw = raw - _act_thr
                 activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
-                intensity = jnp.minimum(jnp.maximum(scores_f, 0.0), _max_int)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
