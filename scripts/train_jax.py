@@ -463,7 +463,7 @@ def _v415_sharded_kwargs(cfg):
     )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
-    if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
+    if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
         kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
     return kw
 
@@ -3689,7 +3689,7 @@ def _print_regular_block(rec, ctx):
             f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
             f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
         )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_message(_format_output_stab_line(rec, indent="  "))
     _cap_scale_min = min(
         rec.get('update_cap_proj_attn_scale', 1.0),
@@ -4417,7 +4417,7 @@ def _print_debug_block(rec, ctx):
         f"gate_max[attn={_g('attn_raw_gate_max'):.3f} "
         f"rst={_g('rst_raw_gate_max'):.3f}]"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_debug_message(_format_output_stab_line(rec, indent=""))
     log_debug_message(
         f"tau_diag: score_std[attn={_g('attn_score_std'):.4f} "
@@ -4560,7 +4560,7 @@ def _print_debug_analysis_block(rec, ctx):
         f"logit_max={_g('debug_logit_max'):.6f} "
         f"logit_norm_mean={_g('debug_emb_norm'):.6f}"
     )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_debug_message(_format_output_stab_line(rec, indent=""))
     reasons = _collapse_reasons(rec, ctx)
     if reasons:
@@ -4893,7 +4893,7 @@ def _print_analysis_block(rec, ctx):
             f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
             f" rst={rec['rst_gate_den_sum']:.1f}"
         )
-    if ctx.get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_message(_format_output_stab_line(rec, indent="  "))
     log_message(
         f"  tau_struct k_std={rec['rst_tau_std']:.2f}"
@@ -5731,14 +5731,14 @@ def main():
                 f" scan_scale={tcfg.get('scan_scale', 0.01)} "
                 f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
             )
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
             gate_msg += (
                 f" rw_contrib_den_floor={tcfg.get('rw_contrib_den_floor', 1.0)}"
             )
         print(gate_msg)
-        if cfg['model'].get('model_version') in ('spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
             print(
-                "  v4158/v4159 diagnostics: "
+                "  v4158 contrib-den diagnostics: "
                 f"debug_local_spikes={debug_local_spikes} "
                 f"warn_compose={collapse_warn_ctx['collapse_warn_compose_norm_threshold']} "
                 f"warn_top1={collapse_warn_ctx['collapse_warn_top1_threshold']} "
@@ -5930,6 +5930,12 @@ def main():
         if _spec.sharded_kwargs is not None:
             _srw_base_kwargs.update(_spec.sharded_kwargs(cfg))
         import inspect as _inspect
+        def _factory_kwargs(factory, kwargs):
+            sig = _inspect.signature(factory)
+            if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+                return dict(kwargs)
+            return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
         _supports_analysis = (
             'analysis' in _inspect.signature(make_sharded_srw).parameters
         )
@@ -5943,12 +5949,16 @@ def main():
         # Slim (train) -analysis defaults to False. Local spike diagnostics,
         # when explicitly enabled, are scalar-only outputs on this path.
         _sharded_single_v = make_sharded_srw(
-            max_chunk_size=attn_v_max_chunk, **_srw_train_kwargs)
+            max_chunk_size=attn_v_max_chunk,
+            **_factory_kwargs(make_sharded_srw, _srw_train_kwargs))
         _sharded_single_rst = make_sharded_srw(
-            max_chunk_size=rst_max_chunk, **_srw_train_kwargs)
+            max_chunk_size=rst_max_chunk,
+            **_factory_kwargs(make_sharded_srw, _srw_train_kwargs))
         if hasattr(_v3, 'make_sharded_srw_paired'):
+            _paired_factory = _v3.make_sharded_srw_paired
             _sharded_paired_attn_qk = _v3.make_sharded_srw_paired(
-                max_chunk_size=attn_qk_max_chunk, **_srw_train_kwargs)
+                max_chunk_size=attn_qk_max_chunk,
+                **_factory_kwargs(_paired_factory, _srw_train_kwargs))
             _sharded_fns = {
                 'single': _sharded_single_v,
                 'attn_v_single': _sharded_single_v,
@@ -5964,13 +5974,16 @@ def main():
         # factory advertises the kwarg.
         if _supports_analysis:
             _sharded_single_v_a = make_sharded_srw(
-                analysis=True, max_chunk_size=attn_v_max_chunk, **_srw_base_kwargs)
+                analysis=True, max_chunk_size=attn_v_max_chunk,
+                **_factory_kwargs(make_sharded_srw, _srw_base_kwargs))
             _sharded_single_rst_a = make_sharded_srw(
-                analysis=True, max_chunk_size=rst_max_chunk, **_srw_base_kwargs)
+                analysis=True, max_chunk_size=rst_max_chunk,
+                **_factory_kwargs(make_sharded_srw, _srw_base_kwargs))
             if hasattr(_v3, 'make_sharded_srw_paired'):
+                _paired_factory = _v3.make_sharded_srw_paired
                 _sharded_paired_a = _v3.make_sharded_srw_paired(
                     analysis=True, max_chunk_size=attn_qk_max_chunk,
-                    **_srw_base_kwargs)
+                    **_factory_kwargs(_paired_factory, _srw_base_kwargs))
                 _sharded_fns_analysis = {
                     'single': _sharded_single_v_a,
                     'attn_v_single': _sharded_single_v_a,
