@@ -101,7 +101,7 @@ training:
   # Exploration / RPE feedback
   exploration_weight: 0.001
   exploration_asymmetry: 1.0
-  exploration_warmup_steps: 1000
+  exploration_warmup_steps: 0
   exploration_lower_bound: -0.5
   exploration_upper_bound: 2.0
   exploration_bound_eps: 0.001
