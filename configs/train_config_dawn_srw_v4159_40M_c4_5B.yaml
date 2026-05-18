@@ -1,0 +1,104 @@
+# DAWN-SRW v4.1.5.9 TC v05 diag — 40M clean stability test
+#
+# Expected files:
+#   models/dawn_srw_v4159_tc_v05_diag.py
+#   scripts/train_jax_tc_v05_diag.py
+#
+# Notes:
+#   - model_version intentionally stays spatial-r1-v4.1.5.9 for checkpoint/config compatibility.
+#   - d_select is the primary split knob; remaining route dims become intensity dims.
+#       d_intensity = d_route - d_select = 128 - 96 = 32
+#   - legacy intensity cap is intentionally omitted: two-channel intensity is bounded by
+#       exp(intensity_beta * tanh(...)), so legacy intensity cap only affects legacy path/legacy cap diag.
+#   - scan is disabled to reduce variables in this stability test.
+
+seed: 1
+use_amp: true
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: spatial-r1-v4.1.5.9
+
+  # Backbone
+  d_model: 432
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+
+  # Route split
+  d_route: 128
+  d_select: 96        # remaining 32 dims are split into intensity
+
+  # Shared SRW pools
+  n_qk: 1240
+  n_v: 7830
+  n_know: 15570
+
+  # Execution / regularization
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+  fixed_depth_pool_scale: true
+
+training:
+  # Batch / schedule
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  restore_training_config_on_resume: false
+  num_epochs: 1
+
+  # Optimizer
+  lr: 0.00065
+  warmup_ratio: 0.06
+  weight_decay: 0.1
+  pool_weight_decay: 0.02
+  tau_lr_mult: 0.25    # conservative tau updates only; other LR paths use defaults
+
+  # Activation channel: selection transition
+  activation_width: 0.075
+  activation_power: 2.0
+
+  # Intensity channel: positive mixture reweighting
+  intensity_beta: 0.5
+  intensity_squash: tanh
+  intensity_width: 1.0
+
+  # Tau initialization / scan
+  tau_offset_init_attn: 1.0
+  tau_offset_init_rst: 2.0
+  scan_scale: 0.0
+  scan_std_floor: 0.5
+
+  # Auxiliary losses
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  dead_penalty_weight: 0.05
+  dead_penalty_threshold: 0.01
+
+  exploration_weight: 0.001
+  exploration_asymmetry: 1.5
+  exploration_warmup_steps: 1000
+  exploration_lower_bound: -0.5
+  exploration_upper_bound: 2.0
+  exploration_bound_eps: 0.001
+
+  # Sharding / chunking
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_know: 1
+
+  # Logging / diagnostics / checkpoints
+  checkpoint_interval: 500
+  val_interval: 500
+  log_interval: 100
+  log_analysis_multiplier: 5
+  heavy_geometry_multiplier: 10
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4159_40M_c4_5B
+log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4159_40M_c4_5B

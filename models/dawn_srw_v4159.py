@@ -3093,6 +3093,14 @@ class DAWN(nn.Module):
             'rst_gate_eff_ratio': rst_gate_eff_ratio_all.mean(),
             'rst_top1_gate_frac': rst_top1_gate_frac_all.mean(),
             'rst_top1_gate_frac_max': rst_top1_gate_frac_max_all.max(),
+
+            # Always-on output diagnostics: cheap scalar reductions used by train logs.
+            # These are kept outside the analysis-only block so out_diag never falls
+            # back to misleading zeros during normal training.
+            'debug_residual_norm': jnp.linalg.norm(x, axis=-1).mean(),
+            'debug_residual_norm_max': jnp.linalg.norm(x, axis=-1).max(),
+            'debug_token_emb_norm': jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean(),
+            'debug_token_emb_norm_max': jnp.linalg.norm(self.token_emb.embedding, axis=-1).max(),
         }
         if return_prune_stats and not self.is_initializing():
             result.update({
@@ -3153,12 +3161,12 @@ class DAWN(nn.Module):
                 'attn_v_raw_norm': attn_v_raw_norm_all.mean(),
                 'rst_raw_out_norm': rst_raw_out_norm_all.mean(),
                 'debug_residual_norm': _residual_norm,
-                'debug_emb_norm': _emb_norm,
+                'debug_token_emb_norm_analysis': _emb_norm,
                 'debug_o_proj_norm': _o_proj_norm,
                 'debug_q_norm': attn_q_norm_all.mean(),
                 'debug_k_norm': attn_k_norm_all.mean(),
                 'debug_v_norm': attn_v_norm_dbg_all.mean(),
-                'debug_logit_max': attn_logit_max_all.mean(),
+                'debug_attn_logit_max_mean': attn_logit_max_all.mean(),
                 'debug_o_input_norm': attn_o_input_norm_all.mean(),
                 'attn_q_norm_mean': attn_q_norm_all.mean(),
                 'attn_q_norm_std': attn_q_norm_std_all.mean(),
@@ -3241,13 +3249,24 @@ class DAWN(nn.Module):
                 loss = per_token_ce.sum() / (vmask.sum() + 1e-8)
                 preds = jnp.argmax(logits, axis=-1)
                 correct = jnp.sum((preds == labs) & vmask)
-                return loss, per_token_ce, correct, jnp.sum(vmask)
+                logits_f = logits.astype(jnp.float32)
+                logit_abs_max = jnp.max(jnp.abs(logits_f))
+                logit_norm_mean = jnp.linalg.norm(logits_f, axis=-1).mean()
+                logit_mean = logits_f.mean()
+                logit_std = logits_f.std()
+                return (loss, per_token_ce, correct, jnp.sum(vmask),
+                        logit_abs_max, logit_norm_mean, logit_mean, logit_std)
 
-            loss, per_token_ce, correct, valid_count = compute_loss_and_acc(
+            (loss, per_token_ce, correct, valid_count,
+             logit_abs_max, logit_norm_mean, logit_mean, logit_std) = compute_loss_and_acc(
                 shift_x, embedding_matrix, shift_labels, valid_mask)
             result['loss'] = loss
             result['correct'] = correct
             result['valid_count'] = valid_count
+            result['debug_logit_max'] = logit_abs_max
+            result['debug_logit_norm_mean'] = logit_norm_mean
+            result['debug_logit_mean'] = logit_mean
+            result['debug_logit_std'] = logit_std
             # v4.1 explore: expose per-token CE + valid mask for RPE loss.
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask

@@ -72,7 +72,7 @@ try:
 except ImportError:
     DAWN_SRW_V4158 = None
 try:
-    from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
+    from models.dawn_srw_v4159_tc_v05_diag import DAWN as DAWN_SRW_V4159
 except ImportError:
     DAWN_SRW_V4159 = None
 
@@ -576,7 +576,7 @@ if DAWN_SRW_V4158 is not None:
 if DAWN_SRW_V4159 is not None:
     MODEL_REGISTRY['spatial-r1-v4.1.5.9'] = ModelSpec(
         name='spatial-r1-v4.1.5.9',
-        module_path='models.dawn_srw_v4159',
+        module_path='models.dawn_srw_v4159_tc_v05_diag',
         cls=DAWN_SRW_V4159,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
@@ -2181,6 +2181,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_intensity_sum_mean': result.get('rst_intensity_sum_mean', jnp.float32(0.0)),
             'attn_gate_den_sum_mean': result.get('attn_gate_den_sum_mean', jnp.float32(0.0)),
             'rst_gate_den_sum_mean': result.get('rst_gate_den_sum_mean', jnp.float32(0.0)),
+            # Output/logit diagnostics are always-on cheap scalar reductions from the model.
+            'debug_residual_norm': result.get('debug_residual_norm', jnp.float32(0.0)),
+            'debug_residual_norm_max': result.get('debug_residual_norm_max', jnp.float32(0.0)),
+            'debug_token_emb_norm': result.get('debug_token_emb_norm', jnp.float32(0.0)),
+            'debug_token_emb_norm_max': result.get('debug_token_emb_norm_max', jnp.float32(0.0)),
+            'debug_logit_max': result.get('debug_logit_max', jnp.float32(0.0)),
+            'debug_logit_norm_mean': result.get('debug_logit_norm_mean', jnp.float32(0.0)),
+            'debug_logit_mean': result.get('debug_logit_mean', jnp.float32(0.0)),
+            'debug_logit_std': result.get('debug_logit_std', jnp.float32(0.0)),
+            'debug_attn_logit_max_mean': result.get('debug_attn_logit_max_mean', jnp.float32(0.0)),
             'attn_contrib_den_sum': result.get('attn_contrib_den_sum', jnp.float32(0.0)),
             'rst_contrib_den_sum': result.get('rst_contrib_den_sum', jnp.float32(0.0)),
             'attn_contrib_den_mean': result.get(
@@ -3582,8 +3592,14 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_v_raw_norm': float(m.get('attn_v_raw_norm', 0.0)),
         'rst_raw_out_norm': float(m.get('rst_raw_out_norm', 0.0)),
         'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
+        'debug_residual_norm_max': float(m.get('debug_residual_norm_max', 0.0)),
         'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
-        'debug_emb_norm': float(m.get('debug_emb_norm', 0.0)),
+        'debug_logit_norm_mean': float(m.get('debug_logit_norm_mean', 0.0)),
+        'debug_logit_mean': float(m.get('debug_logit_mean', 0.0)),
+        'debug_logit_std': float(m.get('debug_logit_std', 0.0)),
+        'debug_token_emb_norm': float(m.get('debug_token_emb_norm', m.get('debug_emb_norm', 0.0))),
+        'debug_token_emb_norm_max': float(m.get('debug_token_emb_norm_max', 0.0)),
+        'debug_attn_logit_max_mean': float(m.get('debug_attn_logit_max_mean', 0.0)),
         'rst_z_mean_active': float(m.get('rst_z_mean_active', 0.0)),
         'attn_qk_z_mean_active': float(m.get('attn_qk_z_mean_active', 0.0)),
         'attn_v_z_mean_active': float(m.get('attn_v_z_mean_active', 0.0)),
@@ -4476,10 +4492,15 @@ def _print_debug_block(rec, ctx):
         f"{_g('raw_scan_offset_attn_bias_2'):+.4f}) "
         f"rst={_g('raw_scan_offset_rst_bias'):+.4f}]"
     )
+    _intensity_bound = float(np.exp(float(ctx.get('intensity_beta', 0.0))))
+    _intensity_bound = _intensity_bound if _intensity_bound > 0 else 1.0
     log_debug_message(
-        f"amp_diag: int_max[attn={_g('attn_int_max', float('nan')):.3f} "
+        f"intensity_diag: int_max[attn={_g('attn_int_max', float('nan')):.3f} "
         f"rst={_g('rst_int_max', float('nan')):.3f}] "
-        f"int_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
+        f"bound=exp(beta)={_intensity_bound:.3f} "
+        f"bound_ratio[attn={_g('attn_int_max') / _intensity_bound:.3f} "
+        f"rst={_g('rst_int_max') / _intensity_bound:.3f}] "
+        f"legacy_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
         f"rst={_g('rst_int_cap_frac'):.6f}] "
         f"op_gain_max[qk={_g('attn_qk_op_gain_max'):.3f} "
         f"v={_g('attn_v_op_gain_max'):.3f} "
@@ -4497,9 +4518,12 @@ def _print_debug_block(rec, ctx):
         f"v={_g('attn_v_pool_scale'):.3f} rst={_g('rst_pool_scale'):.3f}]"
     )
     log_debug_message(
-        f"out_diag: final_resid={_g('debug_residual_norm'):.3f} "
-        f"logit_max={_g('debug_logit_max'):.3f} "
-        f"logit_norm_mean={_g('debug_emb_norm'):.3f} "
+        f"out_diag: resid_mean={_g('debug_residual_norm'):.3f} "
+        f"resid_max={_g('debug_residual_norm_max'):.3f} "
+        f"lm_logit_abs_max={_g('debug_logit_max'):.3f} "
+        f"lm_logit_norm_mean={_g('debug_logit_norm_mean'):.3f} "
+        f"lm_logit_std={_g('debug_logit_std'):.3f} "
+        f"tok_emb_norm={_g('debug_token_emb_norm'):.3f} "
         f"attn_out_mean={_g('attn_out_norm'):.3f} "
         f"rst_out_mean={_g('rst_out_norm'):.3f} "
         f"layer_attn_max={_layer_max('per_layer_attn_out_norm'):.3f} "
@@ -4595,9 +4619,11 @@ def _print_debug_analysis_block(rec, ctx):
         f"rst={_g('rst_contrib_den_sum'):.6f}] "
         f"compose[attn={_g('attn_compose_norm'):.6f} "
         f"rst={_g('rst_compose_norm'):.6f}] "
-        f"final_resid={_g('debug_residual_norm'):.6f} "
-        f"logit_max={_g('debug_logit_max'):.6f} "
-        f"logit_norm_mean={_g('debug_emb_norm'):.6f}"
+        f"resid_mean={_g('debug_residual_norm'):.6f} "
+        f"resid_max={_g('debug_residual_norm_max'):.6f} "
+        f"lm_logit_abs_max={_g('debug_logit_max'):.6f} "
+        f"lm_logit_norm_mean={_g('debug_logit_norm_mean'):.6f} "
+        f"lm_logit_std={_g('debug_logit_std'):.6f}"
     )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_debug_message(_format_output_stab_line(rec, indent=""))
@@ -4735,12 +4761,18 @@ def _build_analysis_record(base, metrics, ctx):
         'attn_current_cost': float(m.get('attn_current_cost', 0.0)),
         'rst_current_cost': float(m.get('rst_current_cost', 0.0)),
         'debug_residual_norm': float(m.get('debug_residual_norm', 0.0)),
-        'debug_emb_norm': float(m.get('debug_emb_norm', 0.0)),
+        'debug_residual_norm_max': float(m.get('debug_residual_norm_max', 0.0)),
+        'debug_token_emb_norm': float(m.get('debug_token_emb_norm', m.get('debug_emb_norm', 0.0))),
+        'debug_token_emb_norm_max': float(m.get('debug_token_emb_norm_max', 0.0)),
         'debug_o_proj_norm': float(m.get('debug_o_proj_norm', 0.0)),
         'debug_q_norm': float(m.get('debug_q_norm', 0.0)),
         'debug_k_norm': float(m.get('debug_k_norm', 0.0)),
         'debug_v_norm': float(m.get('debug_v_norm', 0.0)),
         'debug_logit_max': float(m.get('debug_logit_max', 0.0)),
+        'debug_logit_norm_mean': float(m.get('debug_logit_norm_mean', 0.0)),
+        'debug_logit_mean': float(m.get('debug_logit_mean', 0.0)),
+        'debug_logit_std': float(m.get('debug_logit_std', 0.0)),
+        'debug_attn_logit_max_mean': float(m.get('debug_attn_logit_max_mean', 0.0)),
         'debug_o_input_norm': float(m.get('debug_o_input_norm', 0.0)),
         'attn_q_norm_mean': float(m.get('attn_q_norm_mean', 0.0)),
         'attn_q_norm_std': float(m.get('attn_q_norm_std', 0.0)),
@@ -4949,7 +4981,7 @@ def _print_analysis_block(rec, ctx):
     )
     log_message(
         f"  debug resid={rec['debug_residual_norm']:.2f}"
-        f" emb={rec['debug_emb_norm']:.2f}"
+        f" tok_emb={rec['debug_token_emb_norm']:.2f}"
         f" o_proj={rec['debug_o_proj_norm']:.2f}"
         f" q={rec['debug_q_norm']:.2f}"
         f" rst={rec['debug_k_norm']:.2f}"
@@ -7263,6 +7295,8 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
+                        'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
+                        'intensity_route_dim': int(tcfg.get('intensity_route_dim', 0) or 0),
                     }
                     ctx.update(collapse_warn_ctx)
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
@@ -7339,6 +7373,8 @@ def main():
                     'total_micro_steps': total_micro_steps,
                     'progress': _progress,
                     'model_version': model_version,
+                    'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
+                    'intensity_route_dim': int(tcfg.get('intensity_route_dim', 0) or 0),
                 }
                 debug_ctx.update(collapse_warn_ctx)
                 debug_metrics = jax.device_get(metrics)
