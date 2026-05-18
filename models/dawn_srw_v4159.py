@@ -436,7 +436,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             # Two-channel mode: split the existing route dimension into
             # selection/address dims and intensity/mixture dims.  This keeps
             # the dense routing dot cost approximately unchanged:
-            #   d_sel + d_str == d_route.
+            #   d_select + d_intensity == d_route.
             if _two_channel_intensity:
                 d_total = h_in.shape[-1]
                 d_str = min(max(_intensity_route_dim, 1), d_total - 1)

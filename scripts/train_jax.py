@@ -72,7 +72,7 @@ try:
 except ImportError:
     DAWN_SRW_V4158 = None
 try:
-    from models.dawn_srw_v4159_tc_v03_stable import DAWN as DAWN_SRW_V4159
+    from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
 except ImportError:
     DAWN_SRW_V4159 = None
 
@@ -479,12 +479,25 @@ def _v415_sharded_kwargs(cfg):
     )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
-    # v4.1.5.9+ optional split two-channel routing:
-    # selection/address uses d_route - intensity_route_dim dims;
-    # intensity/mixture reweighting uses intensity_route_dim dims.
-    # Keep this in sharded kwargs because the fused SRW closures own gate physics.
-    if int(t.get('intensity_route_dim', 0) or 0) > 0:
-        kw['intensity_route_dim'] = int(t.get('intensity_route_dim'))
+    # v4.1.5.9+ optional split two-channel routing.
+    # Prefer config model.d_select: selection/address dims are specified
+    # directly, and the remaining route dims are split into intensity:
+    #   d_intensity = d_route - d_select
+    # Legacy training.intensity_route_dim remains as fallback.
+    m = cfg['model']
+    d_route = int(m.get('d_route', m.get('d_bottleneck', 128)))
+    d_select_cfg = m.get('d_select', t.get('d_select', None))
+    if d_select_cfg is not None:
+        d_select = int(d_select_cfg)
+        if not (0 < d_select < d_route):
+            raise ValueError(
+                f"d_select must satisfy 0 < d_select < d_route; "
+                f"got d_select={d_select}, d_route={d_route}")
+        intensity_route_dim = d_route - d_select
+    else:
+        intensity_route_dim = int(t.get('intensity_route_dim', 0) or 0)
+    if intensity_route_dim > 0:
+        kw['intensity_route_dim'] = int(intensity_route_dim)
         kw['intensity_beta'] = float(t.get('intensity_beta', 0.5))
         kw['intensity_squash'] = str(t.get('intensity_squash', 'tanh'))
         kw['intensity_width'] = float(t.get('intensity_width', 1.0))
