@@ -97,7 +97,7 @@ Implementation notes
   parameters remain raw, but SRW execution uses their directions.
 * Raw read/write parameter norms and norm-product stats remain diagnostics.
 * The denominator remains activation-weighted intensity: sum(gate).
-* v4.1.5.9 uses a clipped-linear activation transition over raw / activation_threshold
+* v4.1.5.9 uses a clipped activation transition over raw / activation_width, optionally shaped by activation_power
   and uses pure score-based intensity; tau controls activation only
   and no longer appears in the intensity branch.
 * Dynamic tau alpha parameters are not present; tau is relative threshold
@@ -163,8 +163,9 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers,
 # ================================================================
 # V4.1 physical constants (defaults; overridable via config).
 #
-#   margin        = (score - tau) - ACTIVATION_THRESHOLD
-#   activation    = clip(raw / ACTIVATION_THRESHOLD, 0, 1)
+#   margin        = (score - tau) - activation_width
+#   z             = clip(raw / activation_width, 0, 1)
+#   activation    = z ** activation_power
 #   intensity     = min(max(score, 0), MAX_INTENSITY)
 #   gate          = activation * intensity
 #   den           = max(sum(gate), 1.0)
@@ -255,8 +256,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                      return_prune_stats=False,
                      local_diagnostics=False,
                      route_emb_forward_norm=False,
-                     strength_route_dim=0,
-                     strength_beta=0.5):
+                     intensity_route_dim=0,
+                     intensity_beta=0.5,
+                     intensity_squash="tanh",
+                     intensity_width=1.0,
+                     activation_power=1.0):
     """Create fused shard_map'd gate+srw. Gate never materialised full.
 
     2-pass chunked inside shard_map:
@@ -265,8 +269,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
     v4.1 gate:
         raw           = score - tau
-        margin        = raw - activation_threshold
-        activation    = clip(raw / activation_threshold, 0, 1)
+        margin        = raw - activation_width
+        z             = clip(raw / activation_width, 0, 1)
+        activation    = z ** activation_power
         intensity     = min(max(score, 0), max_intensity)
         gate          = activation * intensity
         den           = max(sum(gate), 1.0)
@@ -316,15 +321,18 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _return_prune_stats = bool(return_prune_stats)
     _local_diagnostics = bool(local_diagnostics)
     # Default is raw route signatures. Forward-normalization is kept as an
-    # optional ablation only; it can reduce routing-strength freedom and may
+    # optional ablation only; it can reduce routing-intensity freedom and may
     # limit expressivity.
     # Default is raw route signatures. Forward-normalization is kept as an
-    # optional ablation only; it can reduce routing-strength freedom and may
+    # optional ablation only; it can reduce routing-intensity freedom and may
     # limit expressivity.
     _route_emb_forward_norm = bool(route_emb_forward_norm)
-    _strength_route_dim = int(strength_route_dim or 0)
-    _two_channel_strength = _strength_route_dim > 0
-    _strength_beta = jnp.float32(strength_beta)
+    _intensity_route_dim = int(intensity_route_dim or 0)
+    _two_channel_intensity = _intensity_route_dim > 0
+    _intensity_beta = jnp.float32(intensity_beta)
+    _intensity_squash = str(intensity_squash).lower()
+    _intensity_width = jnp.float32(intensity_width)
+    _activation_power = jnp.float32(activation_power)
     _int_cap_thresh = _eps + _max_int - jnp.float32(1e-3)
 
     # SLIM out_specs: train path.
@@ -424,14 +432,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
-        def route_relation_and_strength(h_in, route):
+        def route_relation_and_intensity(h_in, route):
             # Two-channel mode: split the existing route dimension into
-            # selection/address dims and strength/mixture dims.  This keeps
+            # selection/address dims and intensity/mixture dims.  This keeps
             # the dense routing dot cost approximately unchanged:
             #   d_sel + d_str == d_route.
-            if _two_channel_strength:
+            if _two_channel_intensity:
                 d_total = h_in.shape[-1]
-                d_str = min(max(_strength_route_dim, 1), d_total - 1)
+                d_str = min(max(_intensity_route_dim, 1), d_total - 1)
                 d_sel = d_total - d_str
                 h_sel = h_in[..., :d_sel].astype(jnp.float32)
                 route_sel = route[:, :d_sel].astype(jnp.float32)
@@ -441,9 +449,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
                 h_str = h_in[..., d_sel:].astype(jnp.bfloat16)
                 route_str = route[:, d_sel:].astype(jnp.bfloat16)
-                strength_raw = (h_str @ route_str.T).astype(jnp.float32)
-                strength = jnp.exp(_strength_beta * jnp.tanh(strength_raw))
-                return relation, strength
+                intensity_raw = (h_str @ route_str.T).astype(jnp.float32)
+                z = intensity_raw / jnp.maximum(_intensity_width, jnp.float32(1e-6))
+                if _intensity_squash == "softsign":
+                    intensity_log = _intensity_beta * (z / (jnp.float32(1.0) + jnp.abs(z)))
+                else:
+                    intensity_log = _intensity_beta * jnp.tanh(z)
+                intensity = jnp.exp(intensity_log)
+                return relation, intensity
 
             scores = (h_in @ route.T).astype(jnp.float32)
             intensity = jnp.minimum(jnp.maximum(scores, 0.0), _max_int)
@@ -468,7 +481,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores_f, _ = route_relation_and_strength(h_bf, route)
+                scores_f, _ = route_relation_and_intensity(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
@@ -488,7 +501,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores_f, _ = route_relation_and_strength(h_bf, route)
+                scores_f, _ = route_relation_and_intensity(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 per_neuron_score = scores_f.mean(axis=(0, 1))  # [cs]
@@ -547,10 +560,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores_f, intensity = route_relation_and_strength(h_bf, route)
+                scores_f, intensity = route_relation_and_intensity(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -657,10 +671,11 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores_f, intensity = route_relation_and_strength(h_bf, route)
+                scores_f, intensity = route_relation_and_intensity(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -957,13 +972,14 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  top1_details) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores_base, intensity_base = route_relation_and_strength(h_bf, route)
+                scores_base, intensity_base = route_relation_and_intensity(h_bf, route)
                 scores_f = scores_base[:, :, None, :]
                 intensity = intensity_base[:, :, None, :]
                 tau_r = tau[:, :, None, :]
                 raw = scores_f - tau_r
                 gate_raw = raw - _act_thr
-                activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1097,8 +1113,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                             return_prune_stats=False,
                             local_diagnostics=False,
                             route_emb_forward_norm=False,
-                            strength_route_dim=0,
-                            strength_beta=0.5):
+                            intensity_route_dim=0,
+                            intensity_beta=0.5,
+                            intensity_squash="tanh",
+                            intensity_width=1.0,
+                            activation_power=1.0):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
     h is [B,S,2,d_route] (h_Q, h_K stacked on axis=2).
@@ -1137,9 +1156,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     _return_prune_stats = bool(return_prune_stats)
     _local_diagnostics = bool(local_diagnostics)
     _route_emb_forward_norm = bool(route_emb_forward_norm)
-    _strength_route_dim = int(strength_route_dim or 0)
-    _two_channel_strength = _strength_route_dim > 0
-    _strength_beta = jnp.float32(strength_beta)
+    _intensity_route_dim = int(intensity_route_dim or 0)
+    _two_channel_intensity = _intensity_route_dim > 0
+    _intensity_beta = jnp.float32(intensity_beta)
+    _intensity_squash = str(intensity_squash).lower()
+    _intensity_width = jnp.float32(intensity_width)
+    _activation_power = jnp.float32(activation_power)
     _int_cap_thresh_paired = _eps + _max_int - jnp.float32(1e-3)
 
     _slim_out_specs = (
@@ -1238,13 +1260,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
-        def route_relation_and_strength(h_in, route):
+        def route_relation_and_intensity(h_in, route):
             # Two-channel mode for paired Q/K routes.  Selection uses a
-            # normalized relation space; strength is a positive mixture
-            # reweighting computed only from the reserved strength dims.
-            if _two_channel_strength:
+            # normalized relation space; intensity is a positive mixture
+            # reweighting computed only from the reserved intensity dims.
+            if _two_channel_intensity:
                 d_total = h_in.shape[-1]
-                d_str = min(max(_strength_route_dim, 1), d_total - 1)
+                d_str = min(max(_intensity_route_dim, 1), d_total - 1)
                 d_sel = d_total - d_str
                 h_sel = h_in[..., :d_sel].astype(jnp.float32)
                 route_sel = route[:, :d_sel].astype(jnp.float32)
@@ -1254,9 +1276,14 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
                 h_str = h_in[..., d_sel:].astype(jnp.bfloat16)
                 route_str = route[:, d_sel:].astype(jnp.bfloat16)
-                strength_raw = jnp.einsum('bsrd,nd->bsrn', h_str, route_str).astype(jnp.float32)
-                strength = jnp.exp(_strength_beta * jnp.tanh(strength_raw))
-                return relation, strength
+                intensity_raw = jnp.einsum('bsrd,nd->bsrn', h_str, route_str).astype(jnp.float32)
+                z = intensity_raw / jnp.maximum(_intensity_width, jnp.float32(1e-6))
+                if _intensity_squash == "softsign":
+                    intensity_log = _intensity_beta * (z / (jnp.float32(1.0) + jnp.abs(z)))
+                else:
+                    intensity_log = _intensity_beta * jnp.tanh(z)
+                intensity = jnp.exp(intensity_log)
+                return relation, intensity
 
             scores = jnp.einsum('bsrd,nd->bsrn', h_in, route).astype(jnp.float32)
             intensity = jnp.minimum(jnp.maximum(scores, 0.0), _max_int)
@@ -1281,7 +1308,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, cube_sum, quad_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores_f, _ = route_relation_and_strength(h_bf, route)
+                scores_f, _ = route_relation_and_intensity(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 cube_sum = cube_sum + (scores_f ** 3).sum(axis=-1, keepdims=True)
@@ -1301,7 +1328,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 s_sum, sq_sum, ns_sum, ns_sq = carry
                 s = i * cs
                 route = route_emb_chunk(s)
-                scores_f, _ = route_relation_and_strength(h_bf, route)
+                scores_f, _ = route_relation_and_intensity(h_bf, route)
                 s_sum = s_sum + scores_f.sum(axis=-1, keepdims=True)
                 sq_sum = sq_sum + (scores_f ** 2).sum(axis=-1, keepdims=True)
                 per_neuron_score = scores_f.mean(axis=(0, 1, 2))  # [cs]
@@ -1357,10 +1384,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores_f, intensity = route_relation_and_strength(h_bf, route)
+                scores_f, intensity = route_relation_and_intensity(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1476,10 +1504,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_int_cap_count, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores_f, intensity = route_relation_and_strength(h_bf, route)
+                scores_f, intensity = route_relation_and_intensity(h_bf, route)
                 raw = scores_f - tau
                 margin = raw - _act_thr
-                activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1785,10 +1814,11 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  top1_details) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
-                scores_f, intensity = route_relation_and_strength(h_bf, route)
+                scores_f, intensity = route_relation_and_intensity(h_bf, route)
                 raw = scores_f - tau
                 gate_raw = raw - _act_thr
-                activation = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
+                activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
                     keep = activation > _prune_thr
@@ -1927,7 +1957,7 @@ class NeuronPool(nn.Module):
         if n_rst_eff is None:
             raise ValueError("NeuronPool requires n_rst or legacy n_know.")
 
-        # Learned route embeddings keep norm as a routing-strength DoF.
+        # Learned route embeddings keep norm as a routing-intensity DoF.
         self.attn_qk_emb = self.param('attn_qk_emb', unit_norm_init(), (self.n_qk, db))
         self.attn_v_emb = self.param('attn_v_emb', unit_norm_init(), (self.n_v, db))
         self.rst_emb = self.param('rst_emb', unit_norm_init(), (n_rst_eff, db))
@@ -1968,18 +1998,25 @@ class Router(nn.Module):
     n_know: Optional[int] = None  # Legacy alias accepted from older configs.
     router_dropout: float = 0.1
     tau_offset_init: float = -0.5
+    tau_offset_init_attn: Optional[float] = None
+    tau_offset_init_rst: Optional[float] = None
 
     def setup(self):
         db = self.d_route
-        tau_init = float(self.tau_offset_init)
+        tau_attn_init = float(
+            self.tau_offset_init if self.tau_offset_init_attn is None
+            else self.tau_offset_init_attn)
+        tau_rst_init = float(
+            self.tau_offset_init if self.tau_offset_init_rst is None
+            else self.tau_offset_init_rst)
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_rst = nn.Dense(db, name='proj_rst')
         self.tau_attn = nn.Dense(3, name='tau_attn',
             kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: jnp.full(s, tau_init, d))
+            bias_init=lambda k, s, d: jnp.full(s, tau_attn_init, d))
         self.tau_rst = nn.Dense(1, name='tau_rst',
             kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: jnp.full(s, tau_init, d))
+            bias_init=lambda k, s, d: jnp.full(s, tau_rst_init, d))
         # Raw learned parameters for bounded scan offsets.
         # Zero-init preserves old behavior at step 0.
         self.raw_scan_offset_attn = nn.Dense(3, name='raw_scan_offset_attn',
@@ -2553,6 +2590,9 @@ class DAWN(nn.Module):
     tau_offset_clip: Optional[float] = None
     # Initial bias for tau_attn/tau_rst relative threshold offsets.
     tau_offset_init: float = -0.5
+    # Optional pool-specific tau init overrides.
+    tau_offset_init_attn: Optional[float] = None
+    tau_offset_init_rst: Optional[float] = None
     # Checkpoint-compatible ablation: keep scale params in NeuronPool, but
     # ignore them in forward/inference and use depth-scaled constants.
     fixed_depth_pool_scale: bool = True
@@ -2575,7 +2615,9 @@ class DAWN(nn.Module):
             d_model=self.d_model, d_route=self.d_route,
             n_qk=self.n_qk, n_v=self.n_v, n_rst=n_rst_eff,
             router_dropout=self.router_dropout,
-            tau_offset_init=self.tau_offset_init)
+            tau_offset_init=self.tau_offset_init,
+            tau_offset_init_attn=self.tau_offset_init_attn,
+            tau_offset_init_rst=self.tau_offset_init_rst)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,
                       dropout_rate=self.dropout_rate, name=f'block_{i}')

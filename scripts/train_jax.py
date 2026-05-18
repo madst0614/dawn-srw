@@ -72,7 +72,7 @@ try:
 except ImportError:
     DAWN_SRW_V4158 = None
 try:
-    from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
+    from models.dawn_srw_v4159_tc_v03_stable import DAWN as DAWN_SRW_V4159
 except ImportError:
     DAWN_SRW_V4159 = None
 
@@ -432,10 +432,16 @@ def _dawn_srw_kwargs(cfg):
     if (version in SRW_ACTIVE_MODEL_VERSIONS
             and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
         kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
-    if (version == 'spatial-r1-v4.1.5.9'
-            and ('tau_offset_init' in m or 'tau_offset_init' in t)):
-        kw['tau_offset_init'] = m.get(
-            'tau_offset_init', t.get('tau_offset_init'))
+    if version == 'spatial-r1-v4.1.5.9':
+        if ('tau_offset_init' in m or 'tau_offset_init' in t):
+            kw['tau_offset_init'] = m.get(
+                'tau_offset_init', t.get('tau_offset_init'))
+        if ('tau_offset_init_attn' in m or 'tau_offset_init_attn' in t):
+            kw['tau_offset_init_attn'] = m.get(
+                'tau_offset_init_attn', t.get('tau_offset_init_attn'))
+        if ('tau_offset_init_rst' in m or 'tau_offset_init_rst' in t):
+            kw['tau_offset_init_rst'] = m.get(
+                'tau_offset_init_rst', t.get('tau_offset_init_rst'))
     pool_scale_mode = str(m.get('pool_scale_mode', 'fixed_depth')).lower()
     learned_scale_requested = (
         pool_scale_mode in ('learned', 'learnable', 'trainable', 'param', 'parameter')
@@ -456,14 +462,15 @@ def _v415_sharded_kwargs(cfg):
     """
     t = cfg['training']
     version = cfg['model'].get('model_version')
-    if version == 'spatial-r1-v4.1.5.9' and t.get('activation_threshold', 0.5) <= 0:
+    activation_width = t.get('activation_width', t.get('activation_threshold', 0.5))
+    if version == 'spatial-r1-v4.1.5.9' and activation_width <= 0:
         raise ValueError(
-            "spatial-r1-v4.1.5.9 requires training.activation_threshold > 0 "
-            "because activation uses raw / activation_threshold.")
+            "spatial-r1-v4.1.5.9 requires training.activation_width > 0 "
+            "(or legacy activation_threshold > 0) because activation uses raw / activation_width.")
     kw = dict(
         dead_threshold=t.get('dead_penalty_threshold', 0.01),
         sharpness=t.get('sharpness', 500.0),
-        activation_threshold=t.get('activation_threshold', 0.5),
+        activation_threshold=activation_width,
         activation_cutoff=t.get('activation_cutoff', 0.01),
         epsilon=t.get('epsilon', 1e-4),
         max_intensity=t.get('max_intensity', 10.0),
@@ -473,12 +480,15 @@ def _v415_sharded_kwargs(cfg):
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
     # v4.1.5.9+ optional split two-channel routing:
-    # selection/address uses d_route - strength_route_dim dims;
-    # strength/mixture reweighting uses strength_route_dim dims.
+    # selection/address uses d_route - intensity_route_dim dims;
+    # intensity/mixture reweighting uses intensity_route_dim dims.
     # Keep this in sharded kwargs because the fused SRW closures own gate physics.
-    if int(t.get('strength_route_dim', 0) or 0) > 0:
-        kw['strength_route_dim'] = int(t.get('strength_route_dim'))
-        kw['strength_beta'] = float(t.get('strength_beta', 0.5))
+    if int(t.get('intensity_route_dim', 0) or 0) > 0:
+        kw['intensity_route_dim'] = int(t.get('intensity_route_dim'))
+        kw['intensity_beta'] = float(t.get('intensity_beta', 0.5))
+        kw['intensity_squash'] = str(t.get('intensity_squash', 'tanh'))
+        kw['intensity_width'] = float(t.get('intensity_width', 1.0))
+        kw['activation_power'] = float(t.get('activation_power', 1.0))
     if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
         kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
     return kw
@@ -1129,8 +1139,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     and add
         explore_loss = 貫 쨌 valid_weighted_mean(signal 쨌 誇 tau_offset)
     to total_loss.  Positive deviations (surprising tokens) push
-    tau_offset DOWN at full strength; negative deviations (easy tokens)
-    push UP at `exploration_asymmetry` of the strength.  The global mean
+    tau_offset DOWN at full intensity; negative deviations (easy tokens)
+    push UP at `exploration_asymmetry` of the intensity.  The global mean
     baseline makes the net push roughly zero-sum each batch, so tau does
     not accumulate monotonically.
 
@@ -5782,7 +5792,7 @@ def main():
         # Active v4.1.5 gate closure constants.
         gate_msg = (
             f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
-            f"act_thr={tcfg.get('activation_threshold', 0.5)} "
+            f"act_width={tcfg.get('activation_width', tcfg.get('activation_threshold', 0.5))} act_power={tcfg.get('activation_power', 1.0)} "
             f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
             f"eps={tcfg.get('epsilon', 1.0e-4)} "
             f"max_int={tcfg.get('max_intensity', 10.0)}"
