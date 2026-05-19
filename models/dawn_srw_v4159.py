@@ -353,7 +353,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                     # den_cost_mean scalar
         P(),                     # activation_cost_mean scalar
         P(),                     # current_cost_mean scalar
-        P(),                     # boundary_residency_loss scalar
+        P(),                     # boundary_residency_loss scalar (L1 boundary commitment)
     )
     # ANALYSIS extras appended after slim.
     _analysis_extra_specs = (
@@ -568,9 +568,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
                 tau_ref = jax.lax.stop_gradient(tau)
                 z_ref = jnp.clip((scores_f - tau_ref) / _act_thr, 0.0, 1.0)
-                chunk_boundary_sum = (z_ref * (1.0 - z_ref)).sum()
-                chunk_boundary_count = jnp.asarray(
-                    z_ref.size, dtype=jnp.float32)
+                inside = jax.lax.stop_gradient(
+                    ((z_ref > 0.0) & (z_ref < 1.0)).astype(jnp.float32))
+                target = jax.lax.stop_gradient(
+                    (z_ref >= 0.5).astype(jnp.float32))
+                boundary_commit = inside * jnp.abs(z_ref - target)
+                chunk_boundary_sum = boundary_commit.sum()
+                chunk_boundary_count = inside.sum()
                 activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
@@ -689,9 +693,13 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
                 tau_ref = jax.lax.stop_gradient(tau)
                 z_ref = jnp.clip((scores_f - tau_ref) / _act_thr, 0.0, 1.0)
-                chunk_boundary_sum = (z_ref * (1.0 - z_ref)).sum()
-                chunk_boundary_count = jnp.asarray(
-                    z_ref.size, dtype=jnp.float32)
+                inside = jax.lax.stop_gradient(
+                    ((z_ref > 0.0) & (z_ref < 1.0)).astype(jnp.float32))
+                target = jax.lax.stop_gradient(
+                    (z_ref >= 0.5).astype(jnp.float32))
+                boundary_commit = inside * jnp.abs(z_ref - target)
+                chunk_boundary_sum = boundary_commit.sum()
+                chunk_boundary_count = inside.sum()
                 activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
@@ -793,7 +801,9 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
         global_boundary_sum = jax.lax.psum(total_boundary_sum, 'model')
         global_boundary_count = jax.lax.psum(total_boundary_count, 'model')
-        boundary_residency_loss = global_boundary_sum / global_boundary_count
+        # Metric name kept for compatibility; now an L1 boundary commitment loss.
+        boundary_residency_loss = (
+            global_boundary_sum / jnp.maximum(global_boundary_count, 1.0))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den
@@ -1207,7 +1217,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                          # den_cost_mean scalar
         P(),                          # activation_cost_mean scalar
         P(),                          # current_cost_mean scalar
-        P(),                          # boundary_residency_loss scalar
+        P(),                          # boundary_residency_loss scalar (L1 boundary commitment)
     )
     _analysis_extra_specs = (
         P('data', None, None),        # phi_binary [B,S,1]
@@ -1418,9 +1428,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
                 tau_ref = jax.lax.stop_gradient(tau)
                 z_ref = jnp.clip((scores_f - tau_ref) / _act_thr, 0.0, 1.0)
-                chunk_boundary_sum = (z_ref * (1.0 - z_ref)).sum()
-                chunk_boundary_count = jnp.asarray(
-                    z_ref.size, dtype=jnp.float32)
+                inside = jax.lax.stop_gradient(
+                    ((z_ref > 0.0) & (z_ref < 1.0)).astype(jnp.float32))
+                target = jax.lax.stop_gradient(
+                    (z_ref >= 0.5).astype(jnp.float32))
+                boundary_commit = inside * jnp.abs(z_ref - target)
+                chunk_boundary_sum = boundary_commit.sum()
+                chunk_boundary_count = inside.sum()
                 activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
@@ -1548,9 +1562,13 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 z_act = jnp.clip(raw / _act_thr, 0.0, 1.0)
                 tau_ref = jax.lax.stop_gradient(tau)
                 z_ref = jnp.clip((scores_f - tau_ref) / _act_thr, 0.0, 1.0)
-                chunk_boundary_sum = (z_ref * (1.0 - z_ref)).sum()
-                chunk_boundary_count = jnp.asarray(
-                    z_ref.size, dtype=jnp.float32)
+                inside = jax.lax.stop_gradient(
+                    ((z_ref > 0.0) & (z_ref < 1.0)).astype(jnp.float32))
+                target = jax.lax.stop_gradient(
+                    (z_ref >= 0.5).astype(jnp.float32))
+                boundary_commit = inside * jnp.abs(z_ref - target)
+                chunk_boundary_sum = boundary_commit.sum()
+                chunk_boundary_count = inside.sum()
                 activation = jnp.power(z_act, _activation_power)
                 base_gate = activation * intensity
                 if _prune_enabled:
@@ -1653,7 +1671,9 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         global_current_cost = jax.lax.psum(total_current_cost, 'model')
         global_boundary_sum = jax.lax.psum(total_boundary_sum, 'model')
         global_boundary_count = jax.lax.psum(total_boundary_count, 'model')
-        boundary_residency_loss = global_boundary_sum / global_boundary_count
+        # Metric name kept for compatibility; now an L1 boundary commitment loss.
+        boundary_residency_loss = (
+            global_boundary_sum / jnp.maximum(global_boundary_count, 1.0))
         global_gate_max = jax.lax.pmax(jax.lax.stop_gradient(total_gate_max), 'model')
         den = jnp.maximum(global_den_cost, 1.0)
         out = raw_out / den

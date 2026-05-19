@@ -80,7 +80,7 @@ training:
   load_balance_weight: 0.0
   dead_penalty_weight: 0.01
   dead_penalty_threshold: 0.01
-  boundary_residency_weight: 0.00005
+  boundary_residency_weight: 0.0001
   boundary_residency_warmup_steps: 10000
 
   # v4.1 two-channel gate physics
