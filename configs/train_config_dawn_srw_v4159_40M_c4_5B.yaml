@@ -84,7 +84,7 @@ training:
   boundary_residency_warmup_steps: 10000
 
   exploration_weight: 0.001
-  exploration_asymmetry: 1.5
+  exploration_asymmetry: 1.2
   exploration_warmup_steps: 1000
   exploration_lower_bound: -0.5
   exploration_upper_bound: 2.0
