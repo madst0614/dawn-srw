@@ -72,7 +72,7 @@ try:
 except ImportError:
     DAWN_SRW_V4158 = None
 try:
-    from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
+    from models.dawn_srw_v4159_purecore_20260520 import DAWN as DAWN_SRW_V4159
 except ImportError:
     DAWN_SRW_V4159 = None
 
@@ -427,11 +427,6 @@ def _dawn_srw_kwargs(cfg):
         kw['n_rst'] = m['n_rst']
         kw['n_know'] = m.get('n_know', None)
     kw['n_chunks_rst'] = t.get('n_chunks_rst', t.get('n_chunks_know', 1))
-    # Optional train/eval-safe tau offset clipping. This adds no parameters,
-    # so existing checkpoints remain load-compatible.
-    if (version in SRW_ACTIVE_MODEL_VERSIONS
-            and ('tau_offset_clip' in m or 'tau_offset_clip' in t)):
-        kw['tau_offset_clip'] = m.get('tau_offset_clip', t.get('tau_offset_clip'))
     if version == 'spatial-r1-v4.1.5.9':
         if ('tau_offset_init' in m or 'tau_offset_init' in t):
             kw['tau_offset_init'] = m.get(
@@ -444,51 +439,28 @@ def _dawn_srw_kwargs(cfg):
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
-    pool_scale_mode = str(m.get('pool_scale_mode', 'fixed_depth')).lower()
-    learned_scale_requested = (
-        pool_scale_mode in ('learned', 'learnable', 'trainable', 'param', 'parameter')
-        or bool(m.get('learned_pool_scale', False))
-        or ('fixed_depth_pool_scale' in m and not bool(m['fixed_depth_pool_scale']))
-    )
-    if version in ('spatial-r1-v4.1.5.6', 'spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
-        kw['fixed_depth_pool_scale'] = not learned_scale_requested
     return kw
 
 
 def _v415_sharded_kwargs(cfg):
-    """Gate constants for the active v4.1.5 sharded SRW path.
-
-    route_emb_forward_norm is an optional v4.1.5.6 ablation kwarg.  Keep it
-    out of the kwargs unless explicitly enabled so v4.1.5.5's model factory
-    remains API-compatible while preserving raw route embeddings by default.
-    """
+    """Gate constants for the active v4.1.5 sharded SRW path."""
     t = cfg['training']
     version = cfg['model'].get('model_version')
     if version == 'spatial-r1-v4.1.5.9':
         kw = dict(
-            dead_threshold=t.get('dead_penalty_threshold', 0.01),
-            dead_penalty_mode=str(t.get(
-                'dead_penalty_mode', 'angular_exposure')),
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
             scan_scale=t.get('scan_scale', 0.0),
             scan_std_floor=t.get('scan_std_floor', 0.5),
             tau_min=t.get('tau_min', 0.0),
         )
     else:
-        activation_width = t.get(
-            'activation_width', t.get('activation_threshold', 0.5))
         kw = dict(
-            dead_threshold=t.get('dead_penalty_threshold', 0.01),
             sharpness=t.get('sharpness', 500.0),
-            activation_threshold=activation_width,
-            activation_cutoff=t.get('activation_cutoff', 0.01),
             epsilon=t.get('epsilon', 1e-4),
             max_intensity=t.get('max_intensity', 10.0),
             scan_scale=t.get('scan_scale', 0.01),
             scan_std_floor=t.get('scan_std_floor', 0.5),
         )
-    if t.get('route_emb_forward_norm', False):
-        kw['route_emb_forward_norm'] = True
     # v4.1.5.9 angular routing uses model.d_select directly:
     #   d_intensity = d_route - d_select
     m = cfg['model']
@@ -509,10 +481,6 @@ def _v415_sharded_kwargs(cfg):
     if intensity_route_dim > 0:
         kw['intensity_route_dim'] = int(intensity_route_dim)
         kw['intensity_beta'] = float(t.get('intensity_beta', 0.5))
-        kw['intensity_squash'] = str(t.get('intensity_squash', 'tanh'))
-        kw['intensity_width'] = float(t.get('intensity_width', 1.0))
-        if version != 'spatial-r1-v4.1.5.9':
-            kw['activation_power'] = float(t.get('activation_power', 1.0))
     if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
         kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
     return kw
@@ -587,7 +555,7 @@ if DAWN_SRW_V4158 is not None:
 if DAWN_SRW_V4159 is not None:
     MODEL_REGISTRY['spatial-r1-v4.1.5.9'] = ModelSpec(
         name='spatial-r1-v4.1.5.9',
-        module_path='models.dawn_srw_v4159',
+        module_path='models.dawn_srw_v4159_purecore_20260520',
         cls=DAWN_SRW_V4159,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
@@ -1036,20 +1004,12 @@ def _op_gain_stats(read, write, prefix, full=False):
     return out
 
 
-def _fixed_depth_pool_scale_enabled(model=None, model_cfg=None):
-    if model is not None:
-        return bool(getattr(model, 'fixed_depth_pool_scale', True))
-    if isinstance(model_cfg, dict):
-        mode = str(model_cfg.get('pool_scale_mode', 'fixed_depth')).lower()
-        if 'fixed_depth_pool_scale' in model_cfg:
-            return bool(model_cfg['fixed_depth_pool_scale'])
-        if mode in ('learned', 'learnable', 'trainable', 'param', 'parameter'):
-            return False
-        return True
+def _depth_scale_enabled(model=None, model_cfg=None):
+    """PureCore always reports fixed depth-scaled pool outputs."""
     return True
 
 
-def _fixed_depth_pool_scales_for(model=None, model_cfg=None):
+def _depth_pool_scales_for(model=None, model_cfg=None):
     if model is not None:
         d_model = getattr(model, 'd_model')
         n_layers = getattr(model, 'n_layers')
@@ -1069,10 +1029,7 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
     """Observational pool norm/gain diagnostics; never feeds loss."""
     pool = params.get('neuron_pool', {})
     out = {}
-    fixed_depth_pool_scale = _fixed_depth_pool_scale_enabled(model, model_cfg)
-    fixed_scales = (
-        _fixed_depth_pool_scales_for(model, model_cfg)
-        if fixed_depth_pool_scale else None)
+    fixed_scales = _depth_pool_scales_for(model, model_cfg)
     specs = (
         ('attn_qk', 'attn_qk_emb', 'attn_qk_read', 'attn_qk_write', 'attn_qk_scale'),
         ('attn_v', 'attn_v_emb', 'attn_v_read', 'attn_v_write', 'attn_v_scale'),
@@ -1089,13 +1046,10 @@ def _pool_param_diagnostics(params, full=False, model=None, model_cfg=None):
             out.update(_op_gain_stats(pool[read_key], pool[write_key],
                                       f'{name}_op_gain', full))
         if scale_key in pool:
-            if fixed_depth_pool_scale:
-                out[f'{name}_pool_scale'] = fixed_scales[i]
-                if full:
-                    out[f'{name}_learned_pool_scale_unused'] = _scalar0(
-                        pool[scale_key])
-            else:
-                out[f'{name}_pool_scale'] = _scalar0(pool[scale_key])
+            out[f'{name}_pool_scale'] = fixed_scales[i]
+            if full:
+                out[f'{name}_learned_pool_scale_unused'] = _scalar0(
+                    pool[scale_key])
     return out
 
 
@@ -5376,11 +5330,6 @@ def main():
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
     tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
     dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)  # v4.0.6
-    dead_penalty_mode = str(tcfg.get(
-        'dead_penalty_mode',
-        'angular_exposure'
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.9'
-        else 'legacy_gate'))
     dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
@@ -5610,8 +5559,6 @@ def main():
             lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
             tau_reg_weight = saved_training_config.get('tau_reg_weight', tau_reg_weight)
             dead_penalty_weight = saved_training_config.get('dead_penalty_weight', dead_penalty_weight)
-            dead_penalty_mode = str(saved_training_config.get(
-                'dead_penalty_mode', dead_penalty_mode))
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
             exploration_weight = saved_training_config.get(
@@ -5697,7 +5644,6 @@ def main():
         'load_balance_weight': lb_weight,
         'tau_reg_weight': tau_reg_weight,
         'dead_penalty_weight': dead_penalty_weight,
-        'dead_penalty_mode': dead_penalty_mode,
         'dead_exposure_target': dead_exposure_target,
         'exploration_weight': exploration_weight,
         'exploration_asymmetry': exploration_asymmetry,
@@ -6049,7 +5995,7 @@ def main():
         print(f"  LB weight: {lb_weight}")
         print(f"  Tau reg weight: {tau_reg_weight}")
         print(f"  Dead penalty: weight={dead_penalty_weight} "
-              f"mode={dead_penalty_mode} exposure_target={dead_exposure_target}")
+              f"exposure_target={dead_exposure_target}")
         print(f"  Exploration weight: {exploration_weight} "
               f"(asymmetry={exploration_asymmetry})")
         print(f"    warmup_steps={exploration_warmup_steps} "
@@ -6066,15 +6012,11 @@ def main():
                 f"tau_offset_init_attn={tcfg.get('tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', 'default'))} "
                 f"tau_offset_init_rst={tcfg.get('tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', 'default'))} "
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
-                f"intensity_squash={tcfg.get('intensity_squash', 'tanh')} "
-                f"intensity_width={tcfg.get('intensity_width', 1.0)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"
             )
         else:
             gate_msg = (
-                f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
-                f"act_width={tcfg.get('activation_width', tcfg.get('activation_threshold', 0.5))} act_power={tcfg.get('activation_power', 1.0)} "
-                f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
+                f"  Gate (legacy v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
                 f"eps={tcfg.get('epsilon', 1.0e-4)} "
                 f"max_int={tcfg.get('max_intensity', 10.0)}"
             )
@@ -7514,8 +7456,7 @@ def main():
                         'orth_weight': orth_weight,
                         'div_weight': div_weight,
                         'dead_penalty_weight': dead_penalty_weight,
-                        'dead_penalty_mode': dead_penalty_mode,
-                        'dead_exposure_target': dead_exposure_target,
+                                        'dead_exposure_target': dead_exposure_target,
                         'n_qk_cfg': cfg['model'].get(
                             'n_qk', cfg['model'].get('n_q', 0)),
                         'n_v_cfg': cfg['model'].get('n_v', 0),
@@ -7597,8 +7538,7 @@ def main():
                     'orth_weight': orth_weight,
                     'div_weight': div_weight,
                     'dead_penalty_weight': dead_penalty_weight,
-                    'dead_penalty_mode': dead_penalty_mode,
-                    'dead_exposure_target': dead_exposure_target,
+                                'dead_exposure_target': dead_exposure_target,
                     'n_qk_cfg': cfg['model'].get(
                         'n_qk', cfg['model'].get('n_q', 0)),
                     'n_v_cfg': cfg['model'].get('n_v', 0),

@@ -1,7 +1,7 @@
 """
-DAWN-SRW v4.1.5.9: SRW neurons and Residual State Transition.
+DAWN-SRW v4.1.5.9 PureCore 20260520: SRW neurons and Residual State Transition.
 
-This file contains the active v4.1.5.9 implementation. DAWN neurons are
+This file contains the active v4.1.5.9 PureCore implementation. DAWN neurons are
 implemented here as SRW neurons: a DAWN neuron has a signature and an
 operation; in DAWN-SRW the signature is a route-space embedding, and the
 operation is an RW operator parameterized by read/write vectors.
@@ -91,9 +91,8 @@ Implementation notes
 --------------------
 * Select uses a cosine/angular relation between the select query and operator
   signature. Intensity is a separate execution-strength branch.
-* v4.1.5.9 can forward-normalize route embeddings inside the sharded
-  SRW closures; stored signature parameters remain raw and their norms remain
-  diagnostics.
+* v4.1.5.9 uses raw route signatures for routing diagnostics; Select
+  unit-normalizes only the selection subspace inside the cosine relation.
 * v4.1.5.9 uses forward unit-normalized read/write vectors: stored read/write
   parameters remain raw, but SRW execution uses their directions.
 * Raw read/write parameter norms and norm-product stats remain diagnostics.
@@ -167,28 +166,7 @@ DEAD_EXPOSURE_DIAG_COUNT = len(DEAD_EXPOSURE_DIAG_NAMES)
 ) = range(DEAD_EXPOSURE_DIAG_COUNT)
 
 
-def _pool_scale_mode_is_learned(mode) -> bool:
-    return str(mode).lower() in (
-        'learned', 'learnable', 'trainable', 'param', 'parameter')
-
-
-def _model_cfg_uses_fixed_depth_pool_scale(model_cfg) -> bool:
-    # Default policy: fixed depth-scaled pool scales.
-    # To opt back into learned sqrt(d_model)-initialized pool scales, set:
-    #   model.pool_scale_mode: learned
-    # or explicitly set:
-    #   model.fixed_depth_pool_scale: false
-    if not isinstance(model_cfg, dict):
-        return True
-    if 'fixed_depth_pool_scale' in model_cfg:
-        return bool(model_cfg['fixed_depth_pool_scale'])
-    mode = model_cfg.get('pool_scale_mode', 'fixed_depth')
-    if _pool_scale_mode_is_learned(mode):
-        return False
-    return True
-
-
-def _fixed_depth_pool_output_scales(d_model, n_layers):
+def _pool_output_scales(d_model, n_layers):
     dm = jnp.asarray(d_model, dtype=jnp.float32)
     nl = jnp.asarray(n_layers, dtype=jnp.float32)
     qk_scale = jnp.sqrt(dm / nl)
@@ -201,15 +179,13 @@ def _fixed_depth_pool_output_scales(d_model, n_layers):
     )
 
 
-def _effective_pool_output_scales(pool_params, d_model, n_layers,
-                                  fixed_depth_pool_scale=False):
-    if fixed_depth_pool_scale:
-        return _fixed_depth_pool_output_scales(d_model, n_layers)
-    return (
-        pool_params['attn_qk_scale'],
-        pool_params['attn_v_scale'],
-        pool_params['rst_scale'],
-    )
+def _effective_pool_output_scales(pool_params, d_model, n_layers):
+    """PureCore uses fixed depth-scaled pool outputs.
+
+    The learned scale parameters stay in the checkpoint tree for compatibility,
+    but the active forward path ignores them.
+    """
+    return _pool_output_scales(d_model, n_layers)
 
 
 # ================================================================
@@ -221,7 +197,7 @@ def _effective_pool_output_scales(pool_params, d_model, n_layers,
 #   selection_margin = rho - tau
 #   positive_margin  = relu(selection_margin)
 #   gate             = positive_margin * intensity
-#   den           = max(sum(gate), 1.0)
+#   den              = max(sum(gate), 1.0)
 # ================================================================
 
 SCAN_SCALE = 0.01              # max absolute scan movement before /std
@@ -288,23 +264,14 @@ ATTN_LOCAL_METRIC_COUNT = 7
 #    fori_loop inside for N_local chunking.
 # ================================================================
 
-def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
+def make_sharded_srw(mesh, max_chunk_size=2048,
                      scan_scale=SCAN_SCALE,
                      scan_std_floor=SCAN_STD_FLOOR,
                      analysis=False,
-                     prune_enabled=False,
-                     prune_positive_margin_threshold=None,
-                     prune_scope="all",
-                     prune_denominator="pruned",
-                     return_prune_stats=False,
                      local_diagnostics=False,
-                     route_emb_forward_norm=False,
                      intensity_route_dim=0,
                      intensity_beta=0.5,
-                     intensity_squash="tanh",
-                     intensity_width=1.0,
                      tau_min=0.0,
-                     dead_penalty_mode="angular_exposure",
                      dead_exposure_target=0.1):
     """Create fused shard_map'd angular Select + SRW.
 
@@ -338,42 +305,16 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     """
     _model_axis_size = mesh.shape['model']
     _data_axis_size = mesh.shape['data']
-    if str(dead_penalty_mode).lower() != "angular_exposure":
-        raise ValueError(
-            "v4.1.5.9 angular SRW requires dead_penalty_mode='angular_exposure'")
-    _ = dead_threshold
     _dead_exposure_target = jnp.float32(dead_exposure_target)
     _scan_scale = jnp.float32(scan_scale)
     _scan_std_floor = jnp.float32(scan_std_floor)
-    _prune_enabled = bool(prune_enabled)
-    if _prune_enabled and prune_positive_margin_threshold is None:
-        raise ValueError(
-            "prune_positive_margin_threshold must be set when prune_enabled=True")
-    if prune_denominator not in ("pruned", "retained", "full"):
-        raise ValueError(
-            "prune_denominator must be 'pruned', 'retained', or 'full', "
-            f"got {prune_denominator!r}")
-    # prune_scope is resolved by the caller that builds pool-specific closures.
-    # It is accepted here so paper-eval configs can carry one canonical option set.
-    _ = prune_scope
-    _prune_thr = jnp.float32(
-        0.0 if prune_positive_margin_threshold is None
-        else prune_positive_margin_threshold)
-    _denominator_is_full = (prune_denominator == "full")
-    _return_prune_stats = bool(return_prune_stats)
     _local_diagnostics = bool(local_diagnostics)
-    # Default is raw route signatures. Forward-normalization is kept as an
-    # optional ablation only; it can reduce routing-intensity freedom and may
-    # limit expressivity.
-    _route_emb_forward_norm = bool(route_emb_forward_norm)
     _intensity_route_dim = int(intensity_route_dim or 0)
     if _intensity_route_dim <= 0:
         raise ValueError(
             "v4.1.5.9 angular SRW requires two-channel routing; set "
             "model.d_select or training.intensity_route_dim.")
     _intensity_beta = jnp.float32(intensity_beta)
-    _intensity_squash = str(intensity_squash).lower()
-    _intensity_width = jnp.float32(intensity_width)
     _tau_min = jnp.float32(tau_min)
     _angular_strong_margin = jnp.float32(0.05)
 
@@ -417,15 +358,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                     # top1_gate_frac_mean scalar
         P(),                     # top1_gate_frac_max scalar
     )
-    _prune_extra_specs = (
-        P(),                     # kept_count_mean scalar
-        P(),                     # kept_frac_mean scalar
-        P(),                     # full_gate_sum_mean scalar
-        P(),                     # kept_gate_sum_mean scalar
-        P(),                     # retained_gate_mass_mean scalar
-        P(),                     # int_cap_frac scalar
-        P(),                     # gate_max_mean scalar
-    )
     _select_diag_specs = tuple(P() for _ in range(SELECT_DIAG_COUNT))
     _dead_exposure_diag_specs = tuple(
         P() for _ in range(DEAD_EXPOSURE_DIAG_COUNT))
@@ -437,8 +369,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
     )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
                   if analysis else _slim_out_specs + _conc_out_specs)
-    if _return_prune_stats:
-        _out_specs = _out_specs + _prune_extra_specs
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
     if _local_diagnostics:
@@ -476,9 +406,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
-            if _route_emb_forward_norm:
-                ec_f = ec.astype(jnp.float32)
-                ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
         def route_relation_and_intensity(h_in, route):
@@ -501,11 +428,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
             h_intensity = h_in[..., d_sel:].astype(jnp.bfloat16)
             route_intensity = route[:, d_sel:].astype(jnp.bfloat16)
             intensity_raw = (h_intensity @ route_intensity.T).astype(jnp.float32)
-            z = intensity_raw / jnp.maximum(_intensity_width, jnp.float32(1e-6))
-            if _intensity_squash == "softsign":
-                intensity_log = _intensity_beta * (z / (jnp.float32(1.0) + jnp.abs(z)))
-            else:
-                intensity_log = _intensity_beta * jnp.tanh(z)
+            intensity_log = _intensity_beta * jnp.tanh(intensity_raw)
             intensity = jnp.exp(intensity_log)
             return rho, intensity, rho_exposure
 
@@ -686,8 +609,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_dead_penalty, total_dead_count,
                  total_exposure_sum, total_exposure_min,
                  total_exposure_max, total_weak_exposure_count,
-                 total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count, total_selection_residency_sum,
+                 total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, select_diag_carry, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
@@ -699,14 +621,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     select_diag_carry, rho, selection_margin, positive_margin)
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                if _prune_enabled:
-                    keep = positive_margin > _prune_thr
-                    gate = jnp.where(keep, base_gate, 0.0)
-                    chunk_kept = keep.astype(jnp.float32).sum(
-                        axis=-1, keepdims=True)
-                else:
-                    gate = base_gate
-                    chunk_kept = jnp.full((B, S, 1), cs, dtype=jnp.float32)
+                gate = base_gate
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -715,9 +630,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
-                chunk_den_cost = (chunk_full_gate if _denominator_is_full
-                                  else chunk_weighted)
+                chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
@@ -769,8 +682,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_exposure_max, chunk_exposure_max),
                         total_weak_exposure_count + chunk_weak_exposure_count,
                         jnp.maximum(total_int_max, chunk_int_max),
-                        total_full_gate + chunk_full_gate,
-                        total_kept_count + chunk_kept,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
@@ -783,8 +694,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
              total_g_log_g, total_dead_penalty, total_dead_count,
              total_exposure_sum, total_exposure_min,
              total_exposure_max, total_weak_exposure_count,
-             total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count, total_selection_residency_sum,
+             total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count, select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
@@ -792,7 +702,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0),
                  jnp.float32(0.0), diag_pos_inf, diag_neg_inf,
                  jnp.float32(0.0),
-                 jnp.float32(0.0), z1, z1, jnp.float32(0.0),
+                 jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
                  select_diag_carry0,
                  diag_vals_init),
@@ -806,8 +716,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_dead_penalty, total_dead_count,
                  total_exposure_sum, total_exposure_min,
                  total_exposure_max, total_weak_exposure_count,
-                 total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count, total_selection_residency_sum,
+                 total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, select_diag_carry, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
@@ -819,14 +728,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     select_diag_carry, rho, selection_margin, positive_margin)
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                if _prune_enabled:
-                    keep = positive_margin > _prune_thr
-                    gate = jnp.where(keep, base_gate, 0.0)
-                    chunk_kept = keep.astype(jnp.float32).sum(
-                        axis=-1, keepdims=True)
-                else:
-                    gate = base_gate
-                    chunk_kept = jnp.full((B, S, 1), cs, dtype=jnp.float32)
+                gate = base_gate
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -835,12 +737,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 c_out = (a.astype(jnp.bfloat16) @ wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_full_gate = (
-                    base_gate.sum(axis=-1, keepdims=True)
-                    if (_return_prune_stats or _denominator_is_full)
-                    else chunk_weighted)
-                chunk_den_cost = (chunk_full_gate if _denominator_is_full
-                                  else chunk_weighted)
+                chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
@@ -884,8 +781,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_exposure_max, chunk_exposure_max),
                         total_weak_exposure_count + chunk_weak_exposure_count,
                         jnp.maximum(total_int_max, chunk_int_max),
-                        total_full_gate + chunk_full_gate,
-                        total_kept_count + chunk_kept,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
@@ -897,8 +792,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
              total_dead_penalty, total_dead_count,
              total_exposure_sum, total_exposure_min,
              total_exposure_max, total_weak_exposure_count,
-             total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count, total_selection_residency_sum,
+             total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count, select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
@@ -1025,26 +919,6 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     selection_residency_loss)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
-        prune_out = ()
-        if _return_prune_stats:
-            global_full_gate = jax.lax.psum(total_full_gate, 'model')
-            global_kept_count = jax.lax.psum(total_kept_count, 'model')
-            global_full_gate_m = jax.lax.stop_gradient(global_full_gate)
-            global_kept_count_m = jax.lax.stop_gradient(global_kept_count)
-            retained_gate_mass = (
-                global_weighted_cost_m / jnp.maximum(global_full_gate_m, 1e-8))
-            int_cap_frac_out = jax.lax.stop_gradient(
-                jax.lax.psum(total_int_cap_count, 'model')
-                / jnp.float32(B * S * N_total))
-            prune_out = (
-                global_kept_count_m.mean(),
-                (global_kept_count_m / N_total).mean(),
-                global_full_gate_m.mean(),
-                global_weighted_cost_m.mean(),
-                retained_gate_mass.mean(),
-                int_cap_frac_out,
-                global_gate_max_m.mean(),
-            )
         local_diag_out = ()
         if _local_diagnostics:
             tau_abs_max = jnp.max(jnp.abs(jax.lax.stop_gradient(tau_offset)))
@@ -1084,7 +958,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 metric_vals.astype(jnp.float32), metric_locs,
                 top1_details, top1_locs)
         if not analysis:
-            return (slim_out + conc_out + prune_out + select_diag_out
+            return (slim_out + conc_out + select_diag_out
                     + dead_exposure_diag_out + local_diag_out)
 
         # --- Analysis-only extras ---
@@ -1118,29 +992,20 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                    margin_band_mid_frac, rho_skew, active_per_token_std,
                    gate_entropy, den_cost_out, selection_cost_out,
                    current_cost_out, rho_kurt, int_cap_frac_out)
-                + prune_out + select_diag_out + dead_exposure_diag_out
+                + select_diag_out + dead_exposure_diag_out
                 + local_diag_out)
 
     return fused_gate_srw
 
 
-def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
+def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                             scan_scale=SCAN_SCALE,
                             scan_std_floor=SCAN_STD_FLOOR,
                             analysis=False,
-                            prune_enabled=False,
-                            prune_positive_margin_threshold=None,
-                            prune_scope="all",
-                            prune_denominator="pruned",
-                            return_prune_stats=False,
                             local_diagnostics=False,
-                            route_emb_forward_norm=False,
                             intensity_route_dim=0,
                             intensity_beta=0.5,
-                            intensity_squash="tanh",
-                            intensity_width=1.0,
                             tau_min=0.0,
-                            dead_penalty_mode="angular_exposure",
                             dead_exposure_target=0.1):
     """Fused Q+K shard_map: two routes sharing same pool in one shard_map call.
 
@@ -1155,38 +1020,16 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     """
     _model_axis_size = mesh.shape['model']
     _data_axis_size = mesh.shape['data']
-    if str(dead_penalty_mode).lower() != "angular_exposure":
-        raise ValueError(
-            "v4.1.5.9 angular SRW requires dead_penalty_mode='angular_exposure'")
-    _ = dead_threshold
     _dead_exposure_target = jnp.float32(dead_exposure_target)
     _scan_scale = jnp.float32(scan_scale)
     _scan_std_floor = jnp.float32(scan_std_floor)
-    _prune_enabled = bool(prune_enabled)
-    if _prune_enabled and prune_positive_margin_threshold is None:
-        raise ValueError(
-            "prune_positive_margin_threshold must be set when prune_enabled=True")
-    if prune_denominator not in ("pruned", "retained", "full"):
-        raise ValueError(
-            "prune_denominator must be 'pruned', 'retained', or 'full', "
-            f"got {prune_denominator!r}")
-    # Scope is resolved by the caller that chooses which pool closures prune.
-    _ = prune_scope
-    _prune_thr = jnp.float32(
-        0.0 if prune_positive_margin_threshold is None
-        else prune_positive_margin_threshold)
-    _denominator_is_full = (prune_denominator == "full")
-    _return_prune_stats = bool(return_prune_stats)
     _local_diagnostics = bool(local_diagnostics)
-    _route_emb_forward_norm = bool(route_emb_forward_norm)
     _intensity_route_dim = int(intensity_route_dim or 0)
     if _intensity_route_dim <= 0:
         raise ValueError(
             "v4.1.5.9 angular SRW requires two-channel routing; set "
             "model.d_select or training.intensity_route_dim.")
     _intensity_beta = jnp.float32(intensity_beta)
-    _intensity_squash = str(intensity_squash).lower()
-    _intensity_width = jnp.float32(intensity_width)
     _tau_min = jnp.float32(tau_min)
     _angular_strong_margin = jnp.float32(0.05)
 
@@ -1228,15 +1071,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
         P(),                          # top1_gate_frac_mean scalar
         P(),                          # top1_gate_frac_max scalar
     )
-    _prune_extra_specs = (
-        P(),                          # kept_count_mean scalar
-        P(),                          # kept_frac_mean scalar
-        P(),                          # full_gate_sum_mean scalar
-        P(),                          # kept_gate_sum_mean scalar
-        P(),                          # retained_gate_mass_mean scalar
-        P(),                          # int_cap_frac scalar
-        P(),                          # gate_max_mean scalar
-    )
     _select_diag_specs = tuple(P() for _ in range(SELECT_DIAG_COUNT))
     _dead_exposure_diag_specs = tuple(
         P() for _ in range(DEAD_EXPOSURE_DIAG_COUNT))
@@ -1248,8 +1082,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
     )
     _out_specs = (_slim_out_specs + _conc_out_specs + _analysis_extra_specs
                   if analysis else _slim_out_specs + _conc_out_specs)
-    if _return_prune_stats:
-        _out_specs = _out_specs + _prune_extra_specs
     _out_specs = _out_specs + _select_diag_specs
     _out_specs = _out_specs + _dead_exposure_diag_specs
     if _local_diagnostics:
@@ -1288,9 +1120,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
 
         def route_emb_chunk(start):
             ec = jax.lax.dynamic_slice_in_dim(emb_bf, start, cs, axis=0)
-            if _route_emb_forward_norm:
-                ec_f = ec.astype(jnp.float32)
-                ec = _forward_unit_direction(ec_f).astype(jnp.bfloat16)
             return ec
 
         def route_relation_and_intensity(h_in, route):
@@ -1313,11 +1142,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
             h_intensity = h_in[..., d_sel:].astype(jnp.bfloat16)
             route_intensity = route[:, d_sel:].astype(jnp.bfloat16)
             intensity_raw = jnp.einsum('bsrd,nd->bsrn', h_intensity, route_intensity).astype(jnp.float32)
-            z = intensity_raw / jnp.maximum(_intensity_width, jnp.float32(1e-6))
-            if _intensity_squash == "softsign":
-                intensity_log = _intensity_beta * (z / (jnp.float32(1.0) + jnp.abs(z)))
-            else:
-                intensity_log = _intensity_beta * jnp.tanh(z)
+            intensity_log = _intensity_beta * jnp.tanh(intensity_raw)
             intensity = jnp.exp(intensity_log)
             return rho, intensity, rho_exposure
 
@@ -1495,8 +1320,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_dead_penalty, total_dead_count,
                  total_exposure_sum, total_exposure_min,
                  total_exposure_max, total_weak_exposure_count,
-                 total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count, total_selection_residency_sum,
+                 total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, select_diag_carry, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
@@ -1508,14 +1332,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     select_diag_carry, rho, selection_margin, positive_margin)
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                if _prune_enabled:
-                    keep = positive_margin > _prune_thr
-                    gate = jnp.where(keep, base_gate, 0.0)
-                    chunk_kept = keep.astype(jnp.float32).sum(
-                        axis=-1, keepdims=True)
-                else:
-                    gate = base_gate
-                    chunk_kept = jnp.full((B, S, 2, 1), cs, dtype=jnp.float32)
+                gate = base_gate
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T  # [B,S,N]
@@ -1524,12 +1341,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)           # [B,S,2,1]
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_full_gate = (
-                    base_gate.sum(axis=-1, keepdims=True)
-                    if (_return_prune_stats or _denominator_is_full)
-                    else chunk_weighted)
-                chunk_den_cost = (chunk_full_gate if _denominator_is_full
-                                  else chunk_weighted)
+                chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
@@ -1586,8 +1398,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_exposure_max, chunk_exposure_max),
                         total_weak_exposure_count + chunk_weak_exposure_count,
                         jnp.maximum(total_int_max, chunk_int_max),
-                        total_full_gate + chunk_full_gate,
-                        total_kept_count + chunk_kept,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
@@ -1600,8 +1410,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
              total_g_log_g, total_dead_penalty, total_dead_count,
              total_exposure_sum, total_exposure_min,
              total_exposure_max, total_weak_exposure_count,
-             total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count, total_selection_residency_sum,
+             total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count, select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
@@ -1610,7 +1419,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  jnp.float32(0.0), jnp.float32(0.0),
                  jnp.float32(0.0), diag_pos_inf, diag_neg_inf,
                  jnp.float32(0.0),
-                 jnp.float32(0.0), z1_r, z1_r, jnp.float32(0.0),
+                 jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
                  select_diag_carry0,
                  diag_vals_init),
@@ -1624,8 +1433,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  total_dead_penalty, total_dead_count,
                  total_exposure_sum, total_exposure_min,
                  total_exposure_max, total_weak_exposure_count,
-                 total_int_max, total_full_gate, total_kept_count,
-                 total_int_cap_count, total_selection_residency_sum,
+                 total_int_max, total_int_cap_count, total_selection_residency_sum,
                  total_selection_residency_count, select_diag_carry, diag_vals) = carry
                 s = i * cs
                 route, rc, wc = route_rw_chunk(s)
@@ -1637,14 +1445,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     select_diag_carry, rho, selection_margin, positive_margin)
                 chunk_selection_residency_sum = jnp.float32(0.0)
                 chunk_selection_residency_count = jnp.float32(0.0)
-                if _prune_enabled:
-                    keep = positive_margin > _prune_thr
-                    gate = jnp.where(keep, base_gate, 0.0)
-                    chunk_kept = keep.astype(jnp.float32).sum(
-                        axis=-1, keepdims=True)
-                else:
-                    gate = base_gate
-                    chunk_kept = jnp.full((B, S, 2, 1), cs, dtype=jnp.float32)
+                gate = base_gate
                 chunk_int_max = intensity.max()
                 chunk_int_cap_count = jnp.float32(0.0)
                 xr = x_bf @ rc.T
@@ -1653,9 +1454,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 c_out = jnp.einsum('bsrn,nd->bsrd', a.astype(jnp.bfloat16), wc).astype(jnp.float32)
                 chunk_weighted = gate.sum(axis=-1, keepdims=True)
                 chunk_gate_sq = jnp.square(gate).sum(axis=-1, keepdims=True)
-                chunk_full_gate = base_gate.sum(axis=-1, keepdims=True)
-                chunk_den_cost = (chunk_full_gate if _denominator_is_full
-                                  else chunk_weighted)
+                chunk_den_cost = chunk_weighted
                 if _local_diagnostics:
                     write_norm = jnp.linalg.norm(
                         wc.astype(jnp.float32), axis=-1)
@@ -1703,8 +1502,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                         jnp.maximum(total_exposure_max, chunk_exposure_max),
                         total_weak_exposure_count + chunk_weak_exposure_count,
                         jnp.maximum(total_int_max, chunk_int_max),
-                        total_full_gate + chunk_full_gate,
-                        total_kept_count + chunk_kept,
                         total_int_cap_count + chunk_int_cap_count,
                         total_selection_residency_sum + chunk_selection_residency_sum,
                         total_selection_residency_count + chunk_selection_residency_count,
@@ -1716,8 +1513,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
              total_dead_penalty, total_dead_count,
              total_exposure_sum, total_exposure_min,
              total_exposure_max, total_weak_exposure_count,
-             total_int_max, total_full_gate, total_kept_count,
-             total_int_cap_count, total_selection_residency_sum,
+             total_int_max, total_int_cap_count, total_selection_residency_sum,
              total_selection_residency_count, select_diag_carry, diag_vals), _ = jax.lax.scan(
                 gate_srw_step,
                 (jnp.zeros((B, S, 2, D), dtype=jnp.float32),
@@ -1848,26 +1644,6 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                     current_cost_mean, selection_residency_loss)
         conc_out = (gate_eff_n.mean(), gate_eff_ratio.mean(),
                     top1_gate_frac.mean(), top1_gate_frac.max())
-        prune_out = ()
-        if _return_prune_stats:
-            global_full_gate = jax.lax.psum(total_full_gate, 'model')
-            global_kept_count = jax.lax.psum(total_kept_count, 'model')
-            global_full_gate_m = jax.lax.stop_gradient(global_full_gate)
-            global_kept_count_m = jax.lax.stop_gradient(global_kept_count)
-            retained_gate_mass = (
-                global_weighted_cost_m / jnp.maximum(global_full_gate_m, 1e-8))
-            int_cap_frac_out = jax.lax.stop_gradient(
-                jax.lax.psum(total_int_cap_count, 'model')
-                / jnp.float32(B * S * 2 * N_total))
-            prune_out = (
-                global_kept_count_m.mean(),
-                (global_kept_count_m / N_total).mean(),
-                global_full_gate_m.mean(),
-                global_weighted_cost_m.mean(),
-                retained_gate_mass.mean(),
-                int_cap_frac_out,
-                global_gate_max_m.mean(),
-            )
         local_diag_out = ()
         if _local_diagnostics:
             tau_abs_max = jnp.max(
@@ -1913,7 +1689,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 metric_vals.astype(jnp.float32), metric_locs,
                 top1_details, top1_locs)
         if not analysis:
-            return (slim_out + conc_out + prune_out + select_diag_out
+            return (slim_out + conc_out + select_diag_out
                     + dead_exposure_diag_out + local_diag_out)
 
         # --- Analysis-only extras ---
@@ -1946,7 +1722,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                    margin_band_mid_frac, rho_skew, active_per_token_std,
                    gate_entropy, den_cost_out, selection_cost_out,
                    current_cost_out, rho_kurt, int_cap_frac_out)
-                + prune_out + select_diag_out + dead_exposure_diag_out
+                + select_diag_out + dead_exposure_diag_out
                 + local_diag_out)
 
     return fused_gate_srw_paired
@@ -2047,9 +1823,8 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                   n_qk, n_v,
                   n_heads, d_model, n_layers,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False, return_prune_stats=False,
-                  local_diagnostics=False, tau_offset_clip=None,
-                  fixed_depth_pool_scale=False):
+                  sharded_fns, analysis=False,
+                  local_diagnostics=False):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis=False` (train path): returns the SLIM tuple. `analysis=True`:
@@ -2089,9 +1864,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
     h_Q, h_K, h_V = jnp.split(h_all, 3, axis=-1)
 
     tau_all = x @ router_params['tau_attn']['kernel'] + router_params['tau_attn']['bias']
-    if tau_offset_clip is not None and tau_offset_clip > 0:
-        tau_offset_clip_f = jnp.float32(tau_offset_clip)
-        tau_all = jnp.clip(tau_all, -tau_offset_clip_f, tau_offset_clip_f)
     raw_scan_offset_all = (
         x @ router_params['raw_scan_offset_attn']['kernel']
         + router_params['raw_scan_offset_attn']['bias'])
@@ -2102,7 +1874,7 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
             jnp.sum(jax.lax.stop_gradient(router_params['tau_attn']['kernel']) ** 2) + 1e-12)
 
     qk_scale, v_scale, _ = _effective_pool_output_scales(
-        pool_params, d_model, n_layers, fixed_depth_pool_scale)
+        pool_params, d_model, n_layers)
 
     if isinstance(sharded_fns, dict):
         fused_paired = sharded_fns.get('attn_qk_paired', sharded_fns.get('qk_paired', sharded_fns['paired']))
@@ -2131,11 +1903,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          qk_kurt, qk_int_cap) = qk_ret[qk_offset:qk_offset + 11]
         qk_offset += 11
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
-    if return_prune_stats:
-        (qk_kept_count, qk_kept_frac, qk_full_gate_sum, qk_kept_gate_sum,
-         qk_retained_gate_mass, qk_int_cap_frac,
-         qk_gate_max_mean) = qk_ret[qk_offset:qk_offset + 7]
-        qk_offset += 7
     qk_select_start = qk_offset
     qk_select_diag = qk_ret[qk_select_start:qk_select_start + SELECT_DIAG_COUNT]
     qk_exposure_start = qk_select_start + SELECT_DIAG_COUNT
@@ -2163,11 +1930,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
          v_kurt, v_int_cap) = v_ret[v_offset:v_offset + 11]
         v_offset += 11
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
-    if return_prune_stats:
-        (v_kept_count, v_kept_frac, v_full_gate_sum, v_kept_gate_sum,
-         v_retained_gate_mass, v_int_cap_frac,
-         v_gate_max_mean) = v_ret[v_offset:v_offset + 7]
-        v_offset += 7
     v_select_start = v_offset
     v_select_diag = v_ret[v_select_start:v_select_start + SELECT_DIAG_COUNT]
     v_exposure_start = v_select_start + SELECT_DIAG_COUNT
@@ -2364,15 +2126,6 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 *attn_exposure_diag)
     if not analysis:
         ret = slim_ret
-        if return_prune_stats:
-            ret = ret + (
-                qk_kept_count, qk_kept_frac, qk_full_gate_sum,
-                qk_kept_gate_sum, qk_retained_gate_mass,
-                qk_int_cap_frac, qk_gate_max_mean,
-                v_kept_count, v_kept_frac, v_full_gate_sum,
-                v_kept_gate_sum, v_retained_gate_mass,
-                v_int_cap_frac, v_gate_max_mean,
-            )
         if local_diagnostics:
             attn_local_layer_values = jnp.stack([
                 q_norm_max, k_norm_max, v_norm_max,
@@ -2446,10 +2199,9 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
 
 def _rst_forward(x, pool_params, router_params, rng,
                   router_dropout, dropout_rate, deterministic,
-                  sharded_fns, analysis=False, return_prune_stats=False,
-                  local_diagnostics=False, tau_offset_clip=None,
-                  d_model=None, n_layers=None,
-                  fixed_depth_pool_scale=False):
+                  sharded_fns, analysis=False,
+                  local_diagnostics=False,
+                  d_model=None, n_layers=None):
     """v4.1: sharded-only. sharded_fns=(fused_single, fused_paired) required.
 
     `analysis` see _attn_forward docstring.
@@ -2467,9 +2219,6 @@ def _rst_forward(x, pool_params, router_params, rng,
     # retaining raw parameter norms as diagnostics.
     rst_emb_unit = rst_emb
     tau = x @ router_params['tau_rst']['kernel'] + router_params['tau_rst']['bias']
-    if tau_offset_clip is not None and tau_offset_clip > 0:
-        tau_offset_clip_f = jnp.float32(tau_offset_clip)
-        tau = jnp.clip(tau, -tau_offset_clip_f, tau_offset_clip_f)
     raw_scan_offset = (
         x @ router_params['raw_scan_offset_rst']['kernel']
         + router_params['raw_scan_offset_rst']['bias'])
@@ -2477,14 +2226,10 @@ def _rst_forward(x, pool_params, router_params, rng,
         rst_tau_std = jax.lax.stop_gradient(tau).std()
         rst_tau_kernel_norm = jnp.sqrt(
             jnp.sum(jax.lax.stop_gradient(router_params['tau_rst']['kernel']) ** 2) + 1e-12)
-
-    if fixed_depth_pool_scale:
-        if d_model is None or n_layers is None:
-            raise ValueError(
-                "fixed_depth_pool_scale requires d_model and n_layers.")
-        _, _, rst_scale = _fixed_depth_pool_output_scales(d_model, n_layers)
-    else:
-        rst_scale = pool_params['rst_scale']
+    if d_model is None or n_layers is None:
+        raise ValueError(
+            "depth-scaled pool outputs require d_model and n_layers.")
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
 
     if isinstance(sharded_fns, dict):
         fused_single = sharded_fns.get('rst_single', sharded_fns['single'])
@@ -2507,11 +2252,6 @@ def _rst_forward(x, pool_params, router_params, rng,
          rst_rho_kurt, rst_int_cap_frac) = rst_ret[rst_offset:rst_offset + 11]
         rst_offset += 11
         rst_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
-    if return_prune_stats:
-        (rst_kept_count, rst_kept_frac, rst_full_gate_sum,
-         rst_kept_gate_sum, rst_retained_gate_mass, rst_int_cap_frac,
-         rst_gate_max_mean) = rst_ret[rst_offset:rst_offset + 7]
-        rst_offset += 7
     rst_select_start = rst_offset
     rst_select_diag = rst_ret[rst_select_start:rst_select_start + SELECT_DIAG_COUNT]
     rst_exposure_start = rst_select_start + SELECT_DIAG_COUNT
@@ -2555,12 +2295,6 @@ def _rst_forward(x, pool_params, router_params, rng,
                 *rst_exposure_diag)
     if not analysis:
         ret = slim_ret
-        if return_prune_stats:
-            ret = ret + (
-                rst_kept_count, rst_kept_frac, rst_full_gate_sum,
-                rst_kept_gate_sum, rst_retained_gate_mass,
-                rst_int_cap_frac, rst_gate_max_mean,
-            )
         if local_diagnostics:
             ret = ret + (
                 rst_local_values, rst_local_locs,
@@ -2658,10 +2392,6 @@ class DAWN(nn.Module):
     n_chunks_know: int = 1    # Legacy config alias; prefer n_chunks_rst.
     n_chunks_qk: int = 1     # N-axis chunking for qk pool
     n_chunks_v: int = 1      # N-axis chunking for v pool
-    # Optional safety bound on the router-produced tau offsets. This is a
-    # forward-time clamp, not a new parameter, so old checkpoints remain
-    # compatible. Set to None/0 to preserve exact v4.1.5.9 behavior.
-    tau_offset_clip: Optional[float] = None
     # Initial bias for tau_attn/tau_rst relative threshold offsets.
     tau_offset_init: float = -0.5
     # Optional pool-specific tau init overrides.
@@ -2669,7 +2399,6 @@ class DAWN(nn.Module):
     tau_offset_init_rst: Optional[float] = None
     # Checkpoint-compatible ablation: keep scale params in NeuronPool, but
     # ignore them in forward/inference and use depth-scaled constants.
-    fixed_depth_pool_scale: bool = True
     d_select: Optional[int] = None
 
     def setup(self):
@@ -2705,7 +2434,7 @@ class DAWN(nn.Module):
 
     def __call__(self, input_ids, labels=None, attention_mask=None,
                  deterministic=False, sharded_fns=None, analysis=False,
-                 return_prune_stats=False, local_diagnostics=False):
+                 local_diagnostics=False):
         """Run the shared-pool SRW Transformer forward pass.
 
         analysis=False is the train/eval path and returns only regular
@@ -2713,10 +2442,6 @@ class DAWN(nn.Module):
         such as distribution shape, selection diagnostics, entropy, tau stats,
         raw norms, and debug norms.
         """
-        if analysis and return_prune_stats:
-            raise ValueError(
-                "return_prune_stats is paper-eval-only and cannot be "
-                "combined with analysis=True")
         B, S = input_ids.shape
         if S > self.max_seq_len:
             raise ValueError(f"Sequence length {S} exceeds max_seq_len")
@@ -2875,10 +2600,7 @@ class DAWN(nn.Module):
                     self.n_heads, self.d_model, self.n_layers,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
-                    return_prune_stats=return_prune_stats,
-                    local_diagnostics=local_diagnostics,
-                    tau_offset_clip=self.tau_offset_clip,
-                    fixed_depth_pool_scale=self.fixed_depth_pool_scale)
+                    local_diagnostics=local_diagnostics)
                 (attn_out, attn_aux, a_qk_active, a_v_active, a_raw_gmax,
                  a_sstd, a_gsum, a_active_n_mean,
                  a_out_norm, a_tau_mean, a_strong,
@@ -2906,13 +2628,6 @@ class DAWN(nn.Module):
                  a_angular_exposure_mean, a_angular_exposure_min,
                  a_angular_exposure_max, a_dead_exposure_frac,
                  a_weak_exposure_frac, a_dead_exposure_target) = attn_ret[:55]
-                if return_prune_stats:
-                    (a_qk_kept_count, a_qk_kept_frac, a_qk_full_gate_sum,
-                     a_qk_kept_gate_sum, a_qk_retained_gate_mass,
-                     a_qk_int_cap_frac, a_qk_gate_max_mean,
-                     a_v_kept_count, a_v_kept_frac, a_v_full_gate_sum,
-                     a_v_kept_gate_sum, a_v_retained_gate_mass,
-                     a_v_int_cap_frac, a_v_gate_max_mean) = attn_ret[55:69]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -2942,11 +2657,8 @@ class DAWN(nn.Module):
                     normed, pool_params, router_params, rng_rst,
                     self.router_dropout, self.dropout_rate, deterministic,
                     sharded_fns=_sharded, analysis=analysis,
-                    return_prune_stats=return_prune_stats,
                     local_diagnostics=local_diagnostics,
-                    tau_offset_clip=self.tau_offset_clip,
-                    d_model=self.d_model, n_layers=self.n_layers,
-                    fixed_depth_pool_scale=self.fixed_depth_pool_scale)
+                    d_model=self.d_model, n_layers=self.n_layers)
                 (rst_out, rst_aux, k_active, k_raw_gmax, k_sstd, k_gsum,
                  k_active_n_mean, k_emb_n, k_read_n, k_write_n, k_out_norm,
                  k_tau_mean, k_strong, k_positive_margin_active, k_tau_abs,
@@ -2968,10 +2680,6 @@ class DAWN(nn.Module):
                  k_angular_exposure_mean, k_angular_exposure_min,
                  k_angular_exposure_max, k_dead_exposure_frac,
                  k_weak_exposure_frac, k_dead_exposure_target) = rst_ret[:49]
-                if return_prune_stats:
-                    (k_kept_count, k_kept_frac, k_full_gate_sum,
-                     k_kept_gate_sum, k_retained_gate_mass,
-                     k_int_cap_frac, k_gate_max_mean) = rst_ret[49:56]
                 if analysis:
                     (k_raw_out_norm,
                      k_tau_std, k_tau_kernel_norm,
@@ -3039,21 +2747,6 @@ class DAWN(nn.Module):
                            k_angular_exposure_max, k_dead_exposure_frac,
                            k_weak_exposure_frac, k_dead_exposure_target,
                            )
-                if return_prune_stats:
-                    slim_ys = slim_ys + (
-                        a_qk_kept_count, a_qk_kept_frac,
-                        a_qk_full_gate_sum, a_qk_kept_gate_sum,
-                        a_qk_retained_gate_mass, a_qk_int_cap_frac,
-                        a_qk_gate_max_mean,
-                        a_v_kept_count, a_v_kept_frac,
-                        a_v_full_gate_sum, a_v_kept_gate_sum,
-                        a_v_retained_gate_mass, a_v_int_cap_frac,
-                        a_v_gate_max_mean,
-                        k_kept_count, k_kept_frac,
-                        k_full_gate_sum, k_kept_gate_sum,
-                        k_retained_gate_mass, k_int_cap_frac,
-                        k_gate_max_mean,
-                    )
                 if not analysis:
                     if local_diagnostics:
                         slim_ys = slim_ys + (
@@ -3166,21 +2859,6 @@ class DAWN(nn.Module):
             rst_weak_exposure_frac_all,
             rst_dead_exposure_target_all) = scan_ys[:102]
             _scan_offset = 102
-            if return_prune_stats:
-                (attn_qk_kept_count_all, attn_qk_kept_frac_all,
-                 attn_qk_full_gate_sum_all, attn_qk_kept_gate_sum_all,
-                 attn_qk_retained_gate_mass_all, attn_qk_int_cap_frac_all,
-                 attn_qk_gate_max_mean_all,
-                 attn_v_kept_count_all, attn_v_kept_frac_all,
-                 attn_v_full_gate_sum_all, attn_v_kept_gate_sum_all,
-                 attn_v_retained_gate_mass_all, attn_v_int_cap_frac_all,
-                 attn_v_gate_max_mean_all,
-                 rst_kept_count_all, rst_kept_frac_all,
-                 rst_full_gate_sum_all, rst_kept_gate_sum_all,
-                 rst_retained_gate_mass_all, rst_int_cap_frac_prune_all,
-                 rst_gate_max_mean_all) = scan_ys[
-                    _scan_offset:_scan_offset + 21]
-                _scan_offset += 21
             if analysis:
                 (attn_qk_raw_norm_all, attn_v_raw_norm_all, rst_raw_out_norm_all,
                  attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
@@ -3345,30 +3023,6 @@ class DAWN(nn.Module):
             'debug_token_emb_norm': jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean(),
             'debug_token_emb_norm_max': jnp.linalg.norm(self.token_emb.embedding, axis=-1).max(),
         }
-        if return_prune_stats and not self.is_initializing():
-            result.update({
-                'attn_qk_kept_count_mean': attn_qk_kept_count_all.mean(),
-                'attn_qk_kept_frac_mean': attn_qk_kept_frac_all.mean(),
-                'attn_qk_full_gate_sum_mean': attn_qk_full_gate_sum_all.mean(),
-                'attn_qk_kept_gate_sum_mean': attn_qk_kept_gate_sum_all.mean(),
-                'attn_qk_retained_gate_mass': attn_qk_retained_gate_mass_all.mean(),
-                'attn_qk_int_cap_frac': attn_qk_int_cap_frac_all.mean(),
-                'attn_qk_gate_max_mean': attn_qk_gate_max_mean_all.mean(),
-                'attn_v_kept_count_mean': attn_v_kept_count_all.mean(),
-                'attn_v_kept_frac_mean': attn_v_kept_frac_all.mean(),
-                'attn_v_full_gate_sum_mean': attn_v_full_gate_sum_all.mean(),
-                'attn_v_kept_gate_sum_mean': attn_v_kept_gate_sum_all.mean(),
-                'attn_v_retained_gate_mass': attn_v_retained_gate_mass_all.mean(),
-                'attn_v_int_cap_frac': attn_v_int_cap_frac_all.mean(),
-                'attn_v_gate_max_mean': attn_v_gate_max_mean_all.mean(),
-                'rst_kept_count_mean': rst_kept_count_all.mean(),
-                'rst_kept_frac_mean': rst_kept_frac_all.mean(),
-                'rst_full_gate_sum_mean': rst_full_gate_sum_all.mean(),
-                'rst_kept_gate_sum_mean': rst_kept_gate_sum_all.mean(),
-                'rst_retained_gate_mass': rst_retained_gate_mass_all.mean(),
-                'rst_int_cap_frac': rst_int_cap_frac_prune_all.mean(),
-                'rst_gate_max_mean': rst_gate_max_mean_all.mean(),
-            })
         if analysis and not self.is_initializing():
             _residual_norm = jnp.linalg.norm(x, axis=-1).mean()
             _emb_norm = jnp.linalg.norm(self.token_emb.embedding, axis=-1).mean()
@@ -3529,7 +3183,6 @@ class DAWN(nn.Module):
             'd_route': self.d_route,
             'n_qk': self.n_qk, 'n_v': self.n_v, 'n_rst': n_rst_eff,
             'n_know': n_rst_eff,
-            'fixed_depth_pool_scale': self.fixed_depth_pool_scale,
         }
         if self.d_select is not None:
             cfg['d_select'] = self.d_select
@@ -3538,7 +3191,7 @@ class DAWN(nn.Module):
     def get_model_info(self):
         n_rst_eff = self.n_rst if self.n_rst is not None else (
             self.n_know if self.n_know is not None else 25200)
-        qk_scale, v_scale, rst_scale = _fixed_depth_pool_output_scales(
+        qk_scale, v_scale, rst_scale = _pool_output_scales(
             self.d_model, self.n_layers)
         return [
             f"DAWN-SRW ({self.__version__})",
@@ -3551,8 +3204,7 @@ class DAWN(nn.Module):
             else f"  Route: learned d_route embedding [{self.d_route}]",
             "  Pool scales: fixed depth-scaled "
             f"(qk={float(qk_scale):.6g}, v={float(v_scale):.6g}, "
-            f"rst={float(rst_scale):.6g})" if self.fixed_depth_pool_scale
-            else "  Pool scales: learned sqrt(d_model)-initialized params",
+            f"rst={float(rst_scale):.6g})",
         ]
 
 
@@ -3595,24 +3247,15 @@ def _angular_gate_kwargs_from_model_cfg(model_cfg):
     return {
         'd_select': d_select,
         'intensity_beta': float(model_cfg.get('intensity_beta', 0.5)),
-        'intensity_squash': str(model_cfg.get(
-            'intensity_squash', 'tanh')).lower(),
-        'intensity_width': float(model_cfg.get('intensity_width', 1.0)),
         'tau_min': float(model_cfg.get('tau_min', 0.0)),
         'scan_scale': float(model_cfg.get('scan_scale', SCAN_SCALE)),
         'scan_std_floor': float(model_cfg.get(
             'scan_std_floor', SCAN_STD_FLOOR)),
-        'route_emb_forward_norm': bool(model_cfg.get(
-            'route_emb_forward_norm', False)),
     }
 
 
-def _angular_relation_and_intensity(h, emb, d_select, intensity_beta,
-                                    intensity_squash, intensity_width,
-                                    route_emb_forward_norm=False):
+def _angular_relation_and_intensity(h, emb, d_select, intensity_beta):
     route = emb.astype(jnp.float32)
-    if route_emb_forward_norm:
-        route = _forward_unit_direction(route)
     q_sel = h[..., :d_select].astype(jnp.float32)
     route_sel = route[:, :d_select]
     q_sel_unit = _forward_unit_direction(q_sel)
@@ -3622,24 +3265,15 @@ def _angular_relation_and_intensity(h, emb, d_select, intensity_beta,
     h_intensity = h[..., d_select:].astype(jnp.float32)
     route_intensity = route[:, d_select:]
     intensity_raw = h_intensity @ route_intensity.T
-    z = intensity_raw / jnp.maximum(
-        jnp.float32(intensity_width), jnp.float32(1e-6))
-    if intensity_squash == "softsign":
-        intensity_shape = z / (jnp.float32(1.0) + jnp.abs(z))
-    else:
-        intensity_shape = jnp.tanh(z)
-    intensity = jnp.exp(jnp.float32(intensity_beta) * intensity_shape)
+    intensity = jnp.exp(jnp.float32(intensity_beta) * jnp.tanh(intensity_raw))
     return rho.astype(jnp.float32), intensity.astype(jnp.float32)
 
 
 def _angular_gate(h, emb, tau_offset, raw_scan_offset, d_select,
-                  intensity_beta=0.5, intensity_squash="tanh",
-                  intensity_width=1.0, tau_min=0.0,
-                  scan_scale=SCAN_SCALE, scan_std_floor=SCAN_STD_FLOOR,
-                  route_emb_forward_norm=False):
+                  intensity_beta=0.5, tau_min=0.0,
+                  scan_scale=SCAN_SCALE, scan_std_floor=SCAN_STD_FLOOR):
     rho, intensity = _angular_relation_and_intensity(
-        h, emb, d_select, intensity_beta, intensity_squash, intensity_width,
-        route_emb_forward_norm=route_emb_forward_norm)
+        h, emb, d_select, intensity_beta)
     rho_mean = rho.mean(axis=-1, keepdims=True)
     rho_std = jnp.sqrt(jnp.mean(
         jnp.square(rho - rho_mean), axis=-1, keepdims=True)) + 1e-8
@@ -3697,7 +3331,6 @@ def _srw_inference_with_gates(x, h, emb, tau_offset, raw_scan_offset, w_read,
 def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                          n_heads, d_model, n_layers,
                          cache_K, cache_V, cache_len,
-                         fixed_depth_pool_scale=False,
                          angular_gate_kwargs=None):
     """Cached attention decode step. x: [B, 1, D]."""
     B = x.shape[0]
@@ -3723,7 +3356,7 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
                            pool_params['attn_v_read'], pool_params['attn_v_write'],
                            **angular_gate_kwargs)
     _qk_s, _v_s, _ = _effective_pool_output_scales(
-        pool_params, d_model, n_layers, fixed_depth_pool_scale)
+        pool_params, d_model, n_layers)
     Q = Q * _qk_s
     K_new = K_new * _qk_s
     V_new = V_new * _v_s
@@ -3750,7 +3383,6 @@ def _attn_forward_cached(x, pool_params, router_params, expand_O_kernel,
 
 def _rst_forward_inference(x, pool_params, router_params,
                            d_model=None, n_layers=None,
-                           fixed_depth_pool_scale=False,
                            angular_gate_kwargs=None):
     """Inference-only RST Layer forward. No chunking, no LB, no dropout."""
     if angular_gate_kwargs is None:
@@ -3763,13 +3395,10 @@ def _rst_forward_inference(x, pool_params, router_params,
     out = _srw_inference(x, h, rst_norm, tau, raw_scan_offset,
                          pool_params['rst_read'], pool_params['rst_write'],
                          **angular_gate_kwargs)
-    if fixed_depth_pool_scale:
-        if d_model is None or n_layers is None:
-            raise ValueError(
-                "fixed_depth_pool_scale requires d_model and n_layers.")
-        _, _, rst_scale = _fixed_depth_pool_output_scales(d_model, n_layers)
-    else:
-        rst_scale = pool_params['rst_scale']
+    if d_model is None or n_layers is None:
+        raise ValueError(
+            "depth-scaled pool outputs require d_model and n_layers.")
+    _, _, rst_scale = _pool_output_scales(d_model, n_layers)
     return out * rst_scale
 
 
@@ -3785,7 +3414,6 @@ def prefill(params, model_cfg, input_ids):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
     angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
     max_seq = model_cfg['max_seq_len']
     d_head = d_model // n_heads
@@ -3793,7 +3421,7 @@ def prefill(params, model_cfg, input_ids):
     pool_params = params['neuron_pool']
     router_params = params['router']
     qk_scale_eff, v_scale_eff, _ = _effective_pool_output_scales(
-        pool_params, d_model, n_layers, fixed_depth_pool_scale)
+        pool_params, d_model, n_layers)
 
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
@@ -3855,7 +3483,6 @@ def prefill(params, model_cfg, input_ids):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            fixed_depth_pool_scale=fixed_depth_pool_scale,
             angular_gate_kwargs=angular_gate_kwargs)
         x = x + rst_out
         return (x, cK, cV), None
@@ -3877,7 +3504,6 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
     angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
 
     pool_params = params['neuron_pool']
@@ -3900,7 +3526,6 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
             bp['attn']['expand_O']['kernel'],
             n_heads, d_model, n_layers,
             cK[layer_idx], cV[layer_idx], pos,
-            fixed_depth_pool_scale=fixed_depth_pool_scale,
             angular_gate_kwargs=angular_gate_kwargs)
         cK = cK.at[layer_idx].set(new_cK)
         cV = cV.at[layer_idx].set(new_cV)
@@ -3910,7 +3535,6 @@ def decode_step(params, model_cfg, token_id, cache_K, cache_V, cache_len):
         rst_out = _rst_forward_inference(
             normed, pool_params, router_params,
             d_model=d_model, n_layers=n_layers,
-            fixed_depth_pool_scale=fixed_depth_pool_scale,
             angular_gate_kwargs=angular_gate_kwargs)
         x = x + rst_out
         return (x, cK, cV, pos), None
@@ -3944,13 +3568,12 @@ def vectorized_eval(params, model_cfg, all_tokens, batch_size=32):
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
     max_seq = model_cfg['max_seq_len']
-    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
     angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
     qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
-        pool_params, d_model, n_layers, fixed_depth_pool_scale)
+        pool_params, d_model, n_layers)
     norm_params = params['norm']
     emb_matrix = jnp.asarray(params['token_emb']['embedding'])
     pos_matrix = jnp.asarray(params['pos_emb']['embedding'])
@@ -4139,13 +3762,12 @@ def analysis_forward(params, model_cfg, input_ids, mode='full'):
     d_model = model_cfg['d_model']
     n_layers = model_cfg['n_layers']
     n_heads = model_cfg['n_heads']
-    fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
     angular_gate_kwargs = _angular_gate_kwargs_from_model_cfg(model_cfg)
 
     pool_params = params['neuron_pool']
     router_params = params['router']
     qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
-        pool_params, d_model, n_layers, fixed_depth_pool_scale)
+        pool_params, d_model, n_layers)
 
     positions = jnp.arange(S)[jnp.newaxis, :]
     x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
@@ -4280,11 +3902,10 @@ def build_suppressed_forward(params, model_cfg, suppress_masks):
         n_layers = model_cfg['n_layers']
         n_heads = model_cfg['n_heads']
         d_head = d_model // n_heads
-        fixed_depth_pool_scale = _model_cfg_uses_fixed_depth_pool_scale(model_cfg)
         pp = params['neuron_pool']
         rp = params['router']
         qk_scale_eff, v_scale_eff, rst_scale_eff = _effective_pool_output_scales(
-            pp, d_model, n_layers, fixed_depth_pool_scale)
+            pp, d_model, n_layers)
 
         positions = jnp.arange(S)[jnp.newaxis, :]
         x = params['token_emb']['embedding'][input_ids] + params['pos_emb']['embedding'][positions]
