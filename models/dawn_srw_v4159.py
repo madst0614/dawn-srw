@@ -904,7 +904,7 @@ def make_sharded_srw(mesh, max_chunk_size=2048, dead_threshold=0.01,
                 (jnp.zeros((B, S, D), dtype=jnp.float32),
                  z1, z1, jnp.full((B, S, 1), -1e9), z1, z1, z1, z1, z1,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0),
-                 jnp.float32(0.0), diag_pos_inf, diag_neg_inf,
+                 diag_pos_inf, diag_neg_inf, jnp.float32(0.0),
                  jnp.float32(0.0),
                  z1, z1, jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
@@ -1724,7 +1724,7 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048, dead_threshold=0.01,
                  z1_r, z1_r, jnp.full((B, S, 2, 1), -1e9),
                  z1_r, z1_r, z1_r, z1_r, z1_r,
                  jnp.float32(0.0), jnp.float32(0.0), jnp.float32(0.0),
-                 jnp.float32(0.0), diag_pos_inf, diag_neg_inf,
+                 diag_pos_inf, diag_neg_inf, jnp.float32(0.0),
                  jnp.float32(0.0),
                  z1_r, z1_r, jnp.float32(0.0),
                  jnp.float32(0.0), jnp.float32(0.0),
@@ -2124,20 +2124,19 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      qk_selection_residency) = qk_ret[:17]
     (qk_gate_eff_n, qk_gate_eff_ratio,
      qk_top1_gate_frac, qk_top1_gate_frac_max) = qk_ret[17:21]
-    if return_prune_stats:
-        (qk_kept_count, qk_kept_frac, qk_full_gate_sum, qk_kept_gate_sum,
-         qk_retained_gate_mass, qk_int_cap_frac,
-         qk_gate_max_mean) = qk_ret[21:28]
+    qk_offset = 21
     if analysis:
         (qk_margin_band, qk_margin_band_wide, qk_margin_band_mid, qk_skew, qk_apt_std, qk_entropy,
          qk_den_cost, qk_selection_cost, qk_current_cost,
-         qk_kurt, qk_int_cap) = qk_ret[21:32]
+         qk_kurt, qk_int_cap) = qk_ret[qk_offset:qk_offset + 11]
+        qk_offset += 11
         qk_raw_norm = jnp.linalg.norm(QK_out, axis=-1).mean()
-        qk_select_start = 32
-    elif return_prune_stats:
-        qk_select_start = 28
-    else:
-        qk_select_start = 21
+    if return_prune_stats:
+        (qk_kept_count, qk_kept_frac, qk_full_gate_sum, qk_kept_gate_sum,
+         qk_retained_gate_mass, qk_int_cap_frac,
+         qk_gate_max_mean) = qk_ret[qk_offset:qk_offset + 7]
+        qk_offset += 7
+    qk_select_start = qk_offset
     qk_select_diag = qk_ret[qk_select_start:qk_select_start + SELECT_DIAG_COUNT]
     qk_exposure_start = qk_select_start + SELECT_DIAG_COUNT
     qk_exposure_diag = qk_ret[
@@ -2157,20 +2156,19 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
      v_selection_residency) = v_ret[:17]
     (v_gate_eff_n, v_gate_eff_ratio,
      v_top1_gate_frac, v_top1_gate_frac_max) = v_ret[17:21]
-    if return_prune_stats:
-        (v_kept_count, v_kept_frac, v_full_gate_sum, v_kept_gate_sum,
-         v_retained_gate_mass, v_int_cap_frac,
-         v_gate_max_mean) = v_ret[21:28]
+    v_offset = 21
     if analysis:
         (v_margin_band, v_margin_band_wide, v_margin_band_mid, v_skew, v_apt_std, v_entropy,
          v_den_cost, v_selection_cost, v_current_cost,
-         v_kurt, v_int_cap) = v_ret[21:32]
+         v_kurt, v_int_cap) = v_ret[v_offset:v_offset + 11]
+        v_offset += 11
         v_raw_norm = jnp.linalg.norm(V, axis=-1).mean()
-        v_select_start = 32
-    elif return_prune_stats:
-        v_select_start = 28
-    else:
-        v_select_start = 21
+    if return_prune_stats:
+        (v_kept_count, v_kept_frac, v_full_gate_sum, v_kept_gate_sum,
+         v_retained_gate_mass, v_int_cap_frac,
+         v_gate_max_mean) = v_ret[v_offset:v_offset + 7]
+        v_offset += 7
+    v_select_start = v_offset
     v_select_diag = v_ret[v_select_start:v_select_start + SELECT_DIAG_COUNT]
     v_exposure_start = v_select_start + SELECT_DIAG_COUNT
     v_exposure_diag = v_ret[
@@ -2501,21 +2499,20 @@ def _rst_forward(x, pool_params, router_params, rng,
      rst_selection_residency) = rst_ret[:17]
     (rst_gate_eff_n, rst_gate_eff_ratio,
      rst_top1_gate_frac, rst_top1_gate_frac_max) = rst_ret[17:21]
-    if return_prune_stats:
-        (rst_kept_count, rst_kept_frac, rst_full_gate_sum,
-         rst_kept_gate_sum, rst_retained_gate_mass, rst_int_cap_frac,
-         rst_gate_max_mean) = rst_ret[21:28]
+    rst_offset = 21
     if analysis:
         (margin_band_frac, rst_margin_band_wide_frac, rst_margin_band_mid_frac,
          rst_rho_skew, rst_active_per_token_std, rst_gate_entropy,
          rst_den_cost, rst_selection_cost, rst_current_cost,
-         rst_rho_kurt, rst_int_cap_frac) = rst_ret[21:32]
+         rst_rho_kurt, rst_int_cap_frac) = rst_ret[rst_offset:rst_offset + 11]
+        rst_offset += 11
         rst_raw_out_norm = jnp.linalg.norm(out, axis=-1).mean()
-        rst_select_start = 32
-    elif return_prune_stats:
-        rst_select_start = 28
-    else:
-        rst_select_start = 21
+    if return_prune_stats:
+        (rst_kept_count, rst_kept_frac, rst_full_gate_sum,
+         rst_kept_gate_sum, rst_retained_gate_mass, rst_int_cap_frac,
+         rst_gate_max_mean) = rst_ret[rst_offset:rst_offset + 7]
+        rst_offset += 7
+    rst_select_start = rst_offset
     rst_select_diag = rst_ret[rst_select_start:rst_select_start + SELECT_DIAG_COUNT]
     rst_exposure_start = rst_select_start + SELECT_DIAG_COUNT
     rst_exposure_diag = rst_ret[
@@ -3340,14 +3337,6 @@ class DAWN(nn.Module):
             'rst_gate_eff_ratio': rst_gate_eff_ratio_all.mean(),
             'rst_top1_gate_frac': rst_top1_gate_frac_all.mean(),
             'rst_top1_gate_frac_max': rst_top1_gate_frac_max_all.max(),
-            'attn_qk_selection_residency': attn_qk_selection_residency_all.mean(),
-            'attn_v_selection_residency': attn_v_selection_residency_all.mean(),
-            'rst_selection_residency': rst_selection_residency_all.mean(),
-            'selection_residency_raw': (
-                attn_qk_selection_residency_all.mean()
-                + attn_v_selection_residency_all.mean()
-                + rst_selection_residency_all.mean()) / 3.0,
-
             # Always-on output diagnostics: cheap scalar reductions used by train logs.
             # These are kept outside the analysis-only block so out_diag never falls
             # back to misleading zeros during normal training.

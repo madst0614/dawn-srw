@@ -1125,8 +1125,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
-                      boundary_residency_weight=0.0,
-                      boundary_residency_warmup_steps=0,
                       weight_decay=0.0, pool_weight_decay=0.0,
                       exploration_warmup_steps=5000,
                       exploration_lower_bound=-0.5,
@@ -1201,8 +1199,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _global_mean_std_reducer = _mean_std_reducer_fn
 
     _asym = jnp.float32(exploration_asymmetry)
-    _boundary_weight = jnp.float32(boundary_residency_weight)
-    _boundary_warmup_steps = jnp.int32(boundary_residency_warmup_steps)
     _explore_lower = jnp.float32(exploration_lower_bound)
     _explore_upper = jnp.float32(exploration_upper_bound)
     _explore_eps = jnp.float32(exploration_bound_eps)
@@ -1258,15 +1254,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             aux_loss = result['aux_loss']
             tau_reg = result.get('tau_reg', jnp.float32(0.0))
             dead_penalty = result.get('dead_penalty', jnp.float32(0.0))
-            boundary_residency_raw = result.get(
-                'boundary_residency_raw', jnp.float32(0.0))
-            boundary_weight_eff = jnp.where(
-                step >= _boundary_warmup_steps,
-                _boundary_weight,
-                jnp.float32(0.0))
-            boundary_residency_weighted = (
-                boundary_weight_eff * boundary_residency_raw)
-
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_offset', None)
@@ -1439,8 +1426,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + tau_reg_weight * tau_reg
                               + div_weight * div_loss
                               + dead_penalty_weighted
-                              + explore_loss_weighted
-                              + boundary_residency_weighted)
+                              + explore_loss_weighted)
             else:
                 orth_loss = compute_orthogonality_loss(
                     params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
@@ -1451,8 +1437,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + orth_weight * orth_loss
                               + div_weight * div_loss
                               + dead_penalty_weighted
-                              + explore_loss_weighted
-                              + boundary_residency_weighted)
+                              + explore_loss_weighted)
 
             explore_stats = dict(
                 global_mean_ce=global_mean_ce,
@@ -1973,15 +1958,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         explore_loss_weighted_unclipped_metric = explore_stats['explore_loss_weighted_unclipped']
         dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
         dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
-        boundary_residency_raw_metric = result.get(
-            'boundary_residency_raw', jnp.float32(0.0))
-        boundary_weight_eff_metric = jnp.where(
-            step >= _boundary_warmup_steps,
-            _boundary_weight,
-            jnp.float32(0.0))
-        boundary_residency_weighted_metric = (
-            boundary_weight_eff_metric * boundary_residency_raw_metric)
-
         metrics = {
             'total_loss': total_loss,
             'ce_loss': ce_loss,
@@ -1999,17 +1975,6 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'diversity_loss_weighted': div_weight * div_loss,
             'dead_penalty_weight': jnp.float32(dead_penalty_weight),
             'dead_penalty_weighted_total': dead_penalty_weighted_metric,
-            'boundary_residency_raw': boundary_residency_raw_metric,
-            'boundary_residency_weighted': boundary_residency_weighted_metric,
-            'boundary_residency_weight_eff': boundary_weight_eff_metric,
-            'boundary_residency_weight': _boundary_weight,
-            'boundary_residency_warmup_steps': _boundary_warmup_steps,
-            'attn_qk_boundary_residency': result.get(
-                'attn_qk_boundary_residency', jnp.float32(0.0)),
-            'attn_v_boundary_residency': result.get(
-                'attn_v_boundary_residency', jnp.float32(0.0)),
-            'rst_boundary_residency': result.get(
-                'rst_boundary_residency', jnp.float32(0.0)),
             'exploration_warmup_factor': explore_stats['explore_active'],
             'exploration_weight_effective': (
                 jnp.float32(exploration_weight) * explore_stats['explore_active']),
@@ -2042,8 +2007,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + orth_weight * orth_loss
                 + div_weight * div_loss
                 + dead_penalty_weighted_metric
-                + explore_loss_weighted_metric
-                + boundary_residency_weighted_metric)),
+                + explore_loss_weighted_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
@@ -3415,23 +3379,6 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dead_penalty_weighted_total': float(m.get(
             'dead_penalty_weighted_total',
             ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)))),
-        'boundary_residency_raw': float(m.get('boundary_residency_raw', 0.0)),
-        'boundary_residency_weighted': float(m.get(
-            'boundary_residency_weighted', 0.0)),
-        'boundary_residency_weight_eff': float(m.get(
-            'boundary_residency_weight_eff', 0.0)),
-        'boundary_residency_weight': float(m.get(
-            'boundary_residency_weight',
-            ctx.get('boundary_residency_weight', 0.0))),
-        'boundary_residency_warmup_steps': int(m.get(
-            'boundary_residency_warmup_steps',
-            ctx.get('boundary_residency_warmup_steps', 0))),
-        'attn_qk_boundary_residency': float(m.get(
-            'attn_qk_boundary_residency', 0.0)),
-        'attn_v_boundary_residency': float(m.get(
-            'attn_v_boundary_residency', 0.0)),
-        'rst_boundary_residency': float(m.get(
-            'rst_boundary_residency', 0.0)),
         'dead_count_total': float(m.get('dead_count_total', 0.0)),
         'dead_penalty_per_dead': float(m.get('dead_penalty_per_dead', 0.0)),
         'attn_dead_penalty_per_dead': float(m.get(
@@ -4068,14 +4015,6 @@ def _print_regular_block(rec, ctx):
         f" block[a={rec['explore_block_frac_a']*100:.1f}%"
         f" rst={rec['explore_block_frac_k']*100:.1f}%]"
     )
-    log_message(
-        f"  boundary_residency: raw={rec['boundary_residency_raw']:.6f}"
-        f" w_eff={rec['boundary_residency_weight_eff']:.6f}"
-        f" weighted={rec['boundary_residency_weighted']:.6f}"
-        f" pools[qk={rec['attn_qk_boundary_residency']:.6f}"
-        f" v={rec['attn_v_boundary_residency']:.6f}"
-        f" rst={rec['rst_boundary_residency']:.6f}]"
-    )
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
     _pl_k = rec.get('per_layer_rst_out_norm', []) or []
     if _pl_a or _pl_k:
@@ -4642,8 +4581,6 @@ def _print_debug_block(rec, ctx):
         f"load_balance_w={_g('load_balance_loss_weighted', _g('aux_weighted')):.6f} "
         f"dead_raw={_g('dead_penalty_raw_total', _g('dead_penalty')):.6f} "
         f"dead_w={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f} "
-        f"boundary_raw={_g('boundary_residency_raw'):.6f} "
-        f"boundary_w={_g('boundary_residency_weighted'):.6f} "
         f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
         f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
         f"wd_pool={_g('pool_weight_decay_loss'):.6f} "
@@ -4678,16 +4615,6 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_dead_exposure_target'):.5f}"
         )
-    log_debug_message(
-        f"boundary_diag: raw={_g('boundary_residency_raw'):.6f} "
-        f"weighted={_g('boundary_residency_weighted'):.6f} "
-        f"w_eff={_g('boundary_residency_weight_eff'):.6f} "
-        f"weight={_g('boundary_residency_weight'):.6f} "
-        f"warmup_steps={int(_g('boundary_residency_warmup_steps'))} "
-        f"pools[qk={_g('attn_qk_boundary_residency'):.6f} "
-        f"v={_g('attn_v_boundary_residency'):.6f} "
-        f"rst={_g('rst_boundary_residency'):.6f}]"
-    )
     log_debug_message(
         f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
         f"w_eff={_g('exploration_weight_effective'):.6f} "
@@ -4885,11 +4812,6 @@ def _print_debug_analysis_block(rec, ctx):
         f"rst={_g('rst_z_lt_075'):.6f}] "
         f"z_lt_030[attn={_g('attn_z_lt_030'):.6f} "
         f"rst={_g('rst_z_lt_030'):.6f}] "
-        f"boundary_residency[raw={_g('boundary_residency_raw'):.6f} "
-        f"w_eff={_g('boundary_residency_weight_eff'):.6f} "
-        f"qk={_g('attn_qk_boundary_residency'):.6f} "
-        f"v={_g('attn_v_boundary_residency'):.6f} "
-        f"rst={_g('rst_boundary_residency'):.6f}] "
         f"entropy[attn={_g('attn_gate_entropy'):.6f} "
         f"rst={_g('rst_gate_entropy'):.6f}] "
         f"int_cap_frac[attn={_g('attn_int_cap_frac'):.6f} "
@@ -4961,23 +4883,6 @@ def _build_analysis_record(base, metrics, ctx):
         'rst_z_lt_075': float(m.get('rst_z_lt_075', 0.0)),
         'attn_z_lt_030': float(m.get('attn_z_lt_030', 0.0)),
         'rst_z_lt_030': float(m.get('rst_z_lt_030', 0.0)),
-        'boundary_residency_raw': float(m.get('boundary_residency_raw', 0.0)),
-        'boundary_residency_weighted': float(m.get(
-            'boundary_residency_weighted', 0.0)),
-        'boundary_residency_weight_eff': float(m.get(
-            'boundary_residency_weight_eff', 0.0)),
-        'boundary_residency_weight': float(m.get(
-            'boundary_residency_weight',
-            ctx.get('boundary_residency_weight', 0.0))),
-        'boundary_residency_warmup_steps': int(m.get(
-            'boundary_residency_warmup_steps',
-            ctx.get('boundary_residency_warmup_steps', 0))),
-        'attn_qk_boundary_residency': float(m.get(
-            'attn_qk_boundary_residency', 0.0)),
-        'attn_v_boundary_residency': float(m.get(
-            'attn_v_boundary_residency', 0.0)),
-        'rst_boundary_residency': float(m.get(
-            'rst_boundary_residency', 0.0)),
         # These are per-validation-batch dead statistics. They are not
         # persistent lifetime dead-neuron counts.
         'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
@@ -5222,13 +5127,6 @@ def _print_analysis_block(rec, ctx):
         f" a_v[phi={rec['attn_v_phi_binary']*100:.1f}%]"
         f" attn[z<075={rec['attn_z_lt_075']*100:.1f}%"
         f" z<030={rec['attn_z_lt_030']*100:.1f}%]"
-    )
-    log_message(
-        f"  boundary_residency raw={rec['boundary_residency_raw']:.6f}"
-        f" w_eff={rec['boundary_residency_weight_eff']:.6f}"
-        f" pools[qk={rec['attn_qk_boundary_residency']:.6f}"
-        f" v={rec['attn_v_boundary_residency']:.6f}"
-        f" rst={rec['rst_boundary_residency']:.6f}]"
     )
     log_message(
         f"  saturation cap_frac[attn={_g('attn_int_cap_frac')*100:.4f}%"
@@ -5484,9 +5382,6 @@ def main():
         if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.9'
         else 'legacy_gate'))
     dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
-    boundary_residency_weight = tcfg.get('boundary_residency_weight', 0.0)
-    boundary_residency_warmup_steps = tcfg.get(
-        'boundary_residency_warmup_steps', 0)
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
     exploration_asymmetry = tcfg.get('exploration_asymmetry', 0.15)
@@ -5719,11 +5614,6 @@ def main():
                 'dead_penalty_mode', dead_penalty_mode))
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
-            boundary_residency_weight = saved_training_config.get(
-                'boundary_residency_weight', boundary_residency_weight)
-            boundary_residency_warmup_steps = saved_training_config.get(
-                'boundary_residency_warmup_steps',
-                boundary_residency_warmup_steps)
             exploration_weight = saved_training_config.get(
                 'exploration_weight', exploration_weight)
             exploration_asymmetry = saved_training_config.get(
@@ -5809,8 +5699,6 @@ def main():
         'dead_penalty_weight': dead_penalty_weight,
         'dead_penalty_mode': dead_penalty_mode,
         'dead_exposure_target': dead_exposure_target,
-        'boundary_residency_weight': boundary_residency_weight,
-        'boundary_residency_warmup_steps': boundary_residency_warmup_steps,
         'exploration_weight': exploration_weight,
         'exploration_asymmetry': exploration_asymmetry,
         'exploration_warmup_steps': exploration_warmup_steps,
@@ -6162,8 +6050,6 @@ def main():
         print(f"  Tau reg weight: {tau_reg_weight}")
         print(f"  Dead penalty: weight={dead_penalty_weight} "
               f"mode={dead_penalty_mode} exposure_target={dead_exposure_target}")
-        print(f"  Boundary residency weight: {boundary_residency_weight} "
-              f"(warmup_steps={boundary_residency_warmup_steps})")
         print(f"  Exploration weight: {exploration_weight} "
               f"(asymmetry={exploration_asymmetry})")
         print(f"    warmup_steps={exploration_warmup_steps} "
@@ -6474,8 +6360,6 @@ def main():
         tau_reg_weight, dead_penalty_weight,
         exploration_weight, exploration_asymmetry,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
-        boundary_residency_weight=boundary_residency_weight,
-        boundary_residency_warmup_steps=boundary_residency_warmup_steps,
         weight_decay=weight_decay, pool_weight_decay=pool_weight_decay,
         exploration_warmup_steps=exploration_warmup_steps,
         exploration_lower_bound=exploration_lower_bound,
@@ -7632,8 +7516,6 @@ def main():
                         'dead_penalty_weight': dead_penalty_weight,
                         'dead_penalty_mode': dead_penalty_mode,
                         'dead_exposure_target': dead_exposure_target,
-                        'boundary_residency_weight': boundary_residency_weight,
-                        'boundary_residency_warmup_steps': boundary_residency_warmup_steps,
                         'n_qk_cfg': cfg['model'].get(
                             'n_qk', cfg['model'].get('n_q', 0)),
                         'n_v_cfg': cfg['model'].get('n_v', 0),
@@ -7717,8 +7599,6 @@ def main():
                     'dead_penalty_weight': dead_penalty_weight,
                     'dead_penalty_mode': dead_penalty_mode,
                     'dead_exposure_target': dead_exposure_target,
-                    'boundary_residency_weight': boundary_residency_weight,
-                    'boundary_residency_warmup_steps': boundary_residency_warmup_steps,
                     'n_qk_cfg': cfg['model'].get(
                         'n_qk', cfg['model'].get('n_q', 0)),
                     'n_v_cfg': cfg['model'].get('n_v', 0),
@@ -7837,8 +7717,6 @@ def main():
                                     'n_rst', cfg['model'].get('n_know', 0)),
                                 'current_lr': float(schedule(global_step // grad_accum_steps)),
                                 'model_version': model_version,
-                                'boundary_residency_weight': boundary_residency_weight,
-                                'boundary_residency_warmup_steps': boundary_residency_warmup_steps,
                             }
                             _ctx_a.update(collapse_warn_ctx)
                             analysis_payload = dict(analysis_result)
@@ -7850,13 +7728,6 @@ def main():
                                     _key = f'{_pool}_{_part}_grad_ratio'
                                     analysis_payload[_key] = metrics.get(
                                         _key, jnp.float32(0.0))
-                            for _key in (
-                                    'boundary_residency_weighted',
-                                    'boundary_residency_weight_eff',
-                                    'boundary_residency_weight',
-                                    'boundary_residency_warmup_steps'):
-                                analysis_payload[_key] = metrics.get(
-                                    _key, jnp.float32(0.0))
                             a_rec = _build_analysis_record(
                                 {}, analysis_payload, _ctx_a)
                             a_rec['step'] = global_step
