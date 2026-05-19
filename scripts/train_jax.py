@@ -72,7 +72,7 @@ try:
 except ImportError:
     DAWN_SRW_V4158 = None
 try:
-    from models.dawn_srw_v4159_purecore_20260520 import DAWN as DAWN_SRW_V4159
+    from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
 except ImportError:
     DAWN_SRW_V4159 = None
 
@@ -555,7 +555,7 @@ if DAWN_SRW_V4158 is not None:
 if DAWN_SRW_V4159 is not None:
     MODEL_REGISTRY['spatial-r1-v4.1.5.9'] = ModelSpec(
         name='spatial-r1-v4.1.5.9',
-        module_path='models.dawn_srw_v4159_purecore_20260520',
+        module_path='models.dawn_srw_v4159',
         cls=DAWN_SRW_V4159,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
