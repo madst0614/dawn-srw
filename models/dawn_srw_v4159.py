@@ -1789,6 +1789,8 @@ class Router(nn.Module):
     router_dropout: float = 0.1
     tau_offset_init: float = -0.5
     tau_offset_init_attn: Optional[float] = None
+    tau_offset_init_attn_qk: Optional[float] = None
+    tau_offset_init_attn_v: Optional[float] = None
     tau_offset_init_rst: Optional[float] = None
 
     def setup(self):
@@ -1796,14 +1798,23 @@ class Router(nn.Module):
         tau_attn_init = float(
             self.tau_offset_init if self.tau_offset_init_attn is None
             else self.tau_offset_init_attn)
+        tau_attn_qk_init = float(
+            tau_attn_init if self.tau_offset_init_attn_qk is None
+            else self.tau_offset_init_attn_qk)
+        tau_attn_v_init = float(
+            tau_attn_init if self.tau_offset_init_attn_v is None
+            else self.tau_offset_init_attn_v)
         tau_rst_init = float(
             self.tau_offset_init if self.tau_offset_init_rst is None
             else self.tau_offset_init_rst)
+        tau_attn_bias_init = jnp.asarray(
+            [tau_attn_qk_init, tau_attn_qk_init, tau_attn_v_init],
+            dtype=jnp.float32)
         self.proj_attn = nn.Dense(db * 3, name='proj_attn')
         self.proj_rst = nn.Dense(db, name='proj_rst')
         self.tau_attn = nn.Dense(3, name='tau_attn',
             kernel_init=nn.initializers.zeros,
-            bias_init=lambda k, s, d: jnp.full(s, tau_attn_init, d))
+            bias_init=lambda k, s, d: tau_attn_bias_init.astype(d))
         self.tau_rst = nn.Dense(1, name='tau_rst',
             kernel_init=nn.initializers.zeros,
             bias_init=lambda k, s, d: jnp.full(s, tau_rst_init, d))
@@ -2395,7 +2406,11 @@ class DAWN(nn.Module):
     # Initial bias for tau_attn/tau_rst relative threshold offsets.
     tau_offset_init: float = -0.5
     # Optional pool-specific tau init overrides.
+    # tau_offset_init_attn remains the shared attention fallback; qk/v
+    # overrides can split the attn tau bias as [qk, qk, v].
     tau_offset_init_attn: Optional[float] = None
+    tau_offset_init_attn_qk: Optional[float] = None
+    tau_offset_init_attn_v: Optional[float] = None
     tau_offset_init_rst: Optional[float] = None
     # Checkpoint-compatible ablation: keep scale params in NeuronPool, but
     # ignore them in forward/inference and use depth-scaled constants.
@@ -2425,6 +2440,8 @@ class DAWN(nn.Module):
             router_dropout=self.router_dropout,
             tau_offset_init=self.tau_offset_init,
             tau_offset_init_attn=self.tau_offset_init_attn,
+            tau_offset_init_attn_qk=self.tau_offset_init_attn_qk,
+            tau_offset_init_attn_v=self.tau_offset_init_attn_v,
             tau_offset_init_rst=self.tau_offset_init_rst)
         self.layers = [
             DAWNBlock(d_model=self.d_model, n_heads=self.n_heads,

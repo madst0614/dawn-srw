@@ -434,6 +434,12 @@ def _dawn_srw_kwargs(cfg):
         if ('tau_offset_init_attn' in m or 'tau_offset_init_attn' in t):
             kw['tau_offset_init_attn'] = m.get(
                 'tau_offset_init_attn', t.get('tau_offset_init_attn'))
+        if ('tau_offset_init_attn_qk' in m or 'tau_offset_init_attn_qk' in t):
+            kw['tau_offset_init_attn_qk'] = m.get(
+                'tau_offset_init_attn_qk', t.get('tau_offset_init_attn_qk'))
+        if ('tau_offset_init_attn_v' in m or 'tau_offset_init_attn_v' in t):
+            kw['tau_offset_init_attn_v'] = m.get(
+                'tau_offset_init_attn_v', t.get('tau_offset_init_attn_v'))
         if ('tau_offset_init_rst' in m or 'tau_offset_init_rst' in t):
             kw['tau_offset_init_rst'] = m.get(
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
@@ -5673,6 +5679,14 @@ def main():
         'scan_update_abs_cap': scan_update_abs_cap,
         'tau_offset_init': tcfg.get(
             'tau_offset_init', cfg['model'].get('tau_offset_init', -0.5)),
+        'tau_offset_init_attn': tcfg.get(
+            'tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', None)),
+        'tau_offset_init_attn_qk': tcfg.get(
+            'tau_offset_init_attn_qk', cfg['model'].get('tau_offset_init_attn_qk', None)),
+        'tau_offset_init_attn_v': tcfg.get(
+            'tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', None)),
+        'tau_offset_init_rst': tcfg.get(
+            'tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', None)),
         'oom_check': run_oom_check,
         'speed_check': run_speed_check,
         'restore_training_config_on_resume': restore_training_config_on_resume,
@@ -5773,9 +5787,14 @@ def main():
         tau_rst_bias = np.asarray(p['router']['tau_rst']['bias'])
         print(
             f"  v4159 {label} tau bias: "
-            f"attn={tau_attn_bias.tolist()} rst={tau_rst_bias.tolist()} "
+            f"attn=[Q={tau_attn_bias[0]:.6g}, K={tau_attn_bias[1]:.6g}, V={tau_attn_bias[2]:.6g}] "
+            f"rst={tau_rst_bias.tolist()} "
             f"(config tau_offset_init="
-            f"{tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))})",
+            f"{tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))} "
+            f"attn={tcfg.get('tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', 'default'))} "
+            f"attn_qk={tcfg.get('tau_offset_init_attn_qk', cfg['model'].get('tau_offset_init_attn_qk', 'default'))} "
+            f"attn_v={tcfg.get('tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', 'default'))} "
+            f"rst={tcfg.get('tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', 'default'))})",
             flush=True,
         )
 
@@ -6010,6 +6029,8 @@ def main():
                 f"tau_min={tcfg.get('tau_min', 0.0)} "
                 f"tau_offset_init={tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))} "
                 f"tau_offset_init_attn={tcfg.get('tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', 'default'))} "
+                f"tau_offset_init_attn_qk={tcfg.get('tau_offset_init_attn_qk', cfg['model'].get('tau_offset_init_attn_qk', 'default'))} "
+                f"tau_offset_init_attn_v={tcfg.get('tau_offset_init_attn_v', cfg['model'].get('tau_offset_init_attn_v', 'default'))} "
                 f"tau_offset_init_rst={tcfg.get('tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', 'default'))} "
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"

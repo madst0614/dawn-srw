@@ -67,8 +67,9 @@ training:
   intensity_width: 1.0
 
   # Tau initialization / scan
-  tau_offset_init_attn: -0.5
-  tau_offset_init_rst: 1.0
+  tau_offset_init_attn_qk: -0.5
+  tau_offset_init_attn_v: 0.0
+  tau_offset_init_rst: 1.5
   scan_scale: 0.0
   scan_std_floor: 0.5
 
