@@ -75,8 +75,9 @@ training:
   # Auxiliary losses
   diversity_weight: 0.1
   load_balance_weight: 0.0
-  dead_penalty_weight: 0.05
-  dead_penalty_threshold: 0.01
+  dead_penalty_weight: 0.005
+  dead_penalty_mode: angular_exposure
+  dead_exposure_target: 0.1
   boundary_residency_weight: 0.0
   boundary_residency_warmup_steps: 10000
 
