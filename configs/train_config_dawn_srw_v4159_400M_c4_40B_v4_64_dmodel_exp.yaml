@@ -43,6 +43,7 @@ model:
 
   # Routing / SRW pool sizes
   d_route: 256
+  d_select: 192
   n_qk: 2330
   n_v: 14640
   n_know: 29130
@@ -80,19 +81,17 @@ training:
   load_balance_weight: 0.0
   dead_penalty_weight: 0.005
   dead_penalty_threshold: 0.01
-  boundary_residency_weight: 0.0001
+  boundary_residency_weight: 0.0
   boundary_residency_warmup_steps: 10000
 
-  # v4.1 gate physics
-  # v4.1.5.9 uses clipped-linear activation over raw / activation_threshold
-  # and detaches tau only in the intensity branch. sharpness is kept for API compatibility.
-  sharpness: 500.0
-  activation_threshold: 0.5
-  activation_cutoff: 0.0
-  epsilon: 0.000001
-  max_intensity: 1000.0
-  tau_offset_init: 1.0
-  scan_scale: 0.01
+  # Angular Select / Intensity
+  tau_min: 0.0
+  tau_offset_init_attn: -0.5
+  tau_offset_init_rst: 1.0
+  intensity_beta: 0.5
+  intensity_squash: tanh
+  intensity_width: 1.0
+  scan_scale: 0.0
   scan_std_floor: 0.5
 
   # Route signature execution mode

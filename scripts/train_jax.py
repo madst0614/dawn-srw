@@ -442,6 +442,8 @@ def _dawn_srw_kwargs(cfg):
         if ('tau_offset_init_rst' in m or 'tau_offset_init_rst' in t):
             kw['tau_offset_init_rst'] = m.get(
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
+        if ('d_select' in m or 'd_select' in t):
+            kw['d_select'] = m.get('d_select', t.get('d_select'))
     pool_scale_mode = str(m.get('pool_scale_mode', 'fixed_depth')).lower()
     learned_scale_requested = (
         pool_scale_mode in ('learned', 'learnable', 'trainable', 'param', 'parameter')
@@ -462,31 +464,39 @@ def _v415_sharded_kwargs(cfg):
     """
     t = cfg['training']
     version = cfg['model'].get('model_version')
-    activation_width = t.get('activation_width', t.get('activation_threshold', 0.5))
-    if version == 'spatial-r1-v4.1.5.9' and activation_width <= 0:
-        raise ValueError(
-            "spatial-r1-v4.1.5.9 requires training.activation_width > 0 "
-            "(or legacy activation_threshold > 0) because activation uses raw / activation_width.")
-    kw = dict(
-        dead_threshold=t.get('dead_penalty_threshold', 0.01),
-        sharpness=t.get('sharpness', 500.0),
-        activation_threshold=activation_width,
-        activation_cutoff=t.get('activation_cutoff', 0.01),
-        epsilon=t.get('epsilon', 1e-4),
-        max_intensity=t.get('max_intensity', 10.0),
-        scan_scale=t.get('scan_scale', 0.01),
-        scan_std_floor=t.get('scan_std_floor', 0.5),
-    )
+    if version == 'spatial-r1-v4.1.5.9':
+        kw = dict(
+            dead_threshold=t.get('dead_penalty_threshold', 0.01),
+            dead_penalty_mode=str(t.get(
+                'dead_penalty_mode', 'angular_exposure')),
+            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
+            scan_scale=t.get('scan_scale', 0.0),
+            scan_std_floor=t.get('scan_std_floor', 0.5),
+            tau_min=t.get('tau_min', 0.0),
+        )
+    else:
+        activation_width = t.get(
+            'activation_width', t.get('activation_threshold', 0.5))
+        kw = dict(
+            dead_threshold=t.get('dead_penalty_threshold', 0.01),
+            sharpness=t.get('sharpness', 500.0),
+            activation_threshold=activation_width,
+            activation_cutoff=t.get('activation_cutoff', 0.01),
+            epsilon=t.get('epsilon', 1e-4),
+            max_intensity=t.get('max_intensity', 10.0),
+            scan_scale=t.get('scan_scale', 0.01),
+            scan_std_floor=t.get('scan_std_floor', 0.5),
+        )
     if t.get('route_emb_forward_norm', False):
         kw['route_emb_forward_norm'] = True
-    # v4.1.5.9+ optional split two-channel routing.
-    # Prefer config model.d_select: selection/address dims are specified
-    # directly, and the remaining route dims are split into intensity:
+    # v4.1.5.9 angular routing uses model.d_select directly:
     #   d_intensity = d_route - d_select
-    # Legacy training.intensity_route_dim remains as fallback.
     m = cfg['model']
     d_route = int(m.get('d_route', m.get('d_bottleneck', 128)))
     d_select_cfg = m.get('d_select', t.get('d_select', None))
+    if version == 'spatial-r1-v4.1.5.9' and d_select_cfg is None:
+        raise ValueError(
+            "spatial-r1-v4.1.5.9 angular SRW requires model.d_select.")
     if d_select_cfg is not None:
         d_select = int(d_select_cfg)
         if not (0 < d_select < d_route):
@@ -501,7 +511,8 @@ def _v415_sharded_kwargs(cfg):
         kw['intensity_beta'] = float(t.get('intensity_beta', 0.5))
         kw['intensity_squash'] = str(t.get('intensity_squash', 'tanh'))
         kw['intensity_width'] = float(t.get('intensity_width', 1.0))
-        kw['activation_power'] = float(t.get('activation_power', 1.0))
+        if version != 'spatial-r1-v4.1.5.9':
+            kw['activation_power'] = float(t.get('activation_power', 1.0))
     if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
         kw['rw_contrib_den_floor'] = t.get('rw_contrib_den_floor', 1.0)
     return kw
@@ -2079,7 +2090,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # Core activity (v4.1).
             'rst_active': result.get('rst_active', jnp.float32(0.0)),
             'rst_strong': result.get('rst_strong', jnp.float32(0.0)),
-            'rst_score_std': result.get('rst_score_std', jnp.float32(0.0)),
+            'rst_score_std': result.get(
+                'rst_score_std', result.get('rst_rho_std', jnp.float32(0.0))),
             'rst_raw_gate_max': result.get('rst_raw_gate_max', jnp.float32(0.0)),
             'rst_gate_sum': result.get('rst_gate_sum', jnp.float32(0.0)),
             'rst_active_n_mean': result.get('rst_active_n_mean', jnp.float32(0.0)),
@@ -2096,7 +2108,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_v_strong': result.get(
                 'attn_v_strong',
                 result.get('attn_strong', jnp.float32(0.0))),
-            'attn_score_std': result.get('attn_score_std', jnp.float32(0.0)),
+            'attn_score_std': result.get(
+                'attn_score_std', result.get('attn_rho_std', jnp.float32(0.0))),
             'attn_score_mean': result.get('attn_score_mean', jnp.float32(0.0)),
             'attn_raw_gate_max': result.get('attn_raw_gate_max', jnp.float32(0.0)),
             'attn_gate_sum': result.get('attn_gate_sum', jnp.float32(0.0)),
@@ -2112,6 +2125,34 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_score_mean': result.get('rst_score_mean', jnp.float32(0.0)),
             'attn_tau_abs_mean': result.get('attn_tau_abs_mean', jnp.float32(0.0)),
             'rst_tau_abs_mean': result.get('rst_tau_abs_mean', jnp.float32(0.0)),
+            'attn_rho_mean': result.get('attn_rho_mean', jnp.float32(0.0)),
+            'attn_rho_std': result.get('attn_rho_std', jnp.float32(0.0)),
+            'attn_rho_max': result.get('attn_rho_max', jnp.float32(0.0)),
+            'attn_tau_raw_mean': result.get('attn_tau_raw_mean', jnp.float32(0.0)),
+            'attn_tau_floor_mean': result.get('attn_tau_floor_mean', jnp.float32(0.0)),
+            'attn_tau_min_hit_frac': result.get('attn_tau_min_hit_frac', jnp.float32(0.0)),
+            'attn_tau_offset_mean': result.get('attn_tau_offset_mean', jnp.float32(0.0)),
+            'attn_tau_offset_min': result.get('attn_tau_offset_min', jnp.float32(0.0)),
+            'attn_tau_offset_max': result.get('attn_tau_offset_max', jnp.float32(0.0)),
+            'attn_selection_margin_mean': result.get('attn_selection_margin_mean', jnp.float32(0.0)),
+            'attn_positive_margin_mean': result.get('attn_positive_margin_mean', jnp.float32(0.0)),
+            'attn_positive_margin_max': result.get('attn_positive_margin_max', jnp.float32(0.0)),
+            'attn_selected_frac': result.get('attn_selected_frac', jnp.float32(0.0)),
+            'attn_no_active_frac': result.get('attn_no_active_frac', jnp.float32(0.0)),
+            'rst_rho_mean': result.get('rst_rho_mean', jnp.float32(0.0)),
+            'rst_rho_std': result.get('rst_rho_std', jnp.float32(0.0)),
+            'rst_rho_max': result.get('rst_rho_max', jnp.float32(0.0)),
+            'rst_tau_raw_mean': result.get('rst_tau_raw_mean', jnp.float32(0.0)),
+            'rst_tau_floor_mean': result.get('rst_tau_floor_mean', jnp.float32(0.0)),
+            'rst_tau_min_hit_frac': result.get('rst_tau_min_hit_frac', jnp.float32(0.0)),
+            'rst_tau_offset_mean': result.get('rst_tau_offset_mean', jnp.float32(0.0)),
+            'rst_tau_offset_min': result.get('rst_tau_offset_min', jnp.float32(0.0)),
+            'rst_tau_offset_max': result.get('rst_tau_offset_max', jnp.float32(0.0)),
+            'rst_selection_margin_mean': result.get('rst_selection_margin_mean', jnp.float32(0.0)),
+            'rst_positive_margin_mean': result.get('rst_positive_margin_mean', jnp.float32(0.0)),
+            'rst_positive_margin_max': result.get('rst_positive_margin_max', jnp.float32(0.0)),
+            'rst_selected_frac': result.get('rst_selected_frac', jnp.float32(0.0)),
+            'rst_no_active_frac': result.get('rst_no_active_frac', jnp.float32(0.0)),
             # Emb norm stats (REGULAR subset; *_max moved to analysis_step).
             'rst_emb_norm': result.get('rst_emb_norm', jnp.float32(0.0)),
             'rst_emb_norm_min': result.get('rst_emb_norm_min', jnp.float32(0.0)),
@@ -2154,6 +2195,30 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_dead_penalty': result.get('rst_dead_penalty', jnp.float32(0.0)),
             'attn_dead_count': result.get('attn_dead_count', jnp.float32(0.0)),
             'rst_dead_count': result.get('rst_dead_count', jnp.float32(0.0)),
+            'attn_angular_exposure_mean': result.get(
+                'attn_angular_exposure_mean', jnp.float32(0.0)),
+            'attn_angular_exposure_min': result.get(
+                'attn_angular_exposure_min', jnp.float32(0.0)),
+            'attn_angular_exposure_max': result.get(
+                'attn_angular_exposure_max', jnp.float32(0.0)),
+            'attn_dead_exposure_frac': result.get(
+                'attn_dead_exposure_frac', jnp.float32(0.0)),
+            'attn_weak_exposure_frac': result.get(
+                'attn_weak_exposure_frac', jnp.float32(0.0)),
+            'attn_dead_exposure_target': result.get(
+                'attn_dead_exposure_target', jnp.float32(0.0)),
+            'rst_angular_exposure_mean': result.get(
+                'rst_angular_exposure_mean', jnp.float32(0.0)),
+            'rst_angular_exposure_min': result.get(
+                'rst_angular_exposure_min', jnp.float32(0.0)),
+            'rst_angular_exposure_max': result.get(
+                'rst_angular_exposure_max', jnp.float32(0.0)),
+            'rst_dead_exposure_frac': result.get(
+                'rst_dead_exposure_frac', jnp.float32(0.0)),
+            'rst_weak_exposure_frac': result.get(
+                'rst_weak_exposure_frac', jnp.float32(0.0)),
+            'rst_dead_exposure_target': result.get(
+                'rst_dead_exposure_target', jnp.float32(0.0)),
             'dead_count_total': (
                 result.get('attn_dead_count', jnp.float32(0.0))
                 + result.get('rst_dead_count', jnp.float32(0.0))),
@@ -3373,6 +3438,30 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'attn_dead_penalty_per_dead', 0.0)),
         'rst_dead_penalty_per_dead': float(m.get(
             'rst_dead_penalty_per_dead', 0.0)),
+        'attn_angular_exposure_mean': float(m.get(
+            'attn_angular_exposure_mean', 0.0)),
+        'attn_angular_exposure_min': float(m.get(
+            'attn_angular_exposure_min', 0.0)),
+        'attn_angular_exposure_max': float(m.get(
+            'attn_angular_exposure_max', 0.0)),
+        'attn_dead_exposure_frac': float(m.get(
+            'attn_dead_exposure_frac', 0.0)),
+        'attn_weak_exposure_frac': float(m.get(
+            'attn_weak_exposure_frac', 0.0)),
+        'attn_dead_exposure_target': float(m.get(
+            'attn_dead_exposure_target', 0.0)),
+        'rst_angular_exposure_mean': float(m.get(
+            'rst_angular_exposure_mean', 0.0)),
+        'rst_angular_exposure_min': float(m.get(
+            'rst_angular_exposure_min', 0.0)),
+        'rst_angular_exposure_max': float(m.get(
+            'rst_angular_exposure_max', 0.0)),
+        'rst_dead_exposure_frac': float(m.get(
+            'rst_dead_exposure_frac', 0.0)),
+        'rst_weak_exposure_frac': float(m.get(
+            'rst_weak_exposure_frac', 0.0)),
+        'rst_dead_exposure_target': float(m.get(
+            'rst_dead_exposure_target', 0.0)),
         # Explore loss (RPE).
         'explore_loss_raw': float(m.get('explore_loss_raw', 0.0)),
         'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
@@ -3559,6 +3648,30 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_top1_gate_frac_max': float(m.get('rst_top1_gate_frac_max', 0.0)),
         'attn_dead_count': float(m.get('attn_dead_count', 0.0)),
         'rst_dead_count': float(m.get('rst_dead_count', 0.0)),
+        'attn_angular_exposure_mean': float(m.get(
+            'attn_angular_exposure_mean', 0.0)),
+        'attn_angular_exposure_min': float(m.get(
+            'attn_angular_exposure_min', 0.0)),
+        'attn_angular_exposure_max': float(m.get(
+            'attn_angular_exposure_max', 0.0)),
+        'attn_dead_exposure_frac': float(m.get(
+            'attn_dead_exposure_frac', 0.0)),
+        'attn_weak_exposure_frac': float(m.get(
+            'attn_weak_exposure_frac', 0.0)),
+        'attn_dead_exposure_target': float(m.get(
+            'attn_dead_exposure_target', 0.0)),
+        'rst_angular_exposure_mean': float(m.get(
+            'rst_angular_exposure_mean', 0.0)),
+        'rst_angular_exposure_min': float(m.get(
+            'rst_angular_exposure_min', 0.0)),
+        'rst_angular_exposure_max': float(m.get(
+            'rst_angular_exposure_max', 0.0)),
+        'rst_dead_exposure_frac': float(m.get(
+            'rst_dead_exposure_frac', 0.0)),
+        'rst_weak_exposure_frac': float(m.get(
+            'rst_weak_exposure_frac', 0.0)),
+        'rst_dead_exposure_target': float(m.get(
+            'rst_dead_exposure_target', 0.0)),
         'attn_tau_mean': float(m.get('attn_tau_mean', 0.0)),
         'rst_tau_mean': float(m.get('rst_tau_mean', 0.0)),
         'attn_score_mean': float(m.get('attn_score_mean', 0.0)),
@@ -3579,6 +3692,34 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'raw_scan_offset_attn_bias_2': float(m.get('raw_scan_offset_attn_bias_2', 0.0)),
         'attn_tau_abs_mean': float(m.get('attn_tau_abs_mean', 0.0)),
         'rst_tau_abs_mean': float(m.get('rst_tau_abs_mean', 0.0)),
+        'attn_rho_mean': float(m.get('attn_rho_mean', 0.0)),
+        'attn_rho_std': float(m.get('attn_rho_std', 0.0)),
+        'attn_rho_max': float(m.get('attn_rho_max', 0.0)),
+        'attn_tau_raw_mean': float(m.get('attn_tau_raw_mean', 0.0)),
+        'attn_tau_floor_mean': float(m.get('attn_tau_floor_mean', 0.0)),
+        'attn_tau_min_hit_frac': float(m.get('attn_tau_min_hit_frac', 0.0)),
+        'attn_tau_offset_mean': float(m.get('attn_tau_offset_mean', 0.0)),
+        'attn_tau_offset_min': float(m.get('attn_tau_offset_min', 0.0)),
+        'attn_tau_offset_max': float(m.get('attn_tau_offset_max', 0.0)),
+        'attn_selection_margin_mean': float(m.get('attn_selection_margin_mean', 0.0)),
+        'attn_positive_margin_mean': float(m.get('attn_positive_margin_mean', 0.0)),
+        'attn_positive_margin_max': float(m.get('attn_positive_margin_max', 0.0)),
+        'attn_selected_frac': float(m.get('attn_selected_frac', 0.0)),
+        'attn_no_active_frac': float(m.get('attn_no_active_frac', 0.0)),
+        'rst_rho_mean': float(m.get('rst_rho_mean', 0.0)),
+        'rst_rho_std': float(m.get('rst_rho_std', 0.0)),
+        'rst_rho_max': float(m.get('rst_rho_max', 0.0)),
+        'rst_tau_raw_mean': float(m.get('rst_tau_raw_mean', 0.0)),
+        'rst_tau_floor_mean': float(m.get('rst_tau_floor_mean', 0.0)),
+        'rst_tau_min_hit_frac': float(m.get('rst_tau_min_hit_frac', 0.0)),
+        'rst_tau_offset_mean': float(m.get('rst_tau_offset_mean', 0.0)),
+        'rst_tau_offset_min': float(m.get('rst_tau_offset_min', 0.0)),
+        'rst_tau_offset_max': float(m.get('rst_tau_offset_max', 0.0)),
+        'rst_selection_margin_mean': float(m.get('rst_selection_margin_mean', 0.0)),
+        'rst_positive_margin_mean': float(m.get('rst_positive_margin_mean', 0.0)),
+        'rst_positive_margin_max': float(m.get('rst_positive_margin_max', 0.0)),
+        'rst_selected_frac': float(m.get('rst_selected_frac', 0.0)),
+        'rst_no_active_frac': float(m.get('rst_no_active_frac', 0.0)),
         'attn_tau_off_min': float(m.get('attn_tau_off_min', 0.0)),
         'attn_tau_off_max': float(m.get('attn_tau_off_max', 0.0)),
         'attn_tau_off_p99': float(m.get('attn_tau_off_p99', 0.0)),
@@ -3589,8 +3730,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_tau_off_p99': float(m.get('rst_tau_off_p99', 0.0)),
         'rst_tau_off_p01': float(m.get('rst_tau_off_p01', 0.0)),
         'rst_tau_off_neg_frac': float(m.get('rst_tau_off_neg_frac', 0.0)),
-        'attn_score_std': float(m.get('attn_score_std', 0.0)),
-        'rst_score_std': float(m.get('rst_score_std', 0.0)),
+        'attn_score_std': float(m.get(
+            'attn_score_std', m.get('attn_rho_std', 0.0))),
+        'rst_score_std': float(m.get(
+            'rst_score_std', m.get('rst_rho_std', 0.0))),
         # Emb norm stats.
         'rst_emb_norm': float(m.get('rst_emb_norm', 0.0)),
         'rst_emb_norm_min': float(m.get('rst_emb_norm_min', 0.0)),
@@ -3770,6 +3913,21 @@ def _print_regular_block(rec, ctx):
         f" attn_v={rec['attn_v_strong']*100:.1f}%"
         f" rst={rec['rst_strong']*100:.1f}%"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
+        log_message(
+            f"  select: rho_std[a={rec['attn_rho_std']:.4f}"
+            f" rst={rec['rst_rho_std']:.4f}]"
+            f" tau[a={rec['attn_tau_floor_mean']:.4f}"
+            f" rst={rec['rst_tau_floor_mean']:.4f}]"
+            f" margin[a={rec['attn_selection_margin_mean']:+.4f}"
+            f" rst={rec['rst_selection_margin_mean']:+.4f}]"
+            f" pos[a={rec['attn_positive_margin_mean']:.4f}"
+            f" rst={rec['rst_positive_margin_mean']:.4f}]"
+            f" selected[a={rec['attn_selected_frac']*100:.1f}%"
+            f" rst={rec['rst_selected_frac']*100:.1f}%]"
+            f" no_active[a={rec['attn_no_active_frac']*100:.2f}%"
+            f" rst={rec['rst_no_active_frac']*100:.2f}%]"
+        )
     log_message(
         f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
         f" rst={rec['rst_raw_gate_max']:.1f}]"
@@ -3779,6 +3937,20 @@ def _print_regular_block(rec, ctx):
         f" attn_v={rec['drift_attn_v_emb']:.2e}"
         f" rst={rec['drift_rst_emb']:.2e}]"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
+        log_message(
+            f"  angular_exposure: mean[a={rec['attn_angular_exposure_mean']:+.4f}"
+            f" rst={rec['rst_angular_exposure_mean']:+.4f}]"
+            f" min[a={rec['attn_angular_exposure_min']:+.4f}"
+            f" rst={rec['rst_angular_exposure_min']:+.4f}]"
+            f" max[a={rec['attn_angular_exposure_max']:+.4f}"
+            f" rst={rec['rst_angular_exposure_max']:+.4f}]"
+            f" dead[a={rec['attn_dead_exposure_frac']*100:.2f}%"
+            f" rst={rec['rst_dead_exposure_frac']*100:.2f}%]"
+            f" weak[a={rec['attn_weak_exposure_frac']*100:.2f}%"
+            f" rst={rec['rst_weak_exposure_frac']*100:.2f}%]"
+            f" target={rec['attn_dead_exposure_target']:.3f}"
+        )
     log_message(
         f"  gate_conc: a[eff={rec['attn_gate_eff_n']:.1f}"
         f" ratio={rec['attn_gate_eff_ratio']:.3f}"
@@ -3852,8 +4024,11 @@ def _print_regular_block(rec, ctx):
         f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
         f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
     )
+    route_std_label = (
+        "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
+        else "score_std")
     log_message(
-        f"  score_std[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
+        f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
         f" | emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
         f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
         f" attn_qk[m={rec['attn_qk_emb_norm_mean']:.2f} s={rec['attn_qk_emb_norm_std']:.2f}"
@@ -4488,6 +4663,21 @@ def _print_debug_block(rec, ctx):
         f"weight={_g('dead_penalty_weight'):.4f} "
         f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
     )
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
+        log_debug_message(
+            f"angular_exposure_diag: "
+            f"mean[attn={_g('attn_angular_exposure_mean'):+.5f} "
+            f"rst={_g('rst_angular_exposure_mean'):+.5f}] "
+            f"min[attn={_g('attn_angular_exposure_min'):+.5f} "
+            f"rst={_g('rst_angular_exposure_min'):+.5f}] "
+            f"max[attn={_g('attn_angular_exposure_max'):+.5f} "
+            f"rst={_g('rst_angular_exposure_max'):+.5f}] "
+            f"dead_frac[attn={_g('attn_dead_exposure_frac'):.5f} "
+            f"rst={_g('rst_dead_exposure_frac'):.5f}] "
+            f"weak_frac[attn={_g('attn_weak_exposure_frac'):.5f} "
+            f"rst={_g('rst_weak_exposure_frac'):.5f}] "
+            f"target={_g('attn_dead_exposure_target'):.5f}"
+        )
     log_debug_message(
         f"boundary_diag: raw={_g('boundary_residency_raw'):.6f} "
         f"weighted={_g('boundary_residency_weighted'):.6f} "
@@ -4545,8 +4735,26 @@ def _print_debug_block(rec, ctx):
     )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_debug_message(_format_output_stab_line(rec, indent=""))
+    if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
+        log_debug_message(
+            f"angular_select_diag: "
+            f"rho_mean[attn={_g('attn_rho_mean'):+.5f} rst={_g('rst_rho_mean'):+.5f}] "
+            f"rho_std[attn={_g('attn_rho_std'):.5f} rst={_g('rst_rho_std'):.5f}] "
+            f"rho_max[attn={_g('attn_rho_max'):.5f} rst={_g('rst_rho_max'):.5f}] "
+            f"tau_raw[attn={_g('attn_tau_raw_mean'):+.5f} rst={_g('rst_tau_raw_mean'):+.5f}] "
+            f"tau[attn={_g('attn_tau_floor_mean'):+.5f} rst={_g('rst_tau_floor_mean'):+.5f}] "
+            f"tau_min_hit[attn={_g('attn_tau_min_hit_frac'):.5f} rst={_g('rst_tau_min_hit_frac'):.5f}] "
+            f"selection_margin[attn={_g('attn_selection_margin_mean'):+.5f} rst={_g('rst_selection_margin_mean'):+.5f}] "
+            f"positive_margin[attn={_g('attn_positive_margin_mean'):.5f}/{_g('attn_positive_margin_max'):.5f} "
+            f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
+            f"selected[attn={_g('attn_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
+            f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
+        )
+    route_std_label = (
+        "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
+        else "score_std")
     log_debug_message(
-        f"tau_diag: score_std[attn={_g('attn_score_std'):.4f} "
+        f"tau_diag: {route_std_label}[attn={_g('attn_score_std'):.4f} "
         f"rst={_g('rst_score_std'):.4f}] "
         f"tau_abs[attn={_g('attn_tau_abs_mean'):.4f} "
         f"rst={_g('rst_tau_abs_mean'):.4f}] "
@@ -4734,10 +4942,14 @@ def _build_analysis_record(base, metrics, ctx):
     rec.update({
         'attn_out_norm': float(m.get('attn_out_norm', 0.0)),
         'rst_out_norm': float(m.get('rst_out_norm', 0.0)),
-        'attn_score_skew': float(m.get('attn_score_skew', 0.0)),
-        'rst_score_skew': float(m.get('rst_score_skew', 0.0)),
-        'attn_score_kurt': float(m.get('attn_score_kurt', 0.0)),
-        'rst_score_kurt': float(m.get('rst_score_kurt', 0.0)),
+        'attn_score_skew': float(m.get(
+            'attn_score_skew', m.get('attn_rho_skew', 0.0))),
+        'rst_score_skew': float(m.get(
+            'rst_score_skew', m.get('rst_rho_skew', 0.0))),
+        'attn_score_kurt': float(m.get(
+            'attn_score_kurt', m.get('attn_rho_kurt', 0.0))),
+        'rst_score_kurt': float(m.get(
+            'rst_score_kurt', m.get('rst_rho_kurt', 0.0))),
         'attn_active_per_token_std': float(m.get('attn_active_per_token_std', 0.0)),
         'rst_active_per_token_std': float(m.get('rst_active_per_token_std', 0.0)),
         'attn_gate_entropy': float(m.get('attn_gate_entropy', 0.0)),
@@ -5266,6 +5478,12 @@ def main():
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
     tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
     dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)  # v4.0.6
+    dead_penalty_mode = str(tcfg.get(
+        'dead_penalty_mode',
+        'angular_exposure'
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.9'
+        else 'legacy_gate'))
+    dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
     boundary_residency_weight = tcfg.get('boundary_residency_weight', 0.0)
     boundary_residency_warmup_steps = tcfg.get(
         'boundary_residency_warmup_steps', 0)
@@ -5497,6 +5715,10 @@ def main():
             lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
             tau_reg_weight = saved_training_config.get('tau_reg_weight', tau_reg_weight)
             dead_penalty_weight = saved_training_config.get('dead_penalty_weight', dead_penalty_weight)
+            dead_penalty_mode = str(saved_training_config.get(
+                'dead_penalty_mode', dead_penalty_mode))
+            dead_exposure_target = float(saved_training_config.get(
+                'dead_exposure_target', dead_exposure_target))
             boundary_residency_weight = saved_training_config.get(
                 'boundary_residency_weight', boundary_residency_weight)
             boundary_residency_warmup_steps = saved_training_config.get(
@@ -5585,6 +5807,8 @@ def main():
         'load_balance_weight': lb_weight,
         'tau_reg_weight': tau_reg_weight,
         'dead_penalty_weight': dead_penalty_weight,
+        'dead_penalty_mode': dead_penalty_mode,
+        'dead_exposure_target': dead_exposure_target,
         'boundary_residency_weight': boundary_residency_weight,
         'boundary_residency_warmup_steps': boundary_residency_warmup_steps,
         'exploration_weight': exploration_weight,
@@ -5936,7 +6160,8 @@ def main():
         print(f"  Div weight: {div_weight}")
         print(f"  LB weight: {lb_weight}")
         print(f"  Tau reg weight: {tau_reg_weight}")
-        print(f"  Dead penalty weight: {dead_penalty_weight}")
+        print(f"  Dead penalty: weight={dead_penalty_weight} "
+              f"mode={dead_penalty_mode} exposure_target={dead_exposure_target}")
         print(f"  Boundary residency weight: {boundary_residency_weight} "
               f"(warmup_steps={boundary_residency_warmup_steps})")
         print(f"  Exploration weight: {exploration_weight} "
@@ -5947,23 +6172,33 @@ def main():
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
         # Active v4.1.5 gate closure constants.
-        gate_msg = (
-            f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
-            f"act_width={tcfg.get('activation_width', tcfg.get('activation_threshold', 0.5))} act_power={tcfg.get('activation_power', 1.0)} "
-            f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
-            f"eps={tcfg.get('epsilon', 1.0e-4)} "
-            f"max_int={tcfg.get('max_intensity', 10.0)}"
-        )
+        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.9':
+            gate_msg = (
+                "  Gate (v4.1.5.9 angular): "
+                f"tau_min={tcfg.get('tau_min', 0.0)} "
+                f"tau_offset_init={tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))} "
+                f"tau_offset_init_attn={tcfg.get('tau_offset_init_attn', cfg['model'].get('tau_offset_init_attn', 'default'))} "
+                f"tau_offset_init_rst={tcfg.get('tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', 'default'))} "
+                f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
+                f"intensity_squash={tcfg.get('intensity_squash', 'tanh')} "
+                f"intensity_width={tcfg.get('intensity_width', 1.0)} "
+                f"scan_scale={tcfg.get('scan_scale', 0.0)}"
+            )
+        else:
+            gate_msg = (
+                f"  Gate (v4.1): sharpness={tcfg.get('sharpness', 500.0)} "
+                f"act_width={tcfg.get('activation_width', tcfg.get('activation_threshold', 0.5))} act_power={tcfg.get('activation_power', 1.0)} "
+                f"act_cut={tcfg.get('activation_cutoff', 0.01)} "
+                f"eps={tcfg.get('epsilon', 1.0e-4)} "
+                f"max_int={tcfg.get('max_intensity', 10.0)}"
+            )
         if cfg['model'].get('model_version') in (
                 'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
-            gate_msg += (
-                f" scan_scale={tcfg.get('scan_scale', 0.01)} "
-                f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
-            )
-        if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.9':
-            gate_msg += (
-                f" tau_offset_init={tcfg.get('tau_offset_init', cfg['model'].get('tau_offset_init', -0.5))}"
-            )
+            if cfg['model'].get('model_version') != 'spatial-r1-v4.1.5.9':
+                gate_msg += (
+                    f" scan_scale={tcfg.get('scan_scale', 0.01)} "
+                    f"scan_std_floor={tcfg.get('scan_std_floor', 0.5)}"
+                )
         if cfg['model'].get('model_version') == 'spatial-r1-v4.1.5.8':
             gate_msg += (
                 f" rw_contrib_den_floor={tcfg.get('rw_contrib_den_floor', 1.0)}"
@@ -7395,6 +7630,8 @@ def main():
                         'orth_weight': orth_weight,
                         'div_weight': div_weight,
                         'dead_penalty_weight': dead_penalty_weight,
+                        'dead_penalty_mode': dead_penalty_mode,
+                        'dead_exposure_target': dead_exposure_target,
                         'boundary_residency_weight': boundary_residency_weight,
                         'boundary_residency_warmup_steps': boundary_residency_warmup_steps,
                         'n_qk_cfg': cfg['model'].get(
@@ -7412,7 +7649,10 @@ def main():
                         'progress': _progress,
                         'model_version': model_version,
                         'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
-                        'intensity_route_dim': int(tcfg.get('intensity_route_dim', 0) or 0),
+                        'd_select': int(cfg['model'].get('d_select', 0) or 0),
+                        'd_intensity': int(
+                            cfg['model'].get('d_route', 0)
+                            - cfg['model'].get('d_select', 0)),
                     }
                     ctx.update(collapse_warn_ctx)
                     rec = _build_regular_record(metrics, win_avgs, ctx, global_step, epoch)
@@ -7475,6 +7715,8 @@ def main():
                     'orth_weight': orth_weight,
                     'div_weight': div_weight,
                     'dead_penalty_weight': dead_penalty_weight,
+                    'dead_penalty_mode': dead_penalty_mode,
+                    'dead_exposure_target': dead_exposure_target,
                     'boundary_residency_weight': boundary_residency_weight,
                     'boundary_residency_warmup_steps': boundary_residency_warmup_steps,
                     'n_qk_cfg': cfg['model'].get(
@@ -7492,7 +7734,10 @@ def main():
                     'progress': _progress,
                     'model_version': model_version,
                     'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
-                    'intensity_route_dim': int(tcfg.get('intensity_route_dim', 0) or 0),
+                    'd_select': int(cfg['model'].get('d_select', 0) or 0),
+                    'd_intensity': int(
+                        cfg['model'].get('d_route', 0)
+                        - cfg['model'].get('d_select', 0)),
                 }
                 debug_ctx.update(collapse_warn_ctx)
                 debug_metrics = jax.device_get(metrics)

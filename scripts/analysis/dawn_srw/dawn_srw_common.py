@@ -52,6 +52,8 @@ def import_dawn_srw(model_version: str | None = None):
         return importlib.import_module("models.dawn_srw_v4156")
     if model_version == "spatial-r1-v4.1.5.8":
         return importlib.import_module("models.dawn_srw_v4158")
+    if model_version == "spatial-r1-v4.1.5.9":
+        return importlib.import_module("models.dawn_srw_v4159")
     return importlib.import_module("models.dawn_srw")
 
 
@@ -75,6 +77,11 @@ def gate_constants_from_config(cfg: Dict[str, Any]) -> Dict[str, float]:
     configured max_intensity.
     """
     t = cfg.get("training", {})
+    if cfg.get("model", {}).get("model_version") == "spatial-r1-v4.1.5.9":
+        return {
+            "scan_scale": float(t.get("scan_scale", 0.0)),
+            "scan_std_floor": float(t.get("scan_std_floor", 0.5)),
+        }
     return {
         "sharpness": float(t.get("sharpness", 500.0)),
         "activation_threshold": float(t.get("activation_threshold", 0.5)),
@@ -97,7 +104,7 @@ def apply_gate_constants_from_config(cfg: Dict[str, Any], mod=None, verbose: boo
         mod = import_dawn_srw()
     const = gate_constants_from_config(cfg)
     for key, attr in GATE_CONSTANTS.items():
-        if hasattr(mod, attr):
+        if key in const and hasattr(mod, attr):
             setattr(mod, attr, const[key])
     if verbose:
         print(
@@ -207,6 +214,9 @@ def build_model(cfg: Dict[str, Any]):
         n_chunks_qk=t.get("n_chunks_qk", 1),
         n_chunks_v=t.get("n_chunks_v", 1),
     )
+    if "d_select" in m and "d_select" in getattr(
+            mod.DAWN, "__dataclass_fields__", {}):
+        kwargs["d_select"] = m["d_select"]
     mode = str(m.get("pool_scale_mode", "fixed_depth")).lower()
     learned_scale_requested = (
         mode in ("learned", "learnable", "trainable", "param", "parameter")
@@ -242,6 +252,12 @@ def model_cfg_from_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "n_chunks_v": t.get("n_chunks_v", 1),
         "n_chunks_rst": t.get("n_chunks_rst", t.get("n_chunks_know", 1)),
         **gate_constants_from_config(cfg),
+        "d_select": m.get("d_select", t.get("d_select", None)),
+        "intensity_beta": float(t.get("intensity_beta", 0.5)),
+        "intensity_squash": str(t.get("intensity_squash", "tanh")),
+        "intensity_width": float(t.get("intensity_width", 1.0)),
+        "tau_min": float(t.get("tau_min", 0.0)),
+        "route_emb_forward_norm": bool(t.get("route_emb_forward_norm", False)),
     }
 
 
