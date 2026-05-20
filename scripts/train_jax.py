@@ -156,6 +156,15 @@ UPDATE_CAP_GROUP_SPECS = (
     ('tau_rst', 'tR', 'update_cap_tau_rst_hit',
      'update_cap_tau_rst_abs_pre', 'update_cap_tau_rst_scale',
      'abs_pre'),
+    ('raw_tau_qk', 'rQ', 'update_cap_raw_tau_qk_hit',
+     'update_cap_raw_tau_qk_abs_pre', 'update_cap_raw_tau_qk_scale',
+     'abs_pre'),
+    ('raw_tau_v', 'rV', 'update_cap_raw_tau_v_hit',
+     'update_cap_raw_tau_v_abs_pre', 'update_cap_raw_tau_v_scale',
+     'abs_pre'),
+    ('raw_tau_rst', 'rR', 'update_cap_raw_tau_rst_hit',
+     'update_cap_raw_tau_rst_abs_pre', 'update_cap_raw_tau_rst_scale',
+     'abs_pre'),
     ('scan_attn', 'sA', 'update_cap_scan_attn_hit',
      'update_cap_scan_attn_abs_pre', 'update_cap_scan_attn_scale',
      'abs_pre'),
@@ -221,7 +230,7 @@ def _attach_update_cap_window_stats(rec, window_stats):
     return rec
 
 
-def _format_update_cap_window_line(rec, indent="  "):
+def _format_update_cap_window_line(rec, indent="  ", is_v4160=False):
     def _g(key, default=0.0):
         val = rec.get(key, default)
         if val is None:
@@ -235,6 +244,13 @@ def _format_update_cap_window_line(rec, indent="  "):
     pre_parts = []
     scale_parts = []
     for group_name, label, _, _, _, pre_kind in UPDATE_CAP_GROUP_SPECS:
+        if is_v4160 and group_name in ('tau_attn', 'tau_rst'):
+            continue
+        if (not is_v4160) and group_name.startswith('raw_tau_'):
+            continue
+        if (is_v4160 and group_name.startswith('raw_tau_')
+                and _g('update_cap_raw_tau_enabled') <= 0.0):
+            continue
         hit_parts.append(
             f"{label}={_g(_cap_window_hit_key(group_name)):.0f}")
         pre_parts.append(
@@ -264,6 +280,16 @@ def _collapse_warn_context(tcfg):
         # dependent; set >0 in config to enable the warning.
         'collapse_warn_scaled_out_threshold': float(
             tcfg.get('collapse_warn_scaled_out_threshold', 0.0)),
+        'collapse_warn_dead_count_threshold': float(
+            tcfg.get('collapse_warn_dead_count_threshold', 100.0)),
+        'collapse_warn_dead_raw_threshold': float(
+            tcfg.get('collapse_warn_dead_raw_threshold', 0.0)),
+        'collapse_warn_dead_weighted_threshold': float(
+            tcfg.get('collapse_warn_dead_weighted_threshold', 0.0)),
+        'collapse_warn_dead_frac_threshold': float(
+            tcfg.get('collapse_warn_dead_frac_threshold', 0.0)),
+        'collapse_warn_weak_frac_threshold': float(
+            tcfg.get('collapse_warn_weak_frac_threshold', 0.0)),
     }
 
 
@@ -1351,10 +1377,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 k_contrib_pre = dev_b * k_tau_t * vmask_b
                 a_contrib = a_contrib_pre * a_active
                 k_contrib = k_contrib_pre * k_active
+                a_qk_contrib_pre = a_contrib_pre[..., :2]
+                a_v_contrib_pre = a_contrib_pre[..., 2:3]
+                a_qk_contrib = a_contrib[..., :2]
+                a_v_contrib = a_contrib[..., 2:3]
+                explore_qk_pre_bound = a_qk_contrib_pre.sum() / vsum_eps
+                explore_v_pre_bound = a_v_contrib_pre.sum() / vsum_eps
                 explore_attn_pre_bound = a_contrib_pre.sum() / vsum_eps
                 explore_rst_pre_bound = k_contrib_pre.sum() / vsum_eps
                 explore_loss_pre_bound = (
                     explore_attn_pre_bound + explore_rst_pre_bound)
+                explore_qk_raw = a_qk_contrib.sum() / vsum_eps
+                explore_v_raw = a_v_contrib.sum() / vsum_eps
                 explore_attn_raw = a_contrib.sum() / vsum_eps
                 explore_rst_raw = k_contrib.sum() / vsum_eps
                 explore_loss_raw = explore_attn_raw + explore_rst_raw
@@ -1371,9 +1405,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 # Off fractions replace pool-mean block fractions. Denominator
                 # is total (layer 횞 batch 횞 valid-time 횞 route) slots.
                 _a_tot = vmask_b.sum() * a_tau_t.shape[0] * a_tau_t.shape[-1]
+                _qk_tot = vmask_b.sum() * a_tau_t.shape[0] * 2
+                _v_tot = vmask_b.sum() * a_tau_t.shape[0]
                 _k_tot = vmask_b.sum() * k_tau_t.shape[0] * k_tau_t.shape[-1]
                 block_frac_a = jax.lax.stop_gradient(
                     (a_off_mask.astype(jnp.float32) * vmask_b).sum() / (_a_tot + 1e-8))
+                block_frac_qk = jax.lax.stop_gradient(
+                    (a_off_mask[..., :2].astype(jnp.float32) * vmask_b).sum()
+                    / (_qk_tot + 1e-8))
+                block_frac_v = jax.lax.stop_gradient(
+                    (a_off_mask[..., 2:3].astype(jnp.float32) * vmask_b).sum()
+                    / (_v_tot + 1e-8))
                 block_frac_k = jax.lax.stop_gradient(
                     (k_off_mask.astype(jnp.float32) * vmask_b).sum() / (_k_tot + 1e-8))
 
@@ -1383,15 +1425,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             else:
                 global_mean_ce = jnp.float32(0.0)
                 explore_loss_raw = jnp.float32(0.0)
+                explore_qk_raw = jnp.float32(0.0)
+                explore_v_raw = jnp.float32(0.0)
                 explore_attn_raw = jnp.float32(0.0)
                 explore_rst_raw = jnp.float32(0.0)
                 explore_loss_pre_bound = jnp.float32(0.0)
+                explore_qk_pre_bound = jnp.float32(0.0)
+                explore_v_pre_bound = jnp.float32(0.0)
                 explore_attn_pre_bound = jnp.float32(0.0)
                 explore_rst_pre_bound = jnp.float32(0.0)
                 pos_frac = jnp.float32(0.0)
                 pos_mean = jnp.float32(0.0)
                 neg_mean = jnp.float32(0.0)
                 block_frac_a = jnp.float32(0.0)
+                block_frac_qk = jnp.float32(0.0)
+                block_frac_v = jnp.float32(0.0)
                 block_frac_k = jnp.float32(0.0)
                 dev_pos_max = jnp.float32(0.0)
                 dev_neg_max = jnp.float32(0.0)
@@ -1452,13 +1500,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             explore_stats = dict(
                 global_mean_ce=global_mean_ce,
                 explore_loss_raw=explore_loss_raw,
+                explore_qk_raw=explore_qk_raw,
+                explore_v_raw=explore_v_raw,
                 explore_attn_raw=explore_attn_raw,
                 explore_rst_raw=explore_rst_raw,
                 explore_loss_pre_bound=explore_loss_pre_bound,
+                explore_qk_pre_bound=explore_qk_pre_bound,
+                explore_v_pre_bound=explore_v_pre_bound,
                 explore_attn_pre_bound=explore_attn_pre_bound,
                 explore_rst_pre_bound=explore_rst_pre_bound,
                 pos_frac=pos_frac, pos_mean=pos_mean, neg_mean=neg_mean,
-                block_frac_a=block_frac_a, block_frac_k=block_frac_k,
+                block_frac_a=block_frac_a, block_frac_qk=block_frac_qk,
+                block_frac_v=block_frac_v, block_frac_k=block_frac_k,
                 dev_pos_max=dev_pos_max, dev_neg_max=dev_neg_max,
                 attn_tau_off_min=attn_tau_off_min, attn_tau_off_max=attn_tau_off_max,
                 attn_tau_off_p99=attn_tau_off_p99, attn_tau_off_p01=attn_tau_off_p01,
@@ -1502,6 +1555,41 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         def _path_to_str(path):
             return '/'.join(str(p.key if hasattr(p, 'key') else p) for p in path)
 
+        def _path_parts(ps):
+            return tuple(part for part in str(ps).split('/') if part)
+
+        def _has_path_part(ps, *names):
+            parts = _path_parts(ps)
+            return any(name in parts for name in names)
+
+        def _is_raw_tau_attn_combined_path(ps):
+            return _has_path_part(ps, 'raw_tau_attn')
+
+        def _is_raw_tau_qk_path(ps):
+            return _has_path_part(ps, 'raw_tau_qk', 'raw_tau_attn_qk')
+
+        def _is_raw_tau_v_path(ps):
+            return _has_path_part(ps, 'raw_tau_v', 'raw_tau_attn_v')
+
+        def _is_raw_tau_rst_path(ps):
+            return _has_path_part(ps, 'raw_tau_rst')
+
+        def _is_generic_raw_tau_path(ps):
+            return _has_path_part(ps, 'raw_tau')
+
+        def _is_legacy_tau_attn_path(ps):
+            return _has_path_part(ps, 'tau_attn')
+
+        def _is_legacy_tau_rst_path(ps):
+            return _has_path_part(ps, 'tau_rst')
+
+        def _is_raw_tau_path(ps):
+            return (_is_raw_tau_attn_combined_path(ps)
+                    or _is_raw_tau_qk_path(ps)
+                    or _is_raw_tau_v_path(ps)
+                    or _is_raw_tau_rst_path(ps)
+                    or _is_generic_raw_tau_path(ps))
+
         # ------------------------------------------------------------------
         # Control-side stabilisation.
         #
@@ -1522,8 +1610,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return sum(leaves)
 
         def _is_tau_path(ps):
-            return (('router/tau_attn' in ps) or ('router/tau_rst' in ps)
-                    or ('router/raw_tau_attn' in ps) or ('router/raw_tau_rst' in ps))
+            return (_is_legacy_tau_attn_path(ps)
+                    or _is_legacy_tau_rst_path(ps)
+                    or _is_raw_tau_path(ps))
 
         def _is_router_proj_path(ps):
             return ('router/proj_attn' in ps) or ('router/proj_rst' in ps)
@@ -1561,10 +1650,14 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/know_emb' in ps))
 
         def _is_tau_attn_path(ps):
-            return ('router/tau_attn' in ps) or ('router/raw_tau_attn' in ps)
+            return (_is_legacy_tau_attn_path(ps)
+                    or _is_raw_tau_attn_combined_path(ps)
+                    or _is_raw_tau_qk_path(ps)
+                    or _is_raw_tau_v_path(ps)
+                    or _is_generic_raw_tau_path(ps))
 
         def _is_tau_rst_path(ps):
-            return ('router/tau_rst' in ps) or ('router/raw_tau_rst' in ps)
+            return _is_legacy_tau_rst_path(ps) or _is_raw_tau_rst_path(ps)
 
         def _is_scan_attn_path(ps):
             return (('router/raw_scan_offset_attn' in ps)
@@ -1579,6 +1672,64 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 if path_pred(_path_to_str(path)):
                     return jnp.max(jnp.abs(leaf.astype(jnp.float32)))
                 return jnp.float32(0.0)
+            leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
+            if not leaves:
+                return jnp.float32(0.0)
+            out = jnp.float32(0.0)
+            for leaf in leaves:
+                out = jnp.maximum(out, leaf)
+            return out
+
+        def _raw_tau_component_leaf(ps, leaf, component):
+            x = leaf.astype(jnp.float32)
+            if _is_raw_tau_attn_combined_path(ps):
+                if x.ndim > 0 and x.shape[-1] >= 3:
+                    if component == 'qk':
+                        return x[..., :2]
+                    if component == 'v':
+                        return x[..., 2:3]
+                return None
+            if _is_generic_raw_tau_path(ps):
+                parts = _path_parts(ps)
+                if ('rst' in parts) or ('know' in parts):
+                    return x if component == 'rst' else None
+                if ('v' in parts) or ('attn_v' in parts):
+                    return x if component == 'v' else None
+                if ('qk' in parts) or ('attn_qk' in parts):
+                    return x if component == 'qk' else None
+                if x.ndim > 0 and x.shape[-1] >= 3:
+                    if component == 'qk':
+                        return x[..., :2]
+                    if component == 'v':
+                        return x[..., 2:3]
+                return x if component == 'qk' else None
+            if _is_raw_tau_qk_path(ps):
+                return x if component == 'qk' else None
+            if _is_raw_tau_v_path(ps):
+                return x if component == 'v' else None
+            if _is_raw_tau_rst_path(ps):
+                return x if component == 'rst' else None
+            return None
+
+        def _raw_tau_component_sq(tree, component):
+            def _visit(path, leaf):
+                sub = _raw_tau_component_leaf(
+                    _path_to_str(path), leaf, component)
+                if sub is None:
+                    return jnp.float32(0.0)
+                return jnp.sum(jnp.square(sub))
+            leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
+            if not leaves:
+                return jnp.float32(0.0)
+            return sum(leaves)
+
+        def _raw_tau_component_max_abs(tree, component):
+            def _visit(path, leaf):
+                sub = _raw_tau_component_leaf(
+                    _path_to_str(path), leaf, component)
+                if sub is None:
+                    return jnp.float32(0.0)
+                return jnp.max(jnp.abs(sub))
             leaves = jax.tree.leaves(jax.tree.map_with_path(_visit, tree))
             if not leaves:
                 return jnp.float32(0.0)
@@ -1680,6 +1831,17 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             hit = jnp.where(active & (abs_pre > cap), jnp.float32(1.0), jnp.float32(0.0))
             return abs_pre, abs_post, scale, hit
 
+        def _raw_tau_abs_cap_stats(updates_tree, component, cap):
+            abs_pre = _raw_tau_component_max_abs(updates_tree, component)
+            active = cap > 0.0
+            scale = jnp.where(
+                active,
+                jnp.minimum(jnp.float32(1.0), cap / (abs_pre + 1e-12)),
+                jnp.float32(1.0))
+            abs_post = abs_pre * scale
+            hit = jnp.where(active & (abs_pre > cap), jnp.float32(1.0), jnp.float32(0.0))
+            return abs_pre, abs_post, scale, hit
+
         if _enable_control_update_caps:
             (upd_proj_attn_ratio_pre, upd_proj_attn_ratio_post,
              upd_proj_attn_scale, upd_proj_attn_hit) = _ratio_cap_stats(
@@ -1703,10 +1865,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 _route_emb_update_ratio_cap)
             (upd_tau_attn_abs_pre, upd_tau_attn_abs_post,
              upd_tau_attn_scale, upd_tau_attn_hit) = _abs_cap_stats(
-                updates, _is_tau_attn_path, _tau_update_abs_cap)
+                updates, _is_legacy_tau_attn_path, _tau_update_abs_cap)
             (upd_tau_rst_abs_pre, upd_tau_rst_abs_post,
              upd_tau_rst_scale, upd_tau_rst_hit) = _abs_cap_stats(
-                updates, _is_tau_rst_path, _tau_update_abs_cap)
+                updates, _is_legacy_tau_rst_path, _tau_update_abs_cap)
+            (upd_raw_tau_qk_abs_pre, upd_raw_tau_qk_abs_post,
+             upd_raw_tau_qk_scale, upd_raw_tau_qk_hit) = _raw_tau_abs_cap_stats(
+                updates, 'qk', _tau_update_abs_cap)
+            (upd_raw_tau_v_abs_pre, upd_raw_tau_v_abs_post,
+             upd_raw_tau_v_scale, upd_raw_tau_v_hit) = _raw_tau_abs_cap_stats(
+                updates, 'v', _tau_update_abs_cap)
+            (upd_raw_tau_rst_abs_pre, upd_raw_tau_rst_abs_post,
+             upd_raw_tau_rst_scale, upd_raw_tau_rst_hit) = _raw_tau_abs_cap_stats(
+                updates, 'rst', _tau_update_abs_cap)
             (upd_scan_attn_abs_pre, upd_scan_attn_abs_post,
              upd_scan_attn_scale, upd_scan_attn_hit) = _abs_cap_stats(
                 updates, _is_scan_attn_path, _scan_update_abs_cap)
@@ -1716,14 +1887,45 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
 
             def _cap_control_update(path, u):
                 ps = _path_to_str(path)
+                if _is_raw_tau_attn_combined_path(ps):
+                    if u.ndim > 0 and u.shape[-1] >= 3:
+                        out = u
+                        out = out.at[..., :2].multiply(
+                            upd_raw_tau_qk_scale.astype(u.dtype))
+                        out = out.at[..., 2:3].multiply(
+                            upd_raw_tau_v_scale.astype(u.dtype))
+                        return out
+                    return u
+                if _is_generic_raw_tau_path(ps):
+                    parts = _path_parts(ps)
+                    if ('rst' in parts) or ('know' in parts):
+                        return u * upd_raw_tau_rst_scale.astype(u.dtype)
+                    if ('v' in parts) or ('attn_v' in parts):
+                        return u * upd_raw_tau_v_scale.astype(u.dtype)
+                    if ('qk' in parts) or ('attn_qk' in parts):
+                        return u * upd_raw_tau_qk_scale.astype(u.dtype)
+                    if u.ndim > 0 and u.shape[-1] >= 3:
+                        out = u
+                        out = out.at[..., :2].multiply(
+                            upd_raw_tau_qk_scale.astype(u.dtype))
+                        out = out.at[..., 2:3].multiply(
+                            upd_raw_tau_v_scale.astype(u.dtype))
+                        return out
+                    return u * upd_raw_tau_qk_scale.astype(u.dtype)
+                if _is_raw_tau_qk_path(ps):
+                    return u * upd_raw_tau_qk_scale.astype(u.dtype)
+                if _is_raw_tau_v_path(ps):
+                    return u * upd_raw_tau_v_scale.astype(u.dtype)
+                if _is_raw_tau_rst_path(ps):
+                    return u * upd_raw_tau_rst_scale.astype(u.dtype)
                 scale = jnp.float32(1.0)
                 scale = jnp.where(_is_router_proj_attn_path(ps), upd_proj_attn_scale, scale)
                 scale = jnp.where(_is_router_proj_rst_path(ps), upd_proj_rst_scale, scale)
                 scale = jnp.where(_is_route_emb_qk_path(ps), upd_emb_qk_scale, scale)
                 scale = jnp.where(_is_route_emb_v_path(ps), upd_emb_v_scale, scale)
                 scale = jnp.where(_is_route_emb_rst_path(ps), upd_emb_rst_scale, scale)
-                scale = jnp.where(_is_tau_attn_path(ps), upd_tau_attn_scale, scale)
-                scale = jnp.where(_is_tau_rst_path(ps), upd_tau_rst_scale, scale)
+                scale = jnp.where(_is_legacy_tau_attn_path(ps), upd_tau_attn_scale, scale)
+                scale = jnp.where(_is_legacy_tau_rst_path(ps), upd_tau_rst_scale, scale)
                 scale = jnp.where(_is_scan_attn_path(ps), upd_scan_attn_scale, scale)
                 scale = jnp.where(_is_scan_rst_path(ps), upd_scan_rst_scale, scale)
                 return u * scale.astype(u.dtype)
@@ -1751,6 +1953,15 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             upd_tau_rst_abs_pre = upd_tau_rst_abs_post = jnp.float32(0.0)
             upd_tau_rst_scale = jnp.float32(1.0)
             upd_tau_rst_hit = jnp.float32(0.0)
+            upd_raw_tau_qk_abs_pre = upd_raw_tau_qk_abs_post = jnp.float32(0.0)
+            upd_raw_tau_qk_scale = jnp.float32(1.0)
+            upd_raw_tau_qk_hit = jnp.float32(0.0)
+            upd_raw_tau_v_abs_pre = upd_raw_tau_v_abs_post = jnp.float32(0.0)
+            upd_raw_tau_v_scale = jnp.float32(1.0)
+            upd_raw_tau_v_hit = jnp.float32(0.0)
+            upd_raw_tau_rst_abs_pre = upd_raw_tau_rst_abs_post = jnp.float32(0.0)
+            upd_raw_tau_rst_scale = jnp.float32(1.0)
+            upd_raw_tau_rst_hit = jnp.float32(0.0)
             upd_scan_attn_abs_pre = upd_scan_attn_abs_post = jnp.float32(0.0)
             upd_scan_attn_scale = jnp.float32(1.0)
             upd_scan_attn_hit = jnp.float32(0.0)
@@ -1791,8 +2002,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         _gpool = grads.get('neuron_pool', {})
         grad_router_proj_attn = _child_norm(_grouter, 'proj_attn')
         grad_router_proj_rst = _child_norm(_grouter, 'proj_rst')
-        grad_router_tau_attn = _child_norm(_grouter, 'tau_attn')
-        grad_router_tau_rst = _child_norm(_grouter, 'tau_rst')
+        grad_router_raw_tau_qk = jnp.sqrt(
+            _raw_tau_component_sq(grads, 'qk') + 1e-12)
+        grad_router_raw_tau_v = jnp.sqrt(
+            _raw_tau_component_sq(grads, 'v') + 1e-12)
+        grad_router_raw_tau_rst = jnp.sqrt(
+            _raw_tau_component_sq(grads, 'rst') + 1e-12)
+        grad_router_tau_attn = (
+            _child_norm(_grouter, 'tau_attn')
+            + grad_router_raw_tau_qk + grad_router_raw_tau_v)
+        grad_router_tau_rst = (
+            _child_norm(_grouter, 'tau_rst')
+            + grad_router_raw_tau_rst)
         grad_router_scan_attn = _child_norm(_grouter, 'raw_scan_offset_attn')
         grad_router_scan_rst = _child_norm(_grouter, 'raw_scan_offset_rst')
         grad_pool_attn_qk_emb = _child_norm(_gpool, 'attn_qk_emb')
@@ -1847,6 +2068,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 [grad_router_tau_attn], dtype=jnp.float32)
             grad_router_tau_rst_per_layer = jnp.asarray(
                 [grad_router_tau_rst], dtype=jnp.float32)
+            grad_router_raw_tau_qk_per_layer = jnp.asarray(
+                [grad_router_raw_tau_qk], dtype=jnp.float32)
+            grad_router_raw_tau_v_per_layer = jnp.asarray(
+                [grad_router_raw_tau_v], dtype=jnp.float32)
+            grad_router_raw_tau_rst_per_layer = jnp.asarray(
+                [grad_router_raw_tau_rst], dtype=jnp.float32)
             grad_pool_attn_qk_rw = jnp.asarray(
                 [grad_pool_attn_qk_read, grad_pool_attn_qk_write],
                 dtype=jnp.float32)
@@ -1869,6 +2096,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             grad_router_proj_rst_per_layer = jnp.zeros((1,), dtype=jnp.float32)
             grad_router_tau_attn_per_layer = jnp.zeros((1,), dtype=jnp.float32)
             grad_router_tau_rst_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_router_raw_tau_qk_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_router_raw_tau_v_per_layer = jnp.zeros((1,), dtype=jnp.float32)
+            grad_router_raw_tau_rst_per_layer = jnp.zeros((1,), dtype=jnp.float32)
             grad_pool_attn_qk_rw = jnp.zeros((2,), dtype=jnp.float32)
             grad_pool_attn_v_rw = jnp.zeros((2,), dtype=jnp.float32)
             grad_pool_rst_rw = jnp.zeros((2,), dtype=jnp.float32)
@@ -1991,8 +2221,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 jnp.float32(exploration_weight) * explore_stats['explore_active']),
             'exploration_asymmetry': jnp.float32(exploration_asymmetry),
             'exploration_loss_raw_total': explore_stats['explore_loss_raw'],
+            'exploration_loss_raw_qk': explore_stats['explore_qk_raw'],
+            'exploration_loss_raw_v': explore_stats['explore_v_raw'],
             'exploration_loss_raw_attn': explore_stats['explore_attn_raw'],
             'exploration_loss_raw_rst': explore_stats['explore_rst_raw'],
+            'exploration_loss_weighted_qk': (
+                exploration_weight * explore_stats['explore_qk_raw']
+                * explore_stats['explore_active']),
+            'exploration_loss_weighted_v': (
+                exploration_weight * explore_stats['explore_v_raw']
+                * explore_stats['explore_active']),
             'exploration_loss_weighted_attn': (
                 exploration_weight * explore_stats['explore_attn_raw']
                 * explore_stats['explore_active']),
@@ -2005,6 +2243,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'dead_penalty_weighted_unclipped': dead_penalty_weighted_unclipped_metric,
             'dead_penalty_weighted_clipped': dead_penalty_weighted_metric,
             'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
+            'exploration_qk_pre_bound': explore_stats['explore_qk_pre_bound'],
+            'exploration_v_pre_bound': explore_stats['explore_v_pre_bound'],
             'exploration_raw_post_bound': explore_stats['explore_loss_raw'],
             'exploration_attn_pre_bound': explore_stats['explore_attn_pre_bound'],
             'exploration_rst_pre_bound': explore_stats['explore_rst_pre_bound'],
@@ -2028,6 +2268,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_pos_emb': grad_pos_emb,
             'grad_router_proj_attn': grad_router_proj_attn,
             'grad_router_proj_rst': grad_router_proj_rst,
+            'grad_router_raw_tau_qk': grad_router_raw_tau_qk,
+            'grad_router_raw_tau_v': grad_router_raw_tau_v,
+            'grad_router_raw_tau_rst': grad_router_raw_tau_rst,
             'grad_router_tau_attn': grad_router_tau_attn,
             'grad_router_tau_rst': grad_router_tau_rst,
             'grad_router_scan_attn': grad_router_scan_attn,
@@ -2047,6 +2290,9 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'grad_lm_head_or_token_tied': grad_lm_head_or_token_tied,
             'grad_router_proj_attn_per_layer': grad_router_proj_attn_per_layer,
             'grad_router_proj_rst_per_layer': grad_router_proj_rst_per_layer,
+            'grad_router_raw_tau_qk_per_layer': grad_router_raw_tau_qk_per_layer,
+            'grad_router_raw_tau_v_per_layer': grad_router_raw_tau_v_per_layer,
+            'grad_router_raw_tau_rst_per_layer': grad_router_raw_tau_rst_per_layer,
             'grad_router_tau_attn_per_layer': grad_router_tau_attn_per_layer,
             'grad_router_tau_rst_per_layer': grad_router_tau_rst_per_layer,
             'grad_pool_attn_qk_rw': grad_pool_attn_qk_rw,
@@ -2226,12 +2472,18 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rpe_dev_pos': explore_stats['dev_pos_max'],
             'rpe_dev_neg': explore_stats['dev_neg_max'],
             'explore_loss_raw': explore_stats['explore_loss_raw'],
+            'explore_qk_raw': explore_stats['explore_qk_raw'],
+            'explore_v_raw': explore_stats['explore_v_raw'],
             'explore_attn_raw': explore_stats['explore_attn_raw'],
             'explore_rst_raw': explore_stats['explore_rst_raw'],
             'explore_loss_weighted': explore_loss_weighted_metric,
             'explore_active': explore_stats['explore_active'],
+            'explore_block_frac_qk': explore_stats['block_frac_qk'],
+            'explore_block_frac_v': explore_stats['block_frac_v'],
             'explore_block_frac_a': explore_stats['block_frac_a'],
             'explore_block_frac_k': explore_stats['block_frac_k'],
+            'rpe_block_qk': explore_stats['block_frac_qk'],
+            'rpe_block_v': explore_stats['block_frac_v'],
             'rpe_block_attn': explore_stats['block_frac_a'],
             'rpe_block_rst': explore_stats['block_frac_k'],
             'dev_pos_max': explore_stats['dev_pos_max'],
@@ -2357,6 +2609,21 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'update_cap_tau_rst_abs_post': upd_tau_rst_abs_post,
             'update_cap_tau_rst_scale': upd_tau_rst_scale,
             'update_cap_tau_rst_hit': upd_tau_rst_hit,
+            'update_cap_raw_tau_enabled': jnp.float32(
+                1.0 if (_enable_control_update_caps
+                        and float(tau_update_abs_cap) > 0.0) else 0.0),
+            'update_cap_raw_tau_qk_abs_pre': upd_raw_tau_qk_abs_pre,
+            'update_cap_raw_tau_qk_abs_post': upd_raw_tau_qk_abs_post,
+            'update_cap_raw_tau_qk_scale': upd_raw_tau_qk_scale,
+            'update_cap_raw_tau_qk_hit': upd_raw_tau_qk_hit,
+            'update_cap_raw_tau_v_abs_pre': upd_raw_tau_v_abs_pre,
+            'update_cap_raw_tau_v_abs_post': upd_raw_tau_v_abs_post,
+            'update_cap_raw_tau_v_scale': upd_raw_tau_v_scale,
+            'update_cap_raw_tau_v_hit': upd_raw_tau_v_hit,
+            'update_cap_raw_tau_rst_abs_pre': upd_raw_tau_rst_abs_pre,
+            'update_cap_raw_tau_rst_abs_post': upd_raw_tau_rst_abs_post,
+            'update_cap_raw_tau_rst_scale': upd_raw_tau_rst_scale,
+            'update_cap_raw_tau_rst_hit': upd_raw_tau_rst_hit,
             'update_cap_scan_attn_abs_pre': upd_scan_attn_abs_pre,
             'update_cap_scan_attn_abs_post': upd_scan_attn_abs_post,
             'update_cap_scan_attn_scale': upd_scan_attn_scale,
@@ -3443,6 +3710,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'explore_loss_weighted': float(m.get('explore_loss_weighted', 0.0)),
         'exploration_loss_raw_total': float(m.get(
             'exploration_loss_raw_total', m.get('explore_loss_raw', 0.0))),
+        'exploration_loss_raw_qk': float(m.get(
+            'exploration_loss_raw_qk', m.get('explore_qk_raw', 0.0))),
+        'exploration_loss_raw_v': float(m.get(
+            'exploration_loss_raw_v', m.get('explore_v_raw', 0.0))),
         'exploration_loss_raw_attn': float(m.get(
             'exploration_loss_raw_attn', m.get('explore_attn_raw', 0.0))),
         'exploration_loss_raw_rst': float(m.get(
@@ -3451,6 +3722,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'exploration_weight_effective': float(m.get(
             'exploration_weight_effective', 0.0)),
         'exploration_asymmetry': float(m.get('exploration_asymmetry', 0.0)),
+        'exploration_loss_weighted_qk': float(m.get(
+            'exploration_loss_weighted_qk', 0.0)),
+        'exploration_loss_weighted_v': float(m.get(
+            'exploration_loss_weighted_v', 0.0)),
         'exploration_loss_weighted_attn': float(m.get(
             'exploration_loss_weighted_attn', 0.0)),
         'exploration_loss_weighted_rst': float(m.get(
@@ -3458,6 +3733,8 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'exploration_loss_weighted_total': float(m.get(
             'exploration_loss_weighted_total', m.get('explore_loss_weighted', 0.0))),
         'exploration_raw_pre_bound': float(m.get('exploration_raw_pre_bound', 0.0)),
+        'exploration_qk_pre_bound': float(m.get('exploration_qk_pre_bound', 0.0)),
+        'exploration_v_pre_bound': float(m.get('exploration_v_pre_bound', 0.0)),
         'exploration_raw_post_bound': float(m.get('exploration_raw_post_bound', 0.0)),
         # Accuracy / training status.
         'accuracy': win_avgs['acc'],
@@ -3468,6 +3745,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'grad_pos_emb': float(m.get('grad_pos_emb', 0.0)),
         'grad_router_proj_attn': float(m.get('grad_router_proj_attn', 0.0)),
         'grad_router_proj_rst': float(m.get('grad_router_proj_rst', 0.0)),
+        'grad_router_raw_tau_qk': float(m.get('grad_router_raw_tau_qk', 0.0)),
+        'grad_router_raw_tau_v': float(m.get('grad_router_raw_tau_v', 0.0)),
+        'grad_router_raw_tau_rst': float(m.get('grad_router_raw_tau_rst', 0.0)),
         'grad_router_tau_attn': float(m.get('grad_router_tau_attn', 0.0)),
         'grad_router_tau_rst': float(m.get('grad_router_tau_rst', 0.0)),
         'grad_router_scan_attn': float(m.get('grad_router_scan_attn', 0.0)),
@@ -3488,6 +3768,9 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             'grad_lm_head_or_token_tied', 0.0)),
         'grad_router_proj_attn_per_layer': _arr('grad_router_proj_attn_per_layer'),
         'grad_router_proj_rst_per_layer': _arr('grad_router_proj_rst_per_layer'),
+        'grad_router_raw_tau_qk_per_layer': _arr('grad_router_raw_tau_qk_per_layer'),
+        'grad_router_raw_tau_v_per_layer': _arr('grad_router_raw_tau_v_per_layer'),
+        'grad_router_raw_tau_rst_per_layer': _arr('grad_router_raw_tau_rst_per_layer'),
         'grad_router_tau_attn_per_layer': _arr('grad_router_tau_attn_per_layer'),
         'grad_router_tau_rst_per_layer': _arr('grad_router_tau_rst_per_layer'),
         'grad_pool_attn_qk_rw': _arr('grad_pool_attn_qk_rw'),
@@ -3529,6 +3812,19 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'update_cap_tau_rst_abs_post': float(m.get('update_cap_tau_rst_abs_post', 0.0)),
         'update_cap_tau_rst_scale': float(m.get('update_cap_tau_rst_scale', 1.0)),
         'update_cap_tau_rst_hit': float(m.get('update_cap_tau_rst_hit', 0.0)),
+        'update_cap_raw_tau_enabled': float(m.get('update_cap_raw_tau_enabled', 0.0)),
+        'update_cap_raw_tau_qk_abs_pre': float(m.get('update_cap_raw_tau_qk_abs_pre', 0.0)),
+        'update_cap_raw_tau_qk_abs_post': float(m.get('update_cap_raw_tau_qk_abs_post', 0.0)),
+        'update_cap_raw_tau_qk_scale': float(m.get('update_cap_raw_tau_qk_scale', 1.0)),
+        'update_cap_raw_tau_qk_hit': float(m.get('update_cap_raw_tau_qk_hit', 0.0)),
+        'update_cap_raw_tau_v_abs_pre': float(m.get('update_cap_raw_tau_v_abs_pre', 0.0)),
+        'update_cap_raw_tau_v_abs_post': float(m.get('update_cap_raw_tau_v_abs_post', 0.0)),
+        'update_cap_raw_tau_v_scale': float(m.get('update_cap_raw_tau_v_scale', 1.0)),
+        'update_cap_raw_tau_v_hit': float(m.get('update_cap_raw_tau_v_hit', 0.0)),
+        'update_cap_raw_tau_rst_abs_pre': float(m.get('update_cap_raw_tau_rst_abs_pre', 0.0)),
+        'update_cap_raw_tau_rst_abs_post': float(m.get('update_cap_raw_tau_rst_abs_post', 0.0)),
+        'update_cap_raw_tau_rst_scale': float(m.get('update_cap_raw_tau_rst_scale', 1.0)),
+        'update_cap_raw_tau_rst_hit': float(m.get('update_cap_raw_tau_rst_hit', 0.0)),
         'update_cap_scan_attn_abs_pre': float(m.get('update_cap_scan_attn_abs_pre', 0.0)),
         'update_cap_scan_attn_abs_post': float(m.get('update_cap_scan_attn_abs_post', 0.0)),
         'update_cap_scan_attn_scale': float(m.get('update_cap_scan_attn_scale', 1.0)),
@@ -3793,10 +4089,18 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rpe_dev_neg': float(m.get('rpe_dev_neg', m.get('dev_neg_max', 0.0))),
         'rpe_block_attn': float(m.get(
             'rpe_block_attn', m.get('explore_block_frac_a', 0.0))),
+        'rpe_block_qk': float(m.get(
+            'rpe_block_qk', m.get('explore_block_frac_qk', 0.0))),
+        'rpe_block_v': float(m.get(
+            'rpe_block_v', m.get('explore_block_frac_v', 0.0))),
         'rpe_block_rst': float(m.get(
             'rpe_block_rst', m.get('explore_block_frac_k', 0.0))),
+        'explore_qk_raw': float(m.get('explore_qk_raw', 0.0)),
+        'explore_v_raw': float(m.get('explore_v_raw', 0.0)),
         'explore_attn_raw': float(m.get('explore_attn_raw', 0.0)),
         'explore_rst_raw': float(m.get('explore_rst_raw', 0.0)),
+        'explore_block_frac_qk': float(m.get('explore_block_frac_qk', 0.0)),
+        'explore_block_frac_v': float(m.get('explore_block_frac_v', 0.0)),
         'explore_block_frac_a': float(m.get('explore_block_frac_a', 0.0)),
         'explore_block_frac_k': float(m.get('explore_block_frac_k', 0.0)),
         'dev_pos_max': float(m.get('dev_pos_max', 0.0)),
@@ -4061,31 +4365,73 @@ def _print_regular_block(rec, ctx):
         rec.get('update_cap_emb_rst_scale', 1.0),
         rec.get('update_cap_tau_attn_scale', 1.0),
         rec.get('update_cap_tau_rst_scale', 1.0),
+        rec.get('update_cap_raw_tau_qk_scale', 1.0),
+        rec.get('update_cap_raw_tau_v_scale', 1.0),
+        rec.get('update_cap_raw_tau_rst_scale', 1.0),
         rec.get('update_cap_scan_attn_scale', 1.0),
         rec.get('update_cap_scan_rst_scale', 1.0),
     )
-    log_message(
-        f"  update_cap: hit[pA={rec.get('update_cap_proj_attn_hit', 0.0):.0f}"
-        f" pR={rec.get('update_cap_proj_rst_hit', 0.0):.0f}"
-        f" eQ={rec.get('update_cap_emb_qk_hit', 0.0):.0f}"
-        f" eV={rec.get('update_cap_emb_v_hit', 0.0):.0f}"
-        f" eR={rec.get('update_cap_emb_rst_hit', 0.0):.0f}"
-        f" tA={rec.get('update_cap_tau_attn_hit', 0.0):.0f}"
-        f" tR={rec.get('update_cap_tau_rst_hit', 0.0):.0f}"
-        f" sA={rec.get('update_cap_scan_attn_hit', 0.0):.0f}"
-        f" sR={rec.get('update_cap_scan_rst_hit', 0.0):.0f}]"
-        f" scale_min={_cap_scale_min:.3f}"
-        f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
-        f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
-        f" emb_pre[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
-        f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
-        f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
-        f" tau_pre[a={rec.get('update_cap_tau_attn_abs_pre', 0.0):.1e}"
-        f" r={rec.get('update_cap_tau_rst_abs_pre', 0.0):.1e}]"
-        f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
-        f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
-    )
-    _cap_window_line = _format_update_cap_window_line(rec, indent="  ")
+    if is_v4160:
+        raw_tau_part = ""
+        raw_tau_hit_part = ""
+        if rec.get('update_cap_raw_tau_enabled', 0.0) > 0.0:
+            raw_tau_hit_part = (
+                f" rQ={rec.get('update_cap_raw_tau_qk_hit', 0.0):.0f}"
+                f" rV={rec.get('update_cap_raw_tau_v_hit', 0.0):.0f}"
+                f" rR={rec.get('update_cap_raw_tau_rst_hit', 0.0):.0f}")
+            raw_tau_part = (
+                f" raw_tau[qk pre={rec.get('update_cap_raw_tau_qk_abs_pre', 0.0):.1e}"
+                f" post={rec.get('update_cap_raw_tau_qk_abs_post', 0.0):.1e}"
+                f" hit={rec.get('update_cap_raw_tau_qk_hit', 0.0):.0f};"
+                f" v pre={rec.get('update_cap_raw_tau_v_abs_pre', 0.0):.1e}"
+                f" post={rec.get('update_cap_raw_tau_v_abs_post', 0.0):.1e}"
+                f" hit={rec.get('update_cap_raw_tau_v_hit', 0.0):.0f};"
+                f" rst pre={rec.get('update_cap_raw_tau_rst_abs_pre', 0.0):.1e}"
+                f" post={rec.get('update_cap_raw_tau_rst_abs_post', 0.0):.1e}"
+                f" hit={rec.get('update_cap_raw_tau_rst_hit', 0.0):.0f}]")
+        log_message(
+            f"  update_cap: hit[pA={rec.get('update_cap_proj_attn_hit', 0.0):.0f}"
+            f" pR={rec.get('update_cap_proj_rst_hit', 0.0):.0f}"
+            f" eQ={rec.get('update_cap_emb_qk_hit', 0.0):.0f}"
+            f" eV={rec.get('update_cap_emb_v_hit', 0.0):.0f}"
+            f" eR={rec.get('update_cap_emb_rst_hit', 0.0):.0f}"
+            f"{raw_tau_hit_part}"
+            f" sA={rec.get('update_cap_scan_attn_hit', 0.0):.0f}"
+            f" sR={rec.get('update_cap_scan_rst_hit', 0.0):.0f}]"
+            f" scale_min={_cap_scale_min:.3f}"
+            f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
+            f" emb_pre[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
+            f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
+            f"{raw_tau_part}"
+            f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
+        )
+    else:
+        log_message(
+            f"  update_cap: hit[pA={rec.get('update_cap_proj_attn_hit', 0.0):.0f}"
+            f" pR={rec.get('update_cap_proj_rst_hit', 0.0):.0f}"
+            f" eQ={rec.get('update_cap_emb_qk_hit', 0.0):.0f}"
+            f" eV={rec.get('update_cap_emb_v_hit', 0.0):.0f}"
+            f" eR={rec.get('update_cap_emb_rst_hit', 0.0):.0f}"
+            f" tA={rec.get('update_cap_tau_attn_hit', 0.0):.0f}"
+            f" tR={rec.get('update_cap_tau_rst_hit', 0.0):.0f}"
+            f" sA={rec.get('update_cap_scan_attn_hit', 0.0):.0f}"
+            f" sR={rec.get('update_cap_scan_rst_hit', 0.0):.0f}]"
+            f" scale_min={_cap_scale_min:.3f}"
+            f" proj_pre[a={rec.get('update_cap_proj_attn_ratio_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_proj_rst_ratio_pre', 0.0):.1e}]"
+            f" emb_pre[q={rec.get('update_cap_emb_qk_ratio_pre', 0.0):.1e}"
+            f" v={rec.get('update_cap_emb_v_ratio_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_emb_rst_ratio_pre', 0.0):.1e}]"
+            f" tau_pre[a={rec.get('update_cap_tau_attn_abs_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_tau_rst_abs_pre', 0.0):.1e}]"
+            f" scan_pre[a={rec.get('update_cap_scan_attn_abs_pre', 0.0):.1e}"
+            f" r={rec.get('update_cap_scan_rst_abs_pre', 0.0):.1e}]"
+        )
+    _cap_window_line = _format_update_cap_window_line(
+        rec, indent="  ", is_v4160=is_v4160)
     if _cap_window_line:
         log_message(_cap_window_line)
     if is_v4160:
@@ -4180,16 +4526,35 @@ def _print_regular_block(rec, ctx):
         f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
         f" max={rec['rst_op_gain_max']:.2f}]"
     )
-    log_message(
-        f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-        f" pos={rec['pos_frac']*100:.1f}%"
-        f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-        f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-        f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
-        f" w={rec['explore_loss_weighted']:+.4f}"
-        f" block[a={rec['explore_block_frac_a']*100:.1f}%"
-        f" rst={rec['explore_block_frac_k']*100:.1f}%]"
-    )
+    if is_v4160:
+        log_message(
+            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+            f" pos={rec['pos_frac']*100:.1f}%"
+            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+            f" expl[qk={rec['explore_qk_raw']:+.3f}"
+            f" v={rec['explore_v_raw']:+.3f}"
+            f" rst={rec['explore_rst_raw']:+.3f}"
+            f" total={rec['explore_loss_raw']:+.3f}]"
+            f" weighted[qk={rec['exploration_loss_weighted_qk']:+.4f}"
+            f" v={rec['exploration_loss_weighted_v']:+.4f}"
+            f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
+            f" total={rec['explore_loss_weighted']:+.4f}]"
+            f" block[qk={rec['explore_block_frac_qk']*100:.1f}%"
+            f" v={rec['explore_block_frac_v']*100:.1f}%"
+            f" rst={rec['explore_block_frac_k']*100:.1f}%]"
+        )
+    else:
+        log_message(
+            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+            f" pos={rec['pos_frac']*100:.1f}%"
+            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+            f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
+            f" w={rec['explore_loss_weighted']:+.4f}"
+            f" block[a={rec['explore_block_frac_a']*100:.1f}%"
+            f" rst={rec['explore_block_frac_k']*100:.1f}%]"
+        )
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
     _pl_k = rec.get('per_layer_rst_out_norm', []) or []
     if _pl_a or _pl_k:
@@ -4201,6 +4566,101 @@ def _print_regular_block(rec, ctx):
         f"  time: {format_time(ctx['epoch_elapsed'])}<{format_time(ctx['eta'])},"
         f" {ctx['s_per_it']:.2f}s/it"
     )
+
+
+def _dead_trigger_info(rec, ctx=None):
+    ctx = ctx or {}
+
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+
+    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
+    if is_v4160:
+        qk_count = _g('attn_qk_dead_count')
+        v_count = _g('attn_v_dead_count')
+        rst_count = _g('rst_dead_count')
+        qk_dead_frac = _g('attn_qk_dead_exposure_frac')
+        v_dead_frac = _g('attn_v_dead_exposure_frac')
+        rst_dead_frac = _g('rst_dead_exposure_frac')
+        qk_weak_frac = _g('attn_qk_weak_exposure_frac')
+        v_weak_frac = _g('attn_v_weak_exposure_frac')
+        rst_weak_frac = _g('rst_weak_exposure_frac')
+    else:
+        qk_count = _g('attn_dead_count')
+        v_count = 0.0
+        rst_count = _g('rst_dead_count')
+        qk_dead_frac = _g('attn_dead_exposure_frac')
+        v_dead_frac = 0.0
+        rst_dead_frac = _g('rst_dead_exposure_frac')
+        qk_weak_frac = _g('attn_weak_exposure_frac')
+        v_weak_frac = 0.0
+        rst_weak_frac = _g('rst_weak_exposure_frac')
+
+    total_count = _g('dead_count_total', qk_count + v_count + rst_count)
+    dead_raw = _g('dead_penalty_raw_total', _g('dead_penalty'))
+    dead_w = _g('dead_penalty_weighted_total', _g('dead_penalty_weighted'))
+    max_dead_frac = max(qk_dead_frac, v_dead_frac, rst_dead_frac)
+    max_weak_frac = max(qk_weak_frac, v_weak_frac, rst_weak_frac)
+
+    checks = []
+    count_threshold = float(ctx.get('collapse_warn_dead_count_threshold', 100.0))
+    if count_threshold > 0.0:
+        checks.append(('dead_count', total_count, count_threshold))
+    raw_threshold = float(ctx.get('collapse_warn_dead_raw_threshold', 0.0))
+    if raw_threshold > 0.0:
+        checks.append(('raw_dead_sum', dead_raw, raw_threshold))
+    weighted_threshold = float(ctx.get('collapse_warn_dead_weighted_threshold', 0.0))
+    if weighted_threshold > 0.0:
+        checks.append(('dead_weighted', dead_w, weighted_threshold))
+    dead_frac_threshold = float(ctx.get('collapse_warn_dead_frac_threshold', 0.0))
+    if dead_frac_threshold > 0.0:
+        checks.append(('dead_frac', max_dead_frac, dead_frac_threshold))
+    weak_frac_threshold = float(ctx.get('collapse_warn_weak_frac_threshold', 0.0))
+    if weak_frac_threshold > 0.0:
+        checks.append(('weak_frac', max_weak_frac, weak_frac_threshold))
+
+    fired = [(name, value, threshold)
+             for name, value, threshold in checks if value > threshold]
+    return {
+        'triggered': bool(fired),
+        'trigger_reason': '+'.join(name for name, _, _ in fired) if fired else 'none',
+        'threshold_used': '+'.join(
+            f'{name}>{threshold:g}' for name, _, threshold in fired) if fired else 'none',
+        'dead_raw': dead_raw,
+        'dead_w': dead_w,
+        'dead_count_qk': qk_count,
+        'dead_count_v': v_count,
+        'dead_count_rst': rst_count,
+        'dead_frac_qk': qk_dead_frac,
+        'dead_frac_v': v_dead_frac,
+        'dead_frac_rst': rst_dead_frac,
+        'weak_frac_qk': qk_weak_frac,
+        'weak_frac_v': v_weak_frac,
+        'weak_frac_rst': rst_weak_frac,
+    }
+
+
+def _log_dead_trigger(rec, ctx, log_fn):
+    info = _dead_trigger_info(rec, ctx)
+    log_fn("dead_trigger:")
+    log_fn(
+        f"  dead_raw={info['dead_raw']:.6f} "
+        f"dead_w={info['dead_w']:.6f}")
+    log_fn(
+        f"  dead_count[qk={info['dead_count_qk']:.1f} "
+        f"v={info['dead_count_v']:.1f} "
+        f"rst={info['dead_count_rst']:.1f}]")
+    log_fn(
+        f"  dead_frac[qk={info['dead_frac_qk']:.6f} "
+        f"v={info['dead_frac_v']:.6f} "
+        f"rst={info['dead_frac_rst']:.6f}]")
+    log_fn(
+        f"  weak_frac[qk={info['weak_frac_qk']:.6f} "
+        f"v={info['weak_frac_v']:.6f} "
+        f"rst={info['weak_frac_rst']:.6f}]")
+    log_fn(
+        f"  threshold_used={info['threshold_used']} "
+        f"trigger_reason={info['trigger_reason']}")
 
 
 def _collapse_reasons(rec, ctx=None):
@@ -4219,7 +4679,7 @@ def _collapse_reasons(rec, ctx=None):
         reasons.append('grad_spike')
     if _g('total_loss_minus_ce') > 5.0:
         reasons.append('loss_minus_ce_spike')
-    if _g('dead_count_total', _g('attn_dead_count') + _g('rst_dead_count')) > 100.0:
+    if _dead_trigger_info(rec, ctx)['triggered']:
         reasons.append('dead_spike')
     if max(_g('attn_int_cap_frac'), _g('rst_int_cap_frac')) > 0.001:
         reasons.append('int_cap_hit')
@@ -4685,16 +5145,26 @@ def _fmt_grad_array(rec, key):
     return "[" + ", ".join(f"{float(v):.6g}" for v in arr) + "]"
 
 
-def _print_grad_layer_block(rec):
+def _print_grad_layer_block(rec, is_v4160=False):
     if 'grad_expand_O_per_layer' not in rec:
         return
     log_debug_message("[GRAD_LAYER]")
     log_debug_message(
         "shared_note=router/pool_rw are shared params; single-entry arrays are pool-level")
-    for label, key in (
+    if is_v4160:
+        raw_tau_items = (
+            ('raw_tau_qk', 'grad_router_raw_tau_qk_per_layer'),
+            ('raw_tau_v', 'grad_router_raw_tau_v_per_layer'),
+            ('raw_tau_rst', 'grad_router_raw_tau_rst_per_layer'),
+        )
+    else:
+        raw_tau_items = (
             ('router_tau_attn', 'grad_router_tau_attn_per_layer'),
-            ('router_proj_attn', 'grad_router_proj_attn_per_layer'),
             ('router_tau_rst', 'grad_router_tau_rst_per_layer'),
+        )
+    for label, key in (
+            *raw_tau_items,
+            ('router_proj_attn', 'grad_router_proj_attn_per_layer'),
             ('router_proj_rst', 'grad_router_proj_rst_per_layer'),
             ('qk_rw_read_write', 'grad_pool_attn_qk_rw'),
             ('v_rw_read_write', 'grad_pool_attn_v_rw'),
@@ -4831,26 +5301,53 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_qk_dead_exposure_target'):.5f}"
         )
-    log_debug_message(
-        f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
-        f"w_eff={_g('exploration_weight_effective'):.6f} "
-        f"asym={_g('exploration_asymmetry'):.3f} "
-        f"raw[a={_g('exploration_loss_raw_attn', _g('explore_attn_raw')):+.6f} "
-        f"rst={_g('exploration_loss_raw_rst', _g('explore_rst_raw')):+.6f} "
-        f"total={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f}] "
-        f"weighted[a={_g('exploration_loss_weighted_attn'):+.6f} "
-        f"rst={_g('exploration_loss_weighted_rst'):+.6f} "
-        f"total={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f}] "
-        f"pre_bound={_g('exploration_raw_pre_bound'):+.6f} "
-        f"post_bound={_g('exploration_raw_post_bound'):+.6f} "
-        f"rpe[pos_frac={_g('rpe_pos_frac', _g('pos_frac')):.3f} "
-        f"pos_avg={_g('rpe_pos_avg', _g('pos_mean')):.4f} "
-        f"neg_avg={_g('rpe_neg_avg', _g('neg_mean')):.4f} "
-        f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
-        f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
-        f"block_attn={_g('rpe_block_attn', _g('explore_block_frac_a')):.3f} "
-        f"block_rst={_g('rpe_block_rst', _g('explore_block_frac_k')):.3f}]"
-    )
+    if is_v4160:
+        log_debug_message(
+            f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
+            f"w_eff={_g('exploration_weight_effective'):.6f} "
+            f"asym={_g('exploration_asymmetry'):.3f} "
+            f"raw[qk={_g('exploration_loss_raw_qk', _g('explore_qk_raw')):+.6f} "
+            f"v={_g('exploration_loss_raw_v', _g('explore_v_raw')):+.6f} "
+            f"rst={_g('exploration_loss_raw_rst', _g('explore_rst_raw')):+.6f} "
+            f"total={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f}] "
+            f"weighted[qk={_g('exploration_loss_weighted_qk'):+.6f} "
+            f"v={_g('exploration_loss_weighted_v'):+.6f} "
+            f"rst={_g('exploration_loss_weighted_rst'):+.6f} "
+            f"total={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f}] "
+            f"pre_bound[qk={_g('exploration_qk_pre_bound'):+.6f} "
+            f"v={_g('exploration_v_pre_bound'):+.6f} "
+            f"total={_g('exploration_raw_pre_bound'):+.6f}] "
+            f"post_bound={_g('exploration_raw_post_bound'):+.6f} "
+            f"rpe[pos_frac={_g('rpe_pos_frac', _g('pos_frac')):.3f} "
+            f"pos_avg={_g('rpe_pos_avg', _g('pos_mean')):.4f} "
+            f"neg_avg={_g('rpe_neg_avg', _g('neg_mean')):.4f} "
+            f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
+            f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
+            f"block[qk={_g('rpe_block_qk', _g('explore_block_frac_qk')):.3f} "
+            f"v={_g('rpe_block_v', _g('explore_block_frac_v')):.3f} "
+            f"rst={_g('rpe_block_rst', _g('explore_block_frac_k')):.3f}]]"
+        )
+    else:
+        log_debug_message(
+            f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
+            f"w_eff={_g('exploration_weight_effective'):.6f} "
+            f"asym={_g('exploration_asymmetry'):.3f} "
+            f"raw[a={_g('exploration_loss_raw_attn', _g('explore_attn_raw')):+.6f} "
+            f"rst={_g('exploration_loss_raw_rst', _g('explore_rst_raw')):+.6f} "
+            f"total={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f}] "
+            f"weighted[a={_g('exploration_loss_weighted_attn'):+.6f} "
+            f"rst={_g('exploration_loss_weighted_rst'):+.6f} "
+            f"total={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f}] "
+            f"pre_bound={_g('exploration_raw_pre_bound'):+.6f} "
+            f"post_bound={_g('exploration_raw_post_bound'):+.6f} "
+            f"rpe[pos_frac={_g('rpe_pos_frac', _g('pos_frac')):.3f} "
+            f"pos_avg={_g('rpe_pos_avg', _g('pos_mean')):.4f} "
+            f"neg_avg={_g('rpe_neg_avg', _g('neg_mean')):.4f} "
+            f"dev_pos={_g('rpe_dev_pos', _g('dev_pos_max')):.4f} "
+            f"dev_neg={_g('rpe_dev_neg', _g('dev_neg_max')):.4f} "
+            f"block_attn={_g('rpe_block_attn', _g('explore_block_frac_a')):.3f} "
+            f"block_rst={_g('rpe_block_rst', _g('explore_block_frac_k')):.3f}]"
+        )
     if is_v4160:
         log_debug_message(
             f"route_diag: active_n[qk={_g('attn_qk_active') * ctx.get('n_qk_cfg', 0):.1f} "
@@ -5008,6 +5505,19 @@ def _print_debug_block(rec, ctx):
     _print_local_spike_inline_block(rec)
     _print_local_spike_block(rec)
     _print_attention_local_block(rec)
+    if is_v4160:
+        log_debug_message(
+            f"raw_tau_grad[qk={_g('grad_router_raw_tau_qk'):.6f} "
+            f"v={_g('grad_router_raw_tau_v'):.6f} "
+            f"rst={_g('grad_router_raw_tau_rst'):.6f}]")
+        tau_grad_part = (
+            f"router_raw_tau_qk={_g('grad_router_raw_tau_qk'):.6f} "
+            f"router_raw_tau_v={_g('grad_router_raw_tau_v'):.6f} "
+            f"router_raw_tau_rst={_g('grad_router_raw_tau_rst'):.6f} ")
+    else:
+        tau_grad_part = (
+            f"router_tau_attn={_g('grad_router_tau_attn'):.6f} "
+            f"router_tau_rst={_g('grad_router_tau_rst'):.6f} ")
     log_debug_message(
         f"grad_groups: global_pre={_g('grad_global_preclip', _g('grad_norm')):.6f} "
         f"global_post={_g('grad_global_postclip'):.6f} "
@@ -5015,8 +5525,7 @@ def _print_debug_block(rec, ctx):
         f"pos_emb={_g('grad_pos_emb'):.6f} "
         f"router_proj_attn={_g('grad_router_proj_attn'):.6f} "
         f"router_proj_rst={_g('grad_router_proj_rst'):.6f} "
-        f"router_tau_attn={_g('grad_router_tau_attn'):.6f} "
-        f"router_tau_rst={_g('grad_router_tau_rst'):.6f} "
+        f"{tau_grad_part}"
         f"router_scan_attn={_g('grad_router_scan_attn'):.6f} "
         f"router_scan_rst={_g('grad_router_scan_rst'):.6f} "
         f"qk_rw={_g('grad_pool_attn_qk_read'):.6f}/{_g('grad_pool_attn_qk_write'):.6f} "
@@ -5027,46 +5536,89 @@ def _print_debug_block(rec, ctx):
         f"ln={_g('grad_layernorms'):.6f} "
         f"lm_head_or_token_tied={_g('grad_lm_head_or_token_tied'):.6f}"
     )
-    log_debug_message(
-        f"update_cap: proj[a pre={_g('update_cap_proj_attn_ratio_pre'):.2e} "
-        f"post={_g('update_cap_proj_attn_ratio_post'):.2e} "
-        f"s={_g('update_cap_proj_attn_scale', 1.0):.2e} "
-        f"hit={_g('update_cap_proj_attn_hit'):.0f}; "
-        f"rst pre={_g('update_cap_proj_rst_ratio_pre'):.2e} "
-        f"post={_g('update_cap_proj_rst_ratio_post'):.2e} "
-        f"s={_g('update_cap_proj_rst_scale', 1.0):.2e} "
-        f"hit={_g('update_cap_proj_rst_hit'):.0f}] "
-        f"emb[qk pre={_g('update_cap_emb_qk_ratio_pre'):.2e} "
-        f"post={_g('update_cap_emb_qk_ratio_post'):.2e} "
-        f"hit={_g('update_cap_emb_qk_hit'):.0f}; "
-        f"v pre={_g('update_cap_emb_v_ratio_pre'):.2e} "
-        f"post={_g('update_cap_emb_v_ratio_post'):.2e} "
-        f"hit={_g('update_cap_emb_v_hit'):.0f}; "
-        f"rst pre={_g('update_cap_emb_rst_ratio_pre'):.2e} "
-        f"post={_g('update_cap_emb_rst_ratio_post'):.2e} "
-        f"hit={_g('update_cap_emb_rst_hit'):.0f}] "
-        f"tau[a pre={_g('update_cap_tau_attn_abs_pre'):.2e} "
-        f"post={_g('update_cap_tau_attn_abs_post'):.2e} "
-        f"hit={_g('update_cap_tau_attn_hit'):.0f}; "
-        f"rst pre={_g('update_cap_tau_rst_abs_pre'):.2e} "
-        f"post={_g('update_cap_tau_rst_abs_post'):.2e} "
-        f"hit={_g('update_cap_tau_rst_hit'):.0f}] "
-        f"scan[a pre={_g('update_cap_scan_attn_abs_pre'):.2e} "
-        f"post={_g('update_cap_scan_attn_abs_post'):.2e} "
-        f"hit={_g('update_cap_scan_attn_hit'):.0f}; "
-        f"rst pre={_g('update_cap_scan_rst_abs_pre'):.2e} "
-        f"post={_g('update_cap_scan_rst_abs_post'):.2e} "
-        f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
-    )
-    _cap_window_line = _format_update_cap_window_line(rec, indent="")
+    if is_v4160:
+        raw_tau_part = ""
+        if _g('update_cap_raw_tau_enabled') > 0.0:
+            raw_tau_part = (
+                f"raw_tau[qk pre={_g('update_cap_raw_tau_qk_abs_pre'):.2e} "
+                f"post={_g('update_cap_raw_tau_qk_abs_post'):.2e} "
+                f"hit={_g('update_cap_raw_tau_qk_hit'):.0f}; "
+                f"v pre={_g('update_cap_raw_tau_v_abs_pre'):.2e} "
+                f"post={_g('update_cap_raw_tau_v_abs_post'):.2e} "
+                f"hit={_g('update_cap_raw_tau_v_hit'):.0f}; "
+                f"rst pre={_g('update_cap_raw_tau_rst_abs_pre'):.2e} "
+                f"post={_g('update_cap_raw_tau_rst_abs_post'):.2e} "
+                f"hit={_g('update_cap_raw_tau_rst_hit'):.0f}] ")
+        log_debug_message(
+            f"update_cap: proj[a pre={_g('update_cap_proj_attn_ratio_pre'):.2e} "
+            f"post={_g('update_cap_proj_attn_ratio_post'):.2e} "
+            f"s={_g('update_cap_proj_attn_scale', 1.0):.2e} "
+            f"hit={_g('update_cap_proj_attn_hit'):.0f}; "
+            f"rst pre={_g('update_cap_proj_rst_ratio_pre'):.2e} "
+            f"post={_g('update_cap_proj_rst_ratio_post'):.2e} "
+            f"s={_g('update_cap_proj_rst_scale', 1.0):.2e} "
+            f"hit={_g('update_cap_proj_rst_hit'):.0f}] "
+            f"emb[qk pre={_g('update_cap_emb_qk_ratio_pre'):.2e} "
+            f"post={_g('update_cap_emb_qk_ratio_post'):.2e} "
+            f"hit={_g('update_cap_emb_qk_hit'):.0f}; "
+            f"v pre={_g('update_cap_emb_v_ratio_pre'):.2e} "
+            f"post={_g('update_cap_emb_v_ratio_post'):.2e} "
+            f"hit={_g('update_cap_emb_v_hit'):.0f}; "
+            f"rst pre={_g('update_cap_emb_rst_ratio_pre'):.2e} "
+            f"post={_g('update_cap_emb_rst_ratio_post'):.2e} "
+            f"hit={_g('update_cap_emb_rst_hit'):.0f}] "
+            f"{raw_tau_part}"
+            f"scan[a pre={_g('update_cap_scan_attn_abs_pre'):.2e} "
+            f"post={_g('update_cap_scan_attn_abs_post'):.2e} "
+            f"hit={_g('update_cap_scan_attn_hit'):.0f}; "
+            f"rst pre={_g('update_cap_scan_rst_abs_pre'):.2e} "
+            f"post={_g('update_cap_scan_rst_abs_post'):.2e} "
+            f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
+        )
+    else:
+        log_debug_message(
+            f"update_cap: proj[a pre={_g('update_cap_proj_attn_ratio_pre'):.2e} "
+            f"post={_g('update_cap_proj_attn_ratio_post'):.2e} "
+            f"s={_g('update_cap_proj_attn_scale', 1.0):.2e} "
+            f"hit={_g('update_cap_proj_attn_hit'):.0f}; "
+            f"rst pre={_g('update_cap_proj_rst_ratio_pre'):.2e} "
+            f"post={_g('update_cap_proj_rst_ratio_post'):.2e} "
+            f"s={_g('update_cap_proj_rst_scale', 1.0):.2e} "
+            f"hit={_g('update_cap_proj_rst_hit'):.0f}] "
+            f"emb[qk pre={_g('update_cap_emb_qk_ratio_pre'):.2e} "
+            f"post={_g('update_cap_emb_qk_ratio_post'):.2e} "
+            f"hit={_g('update_cap_emb_qk_hit'):.0f}; "
+            f"v pre={_g('update_cap_emb_v_ratio_pre'):.2e} "
+            f"post={_g('update_cap_emb_v_ratio_post'):.2e} "
+            f"hit={_g('update_cap_emb_v_hit'):.0f}; "
+            f"rst pre={_g('update_cap_emb_rst_ratio_pre'):.2e} "
+            f"post={_g('update_cap_emb_rst_ratio_post'):.2e} "
+            f"hit={_g('update_cap_emb_rst_hit'):.0f}] "
+            f"tau[a pre={_g('update_cap_tau_attn_abs_pre'):.2e} "
+            f"post={_g('update_cap_tau_attn_abs_post'):.2e} "
+            f"hit={_g('update_cap_tau_attn_hit'):.0f}; "
+            f"rst pre={_g('update_cap_tau_rst_abs_pre'):.2e} "
+            f"post={_g('update_cap_tau_rst_abs_post'):.2e} "
+            f"hit={_g('update_cap_tau_rst_hit'):.0f}] "
+            f"scan[a pre={_g('update_cap_scan_attn_abs_pre'):.2e} "
+            f"post={_g('update_cap_scan_attn_abs_post'):.2e} "
+            f"hit={_g('update_cap_scan_attn_hit'):.0f}; "
+            f"rst pre={_g('update_cap_scan_rst_abs_pre'):.2e} "
+            f"post={_g('update_cap_scan_rst_abs_post'):.2e} "
+            f"hit={_g('update_cap_scan_rst_hit'):.0f}]"
+        )
+    _cap_window_line = _format_update_cap_window_line(
+        rec, indent="", is_v4160=is_v4160)
     if _cap_window_line:
         log_debug_message(_cap_window_line)
-    _print_grad_layer_block(rec)
+    _print_grad_layer_block(rec, is_v4160=is_v4160)
     _print_drop_compare_block(rec)
     reasons = _collapse_reasons(rec, ctx)
     if reasons:
         log_debug_message(
             f"[COLLAPSE_WARN] step={step} reasons={','.join(reasons)}")
+        if 'dead_spike' in reasons:
+            _log_dead_trigger(rec, ctx, log_debug_message)
     log_debug_message("")
 
 
@@ -5107,6 +5659,8 @@ def _print_debug_analysis_block(rec, ctx):
     if reasons:
         log_debug_message(
             f"[COLLAPSE_WARN] step={rec.get('step', 0)} reasons={','.join(reasons)}")
+        if 'dead_spike' in reasons:
+            _log_dead_trigger(rec, ctx, log_debug_message)
     log_debug_message("")
 
 
