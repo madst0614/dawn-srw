@@ -13,7 +13,6 @@
 #   - scan is disabled to reduce variables in this stability test.
 
 seed: 1
-use_amp: true
 
 data:
   bin_train: gs://dawn-tpu-data-c4/c4_train_40B
@@ -44,7 +43,6 @@ model:
   dropout: 0.0
   router_dropout: 0.0
   gradient_checkpointing: true
-  fixed_depth_pool_scale: true
 
 training:
   # Batch / schedule
@@ -63,12 +61,10 @@ training:
   # Angular Select / Intensity
   tau_min: 0.0
   intensity_beta: 0.5
-  intensity_squash: tanh
-  intensity_width: 1.0
 
   # Tau initialization / scan
   tau_offset_init_attn_qk: -0.5
-  tau_offset_init_attn_v: 1.0
+  tau_offset_init_attn_v: 1.5
   tau_offset_init_rst: 2.0
   scan_scale: 0.0
   scan_std_floor: 0.5
@@ -77,10 +73,7 @@ training:
   diversity_weight: 0.1
   load_balance_weight: 0.0
   dead_penalty_weight: 0.005
-  dead_penalty_mode: angular_exposure
   dead_exposure_target: 0.1
-  boundary_residency_weight: 0.0
-  boundary_residency_warmup_steps: 10000
 
   exploration_weight: 0.001
   exploration_asymmetry: 1.2
@@ -102,4 +95,3 @@ training:
   heavy_geometry_multiplier: 10
 
 checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4159_40M_c4_5B
-log_dir: gs://dawn-tpu-data-c4/logs/dawn_srw_v4159_40M_c4_5B
