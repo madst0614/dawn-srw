@@ -1,0 +1,113 @@
+# DAWN-SRW v4.1.6.1 DirectTau + CB1A - 400M config
+#
+# Policy:
+#   - Keep 400M-specific shape, C4-40B scale, TPU mesh, batch, and chunking.
+#   - Keep the v4.1.6.0 DirectTau forward rule unchanged.
+#   - Add CB1A as an auxiliary-only boundary audition loss.
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 40000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: spatial-r1-v4.1.6.1
+
+  # Transformer-scale backbone
+  d_model: 2304
+  n_layers: 18
+  n_heads: 36
+  max_seq_len: 512
+
+  # Route split
+  d_route: 256
+  d_select: 192        # remaining 64 dims are intensity dims
+
+  # Shared SRW pools
+  n_qk: 2330
+  n_v: 14640
+  n_know: 29130
+
+  # Execution / regularization
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+
+training:
+  # Batch / TPU layout / schedule
+  batch_size: 1024
+  mesh_model: 2
+  mesh_data: 16
+  gradient_accumulation_steps: 1
+  restore_training_config_on_resume: false
+  num_epochs: 1
+
+  # Optimizer
+  lr: 0.0003
+  warmup_ratio: 0.08
+  weight_decay: 0.1
+  pool_weight_decay: 0.02
+  tau_lr_mult: 0.1
+  tau_grad_clip: 1.0
+  router_proj_grad_clip: 2.0
+
+  # DirectTau Angular Select / Intensity
+  tau_init_attn_qk: 0.001
+  tau_init_attn_v: 0.08
+  tau_init_rst: 0.15
+  intensity_beta: 0.5
+
+  # Auxiliary losses
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  dead_penalty_weight: 0.005
+  dead_exposure_target: 0.1
+  dead_penalty_qk_weight: 1.0
+  dead_penalty_v_weight: 1.0
+  dead_penalty_rst_weight: 1.0
+
+  # CE-conditioned Boundary-1 Audition (CB1A)
+  cb1a_enabled: true
+  cb1a_weight: 0.001
+  cb1a_challenge_weight: 1.0
+  cb1a_prune_weight: 3.0
+  cb1a_qk_weight: 1.0
+  cb1a_v_weight: 1.0
+  cb1a_rst_weight: 1.0
+  cb1a_qk_challenge_weight: 1.0
+  cb1a_qk_prune_weight: 3.0
+  cb1a_v_challenge_weight: 1.0
+  cb1a_v_prune_weight: 3.0
+  cb1a_rst_challenge_weight: 1.0
+  cb1a_rst_prune_weight: 3.0
+  cb1a_tau_stopgrad: true
+  cb1a_anchor_stopgrad: true
+  cb1a_forward_influence: false
+  cb1a_ce_mode: sigmoid_z
+  cb1a_eps: 1.0e-8
+
+  # Exploration / RPE feedback over direct tau in [0, 1]
+  exploration_weight: 0.001
+  exploration_asymmetry: 3.0
+  exploration_warmup_steps: 0
+  exploration_lower_bound: 0.0
+  exploration_upper_bound: 0.95
+  exploration_bound_eps: 0.001
+
+  # Chunking - 400M-specific memory/mesh setting
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_know: 4
+
+  # Logging / diagnostics / checkpoints
+  checkpoint_interval: 200
+  val_interval: 1000
+  log_interval: 100
+  log_analysis_multiplier: 10
+  heavy_geometry_multiplier: 10
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4161_400M_c4_40B_v4_64_cb1a

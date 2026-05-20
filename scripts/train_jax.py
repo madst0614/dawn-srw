@@ -79,6 +79,10 @@ try:
     from models.dawn_srw_v4160 import DAWN as DAWN_SRW_V4160
 except ImportError:
     DAWN_SRW_V4160 = None
+try:
+    from models.dawn_srw_v4161 import DAWN as DAWN_SRW_V4161
+except ImportError:
+    DAWN_SRW_V4161 = None
 
 # ============================================================
 # Constants
@@ -94,6 +98,7 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.5.8',
     'spatial-r1-v4.1.5.9',
     'spatial-r1-v4.1.6.0',
+    'spatial-r1-v4.1.6.1',
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -497,7 +502,7 @@ def _dawn_srw_kwargs(cfg):
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
-    if version == 'spatial-r1-v4.1.6.0':
+    if version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
         kw['tau_init_attn_qk'] = m.get(
             'tau_init_attn_qk', t.get('tau_init_attn_qk', 0.02))
         kw['tau_init_attn_v'] = m.get(
@@ -520,9 +525,14 @@ def _v415_sharded_kwargs(cfg):
             scan_std_floor=t.get('scan_std_floor', 0.5),
             tau_min=t.get('tau_min', 0.0),
         )
-    elif version == 'spatial-r1-v4.1.6.0':
+    elif version in ('spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
         kw = dict(
             dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
+            cb1a_enabled=bool(t.get('cb1a_enabled', False)),
+            cb1a_tau_stopgrad=bool(t.get('cb1a_tau_stopgrad', True)),
+            cb1a_anchor_stopgrad=bool(t.get('cb1a_anchor_stopgrad', True)),
+            cb1a_forward_influence=bool(t.get('cb1a_forward_influence', False)),
+            cb1a_eps=float(t.get('cb1a_eps', 1.0e-8)),
         )
     else:
         kw = dict(
@@ -532,12 +542,15 @@ def _v415_sharded_kwargs(cfg):
             scan_scale=t.get('scan_scale', 0.01),
             scan_std_floor=t.get('scan_std_floor', 0.5),
         )
-    # v4.1.5.9/v4.1.6.0 angular routing uses model.d_select directly:
+    # v4.1.5.9/v4.1.6.x angular routing uses model.d_select directly:
     #   d_intensity = d_route - d_select
     m = cfg['model']
     d_route = int(m.get('d_route', m.get('d_bottleneck', 128)))
     d_select_cfg = m.get('d_select', t.get('d_select', None))
-    if version in ('spatial-r1-v4.1.5.9', 'spatial-r1-v4.1.6.0') and d_select_cfg is None:
+    if version in (
+            'spatial-r1-v4.1.5.9',
+            'spatial-r1-v4.1.6.0',
+            'spatial-r1-v4.1.6.1') and d_select_cfg is None:
         raise ValueError(
             f"{version} angular SRW requires model.d_select.")
     if d_select_cfg is not None:
@@ -639,6 +652,17 @@ if DAWN_SRW_V4160 is not None:
         name='spatial-r1-v4.1.6.0',
         module_path='models.dawn_srw_v4160',
         cls=DAWN_SRW_V4160,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
+if DAWN_SRW_V4161 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.6.1'] = ModelSpec(
+        name='spatial-r1-v4.1.6.1',
+        module_path='models.dawn_srw_v4161',
+        cls=DAWN_SRW_V4161,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -1171,6 +1195,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       exploration_z_clip=2.0,
                       exploration_z_tanh=True,
                       exploration_weighted_clip=0.0,
+                      dead_penalty_qk_weight=1.0,
+                      dead_penalty_v_weight=1.0,
+                      dead_penalty_rst_weight=1.0,
+                      cb1a_enabled=False,
+                      cb1a_weight=0.0,
+                      cb1a_challenge_weight=1.0,
+                      cb1a_prune_weight=3.0,
+                      cb1a_qk_weight=1.0,
+                      cb1a_v_weight=1.0,
+                      cb1a_rst_weight=1.0,
+                      cb1a_qk_challenge_weight=None,
+                      cb1a_qk_prune_weight=None,
+                      cb1a_v_challenge_weight=None,
+                      cb1a_v_prune_weight=None,
+                      cb1a_rst_challenge_weight=None,
+                      cb1a_rst_prune_weight=None,
+                      cb1a_ce_mode='sigmoid_z',
+                      cb1a_eps=1.0e-8,
                       dead_penalty_weighted_clip=0.0,
                       global_grad_clip=0.0,
                       tau_lr_mult=1.0,
@@ -1245,6 +1287,38 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
     _explore_z_clip = jnp.float32(exploration_z_clip)
     _explore_z_tanh = bool(exploration_z_tanh)
     _explore_weighted_clip = jnp.float32(exploration_weighted_clip)
+    _dead_penalty_qk_weight = jnp.float32(dead_penalty_qk_weight)
+    _dead_penalty_v_weight = jnp.float32(dead_penalty_v_weight)
+    _dead_penalty_rst_weight = jnp.float32(dead_penalty_rst_weight)
+    _cb1a_enabled = bool(cb1a_enabled)
+    _cb1a_weight = jnp.float32(cb1a_weight)
+    _cb1a_challenge_weight = jnp.float32(cb1a_challenge_weight)
+    _cb1a_prune_weight = jnp.float32(cb1a_prune_weight)
+    _cb1a_qk_weight = jnp.float32(cb1a_qk_weight)
+    _cb1a_v_weight = jnp.float32(cb1a_v_weight)
+    _cb1a_rst_weight = jnp.float32(cb1a_rst_weight)
+    _cb1a_qk_challenge_weight = jnp.float32(
+        cb1a_challenge_weight
+        if cb1a_qk_challenge_weight is None else cb1a_qk_challenge_weight)
+    _cb1a_qk_prune_weight = jnp.float32(
+        cb1a_prune_weight
+        if cb1a_qk_prune_weight is None else cb1a_qk_prune_weight)
+    _cb1a_v_challenge_weight = jnp.float32(
+        cb1a_challenge_weight
+        if cb1a_v_challenge_weight is None else cb1a_v_challenge_weight)
+    _cb1a_v_prune_weight = jnp.float32(
+        cb1a_prune_weight
+        if cb1a_v_prune_weight is None else cb1a_v_prune_weight)
+    _cb1a_rst_challenge_weight = jnp.float32(
+        cb1a_challenge_weight
+        if cb1a_rst_challenge_weight is None else cb1a_rst_challenge_weight)
+    _cb1a_rst_prune_weight = jnp.float32(
+        cb1a_prune_weight
+        if cb1a_rst_prune_weight is None else cb1a_rst_prune_weight)
+    _cb1a_ce_mode = str(cb1a_ce_mode).lower()
+    if _cb1a_ce_mode != 'sigmoid_z':
+        raise ValueError(f"Unsupported cb1a_ce_mode={cb1a_ce_mode!r}; expected 'sigmoid_z'.")
+    _cb1a_eps = jnp.float32(cb1a_eps)
     _dead_weighted_clip = jnp.float32(dead_penalty_weighted_clip)
     _global_grad_clip = jnp.float32(global_grad_clip)
     _tau_lr_mult = jnp.float32(tau_lr_mult)
@@ -1289,7 +1363,20 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             ce_loss = result['loss']
             aux_loss = result['aux_loss']
             tau_reg = result.get('tau_reg', jnp.float32(0.0))
-            dead_penalty = result.get('dead_penalty', jnp.float32(0.0))
+            dead_penalty_unweighted = result.get(
+                'dead_penalty', jnp.float32(0.0))
+            dead_qk_raw = result.get('attn_qk_dead_penalty', None)
+            dead_v_raw = result.get('attn_v_dead_penalty', None)
+            dead_rst_raw = result.get('rst_dead_penalty', None)
+            if (dead_qk_raw is not None
+                    and dead_v_raw is not None
+                    and dead_rst_raw is not None):
+                dead_penalty = (
+                    _dead_penalty_qk_weight * dead_qk_raw
+                    + _dead_penalty_v_weight * dead_v_raw
+                    + _dead_penalty_rst_weight * dead_rst_raw)
+            else:
+                dead_penalty = dead_penalty_unweighted
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
             attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
@@ -1453,6 +1540,112 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 rst_tau_off_p99 = jnp.float32(0.0)
                 rst_tau_off_p01 = jnp.float32(0.0)
                 rst_tau_off_neg_frac = jnp.float32(0.0)
+
+            attn_cb1a_challenge = result.get('attn_cb1a_challenge_gap', None)
+            attn_cb1a_prune = result.get('attn_cb1a_prune_gap', None)
+            rst_cb1a_challenge = result.get('rst_cb1a_challenge_gap', None)
+            rst_cb1a_prune = result.get('rst_cb1a_prune_gap', None)
+            have_cb1a = (_cb1a_enabled
+                         and per_token_ce is not None
+                         and valid_mask is not None
+                         and attn_cb1a_challenge is not None
+                         and attn_cb1a_prune is not None
+                         and rst_cb1a_challenge is not None
+                         and rst_cb1a_prune is not None)
+            if have_cb1a:
+                vmask_f = valid_mask.astype(jnp.float32)
+                ce_sg = jax.lax.stop_gradient(per_token_ce.astype(jnp.float32))
+                if _global_mean_std_reducer is not None:
+                    cb1a_ce_mean, cb1a_ce_std = _global_mean_std_reducer(
+                        ce_sg, valid_mask)
+                else:
+                    cb1a_cnt = vmask_f.sum()
+                    cb1a_ce_mean = (ce_sg * vmask_f).sum() / (cb1a_cnt + _cb1a_eps)
+                    cb1a_var = (
+                        jnp.square(ce_sg - cb1a_ce_mean) * vmask_f
+                    ).sum() / (cb1a_cnt + _cb1a_eps)
+                    cb1a_ce_std = jnp.sqrt(jnp.maximum(cb1a_var, 0.0) + _cb1a_eps)
+                cb1a_ce_z = jax.lax.stop_gradient(
+                    (ce_sg - jax.lax.stop_gradient(cb1a_ce_mean))
+                    / (jax.lax.stop_gradient(cb1a_ce_std) + _cb1a_eps))
+                cb1a_hard_weight = jax.lax.stop_gradient(
+                    jax.nn.sigmoid(cb1a_ce_z))
+                cb1a_easy_weight = jax.lax.stop_gradient(
+                    jax.nn.sigmoid(-cb1a_ce_z))
+
+                # Gaps are [L,B,S,route]. CE is next-token loss for positions
+                # [B,S-1], so use routing decisions from positions 0..S-2.
+                a_chal = attn_cb1a_challenge[:, :, :-1, :]
+                a_prune = attn_cb1a_prune[:, :, :-1, :]
+                k_chal = rst_cb1a_challenge[:, :, :-1, :]
+                k_prune = rst_cb1a_prune[:, :, :-1, :]
+                hard_b = cb1a_hard_weight[None, :, :, None]
+                easy_b = cb1a_easy_weight[None, :, :, None]
+                vmask_b = vmask_f[None, :, :, None]
+                vsum = vmask_f.sum()
+                a_layers = jnp.float32(a_chal.shape[0])
+                k_layers = jnp.float32(k_chal.shape[0])
+
+                qk_challenge_raw = (
+                    (a_chal[..., :2] * hard_b * vmask_b).sum()
+                    / (vsum * a_layers * jnp.float32(2.0) + _cb1a_eps))
+                qk_prune_raw = (
+                    (a_prune[..., :2] * easy_b * vmask_b).sum()
+                    / (vsum * a_layers * jnp.float32(2.0) + _cb1a_eps))
+                v_challenge_raw = (
+                    (a_chal[..., 2:3] * hard_b * vmask_b).sum()
+                    / (vsum * a_layers + _cb1a_eps))
+                v_prune_raw = (
+                    (a_prune[..., 2:3] * easy_b * vmask_b).sum()
+                    / (vsum * a_layers + _cb1a_eps))
+                rst_challenge_raw = (
+                    (k_chal * hard_b * vmask_b).sum()
+                    / (vsum * k_layers + _cb1a_eps))
+                rst_prune_raw = (
+                    (k_prune * easy_b * vmask_b).sum()
+                    / (vsum * k_layers + _cb1a_eps))
+
+                pool_weight_sum = (
+                    _cb1a_qk_weight + _cb1a_v_weight + _cb1a_rst_weight
+                    + _cb1a_eps)
+                cb1a_challenge_raw = (
+                    _cb1a_qk_weight * qk_challenge_raw
+                    + _cb1a_v_weight * v_challenge_raw
+                    + _cb1a_rst_weight * rst_challenge_raw) / pool_weight_sum
+                cb1a_prune_raw = (
+                    _cb1a_qk_weight * qk_prune_raw
+                    + _cb1a_v_weight * v_prune_raw
+                    + _cb1a_rst_weight * rst_prune_raw) / pool_weight_sum
+                cb1a_qk_raw = (
+                    _cb1a_qk_challenge_weight * qk_challenge_raw
+                    + _cb1a_qk_prune_weight * qk_prune_raw)
+                cb1a_v_raw = (
+                    _cb1a_v_challenge_weight * v_challenge_raw
+                    + _cb1a_v_prune_weight * v_prune_raw)
+                cb1a_rst_raw = (
+                    _cb1a_rst_challenge_weight * rst_challenge_raw
+                    + _cb1a_rst_prune_weight * rst_prune_raw)
+                cb1a_raw = (
+                    _cb1a_qk_weight * cb1a_qk_raw
+                    + _cb1a_v_weight * cb1a_v_raw
+                    + _cb1a_rst_weight * cb1a_rst_raw) / pool_weight_sum
+                cb1a_loss_weighted = _cb1a_weight * cb1a_raw
+            else:
+                cb1a_ce_mean = jnp.float32(0.0)
+                cb1a_ce_std = jnp.float32(0.0)
+                qk_challenge_raw = jnp.float32(0.0)
+                qk_prune_raw = jnp.float32(0.0)
+                v_challenge_raw = jnp.float32(0.0)
+                v_prune_raw = jnp.float32(0.0)
+                rst_challenge_raw = jnp.float32(0.0)
+                rst_prune_raw = jnp.float32(0.0)
+                cb1a_challenge_raw = jnp.float32(0.0)
+                cb1a_prune_raw = jnp.float32(0.0)
+                cb1a_qk_raw = jnp.float32(0.0)
+                cb1a_v_raw = jnp.float32(0.0)
+                cb1a_rst_raw = jnp.float32(0.0)
+                cb1a_raw = jnp.float32(0.0)
+                cb1a_loss_weighted = jnp.float32(0.0)
             # Warmup gate: zero out explore loss until warmup_steps has passed.
             # W_sense needs time to settle before exploration signals become
             # meaningful; early CE-dominated learning keeps tau gradient clean.
@@ -1484,7 +1677,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + tau_reg_weight * tau_reg
                               + div_weight * div_loss
                               + dead_penalty_weighted
-                              + explore_loss_weighted)
+                              + explore_loss_weighted
+                              + cb1a_loss_weighted)
             else:
                 orth_loss = compute_orthogonality_loss(
                     params, rank, knowledge_rank, n_feature_qk, n_restore_qk)
@@ -1495,7 +1689,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                               + orth_weight * orth_loss
                               + div_weight * div_loss
                               + dead_penalty_weighted
-                              + explore_loss_weighted)
+                              + explore_loss_weighted
+                              + cb1a_loss_weighted)
 
             explore_stats = dict(
                 global_mean_ce=global_mean_ce,
@@ -1522,6 +1717,32 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 explore_active=explore_active,
                 explore_loss_weighted_unclipped=explore_loss_weighted_unclipped,
                 explore_loss_weighted_clipped=explore_loss_weighted,
+                cb1a_ce_mean=cb1a_ce_mean,
+                cb1a_ce_std=cb1a_ce_std,
+                cb1a_raw=cb1a_raw,
+                cb1a_challenge_raw=cb1a_challenge_raw,
+                cb1a_prune_raw=cb1a_prune_raw,
+                cb1a_weighted=cb1a_loss_weighted,
+                cb1a_qk_challenge_raw=qk_challenge_raw,
+                cb1a_qk_prune_raw=qk_prune_raw,
+                cb1a_v_challenge_raw=v_challenge_raw,
+                cb1a_v_prune_raw=v_prune_raw,
+                cb1a_rst_challenge_raw=rst_challenge_raw,
+                cb1a_rst_prune_raw=rst_prune_raw,
+                cb1a_qk_raw=cb1a_qk_raw,
+                cb1a_v_raw=cb1a_v_raw,
+                cb1a_rst_raw=cb1a_rst_raw,
+                cb1a_qk_challenge_weight=_cb1a_qk_challenge_weight,
+                cb1a_qk_prune_weight=_cb1a_qk_prune_weight,
+                cb1a_v_challenge_weight=_cb1a_v_challenge_weight,
+                cb1a_v_prune_weight=_cb1a_v_prune_weight,
+                cb1a_rst_challenge_weight=_cb1a_rst_challenge_weight,
+                cb1a_rst_prune_weight=_cb1a_rst_prune_weight,
+                dead_penalty_raw_unweighted=dead_penalty_unweighted,
+                dead_penalty_raw_weighted_pools=dead_penalty,
+                dead_penalty_qk_weight=_dead_penalty_qk_weight,
+                dead_penalty_v_weight=_dead_penalty_v_weight,
+                dead_penalty_rst_weight=_dead_penalty_rst_weight,
                 dead_penalty_weighted_unclipped=dead_penalty_weighted_unclipped,
                 dead_penalty_weighted_clipped=dead_penalty_weighted,
                 step_in_train=step,
@@ -2197,6 +2418,7 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
         # exploration is disabled or have_explore=False.
         explore_loss_weighted_metric = explore_stats['explore_loss_weighted_clipped']
         explore_loss_weighted_unclipped_metric = explore_stats['explore_loss_weighted_unclipped']
+        cb1a_weighted_metric = explore_stats['cb1a_weighted']
         dead_penalty_weighted_metric = explore_stats['dead_penalty_weighted_clipped']
         dead_penalty_weighted_unclipped_metric = explore_stats['dead_penalty_weighted_unclipped']
         metrics = {
@@ -2216,6 +2438,19 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'diversity_loss_weighted': div_weight * div_loss,
             'dead_penalty_weight': jnp.float32(dead_penalty_weight),
             'dead_penalty_weighted_total': dead_penalty_weighted_metric,
+            'dead_penalty_raw_unweighted': explore_stats['dead_penalty_raw_unweighted'],
+            'dead_penalty_raw_weighted_pools': explore_stats['dead_penalty_raw_weighted_pools'],
+            'dead_penalty_qk_weight': explore_stats['dead_penalty_qk_weight'],
+            'dead_penalty_v_weight': explore_stats['dead_penalty_v_weight'],
+            'dead_penalty_rst_weight': explore_stats['dead_penalty_rst_weight'],
+            'attn_qk_dead_penalty': result.get(
+                'attn_qk_dead_penalty', jnp.float32(0.0)),
+            'attn_v_dead_penalty': result.get(
+                'attn_v_dead_penalty', jnp.float32(0.0)),
+            'attn_qk_dead_count': result.get(
+                'attn_qk_dead_count', jnp.float32(0.0)),
+            'attn_v_dead_count': result.get(
+                'attn_v_dead_count', jnp.float32(0.0)),
             'exploration_warmup_factor': explore_stats['explore_active'],
             'exploration_weight_effective': (
                 jnp.float32(exploration_weight) * explore_stats['explore_active']),
@@ -2240,6 +2475,41 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'exploration_loss_weighted_total': explore_loss_weighted_metric,
             'exploration_loss_weighted_unclipped': explore_loss_weighted_unclipped_metric,
             'exploration_loss_weighted_clipped': explore_loss_weighted_metric,
+            'cb1a_raw': explore_stats['cb1a_raw'],
+            'cb1a_w': cb1a_weighted_metric,
+            'cb1a_weighted': cb1a_weighted_metric,
+            'cb1a_challenge_raw': explore_stats['cb1a_challenge_raw'],
+            'cb1a_prune_raw': explore_stats['cb1a_prune_raw'],
+            'cb1a_challenge': result.get(
+                'cb1a_challenge', explore_stats['cb1a_challenge_raw']),
+            'cb1a_prune': result.get(
+                'cb1a_prune', explore_stats['cb1a_prune_raw']),
+            'cb1a_valid': result.get('cb1a_valid', jnp.float32(0.0)),
+            'cb1a_has_above': result.get('cb1a_has_above', jnp.float32(0.0)),
+            'cb1a_has_below': result.get('cb1a_has_below', jnp.float32(0.0)),
+            'cb1a_qk_challenge': explore_stats['cb1a_qk_challenge_raw'],
+            'cb1a_qk_prune': explore_stats['cb1a_qk_prune_raw'],
+            'cb1a_v_challenge': explore_stats['cb1a_v_challenge_raw'],
+            'cb1a_v_prune': explore_stats['cb1a_v_prune_raw'],
+            'cb1a_rst_challenge': explore_stats['cb1a_rst_challenge_raw'],
+            'cb1a_rst_prune': explore_stats['cb1a_rst_prune_raw'],
+            'cb1a_qk_raw': explore_stats['cb1a_qk_raw'],
+            'cb1a_v_raw': explore_stats['cb1a_v_raw'],
+            'cb1a_rst_raw': explore_stats['cb1a_rst_raw'],
+            'cb1a_weight': _cb1a_weight,
+            'cb1a_challenge_weight': _cb1a_challenge_weight,
+            'cb1a_prune_weight': _cb1a_prune_weight,
+            'cb1a_qk_weight': _cb1a_qk_weight,
+            'cb1a_v_weight': _cb1a_v_weight,
+            'cb1a_rst_weight': _cb1a_rst_weight,
+            'cb1a_qk_challenge_weight': explore_stats['cb1a_qk_challenge_weight'],
+            'cb1a_qk_prune_weight': explore_stats['cb1a_qk_prune_weight'],
+            'cb1a_v_challenge_weight': explore_stats['cb1a_v_challenge_weight'],
+            'cb1a_v_prune_weight': explore_stats['cb1a_v_prune_weight'],
+            'cb1a_rst_challenge_weight': explore_stats['cb1a_rst_challenge_weight'],
+            'cb1a_rst_prune_weight': explore_stats['cb1a_rst_prune_weight'],
+            'cb1a_ce_mean': explore_stats['cb1a_ce_mean'],
+            'cb1a_ce_std': explore_stats['cb1a_ce_std'],
             'dead_penalty_weighted_unclipped': dead_penalty_weighted_unclipped_metric,
             'dead_penalty_weighted_clipped': dead_penalty_weighted_metric,
             'exploration_raw_pre_bound': explore_stats['explore_loss_pre_bound'],
@@ -2258,7 +2528,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 + orth_weight * orth_loss
                 + div_weight * div_loss
                 + dead_penalty_weighted_metric
-                + explore_loss_weighted_metric)),
+                + explore_loss_weighted_metric
+                + cb1a_weighted_metric)),
             'correct': result['correct'],
             'valid_count': result['valid_count'],
             'grad_norm': grad_norm,
@@ -3667,8 +3938,19 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_dead_penalty': float(m.get('attn_dead_penalty', 0.0)),
         'rst_dead_penalty': float(m.get('rst_dead_penalty', 0.0)),
         'dead_penalty_raw_total': float(m.get('dead_penalty_raw_total', 0.0)),
+        'dead_penalty_raw_unweighted': float(m.get(
+            'dead_penalty_raw_unweighted', m.get('dead_penalty_raw_total', 0.0))),
+        'dead_penalty_raw_weighted_pools': float(m.get(
+            'dead_penalty_raw_weighted_pools', m.get('dead_penalty', 0.0))),
         'attn_dead_penalty_raw': float(m.get('attn_dead_penalty_raw', 0.0)),
         'rst_dead_penalty_raw': float(m.get('rst_dead_penalty_raw', 0.0)),
+        'dead_penalty_qk_weight': float(m.get('dead_penalty_qk_weight', 1.0)),
+        'dead_penalty_v_weight': float(m.get('dead_penalty_v_weight', 1.0)),
+        'dead_penalty_rst_weight': float(m.get('dead_penalty_rst_weight', 1.0)),
+        'attn_qk_dead_penalty': float(m.get('attn_qk_dead_penalty', 0.0)),
+        'attn_v_dead_penalty': float(m.get('attn_v_dead_penalty', 0.0)),
+        'attn_qk_dead_count': float(m.get('attn_qk_dead_count', 0.0)),
+        'attn_v_dead_count': float(m.get('attn_v_dead_count', 0.0)),
         'dead_penalty_weight': float(m.get(
             'dead_penalty_weight', ctx['dead_penalty_weight'])),
         'dead_penalty_weighted': ctx['dead_penalty_weight'] * float(m.get('dead_penalty', 0.0)),
@@ -3736,6 +4018,50 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'exploration_qk_pre_bound': float(m.get('exploration_qk_pre_bound', 0.0)),
         'exploration_v_pre_bound': float(m.get('exploration_v_pre_bound', 0.0)),
         'exploration_raw_post_bound': float(m.get('exploration_raw_post_bound', 0.0)),
+        # CB1A boundary audition loss.
+        'cb1a_raw': float(m.get('cb1a_raw', 0.0)),
+        'cb1a_w': float(m.get('cb1a_w', m.get('cb1a_weighted', 0.0))),
+        'cb1a_weighted': float(m.get('cb1a_weighted', 0.0)),
+        'cb1a_challenge_raw': float(m.get('cb1a_challenge_raw', 0.0)),
+        'cb1a_prune_raw': float(m.get('cb1a_prune_raw', 0.0)),
+        'cb1a_challenge': float(m.get('cb1a_challenge', 0.0)),
+        'cb1a_prune': float(m.get('cb1a_prune', 0.0)),
+        'cb1a_valid': float(m.get('cb1a_valid', 0.0)),
+        'cb1a_has_above': float(m.get('cb1a_has_above', 0.0)),
+        'cb1a_has_below': float(m.get('cb1a_has_below', 0.0)),
+        'cb1a_qk_challenge': float(m.get('cb1a_qk_challenge', 0.0)),
+        'cb1a_qk_prune': float(m.get('cb1a_qk_prune', 0.0)),
+        'cb1a_v_challenge': float(m.get('cb1a_v_challenge', 0.0)),
+        'cb1a_v_prune': float(m.get('cb1a_v_prune', 0.0)),
+        'cb1a_rst_challenge': float(m.get('cb1a_rst_challenge', 0.0)),
+        'cb1a_rst_prune': float(m.get('cb1a_rst_prune', 0.0)),
+        'cb1a_qk_raw': float(m.get('cb1a_qk_raw', 0.0)),
+        'cb1a_v_raw': float(m.get('cb1a_v_raw', 0.0)),
+        'cb1a_rst_raw': float(m.get('cb1a_rst_raw', 0.0)),
+        'cb1a_weight': float(m.get('cb1a_weight', 0.0)),
+        'cb1a_challenge_weight': float(m.get('cb1a_challenge_weight', 1.0)),
+        'cb1a_prune_weight': float(m.get('cb1a_prune_weight', 3.0)),
+        'cb1a_qk_weight': float(m.get('cb1a_qk_weight', 1.0)),
+        'cb1a_v_weight': float(m.get('cb1a_v_weight', 1.0)),
+        'cb1a_rst_weight': float(m.get('cb1a_rst_weight', 1.0)),
+        'cb1a_qk_challenge_weight': float(m.get(
+            'cb1a_qk_challenge_weight',
+            m.get('cb1a_challenge_weight', 1.0))),
+        'cb1a_qk_prune_weight': float(m.get(
+            'cb1a_qk_prune_weight',
+            m.get('cb1a_prune_weight', 3.0))),
+        'cb1a_v_challenge_weight': float(m.get(
+            'cb1a_v_challenge_weight',
+            m.get('cb1a_challenge_weight', 1.0))),
+        'cb1a_v_prune_weight': float(m.get(
+            'cb1a_v_prune_weight',
+            m.get('cb1a_prune_weight', 3.0))),
+        'cb1a_rst_challenge_weight': float(m.get(
+            'cb1a_rst_challenge_weight',
+            m.get('cb1a_challenge_weight', 1.0))),
+        'cb1a_rst_prune_weight': float(m.get(
+            'cb1a_rst_prune_weight',
+            m.get('cb1a_prune_weight', 3.0))),
         # Accuracy / training status.
         'accuracy': win_avgs['acc'],
         'grad_norm': float(m['grad_norm']),
@@ -4202,7 +4528,8 @@ def _format_output_stab_line(rec, indent="  "):
 
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
-    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
         f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
@@ -4574,7 +4901,8 @@ def _dead_trigger_info(rec, ctx=None):
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
 
-    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
     if is_v4160:
         qk_count = _g('attn_qk_dead_count')
         v_count = _g('attn_v_dead_count')
@@ -5199,7 +5527,8 @@ def _print_drop_compare_block(rec):
 
 def _print_debug_block(rec, ctx):
     """Write debug-only DAWN-SRW collapse diagnostics to debug_log_*.txt."""
-    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
 
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
@@ -5230,6 +5559,8 @@ def _print_debug_block(rec, ctx):
         f"dead_w={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f} "
         f"expl_raw={_g('exploration_loss_raw_total', _g('explore_loss_raw')):+.6f} "
         f"expl_w={_g('exploration_loss_weighted_total', _g('explore_loss_weighted')):+.6f} "
+        f"cb1a_raw={_g('cb1a_raw'):+.6f} "
+        f"cb1a_w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
         f"wd_pool={_g('pool_weight_decay_loss'):.6f} "
         f"wd_normal={_g('normal_weight_decay_loss'):.6f} "
         f"total_minus_ce={_g('total_loss_minus_ce'):.6f} "
@@ -5251,6 +5582,9 @@ def _print_debug_block(rec, ctx):
             f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
             f"total={_g('dead_penalty_per_dead'):.6f}] "
             f"weight={_g('dead_penalty_weight'):.4f} "
+            f"pool_w[qk={_g('dead_penalty_qk_weight', 1.0):.2f} "
+            f"v={_g('dead_penalty_v_weight', 1.0):.2f} "
+            f"rst={_g('dead_penalty_rst_weight', 1.0):.2f}] "
             f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
         )
     else:
@@ -5265,6 +5599,34 @@ def _print_debug_block(rec, ctx):
             f"total={_g('dead_penalty_per_dead'):.6f}] "
             f"weight={_g('dead_penalty_weight'):.4f} "
             f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
+        )
+    if _g('cb1a_weight') != 0.0 or _g('cb1a_raw') != 0.0:
+        log_debug_message(
+            f"cb1a_diag: raw={_g('cb1a_raw'):+.6f} "
+            f"w={_g('cb1a_w', _g('cb1a_weighted')):+.6f} "
+            f"challenge={_g('cb1a_challenge_raw'):+.6f} "
+            f"prune={_g('cb1a_prune_raw'):+.6f} "
+            f"valid={_g('cb1a_valid'):.3f} "
+            f"has_above={_g('cb1a_has_above'):.3f} "
+            f"has_below={_g('cb1a_has_below'):.3f} "
+            f"pool_challenge[qk={_g('cb1a_qk_challenge'):+.6f} "
+            f"v={_g('cb1a_v_challenge'):+.6f} "
+            f"rst={_g('cb1a_rst_challenge'):+.6f}] "
+            f"pool_prune[qk={_g('cb1a_qk_prune'):+.6f} "
+            f"v={_g('cb1a_v_prune'):+.6f} "
+            f"rst={_g('cb1a_rst_prune'):+.6f}] "
+            f"pool_raw[qk={_g('cb1a_qk_raw'):+.6f} "
+            f"v={_g('cb1a_v_raw'):+.6f} "
+            f"rst={_g('cb1a_rst_raw'):+.6f}] "
+            f"pool_w[qk={_g('cb1a_qk_weight', 1.0):.2f} "
+            f"v={_g('cb1a_v_weight', 1.0):.2f} "
+            f"rst={_g('cb1a_rst_weight', 1.0):.2f}] "
+            f"cp_w[qk=({_g('cb1a_qk_challenge_weight', 1.0):.2f},"
+            f"{_g('cb1a_qk_prune_weight', 3.0):.2f}) "
+            f"v=({_g('cb1a_v_challenge_weight', 1.0):.2f},"
+            f"{_g('cb1a_v_prune_weight', 3.0):.2f}) "
+            f"rst=({_g('cb1a_rst_challenge_weight', 1.0):.2f},"
+            f"{_g('cb1a_rst_prune_weight', 3.0):.2f})]"
         )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_debug_message(
@@ -5416,7 +5778,8 @@ def _print_debug_block(rec, ctx):
             f"selected[attn={_g('attn_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
             f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
         )
-    elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
+    elif ctx.get('model_version') in (
+            'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
         log_debug_message(
             f"direct_tau_select_diag: "
             f"tau[qk={_g('attn_qk_tau_mean'):+.5f} "
@@ -5943,7 +6306,8 @@ def _build_analysis_record(base, metrics, ctx):
 def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
-    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
+    is_v4160 = ctx.get('model_version') in (
+        'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
 
     def _g(key, default=0.0):
         return float(rec.get(key, default))
@@ -6260,6 +6624,9 @@ def main():
     lb_weight = tcfg.get('load_balance_weight', 2e-5)
     tau_reg_weight = tcfg.get('tau_reg_weight', 0.0)
     dead_penalty_weight = tcfg.get('dead_penalty_weight', 0.0)  # v4.0.6
+    dead_penalty_qk_weight = tcfg.get('dead_penalty_qk_weight', 1.0)
+    dead_penalty_v_weight = tcfg.get('dead_penalty_v_weight', 1.0)
+    dead_penalty_rst_weight = tcfg.get('dead_penalty_rst_weight', 1.0)
     dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
@@ -6275,6 +6642,30 @@ def main():
     exploration_z_tanh = tcfg.get('exploration_z_tanh', True)
     exploration_weighted_clip = tcfg.get(
         'exploration_weighted_clip', tcfg.get('expl_w_clip', 0.0))
+    cb1a_enabled = tcfg.get('cb1a_enabled', False)
+    cb1a_weight = tcfg.get('cb1a_weight', 0.0)
+    cb1a_challenge_weight = tcfg.get('cb1a_challenge_weight', 1.0)
+    cb1a_prune_weight = tcfg.get('cb1a_prune_weight', 3.0)
+    cb1a_qk_weight = tcfg.get('cb1a_qk_weight', 1.0)
+    cb1a_v_weight = tcfg.get('cb1a_v_weight', 1.0)
+    cb1a_rst_weight = tcfg.get('cb1a_rst_weight', 1.0)
+    cb1a_qk_challenge_weight = tcfg.get(
+        'cb1a_qk_challenge_weight', cb1a_challenge_weight)
+    cb1a_qk_prune_weight = tcfg.get(
+        'cb1a_qk_prune_weight', cb1a_prune_weight)
+    cb1a_v_challenge_weight = tcfg.get(
+        'cb1a_v_challenge_weight', cb1a_challenge_weight)
+    cb1a_v_prune_weight = tcfg.get(
+        'cb1a_v_prune_weight', cb1a_prune_weight)
+    cb1a_rst_challenge_weight = tcfg.get(
+        'cb1a_rst_challenge_weight', cb1a_challenge_weight)
+    cb1a_rst_prune_weight = tcfg.get(
+        'cb1a_rst_prune_weight', cb1a_prune_weight)
+    cb1a_tau_stopgrad = tcfg.get('cb1a_tau_stopgrad', True)
+    cb1a_anchor_stopgrad = tcfg.get('cb1a_anchor_stopgrad', True)
+    cb1a_forward_influence = tcfg.get('cb1a_forward_influence', False)
+    cb1a_ce_mode = tcfg.get('cb1a_ce_mode', 'sigmoid_z')
+    cb1a_eps = tcfg.get('cb1a_eps', 1.0e-8)
     dead_penalty_weighted_clip = tcfg.get(
         'dead_penalty_weighted_clip', tcfg.get('dead_w_clip', 0.0))
     global_grad_clip = tcfg.get('global_grad_clip', 0.0)
@@ -6489,6 +6880,12 @@ def main():
             lb_weight = saved_training_config.get('load_balance_weight', lb_weight)
             tau_reg_weight = saved_training_config.get('tau_reg_weight', tau_reg_weight)
             dead_penalty_weight = saved_training_config.get('dead_penalty_weight', dead_penalty_weight)
+            dead_penalty_qk_weight = saved_training_config.get(
+                'dead_penalty_qk_weight', dead_penalty_qk_weight)
+            dead_penalty_v_weight = saved_training_config.get(
+                'dead_penalty_v_weight', dead_penalty_v_weight)
+            dead_penalty_rst_weight = saved_training_config.get(
+                'dead_penalty_rst_weight', dead_penalty_rst_weight)
             dead_exposure_target = float(saved_training_config.get(
                 'dead_exposure_target', dead_exposure_target))
             exploration_weight = saved_training_config.get(
@@ -6513,6 +6910,42 @@ def main():
                 'exploration_z_tanh', exploration_z_tanh)
             exploration_weighted_clip = saved_training_config.get(
                 'exploration_weighted_clip', exploration_weighted_clip)
+            cb1a_enabled = saved_training_config.get(
+                'cb1a_enabled', cb1a_enabled)
+            cb1a_weight = saved_training_config.get(
+                'cb1a_weight', cb1a_weight)
+            cb1a_challenge_weight = saved_training_config.get(
+                'cb1a_challenge_weight', cb1a_challenge_weight)
+            cb1a_prune_weight = saved_training_config.get(
+                'cb1a_prune_weight', cb1a_prune_weight)
+            cb1a_qk_weight = saved_training_config.get(
+                'cb1a_qk_weight', cb1a_qk_weight)
+            cb1a_v_weight = saved_training_config.get(
+                'cb1a_v_weight', cb1a_v_weight)
+            cb1a_rst_weight = saved_training_config.get(
+                'cb1a_rst_weight', cb1a_rst_weight)
+            cb1a_qk_challenge_weight = saved_training_config.get(
+                'cb1a_qk_challenge_weight', cb1a_qk_challenge_weight)
+            cb1a_qk_prune_weight = saved_training_config.get(
+                'cb1a_qk_prune_weight', cb1a_qk_prune_weight)
+            cb1a_v_challenge_weight = saved_training_config.get(
+                'cb1a_v_challenge_weight', cb1a_v_challenge_weight)
+            cb1a_v_prune_weight = saved_training_config.get(
+                'cb1a_v_prune_weight', cb1a_v_prune_weight)
+            cb1a_rst_challenge_weight = saved_training_config.get(
+                'cb1a_rst_challenge_weight', cb1a_rst_challenge_weight)
+            cb1a_rst_prune_weight = saved_training_config.get(
+                'cb1a_rst_prune_weight', cb1a_rst_prune_weight)
+            cb1a_tau_stopgrad = saved_training_config.get(
+                'cb1a_tau_stopgrad', cb1a_tau_stopgrad)
+            cb1a_anchor_stopgrad = saved_training_config.get(
+                'cb1a_anchor_stopgrad', cb1a_anchor_stopgrad)
+            cb1a_forward_influence = saved_training_config.get(
+                'cb1a_forward_influence', cb1a_forward_influence)
+            cb1a_ce_mode = saved_training_config.get(
+                'cb1a_ce_mode', cb1a_ce_mode)
+            cb1a_eps = saved_training_config.get(
+                'cb1a_eps', cb1a_eps)
             dead_penalty_weighted_clip = saved_training_config.get(
                 'dead_penalty_weighted_clip', dead_penalty_weighted_clip)
             global_grad_clip = saved_training_config.get(
@@ -6574,6 +7007,9 @@ def main():
         'load_balance_weight': lb_weight,
         'tau_reg_weight': tau_reg_weight,
         'dead_penalty_weight': dead_penalty_weight,
+        'dead_penalty_qk_weight': dead_penalty_qk_weight,
+        'dead_penalty_v_weight': dead_penalty_v_weight,
+        'dead_penalty_rst_weight': dead_penalty_rst_weight,
         'dead_exposure_target': dead_exposure_target,
         'exploration_weight': exploration_weight,
         'exploration_asymmetry': exploration_asymmetry,
@@ -6586,6 +7022,24 @@ def main():
         'exploration_z_clip': exploration_z_clip,
         'exploration_z_tanh': exploration_z_tanh,
         'exploration_weighted_clip': exploration_weighted_clip,
+        'cb1a_enabled': cb1a_enabled,
+        'cb1a_weight': cb1a_weight,
+        'cb1a_challenge_weight': cb1a_challenge_weight,
+        'cb1a_prune_weight': cb1a_prune_weight,
+        'cb1a_qk_weight': cb1a_qk_weight,
+        'cb1a_v_weight': cb1a_v_weight,
+        'cb1a_rst_weight': cb1a_rst_weight,
+        'cb1a_qk_challenge_weight': cb1a_qk_challenge_weight,
+        'cb1a_qk_prune_weight': cb1a_qk_prune_weight,
+        'cb1a_v_challenge_weight': cb1a_v_challenge_weight,
+        'cb1a_v_prune_weight': cb1a_v_prune_weight,
+        'cb1a_rst_challenge_weight': cb1a_rst_challenge_weight,
+        'cb1a_rst_prune_weight': cb1a_rst_prune_weight,
+        'cb1a_tau_stopgrad': cb1a_tau_stopgrad,
+        'cb1a_anchor_stopgrad': cb1a_anchor_stopgrad,
+        'cb1a_forward_influence': cb1a_forward_influence,
+        'cb1a_ce_mode': cb1a_ce_mode,
+        'cb1a_eps': cb1a_eps,
         'dead_penalty_weighted_clip': dead_penalty_weighted_clip,
         'global_grad_clip': global_grad_clip,
         'tau_lr_mult': tau_lr_mult,
@@ -6618,6 +7072,7 @@ def main():
         'log_analysis_multiplier': log_analysis_multiplier,
         'heavy_geometry_multiplier': heavy_geometry_multiplier,
     }
+    cfg.setdefault('training', {}).update(training_config)
 
     # ----------------------------------------------------------
     # Detect devices (multi-host aware)
@@ -6940,12 +7395,25 @@ def main():
         print(f"  LB weight: {lb_weight}")
         print(f"  Tau reg weight: {tau_reg_weight}")
         print(f"  Dead penalty: weight={dead_penalty_weight} "
-              f"exposure_target={dead_exposure_target}")
+              f"exposure_target={dead_exposure_target} "
+              f"pool_w[qk={dead_penalty_qk_weight}, v={dead_penalty_v_weight}, "
+              f"rst={dead_penalty_rst_weight}]")
         print(f"  Exploration weight: {exploration_weight} "
               f"(asymmetry={exploration_asymmetry})")
         print(f"    warmup_steps={exploration_warmup_steps} "
               f"bounds=[{exploration_lower_bound}, {exploration_upper_bound}] "
               f"eps={exploration_bound_eps}")
+        print("  CB1A: "
+              f"enabled={cb1a_enabled} weight={cb1a_weight} "
+              f"challenge={cb1a_challenge_weight} prune={cb1a_prune_weight} "
+              f"pool_w[qk={cb1a_qk_weight}, v={cb1a_v_weight}, rst={cb1a_rst_weight}] "
+              f"ce_mode={cb1a_ce_mode} eps={cb1a_eps}")
+        print("    CB1A pool challenge/prune: "
+              f"qk=({cb1a_qk_challenge_weight}, {cb1a_qk_prune_weight}) "
+              f"v=({cb1a_v_challenge_weight}, {cb1a_v_prune_weight}) "
+              f"rst=({cb1a_rst_challenge_weight}, {cb1a_rst_prune_weight}) "
+              f"stopgrad[tau={cb1a_tau_stopgrad}, anchor={cb1a_anchor_stopgrad}] "
+              f"forward_influence={cb1a_forward_influence}")
         print(f"  Dropout: residual={cfg['model'].get('dropout', 0.0)} "
               f"router={cfg['model'].get('router_dropout', 0.0)}")
         # Active v4.1.5 gate closure constants.
@@ -6961,9 +7429,10 @@ def main():
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"
             )
-        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.0':
+        elif cfg['model'].get('model_version') in (
+                'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1'):
             gate_msg = (
-                "  Gate (v4.1.6.0 direct-tau): "
+                f"  Gate ({cfg['model'].get('model_version')} direct-tau): "
                 f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', 0.02))} "
                 f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', 0.10))} "
                 f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', 0.15))} "
@@ -7267,6 +7736,24 @@ def main():
         exploration_z_clip=exploration_z_clip,
         exploration_z_tanh=exploration_z_tanh,
         exploration_weighted_clip=exploration_weighted_clip,
+        dead_penalty_qk_weight=dead_penalty_qk_weight,
+        dead_penalty_v_weight=dead_penalty_v_weight,
+        dead_penalty_rst_weight=dead_penalty_rst_weight,
+        cb1a_enabled=cb1a_enabled,
+        cb1a_weight=cb1a_weight,
+        cb1a_challenge_weight=cb1a_challenge_weight,
+        cb1a_prune_weight=cb1a_prune_weight,
+        cb1a_qk_weight=cb1a_qk_weight,
+        cb1a_v_weight=cb1a_v_weight,
+        cb1a_rst_weight=cb1a_rst_weight,
+        cb1a_qk_challenge_weight=cb1a_qk_challenge_weight,
+        cb1a_qk_prune_weight=cb1a_qk_prune_weight,
+        cb1a_v_challenge_weight=cb1a_v_challenge_weight,
+        cb1a_v_prune_weight=cb1a_v_prune_weight,
+        cb1a_rst_challenge_weight=cb1a_rst_challenge_weight,
+        cb1a_rst_prune_weight=cb1a_rst_prune_weight,
+        cb1a_ce_mode=cb1a_ce_mode,
+        cb1a_eps=cb1a_eps,
         dead_penalty_weighted_clip=dead_penalty_weighted_clip,
         global_grad_clip=global_grad_clip,
         tau_lr_mult=tau_lr_mult,
