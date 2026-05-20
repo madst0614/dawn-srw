@@ -939,10 +939,12 @@ def make_sharded_srw(mesh, max_chunk_size=2048,
                 jnp.arange(nc))
 
         if _cb1a_enabled:
+            local_below_ref = jax.lax.stop_gradient(total_cb1a_below_best)
+            local_above_ref = jax.lax.stop_gradient(total_cb1a_above_best)
             global_below_sg = jax.lax.stop_gradient(
-                jax.lax.pmax(total_cb1a_below_best, 'model'))
+                jax.lax.pmax(local_below_ref, 'model'))
             global_above_sg = jax.lax.stop_gradient(
-                jax.lax.pmin(total_cb1a_above_best, 'model'))
+                jax.lax.pmin(local_above_ref, 'model'))
             (cb1a_challenge_gap_local, cb1a_prune_gap_local,
              valid_pair, has_above, has_below, _, _) = (
                 _cb1a_local_winner_gaps_from_boundaries(
@@ -1704,10 +1706,12 @@ def make_sharded_srw_paired(mesh, max_chunk_size=2048,
                 jnp.arange(nc))
 
         if _cb1a_enabled:
+            local_below_ref = jax.lax.stop_gradient(total_cb1a_below_best)
+            local_above_ref = jax.lax.stop_gradient(total_cb1a_above_best)
             global_below_sg = jax.lax.stop_gradient(
-                jax.lax.pmax(total_cb1a_below_best, 'model'))
+                jax.lax.pmax(local_below_ref, 'model'))
             global_above_sg = jax.lax.stop_gradient(
-                jax.lax.pmin(total_cb1a_above_best, 'model'))
+                jax.lax.pmin(local_above_ref, 'model'))
             (cb1a_challenge_gap_local, cb1a_prune_gap_local,
              valid_pair, has_above, has_below, _, _) = (
                 _cb1a_local_winner_gaps_from_boundaries(
