@@ -75,6 +75,10 @@ try:
     from models.dawn_srw_v4159 import DAWN as DAWN_SRW_V4159
 except ImportError:
     DAWN_SRW_V4159 = None
+try:
+    from models.dawn_srw_v4160 import DAWN as DAWN_SRW_V4160
+except ImportError:
+    DAWN_SRW_V4160 = None
 
 # ============================================================
 # Constants
@@ -89,6 +93,7 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.5.6',
     'spatial-r1-v4.1.5.8',
     'spatial-r1-v4.1.5.9',
+    'spatial-r1-v4.1.6.0',
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -445,6 +450,15 @@ def _dawn_srw_kwargs(cfg):
                 'tau_offset_init_rst', t.get('tau_offset_init_rst'))
         if ('d_select' in m or 'd_select' in t):
             kw['d_select'] = m.get('d_select', t.get('d_select'))
+    if version == 'spatial-r1-v4.1.6.0':
+        kw['tau_init_attn_qk'] = m.get(
+            'tau_init_attn_qk', t.get('tau_init_attn_qk', 0.02))
+        kw['tau_init_attn_v'] = m.get(
+            'tau_init_attn_v', t.get('tau_init_attn_v', 0.10))
+        kw['tau_init_rst'] = m.get(
+            'tau_init_rst', t.get('tau_init_rst', 0.15))
+        if ('d_select' in m or 'd_select' in t):
+            kw['d_select'] = m.get('d_select', t.get('d_select'))
     return kw
 
 
@@ -459,6 +473,10 @@ def _v415_sharded_kwargs(cfg):
             scan_std_floor=t.get('scan_std_floor', 0.5),
             tau_min=t.get('tau_min', 0.0),
         )
+    elif version == 'spatial-r1-v4.1.6.0':
+        kw = dict(
+            dead_exposure_target=float(t.get('dead_exposure_target', 0.1)),
+        )
     else:
         kw = dict(
             sharpness=t.get('sharpness', 500.0),
@@ -467,14 +485,14 @@ def _v415_sharded_kwargs(cfg):
             scan_scale=t.get('scan_scale', 0.01),
             scan_std_floor=t.get('scan_std_floor', 0.5),
         )
-    # v4.1.5.9 angular routing uses model.d_select directly:
+    # v4.1.5.9/v4.1.6.0 angular routing uses model.d_select directly:
     #   d_intensity = d_route - d_select
     m = cfg['model']
     d_route = int(m.get('d_route', m.get('d_bottleneck', 128)))
     d_select_cfg = m.get('d_select', t.get('d_select', None))
-    if version == 'spatial-r1-v4.1.5.9' and d_select_cfg is None:
+    if version in ('spatial-r1-v4.1.5.9', 'spatial-r1-v4.1.6.0') and d_select_cfg is None:
         raise ValueError(
-            "spatial-r1-v4.1.5.9 angular SRW requires model.d_select.")
+            f"{version} angular SRW requires model.d_select.")
     if d_select_cfg is not None:
         d_select = int(d_select_cfg)
         if not (0 < d_select < d_route):
@@ -563,6 +581,17 @@ if DAWN_SRW_V4159 is not None:
         name='spatial-r1-v4.1.5.9',
         module_path='models.dawn_srw_v4159',
         cls=DAWN_SRW_V4159,
+        build_kwargs=_dawn_srw_kwargs,
+        supports_sharded=True,
+        force_sharded=True,
+        sharded_kwargs=_v415_sharded_kwargs,
+    )
+
+if DAWN_SRW_V4160 is not None:
+    MODEL_REGISTRY['spatial-r1-v4.1.6.0'] = ModelSpec(
+        name='spatial-r1-v4.1.6.0',
+        module_path='models.dawn_srw_v4160',
+        cls=DAWN_SRW_V4160,
         build_kwargs=_dawn_srw_kwargs,
         supports_sharded=True,
         force_sharded=True,
@@ -1216,8 +1245,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             dead_penalty = result.get('dead_penalty', jnp.float32(0.0))
             # v4.1 batch-global-mean exploration loss.
             per_token_ce = result.get('per_token_ce', None)
-            attn_tau_off = result.get('attn_tau_offset', None)
-            rst_tau_off = result.get('rst_tau_offset', None)
+            attn_tau_off = result.get('attn_tau_direct', result.get('attn_tau_offset', None))
+            rst_tau_off = result.get('rst_tau_direct', result.get('rst_tau_offset', None))
             valid_mask = result.get('valid_mask', None)
             have_explore = (per_token_ce is not None
                             and attn_tau_off is not None
@@ -1472,7 +1501,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return sum(leaves)
 
         def _is_tau_path(ps):
-            return ('router/tau_attn' in ps) or ('router/tau_rst' in ps)
+            return (('router/tau_attn' in ps) or ('router/tau_rst' in ps)
+                    or ('router/raw_tau_attn' in ps) or ('router/raw_tau_rst' in ps))
 
         def _is_router_proj_path(ps):
             return ('router/proj_attn' in ps) or ('router/proj_rst' in ps)
@@ -1510,10 +1540,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                     or ('neuron_pool/know_emb' in ps))
 
         def _is_tau_attn_path(ps):
-            return 'router/tau_attn' in ps
+            return ('router/tau_attn' in ps) or ('router/raw_tau_attn' in ps)
 
         def _is_tau_rst_path(ps):
-            return 'router/tau_rst' in ps
+            return ('router/tau_rst' in ps) or ('router/raw_tau_rst' in ps)
 
         def _is_scan_attn_path(ps):
             return (('router/raw_scan_offset_attn' in ps)
@@ -2052,12 +2082,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_rho_mean': result.get('attn_rho_mean', jnp.float32(0.0)),
             'attn_rho_std': result.get('attn_rho_std', jnp.float32(0.0)),
             'attn_rho_max': result.get('attn_rho_max', jnp.float32(0.0)),
-            'attn_tau_raw_mean': result.get('attn_tau_raw_mean', jnp.float32(0.0)),
-            'attn_tau_floor_mean': result.get('attn_tau_floor_mean', jnp.float32(0.0)),
-            'attn_tau_min_hit_frac': result.get('attn_tau_min_hit_frac', jnp.float32(0.0)),
-            'attn_tau_offset_mean': result.get('attn_tau_offset_mean', jnp.float32(0.0)),
-            'attn_tau_offset_min': result.get('attn_tau_offset_min', jnp.float32(0.0)),
-            'attn_tau_offset_max': result.get('attn_tau_offset_max', jnp.float32(0.0)),
+            'attn_raw_tau_mean': result.get('attn_raw_tau_mean', result.get('attn_tau_raw_mean', jnp.float32(0.0))),
+            'attn_tau_min': result.get('attn_tau_min', result.get('attn_tau_floor_mean', jnp.float32(0.0))),
+            'attn_tau_max': result.get('attn_tau_max', jnp.float32(0.0)),
+
             'attn_selection_margin_mean': result.get('attn_selection_margin_mean', jnp.float32(0.0)),
             'attn_positive_margin_mean': result.get('attn_positive_margin_mean', jnp.float32(0.0)),
             'attn_positive_margin_max': result.get('attn_positive_margin_max', jnp.float32(0.0)),
@@ -2066,12 +2094,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_rho_mean': result.get('rst_rho_mean', jnp.float32(0.0)),
             'rst_rho_std': result.get('rst_rho_std', jnp.float32(0.0)),
             'rst_rho_max': result.get('rst_rho_max', jnp.float32(0.0)),
-            'rst_tau_raw_mean': result.get('rst_tau_raw_mean', jnp.float32(0.0)),
-            'rst_tau_floor_mean': result.get('rst_tau_floor_mean', jnp.float32(0.0)),
-            'rst_tau_min_hit_frac': result.get('rst_tau_min_hit_frac', jnp.float32(0.0)),
-            'rst_tau_offset_mean': result.get('rst_tau_offset_mean', jnp.float32(0.0)),
-            'rst_tau_offset_min': result.get('rst_tau_offset_min', jnp.float32(0.0)),
-            'rst_tau_offset_max': result.get('rst_tau_offset_max', jnp.float32(0.0)),
+            'rst_raw_tau_mean': result.get('rst_raw_tau_mean', result.get('rst_tau_raw_mean', jnp.float32(0.0))),
+            'rst_tau_min': result.get('rst_tau_min', result.get('rst_tau_floor_mean', jnp.float32(0.0))),
+            'rst_tau_max': result.get('rst_tau_max', jnp.float32(0.0)),
+
             'rst_selection_margin_mean': result.get('rst_selection_margin_mean', jnp.float32(0.0)),
             'rst_positive_margin_mean': result.get('rst_positive_margin_mean', jnp.float32(0.0)),
             'rst_positive_margin_max': result.get('rst_positive_margin_max', jnp.float32(0.0)),
@@ -3602,12 +3628,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_rho_mean': float(m.get('attn_rho_mean', 0.0)),
         'attn_rho_std': float(m.get('attn_rho_std', 0.0)),
         'attn_rho_max': float(m.get('attn_rho_max', 0.0)),
-        'attn_tau_raw_mean': float(m.get('attn_tau_raw_mean', 0.0)),
-        'attn_tau_floor_mean': float(m.get('attn_tau_floor_mean', 0.0)),
-        'attn_tau_min_hit_frac': float(m.get('attn_tau_min_hit_frac', 0.0)),
-        'attn_tau_offset_mean': float(m.get('attn_tau_offset_mean', 0.0)),
-        'attn_tau_offset_min': float(m.get('attn_tau_offset_min', 0.0)),
-        'attn_tau_offset_max': float(m.get('attn_tau_offset_max', 0.0)),
+        'attn_raw_tau_mean': float(m.get('attn_raw_tau_mean', m.get('attn_tau_raw_mean', 0.0))),
+        'attn_tau_min': float(m.get('attn_tau_min', m.get('attn_tau_floor_mean', 0.0))),
+        'attn_tau_max': float(m.get('attn_tau_max', 0.0)),
+
         'attn_selection_margin_mean': float(m.get('attn_selection_margin_mean', 0.0)),
         'attn_positive_margin_mean': float(m.get('attn_positive_margin_mean', 0.0)),
         'attn_positive_margin_max': float(m.get('attn_positive_margin_max', 0.0)),
@@ -3616,12 +3640,10 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_rho_mean': float(m.get('rst_rho_mean', 0.0)),
         'rst_rho_std': float(m.get('rst_rho_std', 0.0)),
         'rst_rho_max': float(m.get('rst_rho_max', 0.0)),
-        'rst_tau_raw_mean': float(m.get('rst_tau_raw_mean', 0.0)),
-        'rst_tau_floor_mean': float(m.get('rst_tau_floor_mean', 0.0)),
-        'rst_tau_min_hit_frac': float(m.get('rst_tau_min_hit_frac', 0.0)),
-        'rst_tau_offset_mean': float(m.get('rst_tau_offset_mean', 0.0)),
-        'rst_tau_offset_min': float(m.get('rst_tau_offset_min', 0.0)),
-        'rst_tau_offset_max': float(m.get('rst_tau_offset_max', 0.0)),
+        'rst_raw_tau_mean': float(m.get('rst_raw_tau_mean', m.get('rst_tau_raw_mean', 0.0))),
+        'rst_tau_min': float(m.get('rst_tau_min', m.get('rst_tau_floor_mean', 0.0))),
+        'rst_tau_max': float(m.get('rst_tau_max', 0.0)),
+
         'rst_selection_margin_mean': float(m.get('rst_selection_margin_mean', 0.0)),
         'rst_positive_margin_mean': float(m.get('rst_positive_margin_mean', 0.0)),
         'rst_positive_margin_max': float(m.get('rst_positive_margin_max', 0.0)),
@@ -3835,6 +3857,19 @@ def _print_regular_block(rec, ctx):
             f" no_active[a={rec['attn_no_active_frac']*100:.2f}%"
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
+    elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
+        log_message(
+            f"  select: tau[a={rec['attn_tau_mean']:.4f}"
+            f" rst={rec['rst_tau_mean']:.4f}]"
+            f" margin[a={rec['attn_selection_margin_mean']:+.4f}"
+            f" rst={rec['rst_selection_margin_mean']:+.4f}]"
+            f" pos[a={rec['attn_positive_margin_mean']:.4f}"
+            f" rst={rec['rst_positive_margin_mean']:.4f}]"
+            f" selected[a={rec['attn_selected_frac']*100:.1f}%"
+            f" rst={rec['rst_selected_frac']*100:.1f}%]"
+            f" no_active[a={rec['attn_no_active_frac']*100:.2f}%"
+            f" rst={rec['rst_no_active_frac']*100:.2f}%]"
+        )
     log_message(
         f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
         f" rst={rec['rst_raw_gate_max']:.1f}]"
@@ -3918,19 +3953,26 @@ def _print_regular_block(rec, ctx):
         f" abs[attn={rec['attn_tau_abs_mean']:.3f} rst={rec['rst_tau_abs_mean']:.3f}]"
     )
     if ctx.get('model_version') in (
-            'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
+            'spatial-r1-v4.1.5.2', 'dawn_srw',
+            'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6',
+            'spatial-r1-v4.1.5.8', 'spatial-r1-v4.1.5.9'):
         log_message(
             f"  scan_offset: rst={rec['raw_scan_offset_rst_bias']:+.3f}"
             f" attn=[{rec['raw_scan_offset_attn_bias_0']:+.3f} {rec['raw_scan_offset_attn_bias_1']:+.3f} {rec['raw_scan_offset_attn_bias_2']:+.3f}]"
         )
-    log_message(
-        f"  tau_off rst[min={rec['rst_tau_off_min']:+.2f} p01={rec['rst_tau_off_p01']:+.2f}"
-        f" p99={rec['rst_tau_off_p99']:+.2f} max={rec['rst_tau_off_max']:+.2f}"
-        f" neg={rec['rst_tau_off_neg_frac']*100:.1f}%]"
-        f" attn[min={rec['attn_tau_off_min']:+.2f} p01={rec['attn_tau_off_p01']:+.2f}"
-        f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
-        f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
-    )
+        log_message(
+            f"  tau_off rst[min={rec['rst_tau_off_min']:+.2f} p01={rec['rst_tau_off_p01']:+.2f}"
+            f" p99={rec['rst_tau_off_p99']:+.2f} max={rec['rst_tau_off_max']:+.2f}"
+            f" neg={rec['rst_tau_off_neg_frac']*100:.1f}%]"
+            f" attn[min={rec['attn_tau_off_min']:+.2f} p01={rec['attn_tau_off_p01']:+.2f}"
+            f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
+            f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
+        )
+    elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
+        log_message(
+            f"  raw_tau rst[min={rec['rst_raw_tau_min']:+.2f} max={rec['rst_raw_tau_max']:+.2f}]"
+            f" attn[min={rec['attn_raw_tau_min']:+.2f} max={rec['attn_raw_tau_max']:+.2f}]"
+        )
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
         else "score_std")
@@ -4631,6 +4673,17 @@ def _print_debug_block(rec, ctx):
             f"tau_raw[attn={_g('attn_tau_raw_mean'):+.5f} rst={_g('rst_tau_raw_mean'):+.5f}] "
             f"tau[attn={_g('attn_tau_floor_mean'):+.5f} rst={_g('rst_tau_floor_mean'):+.5f}] "
             f"tau_min_hit[attn={_g('attn_tau_min_hit_frac'):.5f} rst={_g('rst_tau_min_hit_frac'):.5f}] "
+            f"selection_margin[attn={_g('attn_selection_margin_mean'):+.5f} rst={_g('rst_selection_margin_mean'):+.5f}] "
+            f"positive_margin[attn={_g('attn_positive_margin_mean'):.5f}/{_g('attn_positive_margin_max'):.5f} "
+            f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
+            f"selected[attn={_g('attn_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
+            f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
+        )
+    elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
+        log_debug_message(
+            f"direct_tau_select_diag: "
+            f"tau[attn={_g('attn_tau_mean'):+.5f} rst={_g('rst_tau_mean'):+.5f}] "
+            f"raw_tau[attn={_g('attn_raw_tau_mean'):+.5f} rst={_g('rst_raw_tau_mean'):+.5f}] "
             f"selection_margin[attn={_g('attn_selection_margin_mean'):+.5f} rst={_g('rst_selection_margin_mean'):+.5f}] "
             f"positive_margin[attn={_g('attn_positive_margin_mean'):.5f}/{_g('attn_positive_margin_max'):.5f} "
             f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
@@ -5783,8 +5836,10 @@ def main():
     def _print_v4159_tau_bias(label, p):
         if not is_host0 or cfg['model'].get('model_version') != 'spatial-r1-v4.1.5.9':
             return
-        tau_attn_bias = np.asarray(p['router']['tau_attn']['bias'])
-        tau_rst_bias = np.asarray(p['router']['tau_rst']['bias'])
+        tau_attn_node = p['router'].get('tau_attn', p['router'].get('raw_tau_attn'))
+        tau_rst_node = p['router'].get('tau_rst', p['router'].get('raw_tau_rst'))
+        tau_attn_bias = np.asarray(tau_attn_node['bias'])
+        tau_rst_bias = np.asarray(tau_rst_node['bias'])
         print(
             f"  v4159 {label} tau bias: "
             f"attn=[Q={tau_attn_bias[0]:.6g}, K={tau_attn_bias[1]:.6g}, V={tau_attn_bias[2]:.6g}] "
@@ -6034,6 +6089,14 @@ def main():
                 f"tau_offset_init_rst={tcfg.get('tau_offset_init_rst', cfg['model'].get('tau_offset_init_rst', 'default'))} "
                 f"intensity_beta={tcfg.get('intensity_beta', 0.5)} "
                 f"scan_scale={tcfg.get('scan_scale', 0.0)}"
+            )
+        elif cfg['model'].get('model_version') == 'spatial-r1-v4.1.6.0':
+            gate_msg = (
+                "  Gate (v4.1.6.0 direct-tau): "
+                f"tau_init_attn_qk={tcfg.get('tau_init_attn_qk', cfg['model'].get('tau_init_attn_qk', 0.02))} "
+                f"tau_init_attn_v={tcfg.get('tau_init_attn_v', cfg['model'].get('tau_init_attn_v', 0.10))} "
+                f"tau_init_rst={tcfg.get('tau_init_rst', cfg['model'].get('tau_init_rst', 0.15))} "
+                f"intensity_beta={tcfg.get('intensity_beta', 0.5)}"
             )
         else:
             gate_msg = (
@@ -6577,8 +6640,8 @@ def main():
                 h_Q = h_Q / (jnp.linalg.norm(h_Q, axis=-1, keepdims=True) + 1e-8)
                 h_K = h_K / (jnp.linalg.norm(h_K, axis=-1, keepdims=True) + 1e-8)
                 h_V = h_V / (jnp.linalg.norm(h_V, axis=-1, keepdims=True) + 1e-8)
-                tau_all = (x @ router_p['tau_attn']['kernel']
-                           + router_p['tau_attn']['bias'])
+                tau_all = (x @ router_p.get('tau_attn', router_p.get('raw_tau_attn'))['kernel']
+                           + router_p.get('tau_attn', router_p.get('raw_tau_attn'))['bias'])
                 if _uses_scan_offset:
                     scan_p = _get_param(
                         router_p, 'raw_scan_offset_attn', 'raw_scan_offset_attn')

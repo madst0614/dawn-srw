@@ -1,0 +1,95 @@
+# DAWN-SRW v4.1.6.0 DirectTau — 40M clean stability test
+#
+# Expected placement:
+#   models/dawn_srw_v4160.py
+#   scripts/train_jax.py  (or merge the registry changes from train_jax_v4160.py)
+#
+# v4.1.6.0 change:
+#   rho = cosine(q_select, signature)
+#   tau = sigmoid(raw_tau)
+#   gate = relu(rho - tau) * intensity
+#
+# Direct tau init uses valid cosine cutoffs in (0, 1):
+#   qk=0.02, v=0.10, rst=0.15
+
+seed: 1
+
+data:
+  bin_train: gs://dawn-tpu-data-c4/c4_train_40B
+  bin_val: gs://dawn-tpu-data-c4/c4_val.bin
+  max_train_tokens: 5000000000
+  max_val_tokens: 10000000
+  local_cache_dir: /tmp/data
+
+model:
+  model_version: spatial-r1-v4.1.6.0
+
+  # Backbone
+  d_model: 432
+  n_layers: 12
+  n_heads: 6
+  max_seq_len: 512
+
+  # Route split
+  d_route: 128
+  d_select: 96        # remaining 32 dims are intensity dims
+
+  # Shared SRW pools
+  n_qk: 1240
+  n_v: 7830
+  n_know: 15570
+
+  # Execution / regularization
+  dropout: 0.0
+  router_dropout: 0.0
+  gradient_checkpointing: true
+
+training:
+  # Batch / schedule
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  restore_training_config_on_resume: false
+  num_epochs: 1
+
+  # Optimizer
+  lr: 0.00065
+  warmup_ratio: 0.06
+  weight_decay: 0.1
+  pool_weight_decay: 0.02
+  tau_lr_mult: 0.1
+  tau_grad_clip: 1.0
+  router_proj_grad_clip: 2.0
+
+  # DirectTau Angular Select / Intensity
+  tau_init_attn_qk: 0.02
+  tau_init_attn_v: 0.10
+  tau_init_rst: 0.15
+  intensity_beta: 0.5
+
+  # Auxiliary losses
+  diversity_weight: 0.1
+  load_balance_weight: 0.0
+  dead_penalty_weight: 0.005
+  dead_exposure_target: 0.1
+
+  # Exploration / RPE feedback over direct tau in [0, 1]
+  exploration_weight: 0.001
+  exploration_asymmetry: 3.0
+  exploration_warmup_steps: 0
+  exploration_lower_bound: 0.0
+  exploration_upper_bound: 0.95
+  exploration_bound_eps: 0.001
+
+  # Sharding / chunking
+  n_chunks_qk: 1
+  n_chunks_v: 1
+  n_chunks_know: 1
+
+  # Logging / diagnostics / checkpoints
+  checkpoint_interval: 500
+  val_interval: 500
+  log_interval: 100
+  log_analysis_multiplier: 5
+  heavy_geometry_multiplier: 10
+
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4160_40M_c4_5B_direct_tau
