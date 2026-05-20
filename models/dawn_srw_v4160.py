@@ -161,6 +161,61 @@ DEAD_EXPOSURE_DIAG_COUNT = len(DEAD_EXPOSURE_DIAG_NAMES)
 ) = range(DEAD_EXPOSURE_DIAG_COUNT)
 
 
+ATTN_SPLIT_CORE_NAMES = (
+    'qk_raw_gate_max',
+    'v_raw_gate_max',
+    'qk_gate_sum',
+    'v_gate_sum',
+    'qk_active_n_mean',
+    'v_active_n_mean',
+    'qk_tau_abs_mean',
+    'v_tau_abs_mean',
+    'qk_dead_count',
+    'v_dead_count',
+    'qk_int_max',
+    'v_int_max',
+    'qk_gate_den_sum_mean',
+    'v_gate_den_sum_mean',
+    'qk_gate_eff_n',
+    'v_gate_eff_n',
+    'qk_gate_eff_ratio',
+    'v_gate_eff_ratio',
+    'qk_top1_gate_frac',
+    'v_top1_gate_frac',
+    'qk_top1_gate_frac_max',
+    'v_top1_gate_frac_max',
+    'qk_dead_penalty',
+    'v_dead_penalty',
+)
+ATTN_SPLIT_CORE_COUNT = len(ATTN_SPLIT_CORE_NAMES)
+(
+    ATTN_SPLIT_QK_RAW_GATE_MAX,
+    ATTN_SPLIT_V_RAW_GATE_MAX,
+    ATTN_SPLIT_QK_GATE_SUM,
+    ATTN_SPLIT_V_GATE_SUM,
+    ATTN_SPLIT_QK_ACTIVE_N_MEAN,
+    ATTN_SPLIT_V_ACTIVE_N_MEAN,
+    ATTN_SPLIT_QK_TAU_ABS_MEAN,
+    ATTN_SPLIT_V_TAU_ABS_MEAN,
+    ATTN_SPLIT_QK_DEAD_COUNT,
+    ATTN_SPLIT_V_DEAD_COUNT,
+    ATTN_SPLIT_QK_INT_MAX,
+    ATTN_SPLIT_V_INT_MAX,
+    ATTN_SPLIT_QK_GATE_DEN_SUM_MEAN,
+    ATTN_SPLIT_V_GATE_DEN_SUM_MEAN,
+    ATTN_SPLIT_QK_GATE_EFF_N,
+    ATTN_SPLIT_V_GATE_EFF_N,
+    ATTN_SPLIT_QK_GATE_EFF_RATIO,
+    ATTN_SPLIT_V_GATE_EFF_RATIO,
+    ATTN_SPLIT_QK_TOP1_GATE_FRAC,
+    ATTN_SPLIT_V_TOP1_GATE_FRAC,
+    ATTN_SPLIT_QK_TOP1_GATE_FRAC_MAX,
+    ATTN_SPLIT_V_TOP1_GATE_FRAC_MAX,
+    ATTN_SPLIT_QK_DEAD_PENALTY,
+    ATTN_SPLIT_V_DEAD_PENALTY,
+) = range(ATTN_SPLIT_CORE_COUNT)
+
+
 def _pool_output_scales(d_model, n_layers):
     dm = jnp.asarray(d_model, dtype=jnp.float32)
     nl = jnp.asarray(n_layers, dtype=jnp.float32)
@@ -1992,6 +2047,36 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
         (qk_exposure_diag[DEAD_EXPOSURE_TARGET]
          + v_exposure_diag[DEAD_EXPOSURE_TARGET]) / 2.0,
     )
+    attn_split_core = jnp.stack((
+        qk_raw_gmax.mean(),
+        v_raw_gmax.mean(),
+        qk_es,
+        v_es,
+        qk_anm,
+        v_anm,
+        qk_tau_abs,
+        v_tau_abs,
+        qk_dead_cnt,
+        v_dead_cnt,
+        qk_int_max,
+        v_int_max,
+        qk_den_cost_mean,
+        v_den_cost_mean,
+        qk_gate_eff_n,
+        v_gate_eff_n,
+        qk_gate_eff_ratio,
+        v_gate_eff_ratio,
+        qk_top1_gate_frac,
+        v_top1_gate_frac,
+        qk_top1_gate_frac_max,
+        v_top1_gate_frac_max,
+        qk_dead_pen,
+        v_dead_pen,
+    )).astype(jnp.float32)
+    attn_qk_select_diag = jnp.stack(qk_select_diag).astype(jnp.float32)
+    attn_v_select_diag = jnp.stack(v_select_diag).astype(jnp.float32)
+    attn_qk_exposure_diag = jnp.stack(qk_exposure_diag).astype(jnp.float32)
+    attn_v_exposure_diag = jnp.stack(v_exposure_diag).astype(jnp.float32)
     # Exploration loss consumes tau offsets per layer: [B, S, 3].
     attn_tau_direct = tau_all
     slim_ret = (out, aux, qk_active.mean(), v_active.mean(), attn_raw_gmax,
@@ -2014,7 +2099,12 @@ def _attn_forward(x, pool_params, router_params, expand_O_kernel, rng,
                 attn_top1_gate_frac, attn_top1_gate_frac_max,
                 qk_selection_residency, v_selection_residency,
                 *attn_select_diag,
-                *attn_exposure_diag)
+                *attn_exposure_diag,
+                attn_split_core,
+                attn_qk_select_diag,
+                attn_v_select_diag,
+                attn_qk_exposure_diag,
+                attn_v_exposure_diag)
     if not analysis:
         ret = slim_ret
         if local_diagnostics:
@@ -2446,6 +2536,16 @@ class DAWN(nn.Module):
             rst_dead_exposure_frac_all = _z
             rst_weak_exposure_frac_all = _z
             rst_dead_exposure_target_all = _z
+            attn_split_core_all = jnp.zeros(
+                (1, ATTN_SPLIT_CORE_COUNT), dtype=jnp.float32)
+            attn_qk_select_diag_all = jnp.zeros(
+                (1, SELECT_DIAG_COUNT), dtype=jnp.float32)
+            attn_v_select_diag_all = jnp.zeros(
+                (1, SELECT_DIAG_COUNT), dtype=jnp.float32)
+            attn_qk_exposure_diag_all = jnp.zeros(
+                (1, DEAD_EXPOSURE_DIAG_COUNT), dtype=jnp.float32)
+            attn_v_exposure_diag_all = jnp.zeros(
+                (1, DEAD_EXPOSURE_DIAG_COUNT), dtype=jnp.float32)
             # Trigger Flax param realization for all submodules (init-only).
             # The real forward runs through scan_body in the else branch and
             # accesses params by path, not via these module calls.
@@ -2516,6 +2616,9 @@ class DAWN(nn.Module):
                  a_angular_exposure_mean, a_angular_exposure_min,
                  a_angular_exposure_max, a_dead_exposure_frac,
                  a_weak_exposure_frac, a_dead_exposure_target) = attn_ret[:55]
+                (a_split_core,
+                 a_qk_select_diag, a_v_select_diag,
+                 a_qk_exposure_diag, a_v_exposure_diag) = attn_ret[55:60]
                 if analysis:
                     (a_qk_raw_norm, a_v_raw_norm,
                      a_q_norm, a_k_norm, a_v_norm_dbg, a_logit_max, a_o_input_norm,
@@ -2532,7 +2635,7 @@ class DAWN(nn.Module):
                      a_softmax_top1_mean, a_softmax_top1_max,
                      a_logit_gap_mean, a_logit_gap_max,
                      a_softmax_entropy_mean, a_softmax_entropy_min,
-                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[55:92]
+                     a_o_input_norm_max, a_o_out_norm_max) = attn_ret[60:97]
                 if local_diagnostics:
                     (a_attn_local_layer_values,
                      a_attn_local_values, a_attn_local_locs,
@@ -2634,6 +2737,9 @@ class DAWN(nn.Module):
                            k_angular_exposure_mean, k_angular_exposure_min,
                            k_angular_exposure_max, k_dead_exposure_frac,
                            k_weak_exposure_frac, k_dead_exposure_target,
+                           a_split_core,
+                           a_qk_select_diag, a_v_select_diag,
+                           a_qk_exposure_diag, a_v_exposure_diag,
                            )
                 if not analysis:
                     if local_diagnostics:
@@ -2747,6 +2853,11 @@ class DAWN(nn.Module):
             rst_weak_exposure_frac_all,
             rst_dead_exposure_target_all) = scan_ys[:102]
             _scan_offset = 102
+            (attn_split_core_all,
+             attn_qk_select_diag_all, attn_v_select_diag_all,
+             attn_qk_exposure_diag_all, attn_v_exposure_diag_all) = scan_ys[
+                _scan_offset:_scan_offset + 5]
+            _scan_offset += 5
             if analysis:
                 (attn_qk_raw_norm_all, attn_v_raw_norm_all, rst_raw_out_norm_all,
                  attn_q_norm_all, attn_k_norm_all, attn_v_norm_dbg_all,
@@ -2790,6 +2901,31 @@ class DAWN(nn.Module):
             total_aux = (attn_auxes + rst_auxes).mean()
 
         x = self.norm(x)
+
+        def _attn_core_mean(idx):
+            return attn_split_core_all[:, idx].mean()
+
+        def _attn_core_max(idx):
+            return attn_split_core_all[:, idx].max()
+
+        def _select_mean(diag_all, idx):
+            return diag_all[:, idx].mean()
+
+        def _select_min(diag_all, idx):
+            return diag_all[:, idx].min()
+
+        def _select_max(diag_all, idx):
+            return diag_all[:, idx].max()
+
+        def _exposure_mean(diag_all, idx):
+            return diag_all[:, idx].mean()
+
+        def _exposure_min(diag_all, idx):
+            return diag_all[:, idx].min()
+
+        def _exposure_max(diag_all, idx):
+            return diag_all[:, idx].max()
+
         result = {
             'aux_loss': total_aux,
             'attn_aux': attn_auxes.mean(),
@@ -2839,6 +2975,66 @@ class DAWN(nn.Module):
             'attn_positive_margin_max': attn_positive_margin_max_all.max(),
             'attn_selected_frac': attn_selected_frac_all.mean(),
             'attn_no_active_frac': attn_no_active_frac_all.mean(),
+            'attn_qk_rho_mean': _select_mean(
+                attn_qk_select_diag_all, SELECT_RHO_MEAN),
+            'attn_qk_rho_std': _select_mean(
+                attn_qk_select_diag_all, SELECT_RHO_STD),
+            'attn_qk_score_std': _select_mean(
+                attn_qk_select_diag_all, SELECT_RHO_STD),
+            'attn_qk_rho_max': _select_max(
+                attn_qk_select_diag_all, SELECT_RHO_MAX),
+            'attn_qk_tau_mean': _select_mean(
+                attn_qk_select_diag_all, SELECT_TAU_MEAN),
+            'attn_qk_tau_min': _select_min(
+                attn_qk_select_diag_all, SELECT_TAU_MIN),
+            'attn_qk_tau_max': _select_max(
+                attn_qk_select_diag_all, SELECT_TAU_MAX),
+            'attn_qk_raw_tau_mean': _select_mean(
+                attn_qk_select_diag_all, SELECT_RAW_TAU_MEAN),
+            'attn_qk_raw_tau_min': _select_min(
+                attn_qk_select_diag_all, SELECT_RAW_TAU_MIN),
+            'attn_qk_raw_tau_max': _select_max(
+                attn_qk_select_diag_all, SELECT_RAW_TAU_MAX),
+            'attn_qk_selection_margin_mean': _select_mean(
+                attn_qk_select_diag_all, SELECT_SELECTION_MARGIN_MEAN),
+            'attn_qk_positive_margin_mean': _select_mean(
+                attn_qk_select_diag_all, SELECT_POSITIVE_MARGIN_MEAN),
+            'attn_qk_positive_margin_max': _select_max(
+                attn_qk_select_diag_all, SELECT_POSITIVE_MARGIN_MAX),
+            'attn_qk_selected_frac': _select_mean(
+                attn_qk_select_diag_all, SELECT_SELECTED_FRAC),
+            'attn_qk_no_active_frac': _select_mean(
+                attn_qk_select_diag_all, SELECT_NO_ACTIVE_FRAC),
+            'attn_v_rho_mean': _select_mean(
+                attn_v_select_diag_all, SELECT_RHO_MEAN),
+            'attn_v_rho_std': _select_mean(
+                attn_v_select_diag_all, SELECT_RHO_STD),
+            'attn_v_score_std': _select_mean(
+                attn_v_select_diag_all, SELECT_RHO_STD),
+            'attn_v_rho_max': _select_max(
+                attn_v_select_diag_all, SELECT_RHO_MAX),
+            'attn_v_tau_mean': _select_mean(
+                attn_v_select_diag_all, SELECT_TAU_MEAN),
+            'attn_v_tau_min': _select_min(
+                attn_v_select_diag_all, SELECT_TAU_MIN),
+            'attn_v_tau_max': _select_max(
+                attn_v_select_diag_all, SELECT_TAU_MAX),
+            'attn_v_raw_tau_mean': _select_mean(
+                attn_v_select_diag_all, SELECT_RAW_TAU_MEAN),
+            'attn_v_raw_tau_min': _select_min(
+                attn_v_select_diag_all, SELECT_RAW_TAU_MIN),
+            'attn_v_raw_tau_max': _select_max(
+                attn_v_select_diag_all, SELECT_RAW_TAU_MAX),
+            'attn_v_selection_margin_mean': _select_mean(
+                attn_v_select_diag_all, SELECT_SELECTION_MARGIN_MEAN),
+            'attn_v_positive_margin_mean': _select_mean(
+                attn_v_select_diag_all, SELECT_POSITIVE_MARGIN_MEAN),
+            'attn_v_positive_margin_max': _select_max(
+                attn_v_select_diag_all, SELECT_POSITIVE_MARGIN_MAX),
+            'attn_v_selected_frac': _select_mean(
+                attn_v_select_diag_all, SELECT_SELECTED_FRAC),
+            'attn_v_no_active_frac': _select_mean(
+                attn_v_select_diag_all, SELECT_NO_ACTIVE_FRAC),
             'rst_rho_mean': rst_rho_mean_all.mean(),
             'rst_rho_std': rst_rho_std_all.mean(),
             'rst_rho_max': rst_rho_max_all.max(),
@@ -2858,6 +3054,30 @@ class DAWN(nn.Module):
             'attn_dead_exposure_frac': attn_dead_exposure_frac_all.mean(),
             'attn_weak_exposure_frac': attn_weak_exposure_frac_all.mean(),
             'attn_dead_exposure_target': attn_dead_exposure_target_all.mean(),
+            'attn_qk_angular_exposure_mean': _exposure_mean(
+                attn_qk_exposure_diag_all, DEAD_EXPOSURE_MEAN),
+            'attn_qk_angular_exposure_min': _exposure_min(
+                attn_qk_exposure_diag_all, DEAD_EXPOSURE_MIN),
+            'attn_qk_angular_exposure_max': _exposure_max(
+                attn_qk_exposure_diag_all, DEAD_EXPOSURE_MAX),
+            'attn_qk_dead_exposure_frac': _exposure_mean(
+                attn_qk_exposure_diag_all, DEAD_EXPOSURE_DEAD_FRAC),
+            'attn_qk_weak_exposure_frac': _exposure_mean(
+                attn_qk_exposure_diag_all, DEAD_EXPOSURE_WEAK_FRAC),
+            'attn_qk_dead_exposure_target': _exposure_mean(
+                attn_qk_exposure_diag_all, DEAD_EXPOSURE_TARGET),
+            'attn_v_angular_exposure_mean': _exposure_mean(
+                attn_v_exposure_diag_all, DEAD_EXPOSURE_MEAN),
+            'attn_v_angular_exposure_min': _exposure_min(
+                attn_v_exposure_diag_all, DEAD_EXPOSURE_MIN),
+            'attn_v_angular_exposure_max': _exposure_max(
+                attn_v_exposure_diag_all, DEAD_EXPOSURE_MAX),
+            'attn_v_dead_exposure_frac': _exposure_mean(
+                attn_v_exposure_diag_all, DEAD_EXPOSURE_DEAD_FRAC),
+            'attn_v_weak_exposure_frac': _exposure_mean(
+                attn_v_exposure_diag_all, DEAD_EXPOSURE_WEAK_FRAC),
+            'attn_v_dead_exposure_target': _exposure_mean(
+                attn_v_exposure_diag_all, DEAD_EXPOSURE_TARGET),
             'rst_angular_exposure_mean': rst_angular_exposure_mean_all.mean(),
             'rst_angular_exposure_min': rst_angular_exposure_min_all.min(),
             'rst_angular_exposure_max': rst_angular_exposure_max_all.max(),
@@ -2880,6 +3100,14 @@ class DAWN(nn.Module):
             'dead_penalty': (attn_dead_penalty_all.mean()
                              + rst_dead_penalty_all.mean()),
             'attn_dead_count': attn_dead_count_all.mean(),
+            'attn_qk_dead_penalty': _attn_core_mean(
+                ATTN_SPLIT_QK_DEAD_PENALTY),
+            'attn_v_dead_penalty': _attn_core_mean(
+                ATTN_SPLIT_V_DEAD_PENALTY),
+            'attn_qk_dead_count': _attn_core_mean(
+                ATTN_SPLIT_QK_DEAD_COUNT),
+            'attn_v_dead_count': _attn_core_mean(
+                ATTN_SPLIT_V_DEAD_COUNT),
             'rst_dead_count': rst_dead_count_all.mean(),
 
             'per_layer_attn_out_norm': attn_out_norm_all,
@@ -2890,13 +3118,51 @@ class DAWN(nn.Module):
             'rst_tau_direct': rst_tau_direct_all,
             # Denominator diagnostic: sum(positive_margin * intensity).
             'attn_int_max': attn_int_max_all.max(),
+            'attn_qk_int_max': _attn_core_max(ATTN_SPLIT_QK_INT_MAX),
+            'attn_v_int_max': _attn_core_max(ATTN_SPLIT_V_INT_MAX),
             'rst_int_max': rst_int_max_all.max(),
+            'attn_qk_raw_gate_max': _attn_core_mean(
+                ATTN_SPLIT_QK_RAW_GATE_MAX),
+            'attn_v_raw_gate_max': _attn_core_mean(
+                ATTN_SPLIT_V_RAW_GATE_MAX),
+            'attn_qk_gate_sum': _attn_core_mean(
+                ATTN_SPLIT_QK_GATE_SUM),
+            'attn_v_gate_sum': _attn_core_mean(
+                ATTN_SPLIT_V_GATE_SUM),
+            'attn_qk_active_n_mean': _attn_core_mean(
+                ATTN_SPLIT_QK_ACTIVE_N_MEAN),
+            'attn_v_active_n_mean': _attn_core_mean(
+                ATTN_SPLIT_V_ACTIVE_N_MEAN),
+            'attn_qk_tau_abs_mean': _attn_core_mean(
+                ATTN_SPLIT_QK_TAU_ABS_MEAN),
+            'attn_v_tau_abs_mean': _attn_core_mean(
+                ATTN_SPLIT_V_TAU_ABS_MEAN),
             'attn_gate_den_sum_mean': attn_den_cost_mean_all.mean(),
+            'attn_qk_gate_den_sum_mean': _attn_core_mean(
+                ATTN_SPLIT_QK_GATE_DEN_SUM_MEAN),
+            'attn_v_gate_den_sum_mean': _attn_core_mean(
+                ATTN_SPLIT_V_GATE_DEN_SUM_MEAN),
             'rst_gate_den_sum_mean': rst_den_cost_mean_all.mean(),
             'attn_gate_eff_n': attn_gate_eff_n_all.mean(),
             'attn_gate_eff_ratio': attn_gate_eff_ratio_all.mean(),
             'attn_top1_gate_frac': attn_top1_gate_frac_all.mean(),
             'attn_top1_gate_frac_max': attn_top1_gate_frac_max_all.max(),
+            'attn_qk_gate_eff_n': _attn_core_mean(
+                ATTN_SPLIT_QK_GATE_EFF_N),
+            'attn_v_gate_eff_n': _attn_core_mean(
+                ATTN_SPLIT_V_GATE_EFF_N),
+            'attn_qk_gate_eff_ratio': _attn_core_mean(
+                ATTN_SPLIT_QK_GATE_EFF_RATIO),
+            'attn_v_gate_eff_ratio': _attn_core_mean(
+                ATTN_SPLIT_V_GATE_EFF_RATIO),
+            'attn_qk_top1_gate_frac': _attn_core_mean(
+                ATTN_SPLIT_QK_TOP1_GATE_FRAC),
+            'attn_v_top1_gate_frac': _attn_core_mean(
+                ATTN_SPLIT_V_TOP1_GATE_FRAC),
+            'attn_qk_top1_gate_frac_max': _attn_core_max(
+                ATTN_SPLIT_QK_TOP1_GATE_FRAC_MAX),
+            'attn_v_top1_gate_frac_max': _attn_core_max(
+                ATTN_SPLIT_V_TOP1_GATE_FRAC_MAX),
             'rst_gate_eff_n': rst_gate_eff_n_all.mean(),
             'rst_gate_eff_ratio': rst_gate_eff_ratio_all.mean(),
             'rst_top1_gate_frac': rst_top1_gate_frac_all.mean(),

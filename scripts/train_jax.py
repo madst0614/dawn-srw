@@ -113,6 +113,27 @@ ATTN_LOCAL_FIELD_NAMES = (
     'q_norm_max', 'k_norm_max', 'v_norm_max', 'attn_logit_max',
     'softmax_top1_max', 'o_in_norm_max', 'o_out_norm_max')
 
+DIRECT_TAU_SELECT_METRIC_NAMES = (
+    'rho_mean', 'rho_std', 'rho_max',
+    'tau_mean', 'tau_min', 'tau_max',
+    'raw_tau_mean', 'raw_tau_min', 'raw_tau_max',
+    'selection_margin_mean',
+    'positive_margin_mean', 'positive_margin_max',
+    'selected_frac', 'no_active_frac',
+)
+DIRECT_TAU_EXPOSURE_METRIC_NAMES = (
+    'angular_exposure_mean', 'angular_exposure_min',
+    'angular_exposure_max', 'dead_exposure_frac',
+    'weak_exposure_frac', 'dead_exposure_target',
+)
+DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES = (
+    'raw_gate_max', 'gate_sum', 'active_n_mean',
+    'tau_abs_mean', 'dead_penalty', 'dead_count',
+    'int_max', 'gate_den_sum_mean', 'gate_eff_n',
+    'gate_eff_ratio', 'top1_gate_frac', 'top1_gate_frac_max',
+    'score_std',
+)
+
 UPDATE_CAP_GROUP_SPECS = (
     ('proj_attn', 'pA', 'update_cap_proj_attn_hit',
      'update_cap_proj_attn_ratio_pre', 'update_cap_proj_attn_scale',
@@ -2345,6 +2366,24 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'update_cap_scan_rst_scale': upd_scan_rst_scale,
             'update_cap_scan_rst_hit': upd_scan_rst_hit,
         }
+        for _pool in ('attn_qk', 'attn_v'):
+            for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
+                _fallback = result.get(
+                    f'attn_{_name}', jnp.float32(0.0))
+                if _name == 'score_std':
+                    _fallback = result.get(
+                        'attn_score_std',
+                        result.get('attn_rho_std', jnp.float32(0.0)))
+                metrics[f'{_pool}_{_name}'] = result.get(
+                    f'{_pool}_{_name}', _fallback)
+            for _name in DIRECT_TAU_SELECT_METRIC_NAMES:
+                metrics[f'{_pool}_{_name}'] = result.get(
+                    f'{_pool}_{_name}',
+                    result.get(f'attn_{_name}', jnp.float32(0.0)))
+            for _name in DIRECT_TAU_EXPOSURE_METRIC_NAMES:
+                metrics[f'{_pool}_{_name}'] = result.get(
+                    f'{_pool}_{_name}',
+                    result.get(f'attn_{_name}', jnp.float32(0.0)))
         if debug_local_spikes:
             metrics.update({
                 'local_spike_values': result.get(
@@ -3764,6 +3803,21 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'dev_neg_max': float(m.get('dev_neg_max', 0.0)),
         'timestamp': datetime.now().isoformat(),
     }
+    for _pool in ('attn_qk', 'attn_v'):
+        for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
+            _fallback = rec.get(f"attn_{_name}", 0.0)
+            if _name == 'score_std':
+                _fallback = rec.get('attn_score_std', 0.0)
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}', _fallback))
+        for _name in DIRECT_TAU_SELECT_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}',
+                rec.get(f'attn_{_name}', 0.0)))
+        for _name in DIRECT_TAU_EXPOSURE_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}',
+                rec.get(f'attn_{_name}', 0.0)))
     if rec['attn_top1_gate_frac'] == 0.0:
         rec['attn_top1_gate_frac'] = rec['attn_raw_gate_max'] / max(rec['attn_gate_sum'], 1e-8)
     if rec['rst_top1_gate_frac'] == 0.0:
@@ -3844,20 +3898,31 @@ def _format_output_stab_line(rec, indent="  "):
 
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
+    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
         f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
         f"grad={rec['grad_norm']:.2f} | "
         f"acc={rec['accuracy']:.4f} lr={rec['lr']:.2e}"
     )
-    log_message(
-        f"  act: attn_qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
-        f" attn_v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
-        f" rst={_fmt_act_count(rec['rst_active'], ctx['n_rst_cfg'])}"
-        f" | strong: attn_qk={rec['attn_qk_strong']*100:.1f}%"
-        f" attn_v={rec['attn_v_strong']*100:.1f}%"
-        f" rst={rec['rst_strong']*100:.1f}%"
-    )
+    if is_v4160:
+        log_message(
+            f"  act: qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
+            f" v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
+            f" rst={_fmt_act_count(rec['rst_active'], ctx['n_rst_cfg'])}"
+            f" | strong: qk={rec['attn_qk_strong']*100:.1f}%"
+            f" v={rec['attn_v_strong']*100:.1f}%"
+            f" rst={rec['rst_strong']*100:.1f}%"
+        )
+    else:
+        log_message(
+            f"  act: attn_qk={_fmt_act_count(rec['attn_qk_active'], ctx['n_qk_cfg'])}"
+            f" attn_v={_fmt_act_count(rec['attn_v_active'], ctx['n_v_cfg'])}"
+            f" rst={_fmt_act_count(rec['rst_active'], ctx['n_rst_cfg'])}"
+            f" | strong: attn_qk={rec['attn_qk_strong']*100:.1f}%"
+            f" attn_v={rec['attn_v_strong']*100:.1f}%"
+            f" rst={rec['rst_strong']*100:.1f}%"
+        )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_message(
             f"  select: rho_std[a={rec['attn_rho_std']:.4f}"
@@ -3873,28 +3938,48 @@ def _print_regular_block(rec, ctx):
             f" no_active[a={rec['attn_no_active_frac']*100:.2f}%"
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
-    elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
+    elif is_v4160:
         log_message(
-            f"  select: tau[a={rec['attn_tau_mean']:.4f}"
+            f"  select: tau[qk={rec['attn_qk_tau_mean']:.4f}"
+            f" v={rec['attn_v_tau_mean']:.4f}"
             f" rst={rec['rst_tau_mean']:.4f}]"
-            f" margin[a={rec['attn_selection_margin_mean']:+.4f}"
+            f" margin[qk={rec['attn_qk_selection_margin_mean']:+.4f}"
+            f" v={rec['attn_v_selection_margin_mean']:+.4f}"
             f" rst={rec['rst_selection_margin_mean']:+.4f}]"
-            f" pos[a={rec['attn_positive_margin_mean']:.4f}"
+            f" pos[qk={rec['attn_qk_positive_margin_mean']:.4f}"
+            f" v={rec['attn_v_positive_margin_mean']:.4f}"
             f" rst={rec['rst_positive_margin_mean']:.4f}]"
-            f" selected[a={rec['attn_selected_frac']*100:.1f}%"
+            f" selected[qk={rec['attn_qk_selected_frac']*100:.1f}%"
+            f" v={rec['attn_v_selected_frac']*100:.1f}%"
             f" rst={rec['rst_selected_frac']*100:.1f}%]"
-            f" no_active[a={rec['attn_no_active_frac']*100:.2f}%"
+            f" no_active[qk={rec['attn_qk_no_active_frac']*100:.2f}%"
+            f" v={rec['attn_v_no_active_frac']*100:.2f}%"
             f" rst={rec['rst_no_active_frac']*100:.2f}%]"
         )
-    log_message(
-        f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
-        f" rst={rec['rst_raw_gate_max']:.1f}]"
-        f" int_max[a={rec['attn_int_max']:.1f} rst={rec['rst_int_max']:.1f}]"
-        f" dead[a={int(rec['attn_dead_count'])} rst={int(rec['rst_dead_count'])}]"
-        f" drift[qk={rec['drift_attn_qk_emb']:.2e}"
-        f" attn_v={rec['drift_attn_v_emb']:.2e}"
-        f" rst={rec['drift_rst_emb']:.2e}]"
-    )
+    if is_v4160:
+        log_message(
+            f"  gate_max[qk={rec['attn_qk_raw_gate_max']:.1f}"
+            f" v={rec['attn_v_raw_gate_max']:.1f}"
+            f" rst={rec['rst_raw_gate_max']:.1f}]"
+            f" int_max[qk={rec['attn_qk_int_max']:.1f}"
+            f" v={rec['attn_v_int_max']:.1f} rst={rec['rst_int_max']:.1f}]"
+            f" dead[qk={int(rec['attn_qk_dead_count'])}"
+            f" v={int(rec['attn_v_dead_count'])}"
+            f" rst={int(rec['rst_dead_count'])}]"
+            f" drift[qk={rec['drift_attn_qk_emb']:.2e}"
+            f" v={rec['drift_attn_v_emb']:.2e}"
+            f" rst={rec['drift_rst_emb']:.2e}]"
+        )
+    else:
+        log_message(
+            f"  gate_max[a={rec['attn_raw_gate_max']:.1f}"
+            f" rst={rec['rst_raw_gate_max']:.1f}]"
+            f" int_max[a={rec['attn_int_max']:.1f} rst={rec['rst_int_max']:.1f}]"
+            f" dead[a={int(rec['attn_dead_count'])} rst={int(rec['rst_dead_count'])}]"
+            f" drift[qk={rec['drift_attn_qk_emb']:.2e}"
+            f" attn_v={rec['drift_attn_v_emb']:.2e}"
+            f" rst={rec['drift_rst_emb']:.2e}]"
+        )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_message(
             f"  angular_exposure: mean[a={rec['attn_angular_exposure_mean']:+.4f}"
@@ -3909,22 +3994,63 @@ def _print_regular_block(rec, ctx):
             f" rst={rec['rst_weak_exposure_frac']*100:.2f}%]"
             f" target={rec['attn_dead_exposure_target']:.3f}"
         )
-    log_message(
-        f"  gate_conc: a[eff={rec['attn_gate_eff_n']:.1f}"
-        f" ratio={rec['attn_gate_eff_ratio']:.3f}"
-        f" top1={rec['attn_top1_gate_frac']:.3f}]"
-        f" k[eff={rec['rst_gate_eff_n']:.1f}"
-        f" ratio={rec['rst_gate_eff_ratio']:.3f}"
-        f" top1={rec['rst_top1_gate_frac']:.3f}]"
-        f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
-        f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
-    )
+    elif is_v4160:
+        log_message(
+            f"  angular_exposure: mean[qk={rec['attn_qk_angular_exposure_mean']:+.4f}"
+            f" v={rec['attn_v_angular_exposure_mean']:+.4f}"
+            f" rst={rec['rst_angular_exposure_mean']:+.4f}]"
+            f" min[qk={rec['attn_qk_angular_exposure_min']:+.4f}"
+            f" v={rec['attn_v_angular_exposure_min']:+.4f}"
+            f" rst={rec['rst_angular_exposure_min']:+.4f}]"
+            f" max[qk={rec['attn_qk_angular_exposure_max']:+.4f}"
+            f" v={rec['attn_v_angular_exposure_max']:+.4f}"
+            f" rst={rec['rst_angular_exposure_max']:+.4f}]"
+            f" dead[qk={rec['attn_qk_dead_exposure_frac']*100:.2f}%"
+            f" v={rec['attn_v_dead_exposure_frac']*100:.2f}%"
+            f" rst={rec['rst_dead_exposure_frac']*100:.2f}%]"
+            f" weak[qk={rec['attn_qk_weak_exposure_frac']*100:.2f}%"
+            f" v={rec['attn_v_weak_exposure_frac']*100:.2f}%"
+            f" rst={rec['rst_weak_exposure_frac']*100:.2f}%]"
+            f" target={rec['attn_qk_dead_exposure_target']:.3f}"
+        )
+    if is_v4160:
+        log_message(
+            f"  gate_conc: qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
+            f" ratio={rec['attn_qk_gate_eff_ratio']:.3f}"
+            f" top1={rec['attn_qk_top1_gate_frac']:.3f}]"
+            f" v[eff={rec['attn_v_gate_eff_n']:.1f}"
+            f" ratio={rec['attn_v_gate_eff_ratio']:.3f}"
+            f" top1={rec['attn_v_top1_gate_frac']:.3f}]"
+            f" rst[eff={rec['rst_gate_eff_n']:.1f}"
+            f" ratio={rec['rst_gate_eff_ratio']:.3f}"
+            f" top1={rec['rst_top1_gate_frac']:.3f}]"
+            f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
+            f" v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
+        )
+    else:
+        log_message(
+            f"  gate_conc: a[eff={rec['attn_gate_eff_n']:.1f}"
+            f" ratio={rec['attn_gate_eff_ratio']:.3f}"
+            f" top1={rec['attn_top1_gate_frac']:.3f}]"
+            f" k[eff={rec['rst_gate_eff_n']:.1f}"
+            f" ratio={rec['rst_gate_eff_ratio']:.3f}"
+            f" top1={rec['rst_top1_gate_frac']:.3f}]"
+            f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
+            f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
+        )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
-        log_message(
-            f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
-            f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
-        )
+        if is_v4160:
+            log_message(
+                f"  gate_den_sum mean[qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
+                f" v={rec['attn_v_gate_den_sum_mean']:.1f}"
+                f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
+            )
+        else:
+            log_message(
+                f"  gate_den_sum mean[a={rec['attn_gate_den_sum_mean']:.1f}"
+                f" rst={rec['rst_gate_den_sum_mean']:.1f}]"
+            )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_message(_format_output_stab_line(rec, indent="  "))
     _cap_scale_min = min(
@@ -3962,12 +4088,22 @@ def _print_regular_block(rec, ctx):
     _cap_window_line = _format_update_cap_window_line(rec, indent="  ")
     if _cap_window_line:
         log_message(_cap_window_line)
-    log_message(
-        f"  tau: rst_b={rec['tau_rst_bias']:+.2f}"
-        f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
-        f" | tau_mean[attn={rec['attn_tau_mean']:+.3f} rst={rec['rst_tau_mean']:+.3f}]"
-        f" abs[attn={rec['attn_tau_abs_mean']:.3f} rst={rec['rst_tau_abs_mean']:.3f}]"
-    )
+    if is_v4160:
+        log_message(
+            f"  tau: tau_mean[qk={rec['attn_qk_tau_mean']:+.3f}"
+            f" v={rec['attn_v_tau_mean']:+.3f}"
+            f" rst={rec['rst_tau_mean']:+.3f}]"
+            f" abs[qk={rec['attn_qk_tau_abs_mean']:.3f}"
+            f" v={rec['attn_v_tau_abs_mean']:.3f}"
+            f" rst={rec['rst_tau_abs_mean']:.3f}]"
+        )
+    else:
+        log_message(
+            f"  tau: rst_b={rec['tau_rst_bias']:+.2f}"
+            f" attn_b=[{rec['tau_attn_bias_0']:+.2f} {rec['tau_attn_bias_1']:+.2f} {rec['tau_attn_bias_2']:+.2f}]"
+            f" | tau_mean[attn={rec['attn_tau_mean']:+.3f} rst={rec['rst_tau_mean']:+.3f}]"
+            f" abs[attn={rec['attn_tau_abs_mean']:.3f} rst={rec['rst_tau_abs_mean']:.3f}]"
+        )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', 'dawn_srw',
             'spatial-r1-v4.1.5.5', 'spatial-r1-v4.1.5.6',
@@ -3984,27 +4120,44 @@ def _print_regular_block(rec, ctx):
             f" p99={rec['attn_tau_off_p99']:+.2f} max={rec['attn_tau_off_max']:+.2f}"
             f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
         )
-    elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
+    elif is_v4160:
         rst_raw_tau_min = rec.get('rst_raw_tau_min', rec.get('rst_raw_tau_mean', 0.0))
         rst_raw_tau_max = rec.get('rst_raw_tau_max', rec.get('rst_raw_tau_mean', 0.0))
-        attn_raw_tau_min = rec.get('attn_raw_tau_min', rec.get('attn_raw_tau_mean', 0.0))
-        attn_raw_tau_max = rec.get('attn_raw_tau_max', rec.get('attn_raw_tau_mean', 0.0))
+        qk_raw_tau_min = rec.get(
+            'attn_qk_raw_tau_min', rec.get('attn_qk_raw_tau_mean', 0.0))
+        qk_raw_tau_max = rec.get(
+            'attn_qk_raw_tau_max', rec.get('attn_qk_raw_tau_mean', 0.0))
+        v_raw_tau_min = rec.get(
+            'attn_v_raw_tau_min', rec.get('attn_v_raw_tau_mean', 0.0))
+        v_raw_tau_max = rec.get(
+            'attn_v_raw_tau_max', rec.get('attn_v_raw_tau_mean', 0.0))
         log_message(
-            f"  raw_tau rst[min={rst_raw_tau_min:+.2f} max={rst_raw_tau_max:+.2f}]"
-            f" attn[min={attn_raw_tau_min:+.2f} max={attn_raw_tau_max:+.2f}]"
+            f"  raw_tau qk[min={qk_raw_tau_min:+.2f} max={qk_raw_tau_max:+.2f}]"
+            f" v[min={v_raw_tau_min:+.2f} max={v_raw_tau_max:+.2f}]"
+            f" rst[min={rst_raw_tau_min:+.2f} max={rst_raw_tau_max:+.2f}]"
         )
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
         else "score_std")
-    log_message(
-        f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
-        f" | emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
-        f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
-        f" attn_qk[m={rec['attn_qk_emb_norm_mean']:.2f} s={rec['attn_qk_emb_norm_std']:.2f}"
-        f" min={rec['attn_qk_emb_norm_min']:.2f} max={rec['attn_qk_emb_norm_max']:.2f}]"
-        f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
-        f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
-    )
+    if is_v4160:
+        log_message(
+            f"  emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
+            f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
+            f" qk[m={rec['attn_qk_emb_norm_mean']:.2f} s={rec['attn_qk_emb_norm_std']:.2f}"
+            f" min={rec['attn_qk_emb_norm_min']:.2f} max={rec['attn_qk_emb_norm_max']:.2f}]"
+            f" v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
+            f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
+        )
+    else:
+        log_message(
+            f"  {route_std_label}[attn={rec['attn_score_std']:.2f} rst={rec['rst_score_std']:.2f}]"
+            f" | emb_n rst[m={rec['rst_emb_norm']:.2f} s={rec['rst_emb_norm_std']:.2f}"
+            f" min={rec['rst_emb_norm_min']:.2f} max={rec['rst_emb_norm_max']:.2f}]"
+            f" attn_qk[m={rec['attn_qk_emb_norm_mean']:.2f} s={rec['attn_qk_emb_norm_std']:.2f}"
+            f" min={rec['attn_qk_emb_norm_min']:.2f} max={rec['attn_qk_emb_norm_max']:.2f}]"
+            f" attn_v[m={rec['attn_v_emb_norm_mean']:.2f} s={rec['attn_v_emb_norm_std']:.2f}"
+            f" min={rec['attn_v_emb_norm_min']:.2f} max={rec['attn_v_emb_norm_max']:.2f}]"
+        )
     log_message(
         f"  rw_n: attn_qk r[m={rec['attn_qk_read_norm_mean']:.2f} s={rec['attn_qk_read_norm_std']:.2f}"
         f" max={rec['attn_qk_read_norm_max']:.2f}]"
@@ -4576,6 +4729,8 @@ def _print_drop_compare_block(rec):
 
 def _print_debug_block(rec, ctx):
     """Write debug-only DAWN-SRW collapse diagnostics to debug_log_*.txt."""
+    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
+
     def _g(key, default=0.0):
         return float(rec.get(key, default) or 0.0)
 
@@ -4610,18 +4765,37 @@ def _print_debug_block(rec, ctx):
         f"total_minus_ce={_g('total_loss_minus_ce'):.6f} "
         f"recon_err={_g('reconstructed_loss_error'):.3e}"
     )
-    log_debug_message(
-        f"dead_diag: a_count={_g('attn_dead_count'):.1f} "
-        f"rst_count={_g('rst_dead_count'):.1f} "
-        f"total={_g('dead_count_total'):.1f} "
-        f"raw[a={_g('attn_dead_penalty_raw', _g('attn_dead_penalty')):.6f} "
-        f"rst={_g('rst_dead_penalty_raw', _g('rst_dead_penalty')):.6f}] "
-        f"per_dead[a={_g('attn_dead_penalty_per_dead'):.6f} "
-        f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
-        f"total={_g('dead_penalty_per_dead'):.6f}] "
-        f"weight={_g('dead_penalty_weight'):.4f} "
-        f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
-    )
+    if is_v4160:
+        _qk_per_dead = _g('attn_qk_dead_penalty') / max(_g('attn_qk_dead_count'), 1.0)
+        _v_per_dead = _g('attn_v_dead_penalty') / max(_g('attn_v_dead_count'), 1.0)
+        log_debug_message(
+            f"dead_diag: qk_count={_g('attn_qk_dead_count'):.1f} "
+            f"v_count={_g('attn_v_dead_count'):.1f} "
+            f"rst_count={_g('rst_dead_count'):.1f} "
+            f"total={_g('dead_count_total'):.1f} "
+            f"raw[qk={_g('attn_qk_dead_penalty'):.6f} "
+            f"v={_g('attn_v_dead_penalty'):.6f} "
+            f"rst={_g('rst_dead_penalty_raw', _g('rst_dead_penalty')):.6f}] "
+            f"per_dead[qk={_qk_per_dead:.6f} "
+            f"v={_v_per_dead:.6f} "
+            f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
+            f"total={_g('dead_penalty_per_dead'):.6f}] "
+            f"weight={_g('dead_penalty_weight'):.4f} "
+            f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
+        )
+    else:
+        log_debug_message(
+            f"dead_diag: a_count={_g('attn_dead_count'):.1f} "
+            f"rst_count={_g('rst_dead_count'):.1f} "
+            f"total={_g('dead_count_total'):.1f} "
+            f"raw[a={_g('attn_dead_penalty_raw', _g('attn_dead_penalty')):.6f} "
+            f"rst={_g('rst_dead_penalty_raw', _g('rst_dead_penalty')):.6f}] "
+            f"per_dead[a={_g('attn_dead_penalty_per_dead'):.6f} "
+            f"rst={_g('rst_dead_penalty_per_dead'):.6f} "
+            f"total={_g('dead_penalty_per_dead'):.6f}] "
+            f"weight={_g('dead_penalty_weight'):.4f} "
+            f"weighted={_g('dead_penalty_weighted_total', _g('dead_penalty_weighted')):.6f}"
+        )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
         log_debug_message(
             f"angular_exposure_diag: "
@@ -4636,6 +4810,26 @@ def _print_debug_block(rec, ctx):
             f"weak_frac[attn={_g('attn_weak_exposure_frac'):.5f} "
             f"rst={_g('rst_weak_exposure_frac'):.5f}] "
             f"target={_g('attn_dead_exposure_target'):.5f}"
+        )
+    elif is_v4160:
+        log_debug_message(
+            f"angular_exposure_diag: "
+            f"mean[qk={_g('attn_qk_angular_exposure_mean'):+.5f} "
+            f"v={_g('attn_v_angular_exposure_mean'):+.5f} "
+            f"rst={_g('rst_angular_exposure_mean'):+.5f}] "
+            f"min[qk={_g('attn_qk_angular_exposure_min'):+.5f} "
+            f"v={_g('attn_v_angular_exposure_min'):+.5f} "
+            f"rst={_g('rst_angular_exposure_min'):+.5f}] "
+            f"max[qk={_g('attn_qk_angular_exposure_max'):+.5f} "
+            f"v={_g('attn_v_angular_exposure_max'):+.5f} "
+            f"rst={_g('rst_angular_exposure_max'):+.5f}] "
+            f"dead_frac[qk={_g('attn_qk_dead_exposure_frac'):.5f} "
+            f"v={_g('attn_v_dead_exposure_frac'):.5f} "
+            f"rst={_g('rst_dead_exposure_frac'):.5f}] "
+            f"weak_frac[qk={_g('attn_qk_weak_exposure_frac'):.5f} "
+            f"v={_g('attn_v_weak_exposure_frac'):.5f} "
+            f"rst={_g('rst_weak_exposure_frac'):.5f}] "
+            f"target={_g('attn_qk_dead_exposure_target'):.5f}"
         )
     log_debug_message(
         f"expl_diag: warm={_g('exploration_warmup_factor'):.3f} "
@@ -4657,31 +4851,57 @@ def _print_debug_block(rec, ctx):
         f"block_attn={_g('rpe_block_attn', _g('explore_block_frac_a')):.3f} "
         f"block_rst={_g('rpe_block_rst', _g('explore_block_frac_k')):.3f}]"
     )
-    log_debug_message(
-        f"route_diag: active_n[qk={_g('attn_qk_active') * ctx.get('n_qk_cfg', 0):.1f} "
-        f"v={_g('attn_v_active') * ctx.get('n_v_cfg', 0):.1f} "
-        f"rst={_g('rst_active') * ctx.get('n_rst_cfg', 0):.1f}] "
-        f"active_frac[qk={_g('attn_qk_active'):.4f} "
-        f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
-        f"strong[qk={_g('attn_qk_strong'):.4f} "
-        f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
-        f"den[attn={_g('attn_gate_den_sum_mean'):.3f} "
-        f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
-        f"contrib[attn={_g('attn_contrib_den_sum'):.3f} "
-        f"rst={_g('rst_contrib_den_sum'):.3f}] "
-        f"compose[attn={_g('attn_compose_norm'):.4f} "
-        f"rst={_g('rst_compose_norm'):.4f}] "
-        f"den_ratio[attn={_g('attn_den_ratio'):.4f} "
-        f"rst={_g('rst_den_ratio'):.4f}] "
-        f"eff[attn={_g('attn_gate_eff_n'):.3f}/{_g('attn_gate_eff_ratio'):.4f} "
-        f"rst={_g('rst_gate_eff_n'):.3f}/{_g('rst_gate_eff_ratio'):.4f}] "
-        f"top1[attn_m={_g('attn_top1_gate_frac'):.4f} "
-        f"attn_max={_g('attn_top1_gate_frac_max'):.4f} "
-        f"rst_m={_g('rst_top1_gate_frac'):.4f} "
-        f"rst_max={_g('rst_top1_gate_frac_max'):.4f}] "
-        f"gate_max[attn={_g('attn_raw_gate_max'):.3f} "
-        f"rst={_g('rst_raw_gate_max'):.3f}]"
-    )
+    if is_v4160:
+        log_debug_message(
+            f"route_diag: active_n[qk={_g('attn_qk_active') * ctx.get('n_qk_cfg', 0):.1f} "
+            f"v={_g('attn_v_active') * ctx.get('n_v_cfg', 0):.1f} "
+            f"rst={_g('rst_active') * ctx.get('n_rst_cfg', 0):.1f}] "
+            f"active_frac[qk={_g('attn_qk_active'):.4f} "
+            f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
+            f"strong[qk={_g('attn_qk_strong'):.4f} "
+            f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
+            f"den[qk={_g('attn_qk_gate_den_sum_mean'):.3f} "
+            f"v={_g('attn_v_gate_den_sum_mean'):.3f} "
+            f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
+            f"eff[qk={_g('attn_qk_gate_eff_n'):.3f}/{_g('attn_qk_gate_eff_ratio'):.4f} "
+            f"v={_g('attn_v_gate_eff_n'):.3f}/{_g('attn_v_gate_eff_ratio'):.4f} "
+            f"rst={_g('rst_gate_eff_n'):.3f}/{_g('rst_gate_eff_ratio'):.4f}] "
+            f"top1[qk_m={_g('attn_qk_top1_gate_frac'):.4f} "
+            f"qk_max={_g('attn_qk_top1_gate_frac_max'):.4f} "
+            f"v_m={_g('attn_v_top1_gate_frac'):.4f} "
+            f"v_max={_g('attn_v_top1_gate_frac_max'):.4f} "
+            f"rst_m={_g('rst_top1_gate_frac'):.4f} "
+            f"rst_max={_g('rst_top1_gate_frac_max'):.4f}] "
+            f"gate_max[qk={_g('attn_qk_raw_gate_max'):.3f} "
+            f"v={_g('attn_v_raw_gate_max'):.3f} "
+            f"rst={_g('rst_raw_gate_max'):.3f}]"
+        )
+    else:
+        log_debug_message(
+            f"route_diag: active_n[qk={_g('attn_qk_active') * ctx.get('n_qk_cfg', 0):.1f} "
+            f"v={_g('attn_v_active') * ctx.get('n_v_cfg', 0):.1f} "
+            f"rst={_g('rst_active') * ctx.get('n_rst_cfg', 0):.1f}] "
+            f"active_frac[qk={_g('attn_qk_active'):.4f} "
+            f"v={_g('attn_v_active'):.4f} rst={_g('rst_active'):.4f}] "
+            f"strong[qk={_g('attn_qk_strong'):.4f} "
+            f"v={_g('attn_v_strong'):.4f} rst={_g('rst_strong'):.4f}] "
+            f"den[attn={_g('attn_gate_den_sum_mean'):.3f} "
+            f"rst={_g('rst_gate_den_sum_mean'):.3f}] "
+            f"contrib[attn={_g('attn_contrib_den_sum'):.3f} "
+            f"rst={_g('rst_contrib_den_sum'):.3f}] "
+            f"compose[attn={_g('attn_compose_norm'):.4f} "
+            f"rst={_g('rst_compose_norm'):.4f}] "
+            f"den_ratio[attn={_g('attn_den_ratio'):.4f} "
+            f"rst={_g('rst_den_ratio'):.4f}] "
+            f"eff[attn={_g('attn_gate_eff_n'):.3f}/{_g('attn_gate_eff_ratio'):.4f} "
+            f"rst={_g('rst_gate_eff_n'):.3f}/{_g('rst_gate_eff_ratio'):.4f}] "
+            f"top1[attn_m={_g('attn_top1_gate_frac'):.4f} "
+            f"attn_max={_g('attn_top1_gate_frac_max'):.4f} "
+            f"rst_m={_g('rst_top1_gate_frac'):.4f} "
+            f"rst_max={_g('rst_top1_gate_frac_max'):.4f}] "
+            f"gate_max[attn={_g('attn_raw_gate_max'):.3f} "
+            f"rst={_g('rst_raw_gate_max'):.3f}]"
+        )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_debug_message(_format_output_stab_line(rec, indent=""))
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.9':
@@ -4702,35 +4922,52 @@ def _print_debug_block(rec, ctx):
     elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
         log_debug_message(
             f"direct_tau_select_diag: "
-            f"tau[attn={_g('attn_tau_mean'):+.5f} rst={_g('rst_tau_mean'):+.5f}] "
-            f"raw_tau[attn={_g('attn_raw_tau_mean'):+.5f} rst={_g('rst_raw_tau_mean'):+.5f}] "
-            f"selection_margin[attn={_g('attn_selection_margin_mean'):+.5f} rst={_g('rst_selection_margin_mean'):+.5f}] "
-            f"positive_margin[attn={_g('attn_positive_margin_mean'):.5f}/{_g('attn_positive_margin_max'):.5f} "
+            f"tau[qk={_g('attn_qk_tau_mean'):+.5f} "
+            f"v={_g('attn_v_tau_mean'):+.5f} rst={_g('rst_tau_mean'):+.5f}] "
+            f"raw_tau[qk={_g('attn_qk_raw_tau_mean'):+.5f} "
+            f"v={_g('attn_v_raw_tau_mean'):+.5f} rst={_g('rst_raw_tau_mean'):+.5f}] "
+            f"selection_margin[qk={_g('attn_qk_selection_margin_mean'):+.5f} "
+            f"v={_g('attn_v_selection_margin_mean'):+.5f} "
+            f"rst={_g('rst_selection_margin_mean'):+.5f}] "
+            f"positive_margin[qk={_g('attn_qk_positive_margin_mean'):.5f}/{_g('attn_qk_positive_margin_max'):.5f} "
+            f"v={_g('attn_v_positive_margin_mean'):.5f}/{_g('attn_v_positive_margin_max'):.5f} "
             f"rst={_g('rst_positive_margin_mean'):.5f}/{_g('rst_positive_margin_max'):.5f}] "
-            f"selected[attn={_g('attn_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
-            f"no_active[attn={_g('attn_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
+            f"selected[qk={_g('attn_qk_selected_frac'):.5f} "
+            f"v={_g('attn_v_selected_frac'):.5f} rst={_g('rst_selected_frac'):.5f}] "
+            f"no_active[qk={_g('attn_qk_no_active_frac'):.5f} "
+            f"v={_g('attn_v_no_active_frac'):.5f} rst={_g('rst_no_active_frac'):.5f}]"
         )
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
         else "score_std")
-    log_debug_message(
-        f"tau_diag: {route_std_label}[attn={_g('attn_score_std'):.4f} "
-        f"rst={_g('rst_score_std'):.4f}] "
-        f"tau_abs[attn={_g('attn_tau_abs_mean'):.4f} "
-        f"rst={_g('rst_tau_abs_mean'):.4f}] "
-        f"tau_offset_attn[min={_g('attn_tau_off_min'):+.4f} "
-        f"p01={_g('attn_tau_off_p01'):+.4f} p99={_g('attn_tau_off_p99'):+.4f} "
-        f"max={_g('attn_tau_off_max'):+.4f} "
-        f"neg={_g('attn_tau_off_neg_frac'):.4f}] "
-        f"tau_offset_rst[min={_g('rst_tau_off_min'):+.4f} "
-        f"p01={_g('rst_tau_off_p01'):+.4f} p99={_g('rst_tau_off_p99'):+.4f} "
-        f"max={_g('rst_tau_off_max'):+.4f} "
-        f"neg={_g('rst_tau_off_neg_frac'):.4f}] "
-        f"scan_offset[attn=({_g('raw_scan_offset_attn_bias_0'):+.4f},"
-        f"{_g('raw_scan_offset_attn_bias_1'):+.4f},"
-        f"{_g('raw_scan_offset_attn_bias_2'):+.4f}) "
-        f"rst={_g('raw_scan_offset_rst_bias'):+.4f}]"
-    )
+    if is_v4160:
+        log_debug_message(
+            f"tau_diag: tau_abs[qk={_g('attn_qk_tau_abs_mean'):.4f} "
+            f"v={_g('attn_v_tau_abs_mean'):.4f} "
+            f"rst={_g('rst_tau_abs_mean'):.4f}] "
+            f"raw_tau[qk={_g('attn_qk_raw_tau_mean'):+.4f} "
+            f"v={_g('attn_v_raw_tau_mean'):+.4f} "
+            f"rst={_g('rst_raw_tau_mean'):+.4f}]"
+        )
+    else:
+        log_debug_message(
+            f"tau_diag: {route_std_label}[attn={_g('attn_score_std'):.4f} "
+            f"rst={_g('rst_score_std'):.4f}] "
+            f"tau_abs[attn={_g('attn_tau_abs_mean'):.4f} "
+            f"rst={_g('rst_tau_abs_mean'):.4f}] "
+            f"tau_offset_attn[min={_g('attn_tau_off_min'):+.4f} "
+            f"p01={_g('attn_tau_off_p01'):+.4f} p99={_g('attn_tau_off_p99'):+.4f} "
+            f"max={_g('attn_tau_off_max'):+.4f} "
+            f"neg={_g('attn_tau_off_neg_frac'):.4f}] "
+            f"tau_offset_rst[min={_g('rst_tau_off_min'):+.4f} "
+            f"p01={_g('rst_tau_off_p01'):+.4f} p99={_g('rst_tau_off_p99'):+.4f} "
+            f"max={_g('rst_tau_off_max'):+.4f} "
+            f"neg={_g('rst_tau_off_neg_frac'):.4f}] "
+            f"scan_offset[attn=({_g('raw_scan_offset_attn_bias_0'):+.4f},"
+            f"{_g('raw_scan_offset_attn_bias_1'):+.4f},"
+            f"{_g('raw_scan_offset_attn_bias_2'):+.4f}) "
+            f"rst={_g('raw_scan_offset_rst_bias'):+.4f}]"
+        )
     _intensity_bound = float(np.exp(float(ctx.get('intensity_beta', 0.0))))
     _intensity_bound = _intensity_bound if _intensity_bound > 0 else 1.0
     log_debug_message(
@@ -4905,6 +5142,12 @@ def _build_analysis_record(base, metrics, ctx):
             'attn_score_kurt', m.get('attn_rho_kurt', 0.0))),
         'rst_score_kurt': float(m.get(
             'rst_score_kurt', m.get('rst_rho_kurt', 0.0))),
+        'attn_rho_mean': float(m.get('attn_rho_mean', 0.0)),
+        'attn_rho_std': float(m.get('attn_rho_std', 0.0)),
+        'attn_rho_max': float(m.get('attn_rho_max', 0.0)),
+        'rst_rho_mean': float(m.get('rst_rho_mean', 0.0)),
+        'rst_rho_std': float(m.get('rst_rho_std', 0.0)),
+        'rst_rho_max': float(m.get('rst_rho_max', 0.0)),
         'attn_active_per_token_std': float(m.get('attn_active_per_token_std', 0.0)),
         'rst_active_per_token_std': float(m.get('rst_active_per_token_std', 0.0)),
         'attn_gate_entropy': float(m.get('attn_gate_entropy', 0.0)),
@@ -5041,6 +5284,21 @@ def _build_analysis_record(base, metrics, ctx):
         'attn_o_output_norm_mean': float(m.get('attn_o_output_norm_mean', 0.0)),
         'attn_o_output_norm_max': float(m.get('attn_o_output_norm_max', 0.0)),
     })
+    for _pool in ('attn_qk', 'attn_v'):
+        for _name in DIRECT_TAU_ATTN_SPLIT_METRIC_NAMES:
+            _fallback = rec.get(f"attn_{_name}", 0.0)
+            if _name == 'score_std':
+                _fallback = rec.get('attn_score_std', rec.get('attn_rho_std', 0.0))
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}', _fallback))
+        for _name in DIRECT_TAU_SELECT_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}',
+                rec.get(f'attn_{_name}', 0.0)))
+        for _name in DIRECT_TAU_EXPOSURE_METRIC_NAMES:
+            rec[f'{_pool}_{_name}'] = float(m.get(
+                f'{_pool}_{_name}',
+                rec.get(f'attn_{_name}', 0.0)))
     try:
         rec['attn_logit_max_layer'] = int(jax.device_get(
             m.get('attn_logit_max_layer', -1)))
@@ -5131,6 +5389,8 @@ def _build_analysis_record(base, metrics, ctx):
 def _print_analysis_block(rec, ctx):
     # Analysis logging must never kill a run.  Missing optional fields are
     # printed as 0.0 instead of raising KeyError.
+    is_v4160 = ctx.get('model_version') == 'spatial-r1-v4.1.6.0'
+
     def _g(key, default=0.0):
         return float(rec.get(key, default))
 
@@ -5152,6 +5412,18 @@ def _print_analysis_block(rec, ctx):
         f" a[skew={rec['attn_score_skew']:+.2f} kurt={rec['attn_score_kurt']:.2f}"
         f" apt_std={rec['attn_active_per_token_std']:.1f} ent={rec['attn_gate_entropy']:.2f}]"
     )
+    if is_v4160:
+        log_message(
+            f"  rho_stats qk[mean={_g('attn_qk_rho_mean'):+.5f}"
+            f" std={_g('attn_qk_rho_std'):.5f}"
+            f" max={_g('attn_qk_rho_max'):.5f}]"
+            f" v[mean={_g('attn_v_rho_mean'):+.5f}"
+            f" std={_g('attn_v_rho_std'):.5f}"
+            f" max={_g('attn_v_rho_max'):.5f}]"
+            f" rst[mean={_g('rst_rho_mean'):+.5f}"
+            f" std={_g('rst_rho_std'):.5f}"
+            f" max={_g('rst_rho_max'):.5f}]"
+        )
     log_message(
         f"  boundary k[phi={rec['rst_phi_binary']*100:.1f}%"
         f" z<075={rec['rst_z_lt_075']*100:.1f}%"
@@ -5189,24 +5461,49 @@ def _print_analysis_block(rec, ctx):
         f" v[{_full('attn_v_op_gain')}]"
         f" k[{_full('rst_op_gain')}]"
     )
-    log_message(
-        f"  gate_conc a[eff={rec['attn_gate_eff_n']:.1f}"
-        f" ratio={rec['attn_gate_eff_ratio']:.3f}"
-        f" top1_m={rec['attn_top1_gate_frac']:.3f}"
-        f" top1_max={rec['attn_top1_gate_frac_max']:.3f}]"
-        f" k[eff={rec['rst_gate_eff_n']:.1f}"
-        f" ratio={rec['rst_gate_eff_ratio']:.3f}"
-        f" top1_m={rec['rst_top1_gate_frac']:.3f}"
-        f" top1_max={rec['rst_top1_gate_frac_max']:.3f}]"
-        f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
-        f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
-    )
+    if is_v4160:
+        log_message(
+            f"  gate_conc qk[eff={rec['attn_qk_gate_eff_n']:.1f}"
+            f" ratio={rec['attn_qk_gate_eff_ratio']:.3f}"
+            f" top1_m={rec['attn_qk_top1_gate_frac']:.3f}"
+            f" top1_max={rec['attn_qk_top1_gate_frac_max']:.3f}]"
+            f" v[eff={rec['attn_v_gate_eff_n']:.1f}"
+            f" ratio={rec['attn_v_gate_eff_ratio']:.3f}"
+            f" top1_m={rec['attn_v_top1_gate_frac']:.3f}"
+            f" top1_max={rec['attn_v_top1_gate_frac_max']:.3f}]"
+            f" rst[eff={rec['rst_gate_eff_n']:.1f}"
+            f" ratio={rec['rst_gate_eff_ratio']:.3f}"
+            f" top1_m={rec['rst_top1_gate_frac']:.3f}"
+            f" top1_max={rec['rst_top1_gate_frac_max']:.3f}]"
+            f" | pool_scale qk={rec['attn_qk_pool_scale']:.3f}"
+            f" v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
+        )
+    else:
+        log_message(
+            f"  gate_conc a[eff={rec['attn_gate_eff_n']:.1f}"
+            f" ratio={rec['attn_gate_eff_ratio']:.3f}"
+            f" top1_m={rec['attn_top1_gate_frac']:.3f}"
+            f" top1_max={rec['attn_top1_gate_frac_max']:.3f}]"
+            f" k[eff={rec['rst_gate_eff_n']:.1f}"
+            f" ratio={rec['rst_gate_eff_ratio']:.3f}"
+            f" top1_m={rec['rst_top1_gate_frac']:.3f}"
+            f" top1_max={rec['rst_top1_gate_frac_max']:.3f}]"
+            f" | pool_scale attn_qk={rec['attn_qk_pool_scale']:.3f}"
+            f" attn_v={rec['attn_v_pool_scale']:.3f} rst={rec['rst_pool_scale']:.3f}"
+        )
     if ctx.get('model_version') in (
             'spatial-r1-v4.1.5.2', *SRW_ACTIVE_MODEL_VERSIONS):
-        log_message(
-            f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
-            f" rst={rec['rst_gate_den_sum']:.1f}"
-        )
+        if is_v4160:
+            log_message(
+                f"  gate_den_sum: qk={rec['attn_qk_gate_den_sum_mean']:.1f}"
+                f" v={rec['attn_v_gate_den_sum_mean']:.1f}"
+                f" rst={rec['rst_gate_den_sum']:.1f}"
+            )
+        else:
+            log_message(
+                f"  gate_den_sum: a={rec['attn_gate_den_sum']:.1f}"
+                f" rst={rec['rst_gate_den_sum']:.1f}"
+            )
     if ctx.get('model_version') == 'spatial-r1-v4.1.5.8':
         log_message(_format_output_stab_line(rec, indent="  "))
     log_message(
