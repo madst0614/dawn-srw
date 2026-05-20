@@ -56,9 +56,9 @@ training:
   router_proj_grad_clip: 2.0
 
   # DirectTau Angular Select / Intensity
-  tau_init_attn_qk: 0.02
+  tau_init_attn_qk: 0.001
   tau_init_attn_v: 0.10
-  tau_init_rst: 0.15
+  tau_init_rst: 0.20
   intensity_beta: 0.5
 
   # Auxiliary losses
