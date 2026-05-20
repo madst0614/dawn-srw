@@ -56,7 +56,7 @@ training:
   warmup_ratio: 0.06
   weight_decay: 0.1
   pool_weight_decay: 0.02
-  tau_lr_mult: 0.25    # conservative tau updates only; other LR paths use defaults
+  tau_lr_mult: 0.1    # conservative tau updates only; other LR paths use defaults
 
   # Angular Select / Intensity
   tau_min: 0.0
@@ -64,8 +64,8 @@ training:
 
   # Tau initialization / scan
   tau_offset_init_attn_qk: -0.5
-  tau_offset_init_attn_v: 1.5
-  tau_offset_init_rst: 2.0
+  tau_offset_init_attn_v: 1.0
+  tau_offset_init_rst: 1.5
   scan_scale: 0.0
   scan_std_floor: 0.5
 
@@ -76,8 +76,8 @@ training:
   dead_exposure_target: 0.1
 
   exploration_weight: 0.001
-  exploration_asymmetry: 1.2
-  exploration_warmup_steps: 1000
+  exploration_asymmetry: 3.0
+  exploration_warmup_steps: 0
   exploration_lower_bound: -0.5
   exploration_upper_bound: 2.0
   exploration_bound_eps: 0.001
