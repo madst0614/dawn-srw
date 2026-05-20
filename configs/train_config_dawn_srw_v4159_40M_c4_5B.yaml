@@ -57,6 +57,8 @@ training:
   weight_decay: 0.1
   pool_weight_decay: 0.02
   tau_lr_mult: 0.1    # conservative tau updates only; other LR paths use defaults
+  tau_grad_clip: 1.0
+  router_proj_grad_clip: 2.0
 
   # Angular Select / Intensity
   tau_min: 0.0
