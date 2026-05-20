@@ -2083,6 +2083,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'attn_rho_std': result.get('attn_rho_std', jnp.float32(0.0)),
             'attn_rho_max': result.get('attn_rho_max', jnp.float32(0.0)),
             'attn_raw_tau_mean': result.get('attn_raw_tau_mean', result.get('attn_tau_raw_mean', jnp.float32(0.0))),
+            'attn_raw_tau_min': result.get('attn_raw_tau_min', result.get('attn_raw_tau_mean', result.get('attn_tau_raw_mean', jnp.float32(0.0)))),
+            'attn_raw_tau_max': result.get('attn_raw_tau_max', result.get('attn_raw_tau_mean', result.get('attn_tau_raw_mean', jnp.float32(0.0)))),
             'attn_tau_min': result.get('attn_tau_min', result.get('attn_tau_floor_mean', jnp.float32(0.0))),
             'attn_tau_max': result.get('attn_tau_max', jnp.float32(0.0)),
 
@@ -2095,6 +2097,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'rst_rho_std': result.get('rst_rho_std', jnp.float32(0.0)),
             'rst_rho_max': result.get('rst_rho_max', jnp.float32(0.0)),
             'rst_raw_tau_mean': result.get('rst_raw_tau_mean', result.get('rst_tau_raw_mean', jnp.float32(0.0))),
+            'rst_raw_tau_min': result.get('rst_raw_tau_min', result.get('rst_raw_tau_mean', result.get('rst_tau_raw_mean', jnp.float32(0.0)))),
+            'rst_raw_tau_max': result.get('rst_raw_tau_max', result.get('rst_raw_tau_mean', result.get('rst_tau_raw_mean', jnp.float32(0.0)))),
             'rst_tau_min': result.get('rst_tau_min', result.get('rst_tau_floor_mean', jnp.float32(0.0))),
             'rst_tau_max': result.get('rst_tau_max', jnp.float32(0.0)),
 
@@ -3629,6 +3633,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'attn_rho_std': float(m.get('attn_rho_std', 0.0)),
         'attn_rho_max': float(m.get('attn_rho_max', 0.0)),
         'attn_raw_tau_mean': float(m.get('attn_raw_tau_mean', m.get('attn_tau_raw_mean', 0.0))),
+        'attn_raw_tau_min': float(m.get(
+            'attn_raw_tau_min',
+            m.get('attn_raw_tau_mean', m.get('attn_tau_raw_mean', 0.0)))),
+        'attn_raw_tau_max': float(m.get(
+            'attn_raw_tau_max',
+            m.get('attn_raw_tau_mean', m.get('attn_tau_raw_mean', 0.0)))),
         'attn_tau_min': float(m.get('attn_tau_min', m.get('attn_tau_floor_mean', 0.0))),
         'attn_tau_max': float(m.get('attn_tau_max', 0.0)),
 
@@ -3641,6 +3651,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'rst_rho_std': float(m.get('rst_rho_std', 0.0)),
         'rst_rho_max': float(m.get('rst_rho_max', 0.0)),
         'rst_raw_tau_mean': float(m.get('rst_raw_tau_mean', m.get('rst_tau_raw_mean', 0.0))),
+        'rst_raw_tau_min': float(m.get(
+            'rst_raw_tau_min',
+            m.get('rst_raw_tau_mean', m.get('rst_tau_raw_mean', 0.0)))),
+        'rst_raw_tau_max': float(m.get(
+            'rst_raw_tau_max',
+            m.get('rst_raw_tau_mean', m.get('rst_tau_raw_mean', 0.0)))),
         'rst_tau_min': float(m.get('rst_tau_min', m.get('rst_tau_floor_mean', 0.0))),
         'rst_tau_max': float(m.get('rst_tau_max', 0.0)),
 
@@ -3969,9 +3985,13 @@ def _print_regular_block(rec, ctx):
             f" neg={rec['attn_tau_off_neg_frac']*100:.1f}%]"
         )
     elif ctx.get('model_version') == 'spatial-r1-v4.1.6.0':
+        rst_raw_tau_min = rec.get('rst_raw_tau_min', rec.get('rst_raw_tau_mean', 0.0))
+        rst_raw_tau_max = rec.get('rst_raw_tau_max', rec.get('rst_raw_tau_mean', 0.0))
+        attn_raw_tau_min = rec.get('attn_raw_tau_min', rec.get('attn_raw_tau_mean', 0.0))
+        attn_raw_tau_max = rec.get('attn_raw_tau_max', rec.get('attn_raw_tau_mean', 0.0))
         log_message(
-            f"  raw_tau rst[min={rec['rst_raw_tau_min']:+.2f} max={rec['rst_raw_tau_max']:+.2f}]"
-            f" attn[min={rec['attn_raw_tau_min']:+.2f} max={rec['attn_raw_tau_max']:+.2f}]"
+            f"  raw_tau rst[min={rst_raw_tau_min:+.2f} max={rst_raw_tau_max:+.2f}]"
+            f" attn[min={attn_raw_tau_min:+.2f} max={attn_raw_tau_max:+.2f}]"
         )
     route_std_label = (
         "rho_std" if ctx.get('model_version') == 'spatial-r1-v4.1.5.9'
