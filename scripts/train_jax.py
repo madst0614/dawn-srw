@@ -4019,9 +4019,12 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'exploration_v_pre_bound': float(m.get('exploration_v_pre_bound', 0.0)),
         'exploration_raw_post_bound': float(m.get('exploration_raw_post_bound', 0.0)),
         # CB1A boundary audition loss.
+        'cb1a_enabled': bool(ctx.get('cb1a_enabled', False)),
+        'cb1a_ce_mean': float(m.get('cb1a_ce_mean', 0.0)),
+        'cb1a_ce_std': float(m.get('cb1a_ce_std', 0.0)),
         'cb1a_raw': float(m.get('cb1a_raw', 0.0)),
         'cb1a_w': float(m.get('cb1a_w', m.get('cb1a_weighted', 0.0))),
-        'cb1a_weighted': float(m.get('cb1a_weighted', 0.0)),
+        'cb1a_weighted': float(m.get('cb1a_weighted', m.get('cb1a_w', 0.0))),
         'cb1a_challenge_raw': float(m.get('cb1a_challenge_raw', 0.0)),
         'cb1a_prune_raw': float(m.get('cb1a_prune_raw', 0.0)),
         'cb1a_challenge': float(m.get('cb1a_challenge', 0.0)),
@@ -4029,12 +4032,30 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'cb1a_valid': float(m.get('cb1a_valid', 0.0)),
         'cb1a_has_above': float(m.get('cb1a_has_above', 0.0)),
         'cb1a_has_below': float(m.get('cb1a_has_below', 0.0)),
-        'cb1a_qk_challenge': float(m.get('cb1a_qk_challenge', 0.0)),
-        'cb1a_qk_prune': float(m.get('cb1a_qk_prune', 0.0)),
-        'cb1a_v_challenge': float(m.get('cb1a_v_challenge', 0.0)),
-        'cb1a_v_prune': float(m.get('cb1a_v_prune', 0.0)),
-        'cb1a_rst_challenge': float(m.get('cb1a_rst_challenge', 0.0)),
-        'cb1a_rst_prune': float(m.get('cb1a_rst_prune', 0.0)),
+        'cb1a_qk_challenge_raw': float(m.get(
+            'cb1a_qk_challenge_raw', m.get('cb1a_qk_challenge', 0.0))),
+        'cb1a_qk_prune_raw': float(m.get(
+            'cb1a_qk_prune_raw', m.get('cb1a_qk_prune', 0.0))),
+        'cb1a_v_challenge_raw': float(m.get(
+            'cb1a_v_challenge_raw', m.get('cb1a_v_challenge', 0.0))),
+        'cb1a_v_prune_raw': float(m.get(
+            'cb1a_v_prune_raw', m.get('cb1a_v_prune', 0.0))),
+        'cb1a_rst_challenge_raw': float(m.get(
+            'cb1a_rst_challenge_raw', m.get('cb1a_rst_challenge', 0.0))),
+        'cb1a_rst_prune_raw': float(m.get(
+            'cb1a_rst_prune_raw', m.get('cb1a_rst_prune', 0.0))),
+        'cb1a_qk_challenge': float(m.get(
+            'cb1a_qk_challenge', m.get('cb1a_qk_challenge_raw', 0.0))),
+        'cb1a_qk_prune': float(m.get(
+            'cb1a_qk_prune', m.get('cb1a_qk_prune_raw', 0.0))),
+        'cb1a_v_challenge': float(m.get(
+            'cb1a_v_challenge', m.get('cb1a_v_challenge_raw', 0.0))),
+        'cb1a_v_prune': float(m.get(
+            'cb1a_v_prune', m.get('cb1a_v_prune_raw', 0.0))),
+        'cb1a_rst_challenge': float(m.get(
+            'cb1a_rst_challenge', m.get('cb1a_rst_challenge_raw', 0.0))),
+        'cb1a_rst_prune': float(m.get(
+            'cb1a_rst_prune', m.get('cb1a_rst_prune_raw', 0.0))),
         'cb1a_qk_raw': float(m.get('cb1a_qk_raw', 0.0)),
         'cb1a_v_raw': float(m.get('cb1a_v_raw', 0.0)),
         'cb1a_rst_raw': float(m.get('cb1a_rst_raw', 0.0)),
@@ -4526,10 +4547,50 @@ def _format_output_stab_line(rec, indent="  "):
     )
 
 
+def _should_print_cb1a_line(rec, ctx):
+    return (
+        bool(ctx.get('cb1a_enabled') or rec.get('cb1a_enabled', False))
+        or float(rec.get('cb1a_weight', 0.0) or 0.0) > 0.0
+        or float(rec.get('cb1a_raw', 0.0) or 0.0) != 0.0
+    )
+
+
+def _print_cb1a_regular_block(rec):
+    def _g(key, default=0.0):
+        return float(rec.get(key, default) or 0.0)
+
+    qk_challenge = _g(
+        'cb1a_qk_challenge_raw', rec.get('cb1a_qk_challenge', 0.0))
+    qk_prune = _g('cb1a_qk_prune_raw', rec.get('cb1a_qk_prune', 0.0))
+    v_challenge = _g(
+        'cb1a_v_challenge_raw', rec.get('cb1a_v_challenge', 0.0))
+    v_prune = _g('cb1a_v_prune_raw', rec.get('cb1a_v_prune', 0.0))
+    rst_challenge = _g(
+        'cb1a_rst_challenge_raw', rec.get('cb1a_rst_challenge', 0.0))
+    rst_prune = _g('cb1a_rst_prune_raw', rec.get('cb1a_rst_prune', 0.0))
+
+    log_message(
+        f"  cb1a: ce[m={_g('cb1a_ce_mean'):.3f} std={_g('cb1a_ce_std'):.3f}]"
+        f" raw={_g('cb1a_raw'):.6f}"
+        f" weighted={_g('cb1a_weighted', rec.get('cb1a_w', 0.0)):.6f}"
+        f" challenge={_g('cb1a_challenge_raw'):.6f}"
+        f" prune={_g('cb1a_prune_raw'):.6f}"
+        f" pool[qk={_g('cb1a_qk_raw'):.6f}"
+        f" v={_g('cb1a_v_raw'):.6f}"
+        f" rst={_g('cb1a_rst_raw'):.6f}]"
+    )
+    log_message(
+        f"  cb1a_split: qk[ch={qk_challenge:.6f} pr={qk_prune:.6f}]"
+        f" v[ch={v_challenge:.6f} pr={v_prune:.6f}]"
+        f" rst[ch={rst_challenge:.6f} pr={rst_prune:.6f}]"
+    )
+
+
 def _print_regular_block(rec, ctx):
     """Print REGULAR tier -~8 lines covering the live training dynamics."""
     is_v4160 = ctx.get('model_version') in (
         'spatial-r1-v4.1.6.0', 'spatial-r1-v4.1.6.1')
+    is_v4161 = ctx.get('model_version') == 'spatial-r1-v4.1.6.1'
     log_message(
         f"[Step {rec['step']}/{ctx['total_micro_steps']} ({ctx['progress']:.1f}%)] "
         f"loss={rec['total_loss']:.4f} ce={rec['ce_loss']:.4f} aux={rec['aux_loss']:.4f} | "
@@ -4853,35 +4914,38 @@ def _print_regular_block(rec, ctx):
         f" k[m={rec['rst_op_gain_mean']:.2f} s={rec['rst_op_gain_std']:.2f}"
         f" max={rec['rst_op_gain_max']:.2f}]"
     )
-    if is_v4160:
-        log_message(
-            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-            f" pos={rec['pos_frac']*100:.1f}%"
-            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-            f" expl[qk={rec['explore_qk_raw']:+.3f}"
-            f" v={rec['explore_v_raw']:+.3f}"
-            f" rst={rec['explore_rst_raw']:+.3f}"
-            f" total={rec['explore_loss_raw']:+.3f}]"
-            f" weighted[qk={rec['exploration_loss_weighted_qk']:+.4f}"
-            f" v={rec['exploration_loss_weighted_v']:+.4f}"
-            f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
-            f" total={rec['explore_loss_weighted']:+.4f}]"
-            f" block[qk={rec['explore_block_frac_qk']*100:.1f}%"
-            f" v={rec['explore_block_frac_v']*100:.1f}%"
-            f" rst={rec['explore_block_frac_k']*100:.1f}%]"
-        )
-    else:
-        log_message(
-            f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
-            f" pos={rec['pos_frac']*100:.1f}%"
-            f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
-            f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
-            f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
-            f" w={rec['explore_loss_weighted']:+.4f}"
-            f" block[a={rec['explore_block_frac_a']*100:.1f}%"
-            f" rst={rec['explore_block_frac_k']*100:.1f}%]"
-        )
+    if _should_print_cb1a_line(rec, ctx):
+        _print_cb1a_regular_block(rec)
+    if not is_v4161:
+        if is_v4160:
+            log_message(
+                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+                f" pos={rec['pos_frac']*100:.1f}%"
+                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+                f" expl[qk={rec['explore_qk_raw']:+.3f}"
+                f" v={rec['explore_v_raw']:+.3f}"
+                f" rst={rec['explore_rst_raw']:+.3f}"
+                f" total={rec['explore_loss_raw']:+.3f}]"
+                f" weighted[qk={rec['exploration_loss_weighted_qk']:+.4f}"
+                f" v={rec['exploration_loss_weighted_v']:+.4f}"
+                f" rst={rec['exploration_loss_weighted_rst']:+.4f}"
+                f" total={rec['explore_loss_weighted']:+.4f}]"
+                f" block[qk={rec['explore_block_frac_qk']*100:.1f}%"
+                f" v={rec['explore_block_frac_v']*100:.1f}%"
+                f" rst={rec['explore_block_frac_k']*100:.1f}%]"
+            )
+        else:
+            log_message(
+                f"  rpe: mean_ce={rec['global_mean_ce']:.3f}"
+                f" pos={rec['pos_frac']*100:.1f}%"
+                f" pos_avg={rec['pos_mean']:.3f} neg_avg={rec['neg_mean']:.3f}"
+                f" dev[+={rec['dev_pos_max']:.2f} -={rec['dev_neg_max']:.2f}]"
+                f" expl[a={rec['explore_attn_raw']:+.3f} rst={rec['explore_rst_raw']:+.3f}]"
+                f" w={rec['explore_loss_weighted']:+.4f}"
+                f" block[a={rec['explore_block_frac_a']*100:.1f}%"
+                f" rst={rec['explore_block_frac_k']*100:.1f}%]"
+            )
     _pl_a = rec.get('per_layer_attn_out_norm', []) or []
     _pl_k = rec.get('per_layer_rst_out_norm', []) or []
     if _pl_a or _pl_k:
@@ -8913,6 +8977,7 @@ def main():
                         'total_micro_steps': total_micro_steps,
                         'progress': _progress,
                         'model_version': model_version,
+                        'cb1a_enabled': bool(cb1a_enabled),
                         'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                         'd_select': int(cfg['model'].get('d_select', 0) or 0),
                         'd_intensity': int(
@@ -8995,6 +9060,7 @@ def main():
                     'total_micro_steps': total_micro_steps,
                     'progress': _progress,
                     'model_version': model_version,
+                    'cb1a_enabled': bool(cb1a_enabled),
                     'intensity_beta': float(tcfg.get('intensity_beta', 0.0)),
                     'd_select': int(cfg['model'].get('d_select', 0) or 0),
                     'd_intensity': int(
