@@ -4160,7 +4160,7 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
         'cb1a_rst_raw': float(m.get('cb1a_rst_raw', 0.0)),
         'cb1a_weight': float(m.get('cb1a_weight', 0.0)),
         'cb1a_challenge_weight': float(m.get('cb1a_challenge_weight', 1.0)),
-        'cb1a_prune_weight': float(m.get('cb1a_prune_weight', 3.0)),
+        'cb1a_prune_weight': float(m.get('cb1a_prune_weight', 1.0)),
         'cb1a_qk_weight': float(m.get('cb1a_qk_weight', 1.0)),
         'cb1a_v_weight': float(m.get('cb1a_v_weight', 1.0)),
         'cb1a_rst_weight': float(m.get('cb1a_rst_weight', 1.0)),
@@ -4169,19 +4169,19 @@ def _build_regular_record(metrics, win_avgs, ctx, global_step, epoch):
             m.get('cb1a_challenge_weight', 1.0))),
         'cb1a_qk_prune_weight': float(m.get(
             'cb1a_qk_prune_weight',
-            m.get('cb1a_prune_weight', 3.0))),
+            m.get('cb1a_prune_weight', 1.0))),
         'cb1a_v_challenge_weight': float(m.get(
             'cb1a_v_challenge_weight',
             m.get('cb1a_challenge_weight', 1.0))),
         'cb1a_v_prune_weight': float(m.get(
             'cb1a_v_prune_weight',
-            m.get('cb1a_prune_weight', 3.0))),
+            m.get('cb1a_prune_weight', 1.0))),
         'cb1a_rst_challenge_weight': float(m.get(
             'cb1a_rst_challenge_weight',
             m.get('cb1a_challenge_weight', 1.0))),
         'cb1a_rst_prune_weight': float(m.get(
             'cb1a_rst_prune_weight',
-            m.get('cb1a_prune_weight', 3.0))),
+            m.get('cb1a_prune_weight', 1.0))),
         # Accuracy / training status.
         'accuracy': win_avgs['acc'],
         'grad_norm': float(m['grad_norm']),
@@ -6822,7 +6822,7 @@ def main():
     cb1a_enabled = tcfg.get('cb1a_enabled', False)
     cb1a_weight = tcfg.get('cb1a_weight', 0.0)
     cb1a_challenge_weight = tcfg.get('cb1a_challenge_weight', 1.0)
-    cb1a_prune_weight = tcfg.get('cb1a_prune_weight', 3.0)
+    cb1a_prune_weight = tcfg.get('cb1a_prune_weight', 1.0)
     cb1a_qk_weight = tcfg.get('cb1a_qk_weight', 1.0)
     cb1a_v_weight = tcfg.get('cb1a_v_weight', 1.0)
     cb1a_rst_weight = tcfg.get('cb1a_rst_weight', 1.0)
