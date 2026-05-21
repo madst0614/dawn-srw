@@ -3461,10 +3461,6 @@ class DAWN(nn.Module):
 
             'per_layer_attn_out_norm': attn_out_norm_all,
             'per_layer_rst_out_norm': rst_out_norm_all,
-            # Per-layer direct tau stacks for exploration loss.
-            # Shapes: attn [L, B, S, 3], RST [L, B, S, 1].
-            'attn_tau_direct': attn_tau_direct_all,
-            'rst_tau_direct': rst_tau_direct_all,
             # Denominator diagnostic: sum(positive_margin * intensity).
             'attn_int_max': attn_int_max_all.max(),
             'attn_qk_int_max': _attn_core_max(ATTN_SPLIT_QK_INT_MAX),
@@ -3665,7 +3661,7 @@ class DAWN(nn.Module):
             result['debug_logit_norm_mean'] = logit_norm_mean
             result['debug_logit_mean'] = logit_mean
             result['debug_logit_std'] = logit_std
-            # v4.1 explore: expose per-token CE + valid mask for RPE loss.
+            # CB1A uses per-token CE statistics for hard/easy weighting.
             result['per_token_ce'] = per_token_ce
             result['valid_mask'] = valid_mask
         else:

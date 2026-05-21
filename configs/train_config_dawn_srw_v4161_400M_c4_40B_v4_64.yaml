@@ -90,14 +90,6 @@ training:
   cb1a_ce_mode: sigmoid_z
   cb1a_eps: 1.0e-8
 
-  # Exploration / RPE feedback over direct tau in [0, 1]
-  exploration_weight: 0.001
-  exploration_asymmetry: 3.0
-  exploration_warmup_steps: 0
-  exploration_lower_bound: 0.0
-  exploration_upper_bound: 0.95
-  exploration_bound_eps: 0.001
-
   # Chunking - 400M-specific memory/mesh setting
   n_chunks_qk: 1
   n_chunks_v: 1
