@@ -73,7 +73,7 @@ training:
 
   # CE-conditioned Boundary-1 Audition (CB1A)
   cb1a_enabled: true
-  cb1a_weight: 0.1
+  cb1a_weight: 1.0
   cb1a_qk_weight: 1.0
   cb1a_v_weight: 1.0
   cb1a_rst_weight: 1.0
