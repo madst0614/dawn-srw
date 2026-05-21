@@ -75,11 +75,11 @@ training:
   cb1a_weight: 1.0
   cb1a_qk_weight: 0.1
   cb1a_v_weight: 0.8
-  cb1a_rst_weight: 1.0
+  cb1a_rst_weight: 1.5
   cb1a_qk_challenge_weight: 1.0
   cb1a_qk_prune_weight: 1.1
   cb1a_v_challenge_weight: 1.0
-  cb1a_v_prune_weight: 1.3
+  cb1a_v_prune_weight: 1.2
   cb1a_rst_challenge_weight: 1.0
   cb1a_rst_prune_weight: 2.0
   cb1a_tau_stopgrad: true
