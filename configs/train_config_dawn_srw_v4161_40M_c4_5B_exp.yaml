@@ -104,4 +104,4 @@ training:
   log_analysis_multiplier: 5
   heavy_geometry_multiplier: 10
 
-checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4161_40M_c4_5B_cb1a
+checkpoint_dir: gs://dawn-tpu-data-c4/checkpoints/dawn_srw_v4161_40M_c4_5B_cb1a_exp
