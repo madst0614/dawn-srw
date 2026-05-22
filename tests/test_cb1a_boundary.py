@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from models.dawn_srw_v4161 import (
+from models.legacy.dawn_srw_v4161 import (
     _cb1a_boundary_gaps_from_rho_tau,
     _cb1a_local_winner_gaps_from_boundaries,
 )
