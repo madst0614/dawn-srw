@@ -79,10 +79,6 @@ try:
     from models.dawn_srw_v4160 import DAWN as DAWN_SRW_V4160
 except ImportError:
     DAWN_SRW_V4160 = None
-try:
-    from models.dawn_srw_v4161 import DAWN as DAWN_SRW_V4161
-except ImportError:
-    DAWN_SRW_V4161 = None
 
 # ============================================================
 # Constants
@@ -98,7 +94,6 @@ SRW_ACTIVE_MODEL_VERSIONS = (
     'spatial-r1-v4.1.5.8',
     'spatial-r1-v4.1.5.9',
     'spatial-r1-v4.1.6.0',
-    'spatial-r1-v4.1.6.1',
 )
 
 LOCAL_SPIKE_POOL_NAMES = ('attn_q', 'attn_k', 'attn_v', 'rst')
@@ -658,17 +653,6 @@ if DAWN_SRW_V4160 is not None:
         sharded_kwargs=_v415_sharded_kwargs,
     )
 
-if DAWN_SRW_V4161 is not None:
-    MODEL_REGISTRY['spatial-r1-v4.1.6.1'] = ModelSpec(
-        name='spatial-r1-v4.1.6.1',
-        module_path='models.dawn_srw_v4161',
-        cls=DAWN_SRW_V4161,
-        build_kwargs=_dawn_srw_kwargs,
-        supports_sharded=True,
-        force_sharded=True,
-        sharded_kwargs=_v415_sharded_kwargs,
-    )
-
 
 def build_model_from_config(cfg):
     """Build model from config via MODEL_REGISTRY.
@@ -1184,6 +1168,9 @@ def _pool_update_diagnostics(params, grads):
 def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                       tau_reg_weight, dead_penalty_weight,
                       exploration_weight, exploration_asymmetry,
+                      exploration_weight_qk,
+                      exploration_weight_v,
+                      exploration_weight_rst,
                       rank, knowledge_rank, n_feature_qk, n_restore_qk,
                       weight_decay=0.0, pool_weight_decay=0.0,
                       exploration_warmup_steps=5000,
@@ -1277,6 +1264,12 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             return mean, std
         _global_mean_std_reducer = _mean_std_reducer_fn
 
+    _explore_weight_qk = jnp.float32(
+        exploration_weight if exploration_weight_qk is None else exploration_weight_qk)
+    _explore_weight_v = jnp.float32(
+        exploration_weight if exploration_weight_v is None else exploration_weight_v)
+    _explore_weight_rst = jnp.float32(
+        exploration_weight if exploration_weight_rst is None else exploration_weight_rst)
     _asym = jnp.float32(exploration_asymmetry)
     _explore_lower = jnp.float32(exploration_lower_bound)
     _explore_upper = jnp.float32(exploration_upper_bound)
@@ -1654,8 +1647,10 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             # meaningful; early CE-dominated learning keeps tau gradient clean.
             explore_active = (step >= _warmup_steps).astype(jnp.float32)
             explore_loss_weighted_unclipped = (
-                jnp.float32(exploration_weight)
-                * explore_loss_raw * explore_active)
+                (_explore_weight_qk * explore_qk_raw
+                 + _explore_weight_v * explore_v_raw
+                 + _explore_weight_rst * explore_rst_raw)
+                * explore_active)
             explore_loss_weighted = jnp.where(
                 _explore_weighted_clip > 0.0,
                 jnp.clip(explore_loss_weighted_unclipped,
@@ -2456,7 +2451,8 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
                 'attn_v_dead_count', jnp.float32(0.0)),
             'exploration_warmup_factor': explore_stats['explore_active'],
             'exploration_weight_effective': (
-                jnp.float32(exploration_weight) * explore_stats['explore_active']),
+                (_explore_weight_qk + _explore_weight_v + _explore_weight_rst)
+                / jnp.float32(3.0) * explore_stats['explore_active']),
             'exploration_asymmetry': jnp.float32(exploration_asymmetry),
             'exploration_loss_raw_total': explore_stats['explore_loss_raw'],
             'exploration_loss_raw_qk': explore_stats['explore_qk_raw'],
@@ -2464,16 +2460,16 @@ def create_train_step(model, optimizer, orth_weight, div_weight, lb_weight,
             'exploration_loss_raw_attn': explore_stats['explore_attn_raw'],
             'exploration_loss_raw_rst': explore_stats['explore_rst_raw'],
             'exploration_loss_weighted_qk': (
-                exploration_weight * explore_stats['explore_qk_raw']
+                _explore_weight_qk * explore_stats['explore_qk_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_v': (
-                exploration_weight * explore_stats['explore_v_raw']
+                _explore_weight_v * explore_stats['explore_v_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_attn': (
-                exploration_weight * explore_stats['explore_attn_raw']
+                ((_explore_weight_qk + _explore_weight_v) / jnp.float32(2.0)) * explore_stats['explore_attn_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_rst': (
-                exploration_weight * explore_stats['explore_rst_raw']
+                _explore_weight_rst * explore_stats['explore_rst_raw']
                 * explore_stats['explore_active']),
             'exploration_loss_weighted_total': explore_loss_weighted_metric,
             'exploration_loss_weighted_unclipped': explore_loss_weighted_unclipped_metric,
@@ -6804,6 +6800,9 @@ def main():
     dead_exposure_target = float(tcfg.get('dead_exposure_target', 0.1))
     # v4.1 RPE exploration loss (0 weight => off; no-op for earlier versions).
     exploration_weight = tcfg.get('exploration_weight', 0.0)
+    exploration_weight_qk = tcfg.get('exploration_weight_qk', exploration_weight)
+    exploration_weight_v = tcfg.get('exploration_weight_v', exploration_weight)
+    exploration_weight_rst = tcfg.get('exploration_weight_rst', exploration_weight)
     exploration_asymmetry = tcfg.get('exploration_asymmetry', 0.15)
     # v4.1+ bounded-explore: warmup + per-element bound-off cap.
     exploration_warmup_steps = tcfg.get('exploration_warmup_steps', 5000)
@@ -6818,6 +6817,9 @@ def main():
         'exploration_weighted_clip', tcfg.get('expl_w_clip', 0.0))
     if not rpe_enabled:
         exploration_weight = 0.0
+        exploration_weight_qk = 0.0
+        exploration_weight_v = 0.0
+        exploration_weight_rst = 0.0
         exploration_weighted_clip = 0.0
     cb1a_enabled = tcfg.get('cb1a_enabled', False)
     cb1a_weight = tcfg.get('cb1a_weight', 0.0)
@@ -7067,6 +7069,12 @@ def main():
                 'dead_exposure_target', dead_exposure_target))
             exploration_weight = saved_training_config.get(
                 'exploration_weight', exploration_weight)
+            exploration_weight_qk = saved_training_config.get(
+                'exploration_weight_qk', exploration_weight_qk)
+            exploration_weight_v = saved_training_config.get(
+                'exploration_weight_v', exploration_weight_v)
+            exploration_weight_rst = saved_training_config.get(
+                'exploration_weight_rst', exploration_weight_rst)
             exploration_asymmetry = saved_training_config.get(
                 'exploration_asymmetry', exploration_asymmetry)
             exploration_warmup_steps = saved_training_config.get(
@@ -7173,6 +7181,9 @@ def main():
 
     if not rpe_enabled:
         exploration_weight = 0.0
+        exploration_weight_qk = 0.0
+        exploration_weight_v = 0.0
+        exploration_weight_rst = 0.0
         exploration_weighted_clip = 0.0
 
     # Build training_config dict for saving in checkpoints
@@ -7193,6 +7204,9 @@ def main():
         'dead_penalty_rst_weight': dead_penalty_rst_weight,
         'dead_exposure_target': dead_exposure_target,
         'exploration_weight': exploration_weight,
+        'exploration_weight_qk': exploration_weight_qk,
+        'exploration_weight_v': exploration_weight_v,
+        'exploration_weight_rst': exploration_weight_rst,
         'exploration_asymmetry': exploration_asymmetry,
         'exploration_warmup_steps': exploration_warmup_steps,
         'exploration_lower_bound': exploration_lower_bound,
@@ -7925,6 +7939,7 @@ def main():
         model, optimizer, orth_weight, div_weight, lb_weight,
         tau_reg_weight, dead_penalty_weight,
         exploration_weight, exploration_asymmetry,
+        exploration_weight_qk, exploration_weight_v, exploration_weight_rst,
         rank, knowledge_rank, n_feature_qk, n_restore_qk,
         weight_decay=weight_decay, pool_weight_decay=pool_weight_decay,
         exploration_warmup_steps=exploration_warmup_steps,
